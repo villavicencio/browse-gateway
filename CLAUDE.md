@@ -34,6 +34,8 @@ browse-gateway/
 │   ├── verbs/              # retrieve(), proxy escalation, CAPTCHA hook
 │   ├── mcp/                # MCP server exposing retrieve as a tool
 │   └── observability/      # viewer wiring, session retention/access
+├── docs/
+│   └── solutions/          # documented solutions to past problems, organized by category with YAML frontmatter (module, tags, problem_type)
 ├── scripts/
 │   └── validate-stealth.mjs  # stealth-validation harness (the kill-gate)
 └── test/
