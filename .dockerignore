@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.gitignore
+coverage
+.nyc_output
+test-results
+playwright-report
+.cache
+**/*.local.md
+**/*.local.yaml
+.env
+.env.*
+.DS_Store
+.compound-engineering
+CONTEXT.local.md
