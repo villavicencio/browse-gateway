@@ -139,6 +139,27 @@ test("retrieve: CF block from datacenter IP escalates to the proxy and then succ
   assert.equal(r.blocked, false);
 });
 
+test("retrieve: rejects non-http(s) URLs before any session opens (file:// local-read)", async () => {
+  const { gateway, calls } = makeFakeGateway([renderOf({ text: "x".repeat(1000), html: articleHtml })]);
+  for (const url of ["file:///etc/passwd", "data:text/html,<h1>x</h1>", "ftp://host/f"]) {
+    await assert.rejects(
+      retrieve(gateway, new SecretStore(() => ({})), { token: "t", url }),
+      /unsupported URL scheme/,
+      url,
+    );
+  }
+  assert.equal(calls.length, 0, "no session opened for a rejected scheme");
+});
+
+test("retrieve: a short-but-valid page is not reported as blocked (false-block regression)", async () => {
+  // Short real content, no block phrase: must return content, not blocked:true.
+  const shortHtml = "<html><body><p>A short but legitimate page body.</p></body></html>";
+  const { gateway } = makeFakeGateway([renderOf({ status: 200, text: "A short but legitimate page body.", html: shortHtml })]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://small.example/" });
+  assert.equal(r.blocked, false, "thin content must not be reported as a block");
+  assert.ok(r.markdown.length > 0, "content returned");
+});
+
 test("retrieve: a detected CAPTCHA is handed to the solver (no dead-end)", async () => {
   const captchaHtml = '<div class="g-recaptcha" data-sitekey="sk-1"></div><script src="https://www.google.com/recaptcha/api.js"></script>';
   const { gateway } = makeFakeGateway([renderOf({ text: "x".repeat(300), html: captchaHtml })]);

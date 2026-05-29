@@ -19,6 +19,9 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
 
 function positiveIntOr(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback;
+  // Require a plain decimal integer. Bare Number() would accept hex/exponent/float
+  // ("1e3" -> 1000, "0x10" -> 16) and silently blow the resource cap past its intent.
+  if (!/^\d+$/.test(value.trim())) return fallback;
   const n = Number(value);
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }

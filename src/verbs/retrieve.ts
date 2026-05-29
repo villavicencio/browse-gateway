@@ -7,9 +7,10 @@
  * extract readable markdown. Proxy creds come from the U4 SecretStore; the CAPTCHA solver
  * is injected (R8).
  */
-import { assess } from "../browser/index.js";
-import type { ProxyConfig } from "../browser/index.js";
+import { isVisiblyBlocked, MIN_CONTENT_LENGTH } from "../browser/index.js";
+import type { ProxyConfig, RenderOptions } from "../browser/index.js";
 import type { Gateway } from "../gateway/index.js";
+import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
@@ -57,7 +58,18 @@ export async function retrieve(
   opts: RetrieveOptions,
 ): Promise<RetrieveResult> {
   const { token, url } = opts;
-  const renderOpts = opts.clearanceTimeoutMs ? { clearanceTimeoutMs: opts.clearanceTimeoutMs } : {};
+  // Scheme allowlist (R14-adjacent): only http(s). Rejects file:/data:/blob:/ftp:/view-source:
+  // before any navigation, so a non-http target can't read local files or bypass the
+  // host-based guard (whose host is empty for those schemes).
+  if (!isHttpUrl(url)) {
+    throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
+  }
+  // clearedTextLength: a page returns as soon as real content (>= MIN_CONTENT_LENGTH) renders
+  // instead of polling to the full clearance timeout (the kill-gate keeps the strong-content
+  // bar). MIN, not 0, so a CF page mid-reload — challenge phrase gone but content not yet
+  // painted — isn't mistaken for cleared.
+  const renderOpts: RenderOptions = { clearedTextLength: MIN_CONTENT_LENGTH };
+  if (opts.clearanceTimeoutMs !== undefined) renderOpts.clearanceTimeoutMs = opts.clearanceTimeoutMs;
   const proxy = proxyFromSecrets(secrets);
   const escalation: EscalationContext = {
     onDatacenterIp: opts.escalation?.onDatacenterIp ?? false,
@@ -70,9 +82,12 @@ export async function retrieve(
   // 1) Direct render through an authenticated, allowlist-guarded session.
   let render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
 
-  // 2) CAPTCHA hook — if one is present and a solver is configured, solve so the flow
-  //    continues instead of dead-ending. (Token injection + resume is the solver impl's
-  //    concern; this guarantees the path is exercised, not abandoned.)
+  // 2) CAPTCHA hook — detect a widget and hand it to an injected solver. NOTE (v1): token
+  //    injection and page-resume are NOT yet wired — the solver receives only the challenge
+  //    descriptor (kind/url/siteKey), not the live page, so a returned token does not yet
+  //    re-render the page. `captchaSolved` therefore means "detected and handed to the
+  //    solver", not "challenge cleared". Full solve+inject+resume belongs in the browser
+  //    core (which owns the page handle) and is tracked for v1.1.
   const captcha = detectCaptcha(render, url);
   if (captcha && opts.solver) {
     await opts.solver.solve(captcha);
@@ -92,7 +107,9 @@ export async function retrieve(
     title: extraction.title || render.title,
     markdown: extraction.markdown,
     degraded: extraction.degraded,
-    blocked: assess(render).blocked,
+    // A visible anti-bot block phrase — NOT merely thin content — marks the page as blocked,
+    // so a legitimately short page isn't reported as a block/error to the consumer.
+    blocked: isVisiblyBlocked(render),
     proxyUsed,
     captchaSolved,
   };

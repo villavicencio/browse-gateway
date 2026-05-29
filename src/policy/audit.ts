@@ -25,8 +25,20 @@ export interface AuditSink {
 /** Keeps records in memory — the default sink and the one tests assert against. */
 export class InMemoryAuditSink implements AuditSink {
   readonly records: AuditRecord[] = [];
+  readonly #max: number;
+
+  /**
+   * `maxRecords > 0` keeps only the most recent N records (ring buffer) so a long-lived
+   * server — e.g. the stdio MCP process — can't grow this array without bound. `0` (default)
+   * is unbounded, for tests and short-lived use.
+   */
+  constructor(maxRecords = 0) {
+    this.#max = maxRecords;
+  }
+
   record(entry: AuditRecord): void {
     this.records.push(entry);
+    if (this.#max > 0 && this.records.length > this.#max) this.records.shift();
   }
   /** Records attributed to a given consumer id. */
   forConsumer(consumerId: string): AuditRecord[] {
@@ -34,7 +46,12 @@ export class InMemoryAuditSink implements AuditSink {
   }
 }
 
-/** Emits structured JSON lines. Wrap with {@link RedactingAuditSink} if any field could carry a secret. */
+/**
+ * Emits structured JSON lines to **stdout**. Do NOT wire this into the stdio MCP server —
+ * stdout there is the JSON-RPC protocol channel and these lines would corrupt it; log to
+ * stderr or a file sink instead. Wrap with {@link RedactingAuditSink} if any field could
+ * carry a secret.
+ */
 export const consoleAuditSink: AuditSink = {
   record(entry: AuditRecord): void {
     console.log(`[audit] ${JSON.stringify(entry)}`);

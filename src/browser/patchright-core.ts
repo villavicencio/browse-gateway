@@ -4,6 +4,7 @@
  */
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
+import { hostFromUrl } from "../security/url.js";
 import { isCleared, type PageSignal } from "./detect.js";
 import {
   buildLaunchOptions,
@@ -28,14 +29,20 @@ type RouteHandler = Parameters<PatchrightContext["route"]>[1];
 const DEFAULT_CLEARANCE_TIMEOUT_MS = 20_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
-/** Capture the title/text/html a page currently renders, tolerant of mid-navigation races. */
-async function snapshot(page: PatchrightPage): Promise<PageSignal> {
+/** Title + visible text only — the cheap signal the clearance poll needs each iteration. */
+async function pollSignal(page: PatchrightPage): Promise<Pick<PageSignal, "title" | "text">> {
   const title = await page.title().catch(() => "");
   const text = String(
     await page
       .evaluate("document.body ? document.body.innerText : ''")
       .catch(() => ""),
   );
+  return { title, text };
+}
+
+/** Capture the title/text/html a page currently renders, tolerant of mid-navigation races. */
+async function snapshot(page: PatchrightPage): Promise<PageSignal> {
+  const { title, text } = await pollSignal(page);
   const html = String(await page.content().catch(() => ""));
   return { title, text, html };
 }
@@ -83,42 +90,34 @@ export class PatchrightBrowserCore implements BrowserCore {
         // Navigation may time out or be aborted by a challenge; assess whatever rendered.
       }
 
-      // Poll until the challenge clears (markers gone + real content) or we time out.
-      // Challenges — Cloudflare especially — solve client-side on a variable delay, so a
-      // fixed wait under-counts clearance; this loop is the fix for that flakiness.
-      let signal = await snapshot(page);
+      // Poll until the challenge clears (markers gone + content) or we time out. Challenges —
+      // Cloudflare especially — solve client-side on a variable delay, so a fixed wait
+      // under-counts clearance; this loop is the fix for that flakiness. Each poll fetches
+      // only title+text (cheap); the full HTML is serialized once at the end.
+      let signal = await pollSignal(page);
       let waited = 0;
-      while (!isCleared(signal) && waited < clearanceTimeoutMs) {
+      while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceTimeoutMs) {
         await page.waitForTimeout(pollIntervalMs);
         waited += pollIntervalMs;
-        signal = await snapshot(page);
+        signal = await pollSignal(page);
       }
-      return { url, status, ...signal, clearanceWaitedMs: waited };
+      const final = await snapshot(page);
+      return { url, status, ...final, clearanceWaitedMs: waited };
     } finally {
       await page.close().catch(() => {});
     }
   }
 
   async setNavigationGuard(guard: NavigationGuard): Promise<void> {
-    // Replace any prior guard so repeated calls don't stack interceptors.
-    if (this.#routeHandler) {
-      await this.#context.unroute("**/*", this.#routeHandler).catch(() => {});
-    }
     const handler: RouteHandler = async (route) => {
       const request = route.request();
       const url = request.url();
-      let host = "";
-      try {
-        host = new URL(url).hostname.toLowerCase();
-      } catch {
-        host = "";
-      }
       // Fail closed: if the guard throws, block.
       let decision: NavigationDecision = "block";
       try {
         decision = guard({
           url,
-          host,
+          host: hostFromUrl(url),
           resourceType: request.resourceType(),
           isNavigationRequest: request.isNavigationRequest(),
         });
@@ -131,10 +130,17 @@ export class PatchrightBrowserCore implements BrowserCore {
         await route.abort("blockedbyclient").catch(() => {});
       }
     };
-    this.#routeHandler = handler;
-    // Intercept every request, context-wide (Playwright routing uses CDP Fetch under the
-    // hood, so this also catches a raw CDP Page.navigate — the below-the-verb-layer guarantee).
+    // Install the new handler BEFORE removing the old one so there is never an unguarded
+    // window: Playwright tries the most-recently-added handler first, so the new guard wins
+    // for any in-flight request during the swap. Intercept every request, context-wide
+    // (Playwright routing uses CDP Fetch under the hood, so this also catches a raw CDP
+    // Page.navigate — the below-the-verb-layer guarantee).
+    const prev = this.#routeHandler;
     await this.#context.route("**/*", handler);
+    this.#routeHandler = handler;
+    if (prev) {
+      await this.#context.unroute("**/*", prev).catch(() => {});
+    }
   }
 
   /**

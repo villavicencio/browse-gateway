@@ -3,10 +3,15 @@
  * www-insensitively) or a subdomain wildcard (`*.example.com`, matching the apex and any
  * subdomain). This is the matching half of the R14 navigation-layer allowlist.
  */
+import { canonicalizeHost } from "../security/url.js";
 
-/** Lowercase, trim, and drop a leading `www.` so `www.x.com` and `x.com` compare equal. */
+/**
+ * Canonicalize (lowercase, trim, strip a trailing FQDN-root dot) and drop a leading `www.`
+ * so `www.x.com`, `x.com`, and `x.com.` all compare equal. Shares the canonicalization
+ * primitive with the egress filter so the allow side and deny side agree on the host.
+ */
 export function normalizeHost(host: string): string {
-  return host.trim().toLowerCase().replace(/^www\./, "");
+  return canonicalizeHost(host).replace(/^www\./, "");
 }
 
 export class Allowlist {

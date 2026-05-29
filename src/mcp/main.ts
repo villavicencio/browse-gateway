@@ -5,12 +5,15 @@
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Gateway, loadConfig } from "../gateway/index.js";
-import { PolicyEngine, ConsumerRegistry } from "../policy/index.js";
-import { SecretStore } from "../security/index.js";
+import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink } from "../policy/index.js";
+import { SecretStore, redactSecrets } from "../security/index.js";
 import { retrieve } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-mcp] ${msg}\n`);
+
+/** Cap on the in-memory audit trail for this long-lived process (most-recent-N ring buffer). */
+const AUDIT_MAX_RECORDS = 10_000;
 
 function loadConsumer(env: NodeJS.ProcessEnv = process.env) {
   const id = env.BGW_MCP_CONSUMER_ID ?? "consumer";
@@ -27,14 +30,24 @@ async function main(): Promise<void> {
   const secrets = new SecretStore();
   const policy = new PolicyEngine({
     registry: new ConsumerRegistry([{ id: consumer.id, token: consumer.token, allow: consumer.allow }]),
+    // Durable-trail default for the live path: bounded in-memory store wrapped in the
+    // secret-scrubbing sink (R9) so BYO proxy/CAPTCHA material can never reach the audit log.
+    audit: new RedactingAuditSink(new InMemoryAuditSink(AUDIT_MAX_RECORDS), secrets),
   });
   const gateway = Gateway.create(loadConfig(), undefined, policy);
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
 
   const server = createGatewayMcpServer({
     version: "0.1.0",
-    retrieve: ({ url }) =>
-      retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp } }),
+    retrieve: async ({ url }) => {
+      try {
+        return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp } });
+      } catch (err) {
+        // Never let a proxy/browser error message carry BYO secret material to the consumer (R9).
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(redactSecrets(message, secrets));
+      }
+    },
   });
 
   const shutdown = async (): Promise<void> => {

@@ -20,10 +20,13 @@ export { createBrowserCore, PatchrightBrowserCore } from "./patchright-core.js";
 export {
   assess,
   isCleared,
+  isVisiblyBlocked,
   matchedBlockPhrases,
   vendorHints,
   BLOCK_PHRASES,
+  CF_BLOCK_PHRASES,
   VENDOR_SCRIPT_HINTS,
+  CF_VENDOR_HINTS,
   MIN_CONTENT_LENGTH,
   STRONG_CONTENT_LENGTH,
   type Assessment,

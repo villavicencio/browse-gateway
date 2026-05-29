@@ -64,6 +64,13 @@ export interface RenderOptions {
   clearanceTimeoutMs?: number;
   /** Poll interval while waiting for clearance, in ms. */
   pollIntervalMs?: number;
+  /**
+   * Body-text length above which the page counts as "cleared" and polling stops. Defaults to
+   * the strong-content bar (the kill-gate's confidence threshold). The `retrieve` verb passes
+   * `0` so a legitimately short page returns immediately instead of polling to the full
+   * clearance timeout.
+   */
+  clearedTextLength?: number;
 }
 
 export type NavigationDecision = "allow" | "block";
@@ -91,8 +98,10 @@ export interface BrowserCore {
   render(url: string, opts?: RenderOptions): Promise<RenderResult>;
   /**
    * Install a guard consulted for every request via network-layer interception. Replaces
-   * any previously installed guard. Calling with no guard is the caller's choice; an
-   * un-guarded core allows everything (the gateway always installs one for a consumer).
+   * any previously installed guard without leaving an unguarded window. A core with NO guard
+   * installed performs no interception and therefore allows every request (fail-open) — only
+   * the kill-gate harness drives a core this way. Every consumer surface MUST go through the
+   * gateway's authenticated path, which installs a guard before any navigation.
    */
   setNavigationGuard(guard: NavigationGuard): Promise<void>;
   /** Tear down the browser and release all processes. */

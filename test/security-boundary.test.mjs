@@ -41,6 +41,26 @@ test("isBlockedEgressHost: allows ordinary public hosts/IPs", () => {
   }
 });
 
+test("isBlockedEgressHost: blocks alternate-encoding + trailing-dot bypasses (SSRF regression)", () => {
+  for (const h of [
+    // IPv4-mapped IPv6 in the hex form URL canonicalization produces — the metadata/loopback bypass
+    "[::ffff:7f00:1]", "::ffff:7f00:1", "[::ffff:a9fe:a9fe]", "::ffff:a9fe:a9fe", "[::ffff:a00:5]",
+    // trailing-dot FQDNs resolve identically to the dotted form, must not evade the name checks
+    "metadata.google.internal.", "localhost.", "svc.internal.",
+    // IPv6 site-local
+    "[fec0::1]", "fec0::1",
+  ]) {
+    assert.equal(isBlockedEgressHost(h), true, `expected ${h} blocked`);
+  }
+});
+
+test("isBlockedEgressHost: does NOT over-block public hosts beginning fc/fd/fe (availability regression)", () => {
+  // The old IPv6-prefix regexes (/^f[cd]/, /^fe[89ab]/) ran on every host and wrongly blocked these.
+  for (const h of ["fc-barcelona.com", "fdn.example.com", "febreze.com", "fcc.gov", "fda.gov"]) {
+    assert.equal(isBlockedEgressHost(h), false, `expected ${h} allowed`);
+  }
+});
+
 test("assertLocalCdpOnly: throws on a non-local debugging address, allows local/none", () => {
   assert.throws(() => assertLocalCdpOnly(["--remote-debugging-address=0.0.0.0"]), /non-local/);
   assertLocalCdpOnly(["--remote-debugging-address=127.0.0.1"]);
@@ -82,6 +102,26 @@ test("redactSecrets: scrubs secret values, leaves short noise, no secret survive
   assert.ok(!out.includes("hunter2-long-password"));
   assert.ok(!out.includes("abcd-1234-secret"));
   assert.equal(out, "proxy=[REDACTED] captcha=[REDACTED]");
+});
+
+test("redactSecrets: also scrubs the URL-encoded form; skips 1-2 char secrets", () => {
+  const store = new SecretStore(() => ({
+    BGW_PROXY_PASSWORD: "p@ss",   // encodes to p%40ss — the realistic proxy-error leak form
+    BGW_PROXY_USERNAME: "ab",     // 2 chars -> skipped so it can't blanket-redact ordinary text
+    BGW_CAPTCHA_API_KEY: "key123",
+  }));
+  const out = redactSecrets("raw=p@ss enc=p%40ss key=key123", store);
+  assert.ok(!out.includes("p@ss"), "verbatim secret leaked");
+  assert.ok(!out.includes("p%40ss"), "url-encoded secret leaked");
+  assert.ok(!out.includes("key123"));
+  assert.equal(redactSecrets("about the table", store), "about the table", "2-char secret must not blanket-redact");
+});
+
+test("InMemoryAuditSink: maxRecords keeps only the most recent N (ring buffer)", () => {
+  const sink = new InMemoryAuditSink(2);
+  for (let i = 0; i < 5; i++) sink.record({ ts: i, consumerId: "a", action: "navigate", decision: "allow" });
+  assert.equal(sink.records.length, 2);
+  assert.deepEqual(sink.records.map((r) => r.ts), [3, 4]);
 });
 
 test("RedactingAuditSink: secret material never reaches the underlying sink", () => {

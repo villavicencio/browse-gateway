@@ -6,6 +6,7 @@
  */
 import type { NavigationGuard } from "../browser/index.js";
 import { isBlockedEgressHost, EGRESS_DENY_REASON } from "../security/egress.js";
+import { isHttpUrl } from "../security/url.js";
 import { InMemoryAuditSink } from "./audit.js";
 import type { AuditSink } from "./audit.js";
 import { ConsumerRegistry } from "./consumer.js";
@@ -80,6 +81,20 @@ export class PolicyEngine {
    */
   guardFor(consumer: Consumer): NavigationGuard {
     return (req) => {
+      // Scheme allowlist: only http(s). file:/data:/blob:/ftp:/view-source: etc. have no
+      // meaningful host for the allowlist/egress checks and must never be navigated.
+      if (!isHttpUrl(req.url)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: "scheme not allowed (only http/https)",
+        });
+        return "block";
+      }
       // Egress deny wins over any allowlist: even an allowlisted host that is a private or
       // metadata address is blocked (R19). Always audited — reaching for one is a signal.
       if (this.#egress(req.host)) {

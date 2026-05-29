@@ -62,17 +62,23 @@ function escapeRegExp(s: string): string {
 }
 
 /**
- * Replace every known secret value in `text` with `[REDACTED]`. Values shorter than 4 chars
- * are skipped to avoid over-matching, and longer secrets are replaced first so a secret that
- * contains another isn't partially revealed.
+ * Replace every known secret value in `text` with `[REDACTED]`. Each secret is matched both
+ * verbatim and in its URL-encoded form (proxy creds frequently surface percent-encoded in
+ * driver error messages), and longer values are replaced first so a secret that contains
+ * another isn't partially revealed. Values shorter than 3 chars are skipped so a 1–2 char
+ * secret can't blanket-redact ordinary output.
  */
 export function redactSecrets(text: string, store: SecretStore): string {
   let out = text;
-  const values = store
-    .secretValues()
-    .filter((v) => v.length >= 4)
-    .sort((a, b) => b.length - a.length);
-  for (const value of values) {
+  const variants = new Set<string>();
+  for (const value of store.secretValues()) {
+    if (value.length < 3) continue;
+    variants.add(value);
+    const encoded = encodeURIComponent(value);
+    if (encoded !== value) variants.add(encoded);
+  }
+  const ordered = [...variants].sort((a, b) => b.length - a.length);
+  for (const value of ordered) {
     out = out.replace(new RegExp(escapeRegExp(value), "g"), "[REDACTED]");
   }
   return out;

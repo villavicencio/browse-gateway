@@ -2,48 +2,51 @@
  * Egress host classification (R19) — pure, no I/O. Blocks requests to cloud metadata and
  * internal/private address space at the browser layer (defense in depth; the container
  * network filter in compose is the complementary layer that also catches DNS-resolved
- * private IPs). Matches literal IP hosts and well-known internal hostnames.
+ * private IPs). IP-literal ranges are matched with node:net.BlockList, which canonicalizes
+ * IPv4-mapped IPv6 (e.g. `::ffff:7f00:1`) against the IPv4 rules — closing the alternate-
+ * encoding bypasses (mapped-IPv6 hex form, decimal/octal IPv4) a hand-rolled regex misses.
+ * Hostnames are canonicalized first so a trailing-dot FQDN (`metadata.google.internal.`)
+ * can't evade the internal-name checks.
  */
+import { BlockList, isIP } from "node:net";
+import { canonicalizeHostForIp } from "./url.js";
 
 export const EGRESS_DENY_REASON = "egress: private/internal/metadata address blocked";
 
-function isPrivateIpv4(host: string): boolean {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!m) return false;
-  const octets = m.slice(1, 5).map(Number);
-  if (octets.some((n) => n > 255)) return false;
-  const [a = -1, b = -1] = octets;
-  if (a === 0 || a === 10 || a === 127) return true; // "this", private-A, loopback
-  if (a === 169 && b === 254) return true; // link-local — incl. 169.254.169.254 metadata
-  if (a === 172 && b >= 16 && b <= 31) return true; // private-B
-  if (a === 192 && b === 168) return true; // private-C
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
-  return false;
-}
+const PRIVATE = new BlockList();
+// IPv4 — "this"/unspecified, private-A/B/C, loopback, link-local (incl. 169.254.169.254
+// metadata), and CGNAT 100.64/10.
+PRIVATE.addSubnet("0.0.0.0", 8, "ipv4");
+PRIVATE.addSubnet("10.0.0.0", 8, "ipv4");
+PRIVATE.addSubnet("127.0.0.0", 8, "ipv4");
+PRIVATE.addSubnet("169.254.0.0", 16, "ipv4");
+PRIVATE.addSubnet("172.16.0.0", 12, "ipv4");
+PRIVATE.addSubnet("192.168.0.0", 16, "ipv4");
+PRIVATE.addSubnet("100.64.0.0", 10, "ipv4");
+// IPv6 — loopback, unspecified, unique-local (fc00::/7), link-local (fe80::/10), and
+// site-local (fec0::/10; deprecated but still routable on some hosts).
+PRIVATE.addAddress("::1", "ipv6");
+PRIVATE.addAddress("::", "ipv6");
+PRIVATE.addSubnet("fc00::", 7, "ipv6");
+PRIVATE.addSubnet("fe80::", 10, "ipv6");
+PRIVATE.addSubnet("fec0::", 10, "ipv6");
 
 /**
  * True when `rawHost` is a metadata/internal/private destination that must never be
  * reachable from the sandbox, regardless of any consumer allowlist.
  */
 export function isBlockedEgressHost(rawHost: string): boolean {
-  let host = rawHost.trim().toLowerCase();
+  const host = canonicalizeHostForIp(rawHost);
   if (!host) return false;
-  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1); // strip IPv6 brackets
 
-  // Internal hostnames
+  // Internal hostnames (canonicalized, so a trailing-dot FQDN can't slip past).
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (host === "metadata" || host === "metadata.google.internal" || host === "metadata.goog") return true;
   if (host.endsWith(".internal") || host.endsWith(".local")) return true;
 
-  // IPv4 literals
-  if (isPrivateIpv4(host)) return true;
-
-  // IPv6 literals
-  if (host === "::1" || host === "::") return true; // loopback / unspecified
-  if (/^fe[89ab]/.test(host)) return true; // fe80::/10 link-local
-  if (/^f[cd]/.test(host)) return true; // fc00::/7 unique-local
-  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(host);
-  if (mapped) return isPrivateIpv4(mapped[1] ?? "");
-
+  // IP literals — BlockList covers every private range plus IPv4-mapped IPv6.
+  const family = isIP(host);
+  if (family === 4) return PRIVATE.check(host, "ipv4");
+  if (family === 6) return PRIVATE.check(host, "ipv6");
   return false;
 }

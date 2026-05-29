@@ -61,6 +61,25 @@ test("Allowlist: exact (www-insensitive) and *.subdomain matching", () => {
   assert.equal(a.allows(""), false);
 });
 
+test("Allowlist: trailing-dot FQDN matches the dotted form (host canonicalization)", () => {
+  const a = new Allowlist(["example.com", "*.news.ycombinator.com"]);
+  assert.equal(a.allows("example.com."), true); // FQDN-root dot must not flip an allow to a deny
+  assert.equal(a.allows("WWW.Example.COM."), true); // case + www + trailing dot
+  assert.equal(a.allows("api.news.ycombinator.com."), true);
+});
+
+test("guardFor: blocks non-http(s) schemes (file:/data:) and audits them", () => {
+  const audit = new InMemoryAuditSink();
+  const policy = new PolicyEngine({
+    registry: new ConsumerRegistry([{ id: "agent-1", token: "tok", allow: ["example.com"] }]),
+    audit,
+  });
+  const guard = policy.guardFor(policy.authenticate("tok"));
+  assert.equal(guard({ url: "file:///etc/passwd", host: "", resourceType: "document", isNavigationRequest: true }), "block");
+  assert.equal(guard({ url: "data:text/html,<h1>x</h1>", host: "", resourceType: "document", isNavigationRequest: true }), "block");
+  assert.equal(audit.forConsumer("agent-1").filter((r) => /scheme/.test(r.reason ?? "")).length, 2);
+});
+
 test("ConsumerRegistry resolves by token; rejects duplicate tokens", () => {
   const r = new ConsumerRegistry([{ id: "a", token: "ta", allow: ["x.com"] }]);
   assert.equal(r.resolve("ta")?.id, "a");

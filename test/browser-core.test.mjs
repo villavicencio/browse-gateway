@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import {
   assess,
   isCleared,
+  isVisiblyBlocked,
   matchedBlockPhrases,
   vendorHints,
   MIN_CONTENT_LENGTH,
@@ -90,10 +91,24 @@ test("assess: content between MIN and STRONG, no phrases => INCONCLUSIVE", () =>
   assert.equal(a.blocked, false);
 });
 
-test("isCleared: true only when no block phrase AND content strong", () => {
+test("isCleared: true only when no block phrase AND content strong (default kill-gate bar)", () => {
   assert.equal(isCleared(clearedCfPage), true);
   assert.equal(isCleared({ title: "Just a moment...", text: realContent, html: "" }), false);
-  assert.equal(isCleared({ title: "x", text: "short", html: "<p/>" }), false);
+  assert.equal(isCleared({ title: "x", text: "short", html: "<p/>" }), false); // < STRONG bar
+});
+
+test("isCleared: low threshold (retrieve path) clears short real pages fast", () => {
+  // A legitimately short page (no block phrase, real text) clears immediately instead of
+  // polling to the full clearance timeout — the fix for the short-page latency/DoS bug.
+  assert.equal(isCleared({ title: "x", text: "a short but genuine article body" }, 0), true);
+  assert.equal(isCleared({ title: "Just a moment...", text: "loading" }, 0), false); // phrase still blocks
+  assert.equal(isCleared({ title: "", text: "   " }, 0), false); // whitespace only -> keep polling
+});
+
+test("isVisiblyBlocked: true only for a visible block phrase, not thin content", () => {
+  assert.equal(isVisiblyBlocked({ title: "Just a moment...", text: "" }), true);
+  assert.equal(isVisiblyBlocked({ title: "Short", text: "tiny" }), false); // thin but NOT a block
+  assert.equal(isVisiblyBlocked({ title: "Article", text: realContent }), false);
 });
 
 test("resolveCoreOptions: defaults are headful + real chrome", () => {
