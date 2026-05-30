@@ -1,0 +1,15 @@
+{
+  "__comment__": "REFERENCE ONLY (U6). Not the live config. At the deployment cutover, mirror the exact schema of the existing third-party browser-MCP entry in the agent runtime's MCP registry and REPLACE it with this one, preserving the single-consumer scoping the prior MCP had. Secrets (BGW_MCP_CONSUMER_TOKEN, BGW_PROXY_*, BGW_CAPTCHA_API_KEY) are injected from the fleet secret store at runtime — never written into the registry. Host-specific install paths live in the private deployment notes.",
+  "mcpServers": {
+    "browse-gateway": {
+      "command": "<FLEET_MCP_BIN>/browse-gateway-mcp-launcher.sh",
+      "args": [],
+      "env": {
+        "BGW_MCP_CONSUMER_ID": "consumer",
+        "BGW_MCP_ALLOWLIST": "example.com,*.example.com",
+        "BGW_ON_DATACENTER_IP": "1"
+      },
+      "__scope__": "single-consumer — replaces the prior browser-MCP entry"
+    }
+  }
+}
