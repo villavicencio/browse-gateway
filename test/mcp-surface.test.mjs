@@ -50,6 +50,21 @@ test("blocked page surfaces a clean tool error (not empty content)", async () =>
   assert.match(res.content[0].text, /Could not retrieve/i);
 });
 
+test("failed navigation (null status + thin content) surfaces a clean error, not the browser error page", async () => {
+  // Off-allowlist / unreachable: goto threw -> status null, only the browser's thin error page.
+  const client = await connect(async () => outcome({ status: null, markdown: "This site can't be reached", blocked: false }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://off-allowlist.example/" } });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /Could not retrieve/i);
+});
+
+test("short-but-valid page (real status, thin content) is returned, not errored", async () => {
+  const client = await connect(async () => outcome({ status: 200, markdown: "A short but legitimate page.", blocked: false }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://small.example/" } });
+  assert.equal(res.isError ?? false, false);
+  assert.equal(res.content[0].text, "A short but legitimate page.");
+});
+
 test("gateway-down surfaces a clean MCP error, not a hang", async () => {
   const client = await connect(async () => {
     throw new Error("gateway unreachable");

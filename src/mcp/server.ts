@@ -6,6 +6,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { MIN_CONTENT_LENGTH } from "../browser/index.js";
 
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
@@ -44,7 +45,12 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
     async ({ url }) => {
       try {
         const result = await deps.retrieve({ url });
-        if (result.blocked || !result.markdown) {
+        // A null status means the navigation never completed — an off-allowlist policy block
+        // or an unreachable host — so the browser's own error page (thin content) must not be
+        // handed back as a successful result. A short-but-valid page has a real status, so it
+        // is unaffected.
+        const navFailed = result.status === null && result.markdown.length < MIN_CONTENT_LENGTH;
+        if (result.blocked || !result.markdown || navFailed) {
           return {
             isError: true,
             content: [
