@@ -1,0 +1,45 @@
+# Capped browser-core / gateway service.
+#
+# U2 defines the service and its resource caps. Later units harden it: U4 adds egress
+# filtering + Tailscale-only network isolation (R13/R19), and U7 tunes the caps against
+# measured headroom on the production host so a browser spike can't starve co-located agents
+# (R2/AE4). The caps below are deliberate placeholders.
+#
+#   docker compose -f docker/compose.yaml up --build
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: browse-gateway:latest
+    init: true # reap Chrome's child processes (no zombies)
+    shm_size: "1gb" # headful Chrome needs more than the 64MB default /dev/shm
+    cpus: 2.0 # placeholder cap — tuned in U7
+    mem_limit: 2gb # placeholder cap — tuned in U7
+    pids_limit: 512 # contain runaway Chrome forks
+    oom_score_adj: 500 # under memory pressure, kill this container before the host/agents
+    # Security hardening (U4 / R13, R17, R19):
+    cap_drop:
+      - ALL # Chrome runs --no-sandbox, so no Linux capabilities are needed
+    security_opt:
+      - no-new-privileges:true
+    # No `ports:` mapping — the browser CDP and the gateway are never published. Chromium is
+    # driven over a pipe (no TCP debugging port), so CDP stays local (R13/R17); reachability
+    # is Tailscale-only in deployment.
+    #
+    # Egress filtering (R19) has two layers: the browser-layer host filter
+    # (src/security/egress.ts) blocks metadata/private destinations on every request, and the
+    # deployment adds a container-network egress rule (block 169.254.169.254 + RFC1918 +
+    # Tailnet) via a NET_ADMIN init/sidecar — kept out of this capped service so it stays
+    # cap_drop ALL. Wired in U7 against the live host.
+    environment:
+      BGW_CHANNEL: chrome
+      BGW_NO_SANDBOX: "1"
+      BGW_MAX_SESSIONS: "2"
+      # BYO proxy/CAPTCHA secrets are injected at runtime from a store readable only by this
+      # process (never baked into the image or committed). U5 consumes them.
+      # BGW_PROXY_URL / BGW_PROXY_USERNAME / BGW_PROXY_PASSWORD / BGW_CAPTCHA_API_KEY
+    # Session-lifecycle bootstrap (U2). The image's ENTRYPOINT provisions Xvfb first, then
+    # exec's this. The U1 kill-gate (validate-stealth.mjs, the image default) and the U6 MCP
+    # launcher run other commands against the same image.
+    command: ["node", "dist/gateway/main.js"]

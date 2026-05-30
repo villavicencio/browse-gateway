@@ -40,3 +40,8 @@ yarn-error.log*
 .cache/
 playwright-report/
 test-results/
+
+# Compound Engineering machine-local config
+.compound-engineering/*.local.yaml
+# ...but keep the committed example (the broad *.local.* rule above would hide it)
+!.compound-engineering/config.local.example.yaml
