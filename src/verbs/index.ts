@@ -8,5 +8,6 @@ export { extractMarkdown } from "./extract.js";
 export type { Extraction } from "./extract.js";
 export { isCloudflareBlock, shouldEscalateToProxy } from "./escalation.js";
 export type { EscalationContext } from "./escalation.js";
+export { proxyOverrideFor, navFailed, PROXY_OPEN_ATTEMPTS } from "./drive.js";
 export { detectCaptcha, NullCaptchaSolver } from "./captcha.js";
 export type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "./captcha.js";

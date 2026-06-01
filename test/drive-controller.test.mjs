@@ -13,7 +13,7 @@ function makeFakeGateway() {
   const open = new Map(); // handle -> session
   const events = [];
   const core = {
-    async navigate(url) { events.push(["navigate", url]); return { url, title: "t", tree: "- x [ref=e1]" }; },
+    async navigate(url) { events.push(["navigate", url]); return { url, title: "t", tree: "- x [ref=e1]", status: 200 }; },
     async snapshot() { events.push(["snapshot"]); return { url: "u", title: "t", tree: "- x [ref=e1]" }; },
     async click(t) { events.push(["click", t]); },
     async type(t, text, opts) { events.push(["type", t, text, opts]); },

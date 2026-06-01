@@ -43,7 +43,8 @@ async function main(): Promise<void> {
   // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
   // The interactive `drive` surface: a persistent, consumer-bound session driven via browser_* tools.
-  const drive = new GatewayDriveController(gateway, secrets, consumer.token);
+  // Proxied (with healthy-exit retry) when a residential proxy is configured and we're on a DC IP.
+  const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp });
 
   const server = createGatewayMcpServer({
     version: "0.1.0",

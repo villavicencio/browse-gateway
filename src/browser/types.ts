@@ -82,6 +82,12 @@ export interface RenderOptions {
 export interface PageSnapshot {
   url: string;
   title: string;
+  /**
+   * HTTP status of the navigation that produced this page, or `null` when the navigation failed
+   * (dead proxy exit, timeout, off-allowlist block). Present on `navigate()`; absent on a pure
+   * `snapshot()`. The drive layer keys exit-health on this.
+   */
+  status?: number | null;
   /** Accessibility tree text with `[ref=eN]` annotations the drive verbs target. */
   tree: string;
 }

@@ -172,15 +172,18 @@ export class PatchrightBrowserCore implements BrowserCore {
   async navigate(url: string, opts: RenderOptions = {}): Promise<PageSnapshot> {
     void opts; // reserved for future per-call clearance tuning; nav uses the core timeout today
     const page = await this.#ensureActivePage();
+    let status: number | null = null;
     try {
-      await page.goto(url, {
+      const resp = await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: this.#resolved.navigationTimeoutMs,
       });
+      status = resp ? resp.status() : null;
     } catch {
-      // A challenge/redirect may abort the navigation; snapshot whatever rendered.
+      // A challenge/redirect/dead-exit may abort the navigation; snapshot whatever rendered and
+      // leave status null so the drive layer treats it as a failed nav.
     }
-    return this.#snapshotOf(page);
+    return { ...(await this.#snapshotOf(page)), status };
   }
 
   async snapshot(): Promise<PageSnapshot> {
