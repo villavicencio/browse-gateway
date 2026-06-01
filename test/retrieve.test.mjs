@@ -81,13 +81,21 @@ test("isCloudflareBlock: true for a CF interstitial, false for cleared/other", (
   assert.equal(isCloudflareBlock({ title: "g2", text: "", html: "captcha-delivery datadome" }), false);
 });
 
-test("shouldEscalateToProxy: only CF block + datacenter IP + proxy available", () => {
-  assert.equal(shouldEscalateToProxy(cfBlockSignal, { onDatacenterIp: true, proxyAvailable: true }), true);
-  assert.equal(shouldEscalateToProxy(cfBlockSignal, { onDatacenterIp: false, proxyAvailable: true }), false);
-  assert.equal(shouldEscalateToProxy(cfBlockSignal, { onDatacenterIp: true, proxyAvailable: false }), false);
-  // Soft/real page: never escalate, even on a datacenter IP with a proxy.
+test("shouldEscalateToProxy: CF block OR hard block, gated on datacenter IP + proxy available", () => {
+  assert.equal(shouldEscalateToProxy(cfBlockSignal, cfBlockSignal.status, { onDatacenterIp: true, proxyAvailable: true }), true);
+  assert.equal(shouldEscalateToProxy(cfBlockSignal, cfBlockSignal.status, { onDatacenterIp: false, proxyAvailable: true }), false);
+  assert.equal(shouldEscalateToProxy(cfBlockSignal, cfBlockSignal.status, { onDatacenterIp: true, proxyAvailable: false }), false);
+  // Soft/real page (200, full content): never escalate, even on a datacenter IP with a proxy.
   assert.equal(
-    shouldEscalateToProxy({ title: "ok", text: "x".repeat(1000), html: "<main/>" }, { onDatacenterIp: true, proxyAvailable: true }),
+    shouldEscalateToProxy({ title: "ok", text: "x".repeat(1000), html: "<main/>" }, 200, { onDatacenterIp: true, proxyAvailable: true }),
+    false,
+  );
+  // Hard block: bare 403 + thin body (no CF phrase) — escalates so a clean residential IP can clear it.
+  const hard = { title: "", text: "Forbidden", html: "Forbidden" };
+  assert.equal(shouldEscalateToProxy(hard, 403, { onDatacenterIp: true, proxyAvailable: true }), true);
+  // A real page that returns 403 yet rendered full content is NOT a hard block.
+  assert.equal(
+    shouldEscalateToProxy({ title: "g2", text: "x".repeat(1000), html: "<main/>" }, 403, { onDatacenterIp: true, proxyAvailable: true }),
     false,
   );
 });
@@ -137,6 +145,42 @@ test("retrieve: CF block from datacenter IP escalates to the proxy and then succ
   assert.deepEqual(calls[1].coreOverrides?.proxy, { server: "http://proxy:8080" });
   assert.match(r.markdown, /Headline/);
   assert.equal(r.blocked, false);
+});
+
+test("retrieve: a bare 403 with thin body is reported as blocked, not returned as content (finding #2)", async () => {
+  // The reputation block: 403 + "Forbidden" (len 9). No proxy configured, so it can't escalate;
+  // it must come back blocked:true rather than markdown="Forbidden", blocked:false.
+  const { gateway, calls } = makeFakeGateway([renderOf({ status: 403, text: "Forbidden", html: "Forbidden" })]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://hard.example/" });
+  assert.equal(r.blocked, true, "a 4xx + thin body is a hard block");
+  assert.equal(r.proxyUsed, false, "no proxy configured");
+  assert.equal(calls.length, 1);
+});
+
+test("retrieve: a hard 403 from a datacenter IP escalates to the proxy and then clears (finding #3)", async () => {
+  const { gateway, calls } = makeFakeGateway([
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }), // reputation block on the datacenter IP
+    renderOf({ status: 200, text: "x".repeat(1000), html: articleHtml }), // clean residential IP clears it
+  ]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080" }));
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyUsed, true);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].coreOverrides?.proxy, { server: "http://proxy:8080" });
+  assert.match(r.markdown, /Headline/);
+  assert.equal(r.blocked, false);
+});
+
+test("retrieve: a hard 403 the proxy still cannot clear stays blocked", async () => {
+  const { gateway, calls } = makeFakeGateway([
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }),
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }), // proxy IP also blocked
+  ]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080" }));
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyUsed, true);
+  assert.equal(calls.length, 2);
+  assert.equal(r.blocked, true, "still blocked after escalation -> reported, not returned as content");
 });
 
 test("retrieve: rejects non-http(s) URLs before any session opens (file:// local-read)", async () => {
