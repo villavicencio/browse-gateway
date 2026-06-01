@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Gateway, SessionManager, SessionManagerError } from "../dist/gateway/index.js";
+import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 
 /** A configurable fake BrowserCore factory that records created cores. */
 function makeFactory({ failTimes = 0 } = {}) {
@@ -20,10 +21,15 @@ function makeFactory({ failTimes = 0 } = {}) {
       kind: "fake",
       closed: false,
       renderCalls: [],
+      guardCalls: 0,
       async render(url) {
         this.renderCalls.push(url);
         if (url === "THROW") throw new Error("render boom");
         return { url, status: 200, title: "t", text: "x".repeat(1000), html: "<main/>", clearanceWaitedMs: 0 };
+      },
+      async setNavigationGuard(guard) {
+        this.guard = guard;
+        this.guardCalls++;
       },
       async close() {
         this.closed = true;
@@ -111,4 +117,91 @@ test("session.core throws once the session is closed", async () => {
   await mgr.release(s.id);
   assert.throws(() => s.core, /is closed/);
   assert.equal(s.state, "closed");
+});
+
+// --- U2: persistent, consumer-bound drive sessions -----------------------------------------
+
+const policyFor = (consumers) => new PolicyEngine({ registry: new ConsumerRegistry(consumers) });
+
+test("openConsumerSession: persists across use calls, installs the guard once, releases on close", async () => {
+  const { factory, cores } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  const handle = await gw.openConsumerSession("tok-a");
+  assert.equal(gw.sessions.activeCount, 1);
+  assert.equal(cores.length, 1);
+  assert.equal(cores[0].guardCalls, 1, "consumer guard installed at open");
+  const r1 = await gw.useConsumerSession("tok-a", handle, (s) => s.core.render("https://example.com/1"));
+  const r2 = await gw.useConsumerSession("tok-a", handle, (s) => s.core.render("https://example.com/2"));
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200);
+  assert.equal(cores.length, 1, "same session/core reused across use calls (no re-acquire)");
+  assert.deepEqual(cores[0].renderCalls, ["https://example.com/1", "https://example.com/2"]);
+  await gw.closeConsumerSession("tok-a", handle);
+  assert.equal(gw.sessions.activeCount, 0, "released on close");
+  assert.equal(cores[0].closed, true);
+});
+
+test("useConsumerSession / closeConsumerSession: a consumer cannot touch another's session", async () => {
+  const { factory } = makeFactory();
+  const policy = policyFor([
+    { id: "a", token: "tok-a", allow: ["example.com"] },
+    { id: "b", token: "tok-b", allow: ["example.com"] },
+  ]);
+  const gw = Gateway.create(config(3), factory, policy);
+  const handle = await gw.openConsumerSession("tok-a");
+  await assert.rejects(gw.useConsumerSession("tok-b", handle, async () => "nope"), /no open session/);
+  await gw.closeConsumerSession("tok-b", handle); // foreign close is a no-op
+  assert.equal(gw.sessions.activeCount, 1, "B's close did not affect A's session");
+  await gw.closeConsumerSession("tok-a", handle);
+  assert.equal(gw.sessions.activeCount, 0);
+});
+
+test("openConsumerSession: an unknown token is rejected before any session opens", async () => {
+  const { factory, cores } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  await assert.rejects(gw.openConsumerSession("not-a-token"));
+  assert.equal(gw.sessions.activeCount, 0);
+  assert.equal(cores.length, 0, "no core launched for an unauthenticated open");
+});
+
+test("reapIdle: closes sessions idle past the TTL; a fresh one survives; reaped handle is gone", async () => {
+  const { factory, cores } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  const handle = await gw.openConsumerSession("tok-a");
+  assert.deepEqual(await gw.sessions.reapIdle(60_000), [], "recently-opened session is not reaped");
+  assert.equal(gw.sessions.activeCount, 1);
+  const reaped = await gw.sessions.reapIdle(1_000, Date.now() + 10_000); // injected future 'now'
+  assert.deepEqual(reaped, [handle]);
+  assert.equal(gw.sessions.activeCount, 0);
+  assert.equal(cores[0].closed, true, "reaped session's core closed");
+  await assert.rejects(gw.useConsumerSession("tok-a", handle, async () => "x"), /no open session/);
+});
+
+test("openConsumerSession: enforces the per-consumer cap (default 1) independent of the global cap", async () => {
+  const { factory } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(5), factory, policy); // global cap generous; per-consumer cap is the limit
+  const h1 = await gw.openConsumerSession("tok-a");
+  await assert.rejects(
+    gw.openConsumerSession("tok-a"),
+    (e) => e instanceof SessionManagerError && e.code === "SESSION_LIMIT",
+  );
+  await gw.closeConsumerSession("tok-a", h1);
+  const h2 = await gw.openConsumerSession("tok-a"); // slot freed
+  assert.equal(gw.sessions.activeCount, 1);
+  await gw.closeConsumerSession("tok-a", h2);
+});
+
+test("shutdown: closes open interactive sessions (no orphaned browsers)", async () => {
+  const { factory, cores } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  await gw.openConsumerSession("tok-a");
+  assert.equal(gw.sessions.activeCount, 1);
+  await gw.shutdown();
+  assert.equal(gw.sessions.activeCount, 0);
+  assert.equal(cores[0].closed, true);
 });
