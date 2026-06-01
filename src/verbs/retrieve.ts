@@ -4,8 +4,8 @@
  *
  * Flow: render direct through an authenticated session -> optional CAPTCHA solve ->
  * scoped proxy re-render on a CF managed challenge OR a hard IP/WAF-reputation block, from a
- * datacenter IP (R7) -> extract readable markdown. Proxy creds come from the U4 SecretStore;
- * the CAPTCHA solver is injected (R8).
+ * datacenter IP (R7), retried across fresh rotating exits -> extract readable markdown. Proxy
+ * creds come from the U4 SecretStore; the CAPTCHA solver is injected (R8).
  */
 import { isVisiblyBlocked, isHardBlock, MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions } from "../browser/index.js";
@@ -17,6 +17,18 @@ import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
 import { detectCaptcha } from "./captcha.js";
 import type { CaptchaSolver } from "./captcha.js";
+
+/**
+ * Proxy-escalation retries (R7). A rotating residential proxy assigns a fresh exit IP per
+ * session/connection, and a fraction of exits are dead or slow (verified 2026-06-01: ~83% good
+ * per fresh session; dead exits fail fast with `net::ERR_EMPTY_RESPONSE`, good-but-slow exits up
+ * to ~17s). Each retry re-acquires a fresh proxied SESSION — and therefore a fresh exit — so we
+ * retry the whole session (never just a new page on the same context, which reuses the same bad
+ * exit) until a real page lands or attempts run out. `PROXY_NAV_TIMEOUT_MS` bounds a hung exit
+ * with margin over the slowest good exit observed, so a retry past a dead exit stays fast.
+ */
+const PROXY_MAX_ATTEMPTS = 3;
+const PROXY_NAV_TIMEOUT_MS = 25_000;
 
 export interface RetrieveOptions {
   token: string;
@@ -96,10 +108,23 @@ export async function retrieve(
 
   // 3) Scoped proxy escalation — a CF managed challenge OR a hard IP/WAF-reputation block
   //    (4xx/5xx + thin body), from a datacenter IP. The proxy's clean residential IP is what
-  //    clears a reputation block; the local datacenter IP cannot (F1, 2026-06-01).
+  //    clears a reputation block; the local datacenter IP cannot (F1, 2026-06-01). Each attempt
+  //    is a fresh proxied session => a fresh rotating exit IP, so we retry past dead/slow exits
+  //    until a real page lands or attempts run out (see PROXY_MAX_ATTEMPTS note above).
   if (proxy && shouldEscalateToProxy(render, render.status, escalation)) {
     proxyUsed = true;
-    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts), { proxy });
+    for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
+      render = await gateway.withConsumerSession(
+        token,
+        (s) => s.core.render(url, renderOpts),
+        { proxy, navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS },
+      );
+      // A fresh exit landed a real page -> done. Retry on a failed nav (null status) or a
+      // still-blocked result (dead exit / proxy error page); a thin-but-OK 200 is not retried.
+      if (render.status !== null && !isVisiblyBlocked(render) && !isHardBlock(render, render.status)) {
+        break;
+      }
+    }
   }
 
   const extraction = extractMarkdown(render.html, url);
@@ -109,11 +134,12 @@ export async function retrieve(
     title: extraction.title || render.title,
     markdown: extraction.markdown,
     degraded: extraction.degraded,
-    // Blocked = a visible anti-bot phrase OR a hard block (4xx/5xx + thin body) on the FINAL
-    // render — so a reputation 403 that escalation couldn't clear is reported as blocked
-    // instead of returning the "Forbidden" body as content (F1 finding #2). A thin *200* is
-    // still NOT blocked, so a legitimately short page isn't reported as a block/error.
-    blocked: isVisiblyBlocked(render) || isHardBlock(render, render.status),
+    // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, or a hard
+    // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy
+    // retry where every exit was dead, is reported as blocked instead of returning the error/empty
+    // body as content (F1 finding #2). A thin *200* is still NOT blocked, so a legitimately short
+    // page isn't flagged.
+    blocked: render.status === null || isVisiblyBlocked(render) || isHardBlock(render, render.status),
     proxyUsed,
     captchaSolved,
   };
