@@ -61,6 +61,43 @@ test("Allowlist: exact (www-insensitive) and *.subdomain matching", () => {
   assert.equal(a.allows(""), false);
 });
 
+test("Allowlist: bare `*` is the allow-all sentinel; empty host still denied", () => {
+  const a = new Allowlist(["*"]);
+  assert.equal(a.allows("example.com"), true);
+  assert.equal(a.allows("anything.example.org"), true);
+  assert.equal(a.allows("sub.deep.tld"), true);
+  assert.equal(a.allows(""), false); // host-less request (data:/about:) is never allowed
+});
+
+test("Allowlist: `*.x` stays a subdomain wildcard, not allow-all", () => {
+  const a = new Allowlist(["*.example.com"]);
+  assert.equal(a.allows("example.com"), true);
+  assert.equal(a.allows("api.example.com"), true);
+  assert.equal(a.allows("evil.com"), false); // a real wildcard must NOT match everything
+});
+
+test("guardFor: egress deny still wins over an allow-all (`*`) consumer", () => {
+  const audit = new InMemoryAuditSink();
+  const policy = new PolicyEngine({
+    registry: new ConsumerRegistry([{ id: "agent-1", token: "tok", allow: ["*"] }]),
+    audit,
+  });
+  const guard = policy.guardFor(policy.authenticate("tok"));
+  // Allow-all lets any public host through...
+  assert.equal(guard(nav("news.ycombinator.com")), "allow");
+  // ...but the egress deny-filter, which runs first, still blocks private/metadata IP literals.
+  assert.equal(guard(nav("169.254.169.254")), "block"); // cloud metadata
+  assert.equal(guard(nav("10.0.0.5")), "block"); // RFC1918
+  assert.equal(guard(nav("[::ffff:169.254.169.254]")), "block"); // IPv4-mapped IPv6 form
+  // And the scheme gate still blocks non-http(s) even under allow-all.
+  assert.equal(
+    guard({ url: "file:///etc/passwd", host: "", resourceType: "document", isNavigationRequest: true }),
+    "block",
+  );
+  const blocks = audit.forConsumer("agent-1").filter((r) => r.decision === "block");
+  assert.ok(blocks.some((r) => /egress/.test(r.reason ?? "")), "egress block audited");
+});
+
 test("Allowlist: trailing-dot FQDN matches the dotted form (host canonicalization)", () => {
   const a = new Allowlist(["example.com", "*.news.ycombinator.com"]);
   assert.equal(a.allows("example.com."), true); // FQDN-root dot must not flip an allow to a deny
