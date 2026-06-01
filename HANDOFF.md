@@ -7,7 +7,7 @@ proven end-to-end, and the agent itself fetched a Cloudflare-protected page thro
 
 ## What Shipped
 
-- **Allow-all consumer allowlist** — committed `d0a4701` on `main` (not pushed). Bare `*` is now an
+- **Allow-all consumer allowlist** — committed `0ebe2d0`, pushed to `main`. Bare `*` is now an
   allow-all sentinel in `src/policy/allowlist.ts`, distinct from the `*.domain` wildcard. The scheme
   gate and egress SSRF filter still run **before** the allowlist in `PolicyEngine.guardFor`, so
   allow-all widens only the host gate — private/internal/metadata IP literals stay blocked even for a
@@ -54,7 +54,9 @@ Captured in memory `retrieve-403-and-proxy-gaps`:
 2. **v1.1** — CAPTCHA solve+inject; `retrieve` 403/thin-as-blocked; proxy escalate-on-hard-block (or
    always-on residential proxy); decide whether to point the agent at `retrieve` over its built-in
    browser for fetch tasks (see gotcha below).
-3. Optionally `git push` `d0a4701` when ready (committed locally only).
+
+_Repo state: `main` is pushed and tree-clean; no open PRs. Both this session's commits
+(`0ebe2d0` allow-all, plus this handoff) are on `origin/main`._
 
 ## Gotchas & Watch-outs
 
