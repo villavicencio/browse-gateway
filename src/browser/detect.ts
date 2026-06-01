@@ -94,6 +94,24 @@ export function isVisiblyBlocked(signal: Pick<PageSignal, "title" | "text">): bo
   return matchedBlockPhrases(signal).length > 0;
 }
 
+/**
+ * A "hard block" — a server error status with no real content rendered. This is the
+ * IP/WAF-reputation block (F1, 2026-06-01): hammering one CF target from the prod datacenter
+ * IP returns a bare `403 Forbidden` (body ~9 chars) that the stealth core CANNOT clear, because
+ * it is the IP's reputation that is blocked, not a client-side challenge. Only a clean
+ * (residential) IP recovers it — so this is the second escalation trigger alongside a CF
+ * managed challenge.
+ *
+ * Keyed on a 4xx/5xx status AND a thin body, NOT status alone: detection runs on the final DOM,
+ * and a real page can return an error status yet render full content (g2.com returns 403 on the
+ * bare homepage, udemy/glassdoor similar) — those have real content and are NOT hard-blocked.
+ * It is also distinct from a thin *200* (a legitimately short page), which must never be
+ * reported as blocked.
+ */
+export function isHardBlock(signal: Pick<PageSignal, "text">, status: number | null): boolean {
+  return status !== null && status >= 400 && signal.text.trim().length < MIN_CONTENT_LENGTH;
+}
+
 /** Vendor protection scripts present in the HTML (diagnostic only). */
 export function vendorHints(signal: PageSignal): string[] {
   return VENDOR_SCRIPT_HINTS.filter((re) => re.test(signal.html)).map(String);

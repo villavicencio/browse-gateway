@@ -1,9 +1,11 @@
 /**
- * Scoped proxy-escalation decision (R7). The residential proxy is engaged ONLY when a
- * Cloudflare *managed challenge* fails to clear from the datacenter IP — never for soft
- * targets or DataDome (the spike showed those pass direct from the datacenter). Pure logic.
+ * Scoped proxy-escalation decision (R7). The residential proxy is engaged from the datacenter
+ * IP on two block kinds the local IP cannot clear: a Cloudflare *managed challenge*, or a *hard
+ * block* — a 4xx/5xx IP/WAF-reputation block with no real content (F1, 2026-06-01; see
+ * `isHardBlock`). It is NOT engaged for soft targets or DataDome (the spike showed those pass
+ * direct from the datacenter). Pure logic.
  */
-import { assess, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
+import { assess, isHardBlock, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
 
 /**
@@ -27,7 +29,16 @@ export interface EscalationContext {
   proxyAvailable: boolean;
 }
 
-/** Engage the proxy only on a CF managed challenge, from a datacenter IP, with a proxy available. */
-export function shouldEscalateToProxy(signal: PageSignal, ctx: EscalationContext): boolean {
-  return ctx.onDatacenterIp && ctx.proxyAvailable && isCloudflareBlock(signal);
+/**
+ * Engage the proxy from a datacenter IP, with a proxy available, on either block the local IP
+ * cannot clear: a CF managed challenge, or a hard 4xx/5xx-with-thin-body block. `status` is the
+ * final-render HTTP status (`isHardBlock` ignores it when `null` or < 400).
+ */
+export function shouldEscalateToProxy(
+  signal: PageSignal,
+  status: number | null,
+  ctx: EscalationContext,
+): boolean {
+  if (!ctx.onDatacenterIp || !ctx.proxyAvailable) return false;
+  return isCloudflareBlock(signal) || isHardBlock(signal, status);
 }

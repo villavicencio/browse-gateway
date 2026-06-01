@@ -3,11 +3,11 @@
  * allowlist, proxy escalation, CAPTCHA) stay hidden from the caller, who just gets content.
  *
  * Flow: render direct through an authenticated session -> optional CAPTCHA solve ->
- * scoped proxy re-render only on a CF managed challenge from a datacenter IP (R7) ->
- * extract readable markdown. Proxy creds come from the U4 SecretStore; the CAPTCHA solver
- * is injected (R8).
+ * scoped proxy re-render on a CF managed challenge OR a hard IP/WAF-reputation block, from a
+ * datacenter IP (R7) -> extract readable markdown. Proxy creds come from the U4 SecretStore;
+ * the CAPTCHA solver is injected (R8).
  */
-import { isVisiblyBlocked, MIN_CONTENT_LENGTH } from "../browser/index.js";
+import { isVisiblyBlocked, isHardBlock, MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions } from "../browser/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
@@ -94,8 +94,10 @@ export async function retrieve(
     captchaSolved = true;
   }
 
-  // 3) Scoped proxy escalation — ONLY a CF managed challenge from a datacenter IP.
-  if (proxy && shouldEscalateToProxy(render, escalation)) {
+  // 3) Scoped proxy escalation — a CF managed challenge OR a hard IP/WAF-reputation block
+  //    (4xx/5xx + thin body), from a datacenter IP. The proxy's clean residential IP is what
+  //    clears a reputation block; the local datacenter IP cannot (F1, 2026-06-01).
+  if (proxy && shouldEscalateToProxy(render, render.status, escalation)) {
     proxyUsed = true;
     render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts), { proxy });
   }
@@ -107,9 +109,11 @@ export async function retrieve(
     title: extraction.title || render.title,
     markdown: extraction.markdown,
     degraded: extraction.degraded,
-    // A visible anti-bot block phrase — NOT merely thin content — marks the page as blocked,
-    // so a legitimately short page isn't reported as a block/error to the consumer.
-    blocked: isVisiblyBlocked(render),
+    // Blocked = a visible anti-bot phrase OR a hard block (4xx/5xx + thin body) on the FINAL
+    // render — so a reputation 403 that escalation couldn't clear is reported as blocked
+    // instead of returning the "Forbidden" body as content (F1 finding #2). A thin *200* is
+    // still NOT blocked, so a legitimately short page isn't reported as a block/error.
+    blocked: isVisiblyBlocked(render) || isHardBlock(render, render.status),
     proxyUsed,
     captchaSolved,
   };

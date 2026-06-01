@@ -14,6 +14,7 @@ import {
   assess,
   isCleared,
   isVisiblyBlocked,
+  isHardBlock,
   matchedBlockPhrases,
   vendorHints,
   MIN_CONTENT_LENGTH,
@@ -109,6 +110,14 @@ test("isVisiblyBlocked: true only for a visible block phrase, not thin content",
   assert.equal(isVisiblyBlocked({ title: "Just a moment...", text: "" }), true);
   assert.equal(isVisiblyBlocked({ title: "Short", text: "tiny" }), false); // thin but NOT a block
   assert.equal(isVisiblyBlocked({ title: "Article", text: realContent }), false);
+});
+
+test("isHardBlock: 4xx/5xx + thin body only; not a thin 200, not a real page that returns 403", () => {
+  assert.equal(isHardBlock({ text: "Forbidden" }, 403), true); // the F1 reputation block
+  assert.equal(isHardBlock({ text: "" }, 503), true); // bare 5xx with no body
+  assert.equal(isHardBlock({ text: "tiny" }, 200), false); // legitimately short page — NOT blocked
+  assert.equal(isHardBlock({ text: realContent }, 403), false); // g2.com: 403 yet full content rendered
+  assert.equal(isHardBlock({ text: "Forbidden" }, null), false); // no status captured
 });
 
 test("resolveCoreOptions: defaults are headful + real chrome", () => {

@@ -21,6 +21,7 @@ export {
   assess,
   isCleared,
   isVisiblyBlocked,
+  isHardBlock,
   matchedBlockPhrases,
   vendorHints,
   BLOCK_PHRASES,
