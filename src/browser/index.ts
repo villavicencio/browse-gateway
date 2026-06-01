@@ -9,14 +9,17 @@ export type {
   BrowserCore,
   BrowserCoreOptions,
   Category,
+  DriveTarget,
   NavigationDecision,
   NavigationGuard,
   NavigationRequest,
+  PageSnapshot,
   ProxyConfig,
   RenderOptions,
   RenderResult,
+  WaitCondition,
 } from "./types.js";
-export { createBrowserCore, PatchrightBrowserCore } from "./patchright-core.js";
+export { createBrowserCore, PatchrightBrowserCore, targetToSelector } from "./patchright-core.js";
 export {
   assess,
   isCleared,

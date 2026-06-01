@@ -22,6 +22,7 @@ import {
   buildLaunchOptions,
   resolveCoreOptions,
   DEFAULT_CORE_OPTIONS,
+  targetToSelector,
 } from "../dist/browser/index.js";
 
 const realContent = "x".repeat(STRONG_CONTENT_LENGTH + 1);
@@ -119,6 +120,23 @@ test("isHardBlock: 4xx/5xx + thin body only; not a thin 200, not a real page tha
   assert.equal(isHardBlock({ text: realContent }, 403), false); // g2.com: 403 yet full content rendered
   assert.equal(isHardBlock({ text: "Forbidden" }, null), false); // no status captured
 });
+
+test("targetToSelector: snapshot refs -> aria-ref selector; raw selectors pass through", () => {
+  // refs from ariaSnapshot({ mode: "ai" }) — the primary drive targeting path
+  assert.equal(targetToSelector("e4"), "aria-ref=e4");
+  assert.equal(targetToSelector("e12"), "aria-ref=e12");
+  assert.equal(targetToSelector("  e7  "), "aria-ref=e7"); // trimmed
+  assert.equal(targetToSelector("f1e2"), "aria-ref=f1e2"); // frame-prefixed ref
+  // raw selectors (the escape hatch) pass through untouched
+  assert.equal(targetToSelector("#submit"), "#submit");
+  assert.equal(targetToSelector("button"), "button");
+  assert.equal(targetToSelector("text=Click me"), "text=Click me");
+  assert.equal(targetToSelector("[data-test=ok]"), "[data-test=ok]");
+});
+
+// NOTE: the live drive primitives (navigate/snapshot/click/type/...) require a real browser and
+// are proven in-container by scripts/validate-drive.mjs (plan U5), not in this network-free suite —
+// matching how the anti-bot bypass is proven by the kill-gate, not here.
 
 test("resolveCoreOptions: defaults are headful + real chrome", () => {
   const r = resolveCoreOptions();
