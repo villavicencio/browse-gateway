@@ -9,7 +9,7 @@ import { Allowlist } from "./allowlist.js";
 export interface ConsumerSpec {
   id: string;
   token: string;
-  /** Allowlist rules scoped to this consumer (exact host or `*.domain`). */
+  /** Allowlist rules scoped to this consumer (exact host, `*.domain`, or bare `*` = allow-all). */
   allow: string[];
   tags?: string[];
 }
