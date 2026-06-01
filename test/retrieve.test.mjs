@@ -171,16 +171,44 @@ test("retrieve: a hard 403 from a datacenter IP escalates to the proxy and then 
   assert.equal(r.blocked, false);
 });
 
-test("retrieve: a hard 403 the proxy still cannot clear stays blocked", async () => {
+test("retrieve: a hard 403 the proxy still cannot clear stays blocked (exhausts retries)", async () => {
   const { gateway, calls } = makeFakeGateway([
     renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }),
-    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }), // proxy IP also blocked
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }), // every proxy exit also blocked
   ]);
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080" }));
   const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
   assert.equal(r.proxyUsed, true);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 4, "direct + 3 fresh-exit retries, all still blocked");
   assert.equal(r.blocked, true, "still blocked after escalation -> reported, not returned as content");
+});
+
+test("retrieve: a dead proxy exit (failed nav) is retried on a fresh session, then clears", async () => {
+  const { gateway, calls } = makeFakeGateway([
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }), // direct -> hard block, escalate
+    renderOf({ status: null, text: "", html: "" }), // 1st exit dead: nav failed, no response
+    renderOf({ status: 200, text: "x".repeat(1000), html: articleHtml }), // 2nd exit good -> clears
+  ]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080" }));
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyUsed, true);
+  assert.equal(calls.length, 3, "direct + dead-exit retry + good-exit");
+  assert.deepEqual(calls[1].coreOverrides?.proxy, { server: "http://proxy:8080" });
+  assert.equal(calls[1].coreOverrides?.navigationTimeoutMs, 25_000, "shorter per-attempt nav timeout on proxied tries");
+  assert.equal(r.blocked, false);
+  assert.match(r.markdown, /Headline/);
+});
+
+test("retrieve: when every proxy exit fails (null status), the result is reported blocked", async () => {
+  const { gateway, calls } = makeFakeGateway([
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }), // direct -> hard block, escalate
+    renderOf({ status: null, text: "", html: "" }), // every proxied attempt: dead exit
+  ]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080" }));
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyUsed, true);
+  assert.equal(calls.length, 4, "direct + 3 dead-exit attempts");
+  assert.equal(r.blocked, true, "a failed nav (null status) reports blocked, not empty success");
 });
 
 test("retrieve: rejects non-http(s) URLs before any session opens (file:// local-read)", async () => {

@@ -52,21 +52,38 @@ const note = (label) => {
 const ipOf = (text) => (text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/) ?? [null])[0];
 const fastRender = { clearedTextLength: 0, clearanceTimeoutMs: 10_000 }; // IP echo is a tiny page
 
+// Each fresh proxied session draws a new rotating exit; some are dead (fail fast). Retry past
+// them — the same resilience the retrieve() escalation path now has built in.
+async function proxiedRenderWithRetry(url, attempts = 3) {
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    last = await gateway.withConsumerSession(token, (s) => s.core.render(url, fastRender), { proxy, navigationTimeoutMs: 25_000 });
+    if (last.status !== null && last.text.trim().length > 0) return last;
+  }
+  return last;
+}
+
 try {
-  // 1) Residential exit IP — direct vs through the proxy.
+  // 1) Residential exit IP — direct vs through the proxy (retried past dead exits).
   const direct = await gateway.withConsumerSession(token, (s) => s.core.render(IP_ECHO, fastRender));
-  const viaProxy = await gateway.withConsumerSession(token, (s) => s.core.render(IP_ECHO, fastRender), { proxy });
+  const viaProxy = await proxiedRenderWithRetry(IP_ECHO);
   const directIp = ipOf(direct.text);
   const proxyIp = ipOf(viaProxy.text);
   console.log(`  exit IP: direct=${directIp ?? "?"}  via-proxy=${proxyIp ?? "?"}`);
   check("proxy reachable and returned an exit IP", Boolean(proxyIp));
   check("proxy exits from a different IP than direct (residential, not the DC IP)", Boolean(directIp && proxyIp && directIp !== proxyIp));
 
-  // 2) Hard block (4xx + thin) — flagged blocked AND fires escalation through the proxy. Deterministic.
+  // 2) Hard block (4xx + thin) — flagged blocked AND fires escalation through the proxy. Uses
+  //    httpbin /status/403; if that service is unreachable (status=null), the end-to-end trigger
+  //    assertion is skipped with a note (unit tests cover the trigger logic deterministically).
   const r403 = await retrieve(gateway, secrets, { token, url: HARD_403, escalation: { onDatacenterIp: true }, clearanceTimeoutMs: 10_000 });
-  console.log(`  httpbin/403: status=${r403.status} blocked=${r403.blocked} proxyUsed=${r403.proxyUsed}`);
-  check("a 4xx + thin response is flagged blocked, not returned as content (finding #2)", r403.blocked === true);
-  check("escalation fired through the proxy on the hard block (finding #3)", r403.proxyUsed === true);
+  console.log(`  ${HARD_403}: status=${r403.status} blocked=${r403.blocked} proxyUsed=${r403.proxyUsed}`);
+  if (r403.status === null) {
+    note(`deterministic 403 target unreachable (status=null) — skipping end-to-end escalation assertion; unit tests cover the trigger`);
+  } else {
+    check("a 4xx + thin response is flagged blocked, not returned as content (finding #2)", r403.blocked === true);
+    check("escalation fired through the proxy on the hard block (finding #3)", r403.proxyUsed === true);
+  }
 
   // 3) Real reputation-403 target — best-effort (depends on current DC-IP heat).
   const rt = await retrieve(gateway, secrets, { token, url: HARD_TARGET, escalation: { onDatacenterIp: true }, clearanceTimeoutMs: 20_000 });
