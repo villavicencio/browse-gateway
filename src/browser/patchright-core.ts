@@ -34,6 +34,11 @@ const DEFAULT_CLEARANCE_TIMEOUT_MS = 20_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 /** Per-action timeout for interactive drive verbs (click/type/select/wait). */
 const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
+/**
+ * Hard ceiling on a `waitFor({ timeMs })` delay. Kept well under the idle-reaper TTL so a single
+ * wait can't hold the session open past the point where the reaper would close it under the caller.
+ */
+const MAX_WAIT_MS = 60_000;
 
 /**
  * A snapshot ref looks like `e4` (top frame) or a frame-prefixed `f1e2`; anything else is a raw
@@ -225,12 +230,15 @@ export class PatchrightBrowserCore implements BrowserCore {
         .first()
         .waitFor({ timeout: DEFAULT_ACTION_TIMEOUT_MS });
     } else if (condition.timeMs !== undefined) {
-      await page.waitForTimeout(condition.timeMs);
+      // Clamp the fixed delay so one wait can't outlive the idle-reaper TTL and pin the session.
+      await page.waitForTimeout(Math.min(Math.max(0, condition.timeMs), MAX_WAIT_MS));
+    } else {
+      throw new Error("waitFor requires either text or timeMs");
     }
   }
 
   async screenshot(): Promise<string> {
-    const buf = await this.#requireActivePage().screenshot();
+    const buf = await this.#requireActivePage().screenshot({ timeout: DEFAULT_ACTION_TIMEOUT_MS });
     return buf.toString("base64");
   }
 
@@ -269,7 +277,16 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
   }
 
-  /** Ref-annotated accessibility snapshot via Patchright's `ariaSnapshot({ mode: "ai" })`. */
+  /**
+   * Ref-annotated accessibility snapshot via Patchright's `ariaSnapshot({ mode: "ai" })`.
+   *
+   * The double-cast is deliberate: Patchright's published `Locator.ariaSnapshot` type does not yet
+   * expose the `{ mode: "ai" }` overload (the ref-annotated path, verified on 1.60 where the older
+   * internal `_snapshotForAI` was removed), so we widen to the call shape we actually invoke. The
+   * `.catch(() => "")` degrades to an empty tree if the method is missing on an older build — note
+   * that this masks a Patchright-version mismatch as a blank snapshot rather than a hard error, so
+   * keep the pinned version ≥ 1.60.
+   */
   async #snapshotOf(page: PatchrightPage): Promise<PageSnapshot> {
     const root = page.locator("html");
     const aria = root.ariaSnapshot as unknown as (

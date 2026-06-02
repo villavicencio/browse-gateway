@@ -67,38 +67,23 @@ export class GatewayDriveController implements DriveController {
   }
 
   async click(target: DriveTarget): Promise<PageSnapshot> {
-    return this.#run(async (s) => {
-      await s.core.click(target);
-      return s.core.snapshot();
-    });
+    return this.#actAndSnap((s) => s.core.click(target));
   }
 
   async type(target: DriveTarget, text: string, submit?: boolean): Promise<PageSnapshot> {
-    return this.#run(async (s) => {
-      await s.core.type(target, text, { submit });
-      return s.core.snapshot();
-    });
+    return this.#actAndSnap((s) => s.core.type(target, text, { submit }));
   }
 
   async selectOption(target: DriveTarget, values: string[]): Promise<PageSnapshot> {
-    return this.#run(async (s) => {
-      await s.core.selectOption(target, values);
-      return s.core.snapshot();
-    });
+    return this.#actAndSnap((s) => s.core.selectOption(target, values));
   }
 
   async pressKey(key: string): Promise<PageSnapshot> {
-    return this.#run(async (s) => {
-      await s.core.pressKey(key);
-      return s.core.snapshot();
-    });
+    return this.#actAndSnap((s) => s.core.pressKey(key));
   }
 
   async waitFor(condition: WaitCondition): Promise<PageSnapshot> {
-    return this.#run(async (s) => {
-      await s.core.waitFor(condition);
-      return s.core.snapshot();
-    });
+    return this.#actAndSnap((s) => s.core.waitFor(condition));
   }
 
   async screenshot(): Promise<string> {
@@ -124,6 +109,8 @@ export class GatewayDriveController implements DriveController {
    * First navigate of a proxied session: try fresh sessions (each a fresh rotating exit) until one
    * lands the page, then pin it. A dead/blocked exit fails fast, so retries stay cheap; the per-
    * consumer cap is respected because the unhealthy session is discarded before the next opens.
+   * Worst case is PROXY_OPEN_ATTEMPTS × the bounded proxy nav timeout (~25s each) — kept well under
+   * the idle-reaper TTL so an in-progress retry isn't reclaimed mid-flight.
    */
   async #openHealthyAndNavigate(url: string): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
@@ -155,6 +142,14 @@ export class GatewayDriveController implements DriveController {
       throw new Error("no active drive session — call browser_navigate to start one");
     }
     return this.#handle;
+  }
+
+  /** Run a mutating action, then return the post-action snapshot (the verb's observable result). */
+  async #actAndSnap(act: (session: Session) => Promise<unknown>): Promise<PageSnapshot> {
+    return this.#run(async (s) => {
+      await act(s);
+      return s.core.snapshot();
+    });
   }
 
   async #run<T>(fn: (session: Session) => Promise<T>): Promise<T> {

@@ -9,7 +9,7 @@ import { Gateway, SessionManager, SessionManagerError } from "../dist/gateway/in
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 
 /** A configurable fake BrowserCore factory that records created cores. */
-function makeFactory({ failTimes = 0 } = {}) {
+function makeFactory({ failTimes = 0, failGuard = false } = {}) {
   const cores = [];
   let fails = failTimes;
   const factory = async () => {
@@ -28,6 +28,7 @@ function makeFactory({ failTimes = 0 } = {}) {
         return { url, status: 200, title: "t", text: "x".repeat(1000), html: "<main/>", clearanceWaitedMs: 0 };
       },
       async setNavigationGuard(guard) {
+        if (failGuard) throw new Error("guard install boom");
         this.guard = guard;
         this.guardCalls++;
       },
@@ -204,4 +205,42 @@ test("shutdown: closes open interactive sessions (no orphaned browsers)", async 
   await gw.shutdown();
   assert.equal(gw.sessions.activeCount, 0);
   assert.equal(cores[0].closed, true);
+});
+
+test("touch() advances lastActivityAt so a freshly-used session survives the reaper", async () => {
+  const { factory } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  const handle = await gw.openConsumerSession("tok-a");
+  const session = gw.sessions.get(handle);
+  const created = session.lastActivityAt;
+  await new Promise((r) => setTimeout(r, 5)); // let the wall clock advance a few ms
+  session.touch();
+  assert.ok(session.lastActivityAt > created, "touch advanced lastActivityAt past creation");
+  const t = session.lastActivityAt;
+  // The reaper keys off lastActivityAt, which touch() just refreshed: a now within the TTL of the
+  // last touch spares the session even though it is older than the TTL by its creation time.
+  assert.deepEqual(await gw.sessions.reapIdle(1_000, t + 500), [], "within TTL of last touch -> survives");
+  assert.deepEqual(await gw.sessions.reapIdle(1_000, t + 2_000), [handle], "past TTL of last touch -> reaped");
+});
+
+test("per-consumer cap counts only consumer-bound sessions, not transient retrieve sessions", async () => {
+  const { factory } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(5), factory, policy); // global cap generous; per-consumer cap is 1
+  const handle = await gw.openConsumerSession("tok-a"); // tok-a now at its per-consumer cap
+  const r = await gw.withSession((s) => s.core.render("https://example.com/"));
+  assert.equal(r.status, 200, "a transient session still runs while a drive session is held");
+  assert.equal(gw.sessions.activeCount, 1, "transient released; only the held drive session remains");
+  await gw.closeConsumerSession("tok-a", handle);
+  assert.equal(gw.sessions.activeCount, 0);
+});
+
+test("openConsumerSession: releases the half-open session if guard install fails (no leak)", async () => {
+  const { factory, cores } = makeFactory({ failGuard: true });
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  await assert.rejects(gw.openConsumerSession("tok-a"), /guard install boom/);
+  assert.equal(gw.sessions.activeCount, 0, "no half-open session left after guard-install failure");
+  assert.equal(cores[0].closed, true, "the half-open session's core was closed");
 });

@@ -124,13 +124,19 @@ export class SessionManager {
   }
 
   /**
-   * Close every session whose last activity is older than `ttlMs`, returning the reaped ids.
-   * `now` is injectable for testing. Drive sessions are refreshed via `Session.touch()` on each
-   * use, so only genuinely idle ones are reaped — the load-bearing leak guard for held sessions.
+   * Close every consumer-bound (drive) session whose last activity is older than `ttlMs`, returning
+   * the reaped ids. `now` is injectable for testing. Drive sessions are refreshed via
+   * `Session.touch()` on each use, so only genuinely idle ones are reaped — the load-bearing leak
+   * guard for held sessions. Transient (retrieve) sessions are untagged and released synchronously
+   * by their caller, so they are never reaped here and a mid-flight retrieve can't be closed under it.
    */
   async reapIdle(ttlMs: number, now: number = Date.now()): Promise<string[]> {
-    const stale = [...this.#sessions.values()].filter((s) => now - s.lastActivityAt > ttlMs);
-    await Promise.all(stale.map((s) => this.release(s.id)));
+    const stale = [...this.#sessions.values()].filter(
+      (s) => s.consumerId !== undefined && now - s.lastActivityAt > ttlMs,
+    );
+    // Swallow per-session close failures: reapIdle is driven fire-and-forget from the reaper's
+    // setInterval, so a single core.close() rejection must not surface as an unhandled rejection.
+    await Promise.all(stale.map((s) => this.release(s.id).catch(() => {})));
     return stale.map((s) => s.id);
   }
 

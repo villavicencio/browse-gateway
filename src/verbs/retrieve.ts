@@ -27,8 +27,8 @@ import type { CaptchaSolver } from "./captcha.js";
  * exit) until a real page lands or attempts run out. `PROXY_NAV_TIMEOUT_MS` bounds a hung exit
  * with margin over the slowest good exit observed, so a retry past a dead exit stays fast.
  */
-const PROXY_MAX_ATTEMPTS = 3;
-const PROXY_NAV_TIMEOUT_MS = 25_000;
+export const PROXY_MAX_ATTEMPTS = 3;
+export const PROXY_NAV_TIMEOUT_MS = 25_000;
 
 export interface RetrieveOptions {
   token: string;

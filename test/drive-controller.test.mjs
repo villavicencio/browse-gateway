@@ -84,3 +84,32 @@ test("controller: a reaped session resets the handle so the next navigate reopen
   assert.equal(open.size, 1);
   assert.notEqual([...open.keys()][0], firstHandle, "a new session handle");
 });
+
+test("controller: a driver error carrying proxy credentials is redacted before reaching the consumer (R9)", async () => {
+  // A BYO proxy URL with a real-length password; redactSecrets must scrub it from any error text.
+  const proxyUrl = "http://user:sup3r-secret-proxy-pass@proxy.example:8080";
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: proxyUrl }));
+  let nextId = 1;
+  const handles = new Map();
+  const gateway = {
+    sessions: { get: (h) => handles.get(h) },
+    async openConsumerSession() {
+      const id = "h" + nextId++;
+      handles.set(id, {});
+      return id;
+    },
+    // Simulate a driver/proxy failure whose message embeds the BYO proxy credentials.
+    async useConsumerSession() {
+      throw new Error(`net::ERR_PROXY_CONNECTION_FAILED connecting via ${proxyUrl}`);
+    },
+    async closeConsumerSession(_t, h) {
+      handles.delete(h);
+    },
+  };
+  const c = new GatewayDriveController(gateway, secrets, "tok"); // direct path: navigate runs through #run
+  await assert.rejects(c.navigate("https://example.com/"), (e) => {
+    assert.ok(!e.message.includes("sup3r-secret-proxy-pass"), "raw secret must not survive");
+    assert.ok(!e.message.includes(proxyUrl), "the proxy URL must be redacted");
+    return true;
+  });
+});

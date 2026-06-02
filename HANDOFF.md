@@ -31,7 +31,7 @@ Also: dogfooded `retrieve`+`drive` on a proxy vendor's JS pricing page to answer
 - **Drive = Approach A** (high-level verbs only, never raw CDP) — the consumer can't disable the below-verb-layer `context.route` guard, so the interactive surface is safe under existing enforcement. **Approach B (CDP-attach) deferred** behind the U7 NET_ADMIN egress sidecar (raw CDP *can* bypass the in-browser guard).
 - Snapshot/ref via Patchright's built-in `ariaSnapshot({mode:"ai"})` — no DOM-walk needed (KTD-2 verified empirically). KTD-3: one implicit active drive session per consumer.
 - Residential proxy provider chosen (never-expiring PAYG); escalate-on-hard-block (not always-on).
-- A **cheaper alternative provider is parked as a fallback** — non-expiring PAYG at ~$4/GB vs the current ~$5–7/GB. Do NOT switch on price alone: A/B exit reliability first (exit health, not $/GB, decides). Provider names + the comparison are in memory `retrieve-403-and-proxy-gaps`.
+- A **cheaper alternative provider is parked as a fallback** — non-expiring PAYG at a lower per-GB rate than the current provider. Do NOT switch on price alone: A/B exit reliability first (exit health, not $/GB, decides). Provider names + the pricing comparison are in memory `retrieve-403-and-proxy-gaps` / `CUTOVER.local.md`.
 
 ## What Didn't Work
 - **"Request interception (`context.route`) breaks Chromium proxy auth"** — plausible, nearly implemented a `Proxy-Authorization` fix; a 3-config probe **disproved** it. Real cause was rotating-exit flakiness. Don't re-chase.
@@ -43,13 +43,13 @@ Also: dogfooded `retrieve`+`drive` on a proxy vendor's JS pricing page to answer
 2. **Before enabling drive in prod: bump `BGW_MAX_SESSIONS` > 1** — held drive sessions share the global session pool with `retrieve`; at 1, a held drive session starves `retrieve`.
 3. **U7** — capped-deploy tuning vs measured headroom, observability/retention, and the NET_ADMIN egress sidecar (also unblocks Approach B / CDP-attach).
 4. **(Optional) alternative-provider A/B** — buy a few GB PAYG, run `validate-proxy-escalation.mjs` against it, compare exit reliability/latency to the current provider; switch is a `BGW_PROXY_*` creds-only change if it holds up.
-5. **Confirm the second prod runtime** is on the new `:latest` (proxyretry) image — only one container was confirmed running on it; the second runtime may still hold an old container until restarted.
+5. **Confirm all prod runtimes are on the new `:latest` image** — not every runtime was confirmed on it yet; some may still hold an older container until restarted. (Fleet/runtime specifics: `CUTOVER.local.md`.)
 
 ## Gotchas & Watch-outs
 - **PUBLIC repo** — never commit fleet detail (host / agent / path / vendor / exit-IP names) in source, comments, commit messages, or fixtures (incl. this file). Pre-commit scrub-grep gated on exit status; fleet specifics live in gitignored `CUTOVER.local.md` / `CONTEXT.local.md` and agent memory.
 - **`BGW_MAX_SESSIONS=1` in prod** will starve `retrieve` once a drive session is held — bump before enabling drive (#2).
 - **Drive sessions are DIRECT** (no proxy) unless `BGW_ON_DATACENTER_IP=1` + proxy configured. Proxied drive retries a healthy exit at the **first navigate only**; a mid-flow block → clean restart error (no live exit swap, which would lose page state).
-- **Proxy reliability, not price, decides** provider choice (~83% healthy/fail-fast → 3-retry ≈ 99.5%). A cheaper, dirtier pool can cost more per *successful* fetch.
+- **Proxy reliability, not price, decides** provider choice (a meaningful fraction of exits are dead/slow, so the 3-retry brings effective success to near-certain). A cheaper, dirtier pool can cost more per *successful* fetch. (Measured exit-health figures: `CUTOVER.local.md` / memory.)
 - **IP reputation is real** — don't hammer one CF target from the prod DC IP; it 403s and the stealth core can't recover it (only a clean residential exit does).
 - **Patchright API:** `ariaSnapshot({mode:"ai"})` is the ref-snapshot path (`_snapshotForAI` is gone in 1.60); `aria-ref=<ref>` resolves a ref to a locator.
 - **Stealth gate envs:** set both `BGW_ATTEMPTS=1` + `BGW_REQUIRED=1` for a quick confirm; `3/3` is the real bar.

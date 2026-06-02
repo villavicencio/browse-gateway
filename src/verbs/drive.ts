@@ -11,21 +11,28 @@
 import { isHardBlock } from "../browser/index.js";
 import type { BrowserCoreOptions, PageSnapshot } from "../browser/index.js";
 import type { SecretStore } from "../security/index.js";
-import { proxyFromSecrets } from "./retrieve.js";
+import { proxyFromSecrets, PROXY_MAX_ATTEMPTS, PROXY_NAV_TIMEOUT_MS } from "./retrieve.js";
 
-/** Max fresh proxied sessions to try when landing a healthy exit for a drive session. */
-export const PROXY_OPEN_ATTEMPTS = 3;
+/**
+ * Max fresh proxied sessions to try when landing a healthy exit for a drive session. Sourced from
+ * retrieve's attempt budget so the two proxy-retry surfaces share one value and can't drift apart.
+ */
+export const PROXY_OPEN_ATTEMPTS = PROXY_MAX_ATTEMPTS;
 
 /**
  * The core overrides to open a drive session with: the residential proxy when one is configured AND
- * we're on a datacenter IP (matching retrieve's escalation gate). Otherwise undefined (direct).
+ * we're on a datacenter IP (matching retrieve's escalation gate). Otherwise undefined (direct). The
+ * nav timeout is bounded (same value as retrieve) so a dead/slow exit fails fast and one hung exit
+ * can't eat the whole retry budget.
  */
 export function proxyOverrideFor(
   secrets: SecretStore,
   onDatacenterIp: boolean,
 ): BrowserCoreOptions | undefined {
   const proxy = proxyFromSecrets(secrets);
-  return proxy && onDatacenterIp ? { proxy } : undefined;
+  return proxy && onDatacenterIp
+    ? { proxy, navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS }
+    : undefined;
 }
 
 /**
