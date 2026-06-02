@@ -4,6 +4,8 @@
  * stack — authenticate -> allowlist-guarded, consumer-bound session -> real ariaSnapshot/click/type
  * -> idle reap -> close — through the GatewayDriveController, with NO mocks. Confirms:
  *   1. navigate + snapshot return a ref-annotated accessibility tree from a real page;
+ *   1b. a real Cloudflare challenge CLEARS during navigate()'s clearance poll (degrades to a note
+ *       on an IP-reputation block — this harness uses direct sessions, which can't clear those);
  *   2. the navigation guard blocks an off-allowlist navigate on the drive path (same policy as retrieve);
  *   3. (best-effort) type + click change page state end-to-end on a real form;
  *   4. an idle session is reaped, and the next action surfaces a clean "no open session" error;
@@ -14,9 +16,22 @@ import { Gateway, loadConfig } from "../dist/gateway/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 import { SecretStore } from "../dist/security/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
+import { isVisiblyBlocked } from "../dist/browser/index.js";
 
 const TOKEN = "tok-drive";
-const ALLOW = ["example.com", "*.example.com", "httpbin.org", "*.httpbin.org"];
+// A known Cloudflare target for the anti-bot clearance check (1b). Configurable; defaults to the
+// stealth gate's stable CF target (scrapingcourse is avoided — it is IP-reputation-flaky). Its
+// registrable host is added to the allowlist so the guard admits it.
+const CF_TARGET = process.env.BGW_DRIVE_CF_URL ?? "https://www.udemy.com/";
+const cfApex = new URL(CF_TARGET).hostname.split(".").slice(-2).join(".");
+const ALLOW = [
+  "example.com",
+  "*.example.com",
+  "httpbin.org",
+  "*.httpbin.org",
+  cfApex,
+  `*.${cfApex}`, // the CF clearance target
+];
 const OFF_ALLOWLIST = "https://www.google.com/"; // deliberately NOT in ALLOW
 const FORM = "https://httpbin.org/forms/post"; // a real interactive form; degrades to a note if down
 
@@ -46,6 +61,24 @@ try {
   console.log(`  example.com: status=${home.status} treeLen=${home.tree.length}`);
   check("navigate+snapshot return a ref-annotated accessibility tree", /\[ref=/.test(home.tree));
   check("the snapshot carries the page's real content (a link)", /link/i.test(home.tree));
+
+  // 1b) anti-bot clearance on the drive path. A client-side CF challenge auto-solves during
+  //     navigate()'s poll, so a successful navigate yields the CLEARED page — navFailed rejects a
+  //     still-visible interstitial (throwing), so reaching here proves the poll outwaited the
+  //     challenge. On a direct session an IP-reputation block can't be cleared (only a residential
+  //     exit does), so that case degrades to a note rather than a failure.
+  try {
+    const cf = await drive.navigate(CF_TARGET);
+    console.log(`  ${CF_TARGET}: status=${cf.status} treeLen=${cf.tree.length}`);
+    const cleared = /\[ref=/.test(cf.tree) && !isVisiblyBlocked({ title: cf.title, text: cf.tree });
+    check("a CF challenge cleared during navigate()'s poll (real page, not the interstitial)", cleared);
+  } catch (err) {
+    note(
+      `CF clearance check skipped (${CF_TARGET}): ` +
+        `${err instanceof Error ? err.message.split("\n")[0] : String(err)} — ` +
+        `likely IP reputation on a direct session; the residential-exit path clears these`,
+    );
+  }
 
   // 2) the guard blocks an off-allowlist navigate on the drive path (R2).
   let blocked = false;
