@@ -4,6 +4,12 @@
  * reuses it across verbs, and closes it on demand. Errors are scrubbed of BYO secret material (R9);
  * a session that was idle-reaped out from under us is detected and the handle reset so the next
  * navigate transparently reopens. Action verbs return the post-action snapshot.
+ *
+ * Proxy posture is escalate-on-block (matching retrieve, not always-on): the first navigate goes
+ * DIRECT, and only escalates to a proxied residential exit if direct is blocked — and only on that
+ * first navigate, before any interaction, because a stateful session can't swap its exit mid-flow
+ * without losing page state (KTD-5). The proxy override is resolved fresh per open, so a secret
+ * rotation takes effect on the next session.
  */
 import { isHttpUrl, redactSecrets } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -15,8 +21,10 @@ import type { DriveController } from "./server.js";
 
 export class GatewayDriveController implements DriveController {
   #handle?: string;
-  /** True once a (proxied) session has landed a healthy exit; pinned exits are not re-rolled. */
+  /** True once the current session's first navigate landed a page — its exit/mode is committed. */
   #pinned = false;
+  /** Whether the current session was opened proxied (vs direct) — drives reopen-after-reap + messaging. */
+  #proxiedSession = false;
   readonly #gateway: Gateway;
   readonly #secrets: SecretStore;
   readonly #token: string;
@@ -46,7 +54,9 @@ export class GatewayDriveController implements DriveController {
   }
 
   async open(): Promise<void> {
-    await this.#ensureOpen();
+    // Open a direct session lazily; escalation to a proxied exit (if needed) happens on the first
+    // navigate — the only point we know whether the target blocks the direct IP.
+    if (!this.#handle) await this.#openSession(undefined);
   }
 
   async navigate(url: string): Promise<PageSnapshot> {
@@ -55,31 +65,50 @@ export class GatewayDriveController implements DriveController {
     if (!isHttpUrl(url)) {
       throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
     }
-    const proxied = this.#resolveProxyOverride() !== undefined;
-    // Proxied session, not yet pinned: retry across fresh exits until one lands the page (R7 / KTD-5).
-    if (proxied && !this.#pinned) {
-      return this.#openHealthyAndNavigate(url);
+    // First navigate of a session: try direct, escalate to a proxied exit only on a block.
+    if (!this.#pinned) {
+      return this.#firstNavigate(url);
     }
-    // Pinned proxied session or a direct session: one shot. A failed nav is surfaced cleanly rather
-    // than returned as a blank page. For a proxied session a mid-flow failure also discards the
-    // session (below) so the next navigate auto-draws a fresh exit; a direct session is left intact.
+    // Pinned session (direct or proxied): one shot. Reopen first if an idle reap closed it (same
+    // mode). A failed nav means the committed exit/IP went bad, so discard it — the next navigate
+    // re-runs the direct-first escalation rather than stranding the caller on a known-bad exit. We
+    // surface the failure rather than swap the exit live under the page (that would lose state, KTD-5).
     await this.#ensureOpen();
     const snap = await this.#run((s) => s.core.navigate(url));
     if (navFailed(snap)) {
-      if (proxied) {
-        // The pinned exit went bad (or the page stayed blocked): discard + unpin so the NEXT
-        // navigate transparently draws a fresh exit instead of stranding the caller on the known-bad
-        // pinned exit. We still surface the failure rather than swap the exit live under the current
-        // page — that would lose page state (KTD-5).
-        await this.#discardSession();
-        this.#pinned = false;
-      }
+      await this.#discardSession();
+      const proxyAvailable = this.#resolveProxyOverride() !== undefined;
       throw new Error(
         `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
-          `reached${proxied ? " — retry navigate for a fresh exit" : ""}`,
+          `reached${proxyAvailable ? " — retry navigate for a fresh exit" : ""}`,
       );
     }
     return snap;
+  }
+
+  /**
+   * First navigate of a session, escalate-on-block (matching retrieve's posture). Try DIRECT first —
+   * the stealth core clears most client-side challenges (e.g. a Cloudflare JS challenge) on the
+   * datacenter IP with no proxy cost. Only if direct is hard-blocked (IP reputation) do we escalate
+   * to a proxied residential exit, and only here — BEFORE any interaction — because a stateful
+   * session can't swap its exit mid-flow without losing page state (KTD-5).
+   */
+  async #firstNavigate(url: string): Promise<PageSnapshot> {
+    if (!this.#handle) await this.#openSession(undefined); // reuse a pre-opened (direct) session if any
+    const direct = await this.#run((s) => s.core.navigate(url));
+    if (!navFailed(direct)) {
+      this.#pinned = true; // direct works → commit it (no residential GB spent)
+      return direct;
+    }
+    // Direct blocked. Escalate to a proxied exit if one is available; otherwise surface the block.
+    const override = this.#resolveProxyOverride();
+    await this.#discardSession(); // drop the blocked direct session before escalating
+    if (!override) {
+      throw new Error(
+        `navigation failed (status=${direct.status ?? "n/a"}): the page was blocked or could not be reached`,
+      );
+    }
+    return this.#openHealthyAndNavigate(url, override);
   }
 
   async snapshot(): Promise<PageSnapshot> {
@@ -112,30 +141,39 @@ export class GatewayDriveController implements DriveController {
 
   async close(): Promise<void> {
     this.#pinned = false;
+    this.#proxiedSession = false;
     const handle = this.#handle;
     if (!handle) return;
     this.#handle = undefined;
     await this.#gateway.closeConsumerSession(this.#token, handle).catch(() => {});
   }
 
-  /** Open the session lazily on first use, with a freshly-resolved proxy override (rotation-safe). */
+  /** Reopen the pinned session if an idle reap closed it, with the mode it committed to (direct or
+   *  proxied; rotation-safe for the proxied case). Used on the pinned one-shot path. */
   async #ensureOpen(): Promise<void> {
     if (!this.#handle) {
-      this.#handle = await this.#gateway.openConsumerSession(this.#token, this.#resolveProxyOverride());
+      await this.#openSession(this.#proxiedSession ? this.#resolveProxyOverride() : undefined);
     }
   }
 
+  /** Open a consumer session with the given core override (a proxied exit, or undefined for direct),
+   *  recording whether it is proxied for reopen-after-reap and failure messaging. */
+  async #openSession(override: BrowserCoreOptions | undefined): Promise<void> {
+    this.#handle = await this.#gateway.openConsumerSession(this.#token, override);
+    this.#proxiedSession = override !== undefined;
+  }
+
   /**
-   * First navigate of a proxied session: try fresh sessions (each a fresh rotating exit) until one
-   * lands the page, then pin it. A dead/blocked exit fails fast, so retries stay cheap; the per-
-   * consumer cap is respected because the unhealthy session is discarded before the next opens.
-   * Worst case is PROXY_OPEN_ATTEMPTS × the bounded proxy nav timeout (~25s each) — kept well under
-   * the idle-reaper TTL so an in-progress retry isn't reclaimed mid-flight.
+   * Escalation path: open a proxied session (each a fresh rotating exit) and navigate, retrying fresh
+   * exits until one lands the page, then pin it. A dead/blocked exit fails fast (bounded proxy nav
+   * timeout), so retries stay cheap; the per-consumer cap is respected because the unhealthy session
+   * is discarded before the next opens. Worst case PROXY_OPEN_ATTEMPTS × the bounded proxy nav timeout
+   * (~25s) — well under the idle-reaper TTL so an in-progress retry isn't reclaimed mid-flight.
    */
-  async #openHealthyAndNavigate(url: string): Promise<PageSnapshot> {
+  async #openHealthyAndNavigate(url: string, override: BrowserCoreOptions): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
     for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
-      await this.#ensureOpen();
+      await this.#openSession(override);
       const snap = await this.#run((s) => s.core.navigate(url));
       if (!navFailed(snap)) {
         this.#pinned = true;
@@ -150,10 +188,13 @@ export class GatewayDriveController implements DriveController {
     );
   }
 
-  /** Close and forget the current session (used between retry attempts to force a fresh exit). */
+  /** Close and forget the current session and its committed exit/mode, so the next navigate re-runs
+   *  the direct-first escalation. Used between retry attempts and on a committed-exit failure. */
   async #discardSession(): Promise<void> {
     const handle = this.#handle;
     this.#handle = undefined;
+    this.#pinned = false;
+    this.#proxiedSession = false;
     if (handle) await this.#gateway.closeConsumerSession(this.#token, handle).catch(() => {});
   }
 

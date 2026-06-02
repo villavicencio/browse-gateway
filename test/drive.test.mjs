@@ -1,7 +1,11 @@
 /**
  * U4 drive proxy-posture tests — the proxyOverrideFor/navFailed helpers, plus the controller's
- * first-navigate retry across fresh rotating exits, pinning, and pinned/direct failure surfacing.
+ * escalate-on-block first navigate (direct first; escalate to a proxied exit only when direct is
+ * blocked), the fresh-exit retry + pinning, secret-rotation safety, and mid-flow failure recovery.
  * Exercised with a fake gateway (no real browser); the live path is proven by scripts/validate-drive.mjs (U5).
+ *
+ * In the fake gateway, session index 0 is the DIRECT attempt (override undefined) and sessions 1+ are
+ * proxied — so a test triggers escalation by making session 0 block.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -71,59 +75,82 @@ function makeProxyGateway(sessionNavLists) {
   return { gateway, open, opened };
 }
 
-test("controller: proxied first navigate retries fresh sessions until a healthy exit lands, then pins", async () => {
-  const { gateway, open, opened } = makeProxyGateway([[{ status: null, tree: "" }], [{ status: 200, tree: REAL }]]);
+test("controller: direct blocked -> escalates to a proxied exit, retrying fresh exits until healthy, then pins", async () => {
+  const { gateway, open, opened } = makeProxyGateway([
+    [{ status: 403, tree: "Forbidden" }], // session 0: DIRECT attempt — hard-blocked
+    [{ status: null, tree: "" }], //          session 1: proxied attempt 1 — dead exit
+    [{ status: 200, tree: REAL }], //         session 2: proxied attempt 2 — healthy
+  ]);
   const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
   const snap = await c.navigate("https://example.com/");
-  assert.equal(snap.status, 200, "landed a healthy exit");
-  assert.equal(opened.length, 2, "retried with a second fresh session");
-  assert.ok(opened[0].overrides?.proxy, "opened with the proxy override");
+  assert.equal(snap.status, 200, "landed a healthy proxied exit after direct was blocked");
+  assert.equal(opened.length, 3, "one direct attempt + two proxied attempts");
+  assert.equal(opened[0].overrides, undefined, "first attempt was DIRECT (no proxy spent)");
+  assert.ok(opened[1].overrides?.proxy, "escalated to the proxy after the direct block");
+  assert.ok(opened[2].overrides?.proxy, "retried a fresh proxied exit");
   assert.equal(open.size, 1, "only the healthy session remains open");
   await c.navigate("https://example.com/next"); // pinned -> no re-roll
-  assert.equal(opened.length, 2, "no re-open after pinning");
+  assert.equal(opened.length, 3, "no re-open after pinning");
 });
 
-test("controller: proxied open throws when no exit lands within the attempt budget", async () => {
-  const { gateway, opened } = makeProxyGateway([[{ status: null, tree: "" }]]); // every session dead
+test("controller: direct that clears (no block) pins direct and never opens the proxy", async () => {
+  const { gateway, opened } = makeProxyGateway([[{ status: 200, tree: REAL }]]); // direct succeeds
+  const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
+  const snap = await c.navigate("https://example.com/");
+  assert.equal(snap.status, 200);
+  assert.equal(opened.length, 1, "only the direct session was opened");
+  assert.equal(opened[0].overrides, undefined, "no proxy spent — direct cleared on its own");
+});
+
+test("controller: escalation throws when no proxied exit lands within the attempt budget", async () => {
+  const { gateway, opened } = makeProxyGateway([
+    [{ status: 403, tree: "Forbidden" }], // direct: blocked
+    [{ status: null, tree: "" }], //          proxied attempts: all dead (repeats for si>=1)
+  ]);
   const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
   await assert.rejects(c.navigate("https://example.com/"), /could not land a working proxied exit/);
-  assert.equal(opened.length, 3, "tried the full attempt budget");
+  assert.equal(opened.length, 4, "one direct attempt + the full 3-attempt proxied budget");
 });
 
-test("controller: a direct session surfaces a failed navigation as an error, not blank content", async () => {
+test("controller: a direct-only session (no proxy) surfaces a failed navigation as an error", async () => {
   const { gateway } = makeProxyGateway([[{ status: null, tree: "" }]]);
-  const c = new GatewayDriveController(gateway, noSecrets(), "tok", { onDatacenterIp: true }); // no proxy -> direct
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", { onDatacenterIp: true }); // no proxy -> direct only
   await assert.rejects(c.navigate("https://example.com/"), /navigation failed/);
 });
 
 test("controller: resolves the proxy override per open, so a secret rotation takes effect (no cached creds)", async () => {
   let env = { BGW_PROXY_URL: "http://old-exit:1111" };
   const secrets = new SecretStore(() => env);
-  const { gateway, opened } = makeProxyGateway([[{ status: 200, tree: REAL }], [{ status: 200, tree: REAL }]]);
+  const { gateway, opened } = makeProxyGateway([
+    [{ status: 403, tree: "Forbidden" }], // s0 direct: blocked -> escalate
+    [{ status: 200, tree: REAL }], //         s1 proxied: healthy (old creds)
+    [{ status: 403, tree: "Forbidden" }], // s2 direct: blocked -> escalate
+    [{ status: 200, tree: REAL }], //         s3 proxied: healthy (new creds)
+  ]);
   const c = new GatewayDriveController(gateway, secrets, "tok", { onDatacenterIp: true });
   await c.navigate("https://example.com/");
-  assert.match(opened[0].overrides?.proxy?.server ?? "", /old-exit/, "first session opened with the original proxy");
+  assert.match(opened[1].overrides?.proxy?.server ?? "", /old-exit/, "escalated with the original proxy");
   await c.close();
   env = { BGW_PROXY_URL: "http://new-exit:2222" }; // rotate the proxy out from under the controller
   secrets.reload();
   await c.navigate("https://example.com/again");
-  assert.match(opened[1].overrides?.proxy?.server ?? "", /new-exit/, "next session used the rotated proxy, not a cached override");
+  assert.match(opened[3].overrides?.proxy?.server ?? "", /new-exit/, "next escalation used the rotated proxy, not a cached override");
 });
 
-test("controller: a pinned proxied session that fails mid-flow discards, so the next navigate re-rolls a fresh exit", async () => {
-  // session 1: first nav healthy (pins), second nav fails (exit went bad mid-flow);
-  // session 2: a fresh healthy exit on the auto-reopened navigate.
+test("controller: a pinned proxied session that fails mid-flow discards, so the next navigate re-escalates a fresh exit", async () => {
   const { gateway, opened } = makeProxyGateway([
-    [{ status: 200, tree: REAL }, { status: null, tree: "" }],
-    [{ status: 200, tree: REAL }],
+    [{ status: 403, tree: "Forbidden" }], //                     s0 direct: blocked -> escalate
+    [{ status: 200, tree: REAL }, { status: null, tree: "" }], // s1 proxied: 1st nav healthy (pins), 2nd fails
+    [{ status: 403, tree: "Forbidden" }], //                     s2 direct (retry): blocked -> escalate
+    [{ status: 200, tree: REAL }], //                            s3 proxied: a fresh healthy exit
   ]);
   const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
   const first = await c.navigate("https://example.com/");
-  assert.equal(first.status, 200);
+  assert.equal(first.status, 200, "escalated to a healthy proxied exit");
+  assert.equal(opened.length, 2, "one direct attempt + one proxied (healthy)");
   await assert.rejects(c.navigate("https://example.com/2"), /retry navigate for a fresh exit/);
-  assert.equal(opened.length, 1, "the failing navigate does not re-roll within the same call (no live swap)");
-  // The session was discarded + unpinned, so the next navigate transparently re-rolls a fresh exit.
+  // The pinned exit went bad mid-flow: discarded, so the next navigate re-runs direct-first escalation.
   const recovered = await c.navigate("https://example.com/3");
-  assert.equal(recovered.status, 200, "auto-reopened on a fresh exit");
-  assert.equal(opened.length, 2, "exactly one fresh session opened on recovery");
+  assert.equal(recovered.status, 200, "re-escalated to a fresh healthy exit");
+  assert.equal(opened.length, 4, "a fresh direct attempt + a fresh proxied exit on recovery");
 });
