@@ -1,56 +1,88 @@
-# HANDOFF — 2026-06-02
+# HANDOFF — 2026-06-02, afternoon
 
-Picked up from the U6 cutover and ran two arcs. **Arc 1:** finished the residential-proxy
-escalation work (escalate-on-hard-block + rotating-exit retry) and got it **verified live in
-prod**. **Arc 2:** built the entire interactive **`drive` verb set** (Approach A, U1–U5) on a
-feature branch — now **PR #2**, full unit suite green + an end-to-end browser proof passing.
-
-> Provider names and per-host/agent specifics are deliberately kept out of this public file —
-> they live in agent memory `retrieve-403-and-proxy-gaps` and gitignored `CUTOVER.local.md`.
+Picked up the interactive **`drive` verb set** as PR #2 (built in the prior session, U1–U5 of
+the drive plan). Ran a multi-agent code review, then iterated through **six external review
+passes** hardening the drive surface — each pass surfaced one more edge in block-detection /
+proxy-escalation / lifecycle — and finally **squash-merged PR #2 to `main`** (`e431101`).
+`drive` now ships on `main`; it lands dormant (config/deploy-gated) until enabled in prod.
 
 ## What We Built
-
-**Arc 1 — proxy escalation (on `main`, pushed):**
-- `f2a566e` feat(verbs): escalate-on-hard-block — `isHardBlock` (4xx/5xx + thin) in `detect.ts`, broadened `shouldEscalateToProxy` (CF challenge **or** hard block), `retrieve.blocked` also true on `status===null`. (cutover findings #2/#3)
-- `bbe17da` fix(verbs): rotating-exit retry — session-level retry (3 attempts, 25s/attempt) in `retrieve.ts`. Root cause = rotating residential exit variance (~83% healthy/fail-fast), **not** route-interception-breaks-proxy-auth (disproven).
-- `0b8d742` `scripts/validate-proxy-escalation.mjs` proof; `4822c82` docs: `docs/solutions/runtime-errors/residential-proxy-rotating-exit-retry.md`.
-- **Verified end-to-end on prod** through the residential proxy: a hard reputation-403 target cleared via a fresh residential exit (~3KB markdown). Image-promotion + runtime-rollout specifics (tags, which runtimes were restarted) live in `CUTOVER.local.md`.
-
-**Arc 2 — drive feature (branch `feat/drive-interactive-verbs`, [PR #2](https://github.com/villavicencio/browse-gateway/pull/2)):**
-- `e4d85f4` **U1** — core interactive primitives (`navigate/snapshot/click/type/selectOption/pressKey/waitFor/screenshot/closeActivePage`) + aria-ref snapshot model (Patchright `ariaSnapshot({mode:"ai"})` + `aria-ref=`, verified on 1.60; `targetToSelector` in `patchright-core.ts`).
-- `940b552` **U2** — persistent consumer-bound sessions + idle reaping (`session.ts` consumerId/lastActivityAt/touch; `session-manager.ts` per-consumer cap + `reapIdle`/`startReaper`; gateway `openConsumerSession`/`useConsumerSession`/`closeConsumerSession`).
-- `aa61f00` **U3** — 10 `browser_*` MCP tools + `GatewayDriveController` (`src/mcp/{server,drive-controller,main}.ts`); `retrieve` description strengthened (read-vs-act).
-- `ebd4139` **U4** — proxied drive with healthy-exit retry (`src/verbs/drive.ts`: `proxyOverrideFor`/`navFailed`; first navigate retries fresh exits then pins; mid-flow failure → restart error).
-- `faada8b` **U5** — `scripts/validate-drive.mjs` in-container end-to-end proof.
-- **Full unit suite green; `validate-drive.mjs` → PASS in-container** (navigate+snapshot, off-allowlist-blocked-on-drive, anti-bot clearance, type+submit state change, idle reap, clean close).
-- ce-compound architecture doc `docs/solutions/architecture-patterns/interactive-drive-verbs-over-policy-guard.md`.
-
-Also: dogfooded `retrieve`+`drive` on a proxy vendor's JS pricing page to answer a PAYG question (and proved retrieve-vs-drive in the process — see What Didn't Work).
+- **Merged PR #2 → `main` as squash `e431101`** ("feat: interactive `drive` verb set …"), branch
+  deleted, local `main` synced. The squash body summarizes the feature; the six-pass fix history
+  is collapsed (per-pass detail below + in agent memory).
+- **Drive surface on `main`:** 10 `browser_*` MCP tools (open/navigate/snapshot/click/type/
+  select_option/press_key/wait_for/take_screenshot/close) over a ref-annotated `ariaSnapshot`
+  model; consumer-bound persistent sessions (per-consumer cap + idle reaper + clean teardown);
+  Approach A (high-level verbs only, never raw CDP) so the below-verb-layer guard can't be removed.
+- **Hardening produced by the review passes (all on `main` now):**
+  - `navigate()` polls anti-bot clearance (only while a block phrase shows); `navFailed` flags a
+    still-visible challenge, a 4xx+thin **hard block**, AND a `chrome-error://` **dead nav**.
+  - Post-action snapshots carry the last main-frame nav **status** (response listener) so a bare
+    `403` reached by a click/submit is caught, not returned as success.
+  - **Escalate-on-block proxy posture** (`#4`, mirrors `retrieve`): first navigate goes DIRECT;
+    escalates to a residential exit only on a CF challenge (visible phrase **or** `cfHint`
+    vendor-hint) or a hard block, and only at the first navigate (before interaction; KTD-5). A
+    pinned exit that fails mid-flow is discarded so the next navigate re-escalates.
+  - **Secret-rotation safety (R9):** proxy override resolved fresh per session-open;
+    `SecretStore.redactableValues()` scrubs every value ever loaded (retired-but-in-flight creds
+    can't leak).
+  - **Per-consumer cap race fixed:** `#reservedByConsumer` counts in-flight launches.
+  - `cfHint`: a **scrubbed boolean** on `PageSnapshot` (CF vendor-hint in HTML, computed in the
+    core) so drive's CF escalation matches `retrieve`'s `isCloudflareBlock` exactly — no raw HTML
+    carried, not exposed via MCP.
+- **Tests:** 112 unit (`npm test`), typecheck clean. **In-container `validate-drive.mjs` PASS
+  0/0** (real browser: CF cleared *direct*, off-allowlist blocked, type+submit state change, idle
+  reap, clean close; step 1b CF-clearance + a bare-403 / chrome-error post-action regression).
+- **Memory:** wrote `drive-retrieve-detection-parity.md`; updated `build-progress.md` + `MEMORY.md`.
 
 ## Decisions Made
-- **Drive = Approach A** (high-level verbs only, never raw CDP) — the consumer can't disable the below-verb-layer `context.route` guard, so the interactive surface is safe under existing enforcement. **Approach B (CDP-attach) deferred** behind the U7 NET_ADMIN egress sidecar (raw CDP *can* bypass the in-browser guard).
-- Snapshot/ref via Patchright's built-in `ariaSnapshot({mode:"ai"})` — no DOM-walk needed (KTD-2 verified empirically). KTD-3: one implicit active drive session per consumer.
-- Residential proxy provider chosen (never-expiring PAYG); escalate-on-hard-block (not always-on).
-- A **cheaper alternative provider is parked as a fallback** — non-expiring PAYG at a lower per-GB rate than the current provider. Do NOT switch on price alone: A/B exit reliability first (exit health, not $/GB, decides). Provider names + the pricing comparison are in memory `retrieve-403-and-proxy-gaps` / `CUTOVER.local.md`.
+- **Escalate-on-block, not always-on** for drive (`#4`) — direct-first saves residential GB when
+  the stealth core clears CF directly on the datacenter IP; proxy spent only on hard reputation
+  blocks. Matches `retrieve`'s recorded posture.
+- **Dead-nav detection via the `chrome-error://` URL check** (deterministic), NOT nulling status on
+  `requestfailed` — the latter false-positives on a download/aborted-nav click that leaves the page
+  on a good document. (Added then reverted within the 4th pass.)
+- **`cfHint` carried as a scrubbed boolean**, not raw HTML — keeps snapshots lean and avoids
+  leaking page content while matching `retrieve`'s vendor-hint CF detection.
+- **`#5` middle-path:** a proxied mid-flow failure discards+unpins (next navigate re-escalates);
+  a direct session is left intact (no state-losing discard).
+- **Squash merge** (user's choice) to collapse the six-pass history into one feature commit.
+- **`@mozilla/readability` ReDoS bump deferred** to a separate PR — it's a `retrieve` dependency,
+  out of scope for the drive feature.
 
 ## What Didn't Work
-- **"Request interception (`context.route`) breaks Chromium proxy auth"** — plausible, nearly implemented a `Proxy-Authorization` fix; a 3-config probe **disproved** it. Real cause was rotating-exit flakiness. Don't re-chase.
-- **`retrieve`/Readability on a JS pricing widget** → returns marketing boilerplate (extracts an "article"); use `drive`'s accessibility snapshot for interactive/widget content.
-- httpbin.org is flaky as a deterministic test target (degrade to a note, not a failure).
+- **`requestfailed` listener nulling `#lastDocStatus`** — false-positives on download/aborted-nav
+  clicks (page stays good, status wrongly nulled). Don't re-add; the `chrome-error://` URL is the
+  signal.
+- **Narrowing `shouldEscalateDrive` to CF *visible phrases* only** (`isCloudflareVisible`) — missed
+  a CF interstitial detected only by the HTML vendor hint (`challenge-platform`) that `retrieve`
+  escalates. Needed `cfHint`. Don't narrow to visible-only.
 
 ## What's Next
-1. **Review + merge [PR #2](https://github.com/villavicencio/browse-gateway/pull/2)** (drive feature) — the headline deliverable.
-2. **Set `BGW_MAX_SESSIONS` high enough that a held drive session doesn't starve `retrieve`** — they share one global session pool (code default is 2). The deployment value lives in `CUTOVER.local.md`; confirm it there before enabling drive.
-3. **U7** — capped-deploy tuning vs measured headroom, observability/retention, and the NET_ADMIN egress sidecar (also unblocks Approach B / CDP-attach).
-4. **(Optional) alternative-provider A/B** — buy a few GB PAYG, run `validate-proxy-escalation.mjs` against it, compare exit reliability/latency to the current provider; switch is a `BGW_PROXY_*` creds-only change if it holds up.
-5. **Confirm the prod-runtime image rollout is complete** before relying on the new behavior everywhere — current rollout status + per-runtime specifics live in `CUTOVER.local.md`.
+1. **Before enabling drive in prod (the gate):** bump **`BGW_MAX_SESSIONS`** (> 2; held drive
+   sessions share the global pool with `retrieve`, code default 2) and confirm
+   **`BGW_ON_DATACENTER_IP`** + proxy on the runtime host. The deployment env file + values live in
+   `CUTOVER.local.md`. Merging did **not** enable drive — it's config/deploy-gated.
+2. **Parked follow-up:** bump **`@mozilla/readability` ≥ 0.6.0** (low-sev ReDoS
+   GHSA-3p6v-hrg8-8qj7, pre-existing, used by `retrieve`'s `extractMarkdown`) as a separate small
+   PR + verify extraction still produces clean markdown on 0.6.0.
+3. **U7:** capped-deploy tuning vs measured headroom, observability/retention, and the NET_ADMIN
+   egress sidecar (also unblocks drive **Approach B / CDP-attach**).
 
 ## Gotchas & Watch-outs
-- **PUBLIC repo** — never commit fleet detail (host / agent / path / vendor / exit-IP names) in source, comments, commit messages, or fixtures (incl. this file). Pre-commit scrub-grep gated on exit status; fleet specifics live in gitignored `CUTOVER.local.md` / `CONTEXT.local.md` and agent memory.
-- **A too-low `BGW_MAX_SESSIONS` starves `retrieve`** once a drive session is held (shared global pool; code default 2). Confirm the deployment value in `CUTOVER.local.md` before enabling drive (#2).
-- **Drive is escalate-on-block:** the first navigate goes DIRECT; it escalates to a residential exit only if direct is blocked (a CF/WAF challenge or a hard reputation block) AND `BGW_ON_DATACENTER_IP=1` + a proxy is configured — and only on that first navigate. A mid-flow block → clean restart error (no live exit swap, which would lose page state).
-- **Proxy reliability, not price, decides** provider choice (a meaningful fraction of exits are dead/slow, so the 3-retry brings effective success to near-certain). A cheaper, dirtier pool can cost more per *successful* fetch. (Measured exit-health figures: `CUTOVER.local.md` / memory.)
-- **IP reputation is real** — don't hammer one CF target from the prod DC IP; it 403s and the stealth core can't recover it (only a clean residential exit does).
-- **Patchright API:** `ariaSnapshot({mode:"ai"})` is the ref-snapshot path (`_snapshotForAI` is gone in 1.60); `aria-ref=<ref>` resolves a ref to a locator.
-- **Stealth gate envs:** set both `BGW_ATTEMPTS=1` + `BGW_REQUIRED=1` for a quick confirm; `3/3` is the real bar.
-- The drive plan lives in gitignored `docs/plans/2026-06-01-001-feat-drive-interactive-verbs-plan.local.md` (`status: completed`).
+- **drive↔retrieve detection parity** (the recurring theme of all six passes): `navFailed` and
+  `shouldEscalateDrive` re-derive `retrieve`'s detection on a *reduced signal surface* (aria tree +
+  status + `cfHint`, no HTML). When touching either side — or `retrieve`'s escalation — change BOTH
+  together and add a parity unit test. New HTML-derived signals → carry as a scrubbed boolean like
+  `cfHint`, never raw HTML. See memory `drive-retrieve-detection-parity`.
+- **PUBLIC repo** — never commit fleet detail (host / agent / path / vendor / pricing / exit-IP) in
+  source, comments, commit messages, or this file. Fleet specifics live in gitignored
+  `CUTOVER.local.md` / `CONTEXT.local.md` and agent memory.
+- **In-container gate run:** colima is arm64 → build/run with `--platform linux/amd64` (Chrome is
+  amd64-only); `--init --shm-size=1g`; **don't pipe `docker run` through `tail`** (wedges the
+  headful stdout — redirect to a file); use a throwaway tag (not `:latest`). Clean up after with
+  `docker rmi <tag>` + `docker builder prune -f`.
+- **`navigate()` now does one `page.content()` per nav** (to compute `cfHint`) — cheap, but it's an
+  extra HTML serialize per navigation (not per action).
+- **Untracked `AGENTS.md`** is present in the working tree — not created or committed by this
+  session; left as-is.
