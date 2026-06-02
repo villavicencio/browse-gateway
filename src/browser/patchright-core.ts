@@ -5,7 +5,7 @@
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
 import { hostFromUrl } from "../security/url.js";
-import { isCleared, type PageSignal } from "./detect.js";
+import { isCleared, isVisiblyBlocked, type PageSignal } from "./detect.js";
 import {
   buildLaunchOptions,
   resolveCoreOptions,
@@ -39,6 +39,13 @@ const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
  * wait can't hold the session open past the point where the reaper would close it under the caller.
  */
 const MAX_WAIT_MS = 60_000;
+/**
+ * How long `navigate()` polls a visible anti-bot interstitial waiting for it to auto-solve before
+ * snapshotting. The poll runs ONLY while a block phrase is showing, so a clean (or dead/blank) page
+ * incurs no wait — only an actual challenge costs latency. Mirrors render()'s clearance loop with a
+ * drive-tuned budget; overridable per call via `RenderOptions.clearanceTimeoutMs`.
+ */
+const DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS = 15_000;
 
 /**
  * A snapshot ref looks like `e4` (top frame) or a frame-prefixed `f1e2`; anything else is a raw
@@ -175,7 +182,8 @@ export class PatchrightBrowserCore implements BrowserCore {
   // the guard. Element targeting uses snapshot refs (aria-ref=) per `targetToSelector`.
 
   async navigate(url: string, opts: RenderOptions = {}): Promise<PageSnapshot> {
-    void opts; // reserved for future per-call clearance tuning; nav uses the core timeout today
+    const clearanceTimeoutMs = opts.clearanceTimeoutMs ?? DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS;
+    const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const page = await this.#ensureActivePage();
     let status: number | null = null;
     try {
@@ -187,6 +195,18 @@ export class PatchrightBrowserCore implements BrowserCore {
     } catch {
       // A challenge/redirect/dead-exit may abort the navigation; snapshot whatever rendered and
       // leave status null so the drive layer treats it as a failed nav.
+    }
+    // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does — but
+    // poll ONLY while a visible block phrase is showing, so a clean or dead/blank page incurs no
+    // wait and only an actual interstitial costs latency. A page still blocked after the budget is
+    // surfaced by navFailed (the snapshot tree still carries the phrase), so a proxied first
+    // navigate rotates to a fresh exit instead of pinning the blocked one.
+    let signal = await pollSignal(page);
+    let waited = 0;
+    while (isVisiblyBlocked(signal) && waited < clearanceTimeoutMs) {
+      await page.waitForTimeout(pollIntervalMs);
+      waited += pollIntervalMs;
+      signal = await pollSignal(page);
     }
     return { ...(await this.#snapshotOf(page)), status };
   }

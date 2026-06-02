@@ -49,14 +49,22 @@ export class GatewayDriveController implements DriveController {
       return this.#openHealthyAndNavigate(url);
     }
     // Pinned proxied session or a direct session: one shot. A failed nav is surfaced cleanly rather
-    // than returned as a blank page — for a proxied session the exit may have gone bad mid-flow, so
-    // closing and reopening the drive session draws a fresh exit.
+    // than returned as a blank page. For a proxied session a mid-flow failure also discards the
+    // session (below) so the next navigate auto-draws a fresh exit; a direct session is left intact.
     await this.#ensureOpen();
     const snap = await this.#run((s) => s.core.navigate(url));
     if (navFailed(snap)) {
+      if (this.#proxyOverride) {
+        // The pinned exit went bad (or the page stayed blocked): discard + unpin so the NEXT
+        // navigate transparently draws a fresh exit instead of stranding the caller on the known-bad
+        // pinned exit. We still surface the failure rather than swap the exit live under the current
+        // page — that would lose page state (KTD-5).
+        await this.#discardSession();
+        this.#pinned = false;
+      }
       throw new Error(
         `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
-          `reached${this.#proxyOverride ? " — close and reopen the drive session for a fresh exit" : ""}`,
+          `reached${this.#proxyOverride ? " — retry navigate for a fresh exit" : ""}`,
       );
     }
     return snap;

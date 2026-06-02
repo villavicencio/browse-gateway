@@ -8,7 +8,7 @@
  * failure is surfaced as a restart-the-session error rather than swapping exits live (which would
  * lose page state). Pure helpers — no I/O.
  */
-import { isHardBlock } from "../browser/index.js";
+import { isHardBlock, isVisiblyBlocked } from "../browser/index.js";
 import type { BrowserCoreOptions, PageSnapshot } from "../browser/index.js";
 import type { SecretStore } from "../security/index.js";
 import { proxyFromSecrets, PROXY_MAX_ATTEMPTS, PROXY_NAV_TIMEOUT_MS } from "./retrieve.js";
@@ -37,11 +37,17 @@ export function proxyOverrideFor(
 
 /**
  * True when a navigation did not land real content: no response captured (dead exit / nav error /
- * off-allowlist block) or a hard block (4xx/5xx + thin page). Drives the retry-fresh-exit decision
- * on the first navigate, and the restart error on a pinned/direct session. A real page that returns
- * a 4xx but renders full content (rare) is NOT failed — mirrors retrieve's isHardBlock nuance.
+ * off-allowlist block), a still-visible anti-bot interstitial (a CF/WAF challenge that did NOT clear
+ * within navigate()'s poll — a 200, non-thin page that is nonetheless blocked), or a hard block
+ * (4xx/5xx + thin page). Drives the retry-fresh-exit decision on the first navigate and the restart
+ * error on a pinned/direct session. A real page that returns a 4xx but renders full content (rare)
+ * is NOT failed — mirrors retrieve's isHardBlock nuance.
  */
 export function navFailed(snap: PageSnapshot): boolean {
   const status = snap.status ?? null;
-  return status === null || isHardBlock({ text: snap.tree }, status);
+  return (
+    status === null ||
+    isVisiblyBlocked({ title: snap.title, text: snap.tree }) ||
+    isHardBlock({ text: snap.tree }, status)
+  );
 }

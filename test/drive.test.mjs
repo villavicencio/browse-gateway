@@ -19,9 +19,12 @@ test("proxyOverrideFor: {proxy} only with a proxy configured AND on a datacenter
   assert.equal(proxyOverrideFor(noSecrets(), true), undefined, "no proxy -> no override");
 });
 
-test("navFailed: null status or a 4xx+thin page fails; a real 200 (or 4xx-with-content) does not", () => {
+test("navFailed: fails on null status, a 4xx+thin page, or a visible interstitial; a real cleared page does not", () => {
   assert.equal(navFailed({ url: "u", title: "t", tree: "", status: null }), true);
   assert.equal(navFailed({ url: "u", title: "t", tree: "Forbidden", status: 403 }), true);
+  // CF interstitial: 200 + non-thin content, but a visible block phrase -> still failed, so a
+  // proxied first navigate rotates past the blocked exit instead of pinning it.
+  assert.equal(navFailed({ url: "u", title: "Just a moment...", tree: REAL, status: 200 }), true);
   assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 200 }), false);
   assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 403 }), false);
 });
@@ -93,12 +96,20 @@ test("controller: a direct session surfaces a failed navigation as an error, not
   await assert.rejects(c.navigate("https://example.com/"), /navigation failed/);
 });
 
-test("controller: a pinned proxied session that fails mid-flow surfaces a restart error", async () => {
-  // one session: first nav healthy (pins), second nav fails (exit went bad mid-flow)
-  const { gateway, opened } = makeProxyGateway([[{ status: 200, tree: REAL }, { status: null, tree: "" }]]);
+test("controller: a pinned proxied session that fails mid-flow discards, so the next navigate re-rolls a fresh exit", async () => {
+  // session 1: first nav healthy (pins), second nav fails (exit went bad mid-flow);
+  // session 2: a fresh healthy exit on the auto-reopened navigate.
+  const { gateway, opened } = makeProxyGateway([
+    [{ status: 200, tree: REAL }, { status: null, tree: "" }],
+    [{ status: 200, tree: REAL }],
+  ]);
   const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
   const first = await c.navigate("https://example.com/");
   assert.equal(first.status, 200);
-  await assert.rejects(c.navigate("https://example.com/2"), /close and reopen the drive session/);
-  assert.equal(opened.length, 1, "pinned session is not re-rolled on a mid-flow failure");
+  await assert.rejects(c.navigate("https://example.com/2"), /retry navigate for a fresh exit/);
+  assert.equal(opened.length, 1, "the failing navigate does not re-roll within the same call (no live swap)");
+  // The session was discarded + unpinned, so the next navigate transparently re-rolls a fresh exit.
+  const recovered = await c.navigate("https://example.com/3");
+  assert.equal(recovered.status, 200, "auto-reopened on a fresh exit");
+  assert.equal(opened.length, 2, "exactly one fresh session opened on recovery");
 });
