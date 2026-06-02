@@ -9,11 +9,15 @@ import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink }
 import { SecretStore, redactSecrets } from "../security/index.js";
 import { retrieve } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
+import { GatewayDriveController } from "./drive-controller.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-mcp] ${msg}\n`);
 
 /** Cap on the in-memory audit trail for this long-lived process (most-recent-N ring buffer). */
 const AUDIT_MAX_RECORDS = 10_000;
+/** Idle drive sessions are reaped after this long; the reaper scans on this interval. (U7-tunable.) */
+const DRIVE_IDLE_TTL_MS = 5 * 60_000;
+const DRIVE_REAPER_INTERVAL_MS = 60_000;
 
 function loadConsumer(env: NodeJS.ProcessEnv = process.env) {
   const id = env.BGW_MCP_CONSUMER_ID ?? "consumer";
@@ -36,9 +40,15 @@ async function main(): Promise<void> {
   });
   const gateway = Gateway.create(loadConfig(), undefined, policy);
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
+  // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
+  gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
+  // The interactive `drive` surface: a persistent, consumer-bound session driven via browser_* tools.
+  // Proxied (with healthy-exit retry) when a residential proxy is configured and we're on a DC IP.
+  const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp });
 
   const server = createGatewayMcpServer({
     version: "0.1.0",
+    drive,
     retrieve: async ({ url }) => {
       try {
         return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp } });

@@ -85,3 +85,99 @@ test("invalid arguments (missing url) do not silently succeed", async () => {
   }
   assert.equal(errored, true, "missing required url must be an error, not a success");
 });
+
+// --- U3: the browser_* drive tool surface --------------------------------------------------
+
+function makeFakeDrive() {
+  const calls = [];
+  const snap = (over = {}) => ({ url: "https://example.com/", title: "Example", tree: '- button "Go" [ref=e4]', ...over });
+  const drive = {
+    async open() { calls.push(["open"]); },
+    async navigate(url) { calls.push(["navigate", url]); if (url === "https://boom/") throw new Error("nav boom"); return snap({ url }); },
+    async snapshot() { calls.push(["snapshot"]); return snap(); },
+    async click(target) { calls.push(["click", target]); return snap(); },
+    async type(target, text, submit) { calls.push(["type", target, text, submit]); return snap(); },
+    async selectOption(target, values) { calls.push(["selectOption", target, values]); return snap(); },
+    async pressKey(key) { calls.push(["pressKey", key]); return snap(); },
+    async waitFor(cond) { calls.push(["waitFor", cond]); return snap(); },
+    async screenshot() { calls.push(["screenshot"]); return "QUJD"; },
+    async close() { calls.push(["close"]); },
+  };
+  return { drive, calls };
+}
+
+async function connectWithDrive(drive, retrieve = async () => outcome()) {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const server = createGatewayMcpServer({ retrieve, drive });
+  await server.connect(serverTransport);
+  const client = new Client({ name: "test", version: "1.0.0" });
+  await client.connect(clientTransport);
+  return client;
+}
+
+const DRIVE_TOOLS = [
+  "browser_open", "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+  "browser_select_option", "browser_press_key", "browser_wait_for", "browser_take_screenshot", "browser_close",
+];
+
+test("tools/list includes the browser_* drive tools when a controller is injected", async () => {
+  const { drive } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  const names = (await client.listTools()).tools.map((t) => t.name);
+  assert.ok(names.includes("retrieve"));
+  for (const n of DRIVE_TOOLS) assert.ok(names.includes(n), `missing ${n}`);
+});
+
+test("drive tools are absent on a retrieve-only server (no controller injected)", async () => {
+  const client = await connect(async () => outcome());
+  const names = (await client.listTools()).tools.map((t) => t.name);
+  assert.deepEqual(names, ["retrieve"]);
+  assert.ok(!names.some((n) => n.startsWith("browser_")));
+});
+
+test("browser_navigate returns a formatted snapshot; browser_click maps to the controller", async () => {
+  const { drive, calls } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  const nav = await client.callTool({ name: "browser_navigate", arguments: { url: "https://example.com/" } });
+  assert.equal(nav.isError ?? false, false);
+  assert.match(nav.content[0].text, /url: https:\/\/example\.com\//);
+  assert.match(nav.content[0].text, /\[ref=e4\]/);
+  await client.callTool({ name: "browser_click", arguments: { target: "e4", element: "Go button" } });
+  const clickCall = calls.find((c) => c[0] === "click");
+  assert.equal(clickCall[1].target, "e4");
+  assert.equal(clickCall[1].element, "Go button");
+});
+
+test("browser_type passes text + submit through to the controller", async () => {
+  const { drive, calls } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  await client.callTool({ name: "browser_type", arguments: { target: "e5", text: "hi", submit: true } });
+  const typeCall = calls.find((c) => c[0] === "type");
+  assert.equal(typeCall[1].target, "e5");
+  assert.equal(typeCall[2], "hi");
+  assert.equal(typeCall[3], true);
+});
+
+test("browser_take_screenshot returns an image content block", async () => {
+  const { drive } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  const res = await client.callTool({ name: "browser_take_screenshot", arguments: {} });
+  assert.equal(res.content[0].type, "image");
+  assert.equal(res.content[0].mimeType, "image/png");
+  assert.equal(res.content[0].data, "QUJD");
+});
+
+test("a drive verb error surfaces a clean MCP error, not a hang", async () => {
+  const { drive } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  const res = await client.callTool({ name: "browser_navigate", arguments: { url: "https://boom/" } });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /browse-gateway error: nav boom/);
+});
+
+test("browser_close invokes the controller's close", async () => {
+  const { drive, calls } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  await client.callTool({ name: "browser_close", arguments: {} });
+  assert.ok(calls.some((c) => c[0] === "close"));
+});

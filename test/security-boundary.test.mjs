@@ -117,6 +117,17 @@ test("redactSecrets: also scrubs the URL-encoded form; skips 1-2 char secrets", 
   assert.equal(redactSecrets("about the table", store), "about the table", "2-char secret must not blanket-redact");
 });
 
+test("redactSecrets: still scrubs a credential rotated OUT of the store (rotation can't un-redact)", () => {
+  let env = { BGW_PROXY_PASSWORD: "old-rotated-password" };
+  const store = new SecretStore(() => env);
+  env = { BGW_PROXY_PASSWORD: "new-current-password" };
+  store.reload(); // rotation: the old value is gone from the *current* set
+  const out = redactSecrets("err old=old-rotated-password new=new-current-password", store);
+  assert.ok(!out.includes("old-rotated-password"), "a retired-but-in-flight credential must still be redacted");
+  assert.ok(!out.includes("new-current-password"), "current credential redacted");
+  assert.equal(out, "err old=[REDACTED] new=[REDACTED]");
+});
+
 test("InMemoryAuditSink: maxRecords keeps only the most recent N (ring buffer)", () => {
   const sink = new InMemoryAuditSink(2);
   for (let i = 0; i < 5; i++) sink.record({ ts: i, consumerId: "a", action: "navigate", decision: "allow" });

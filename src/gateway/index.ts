@@ -92,6 +92,63 @@ export class Gateway {
     }, coreOverrides);
   }
 
+  #requirePolicy(): PolicyEngine {
+    if (!this.#policy) throw new Error("gateway has no policy engine configured");
+    return this.#policy;
+  }
+
+  /**
+   * Open a persistent, consumer-bound session for the stateful `drive` path: authenticate, acquire
+   * a session tagged to the consumer (capped per-consumer), install that consumer's allowlist guard,
+   * and return a handle. Unlike {@link withConsumerSession}, the session is NOT released — the caller
+   * drives it via {@link useConsumerSession} and ends it with {@link closeConsumerSession}. The guard
+   * is installed before the handle is returned, so the session is never drivable while unguarded.
+   */
+  async openConsumerSession(token: string, coreOverrides?: BrowserCoreOptions): Promise<string> {
+    const policy = this.#requirePolicy();
+    const consumer = policy.authenticate(token);
+    const session = await this.#sessions.acquire(coreOverrides, { consumerId: consumer.id });
+    try {
+      await session.core.setNavigationGuard(policy.guardFor(consumer));
+    } catch (err) {
+      await this.#sessions.release(session.id); // never leave a half-open, unguarded session
+      throw err;
+    }
+    return session.id;
+  }
+
+  /**
+   * Run `fn` against an already-open consumer session. Re-authenticates and verifies the handle
+   * belongs to this consumer (so one consumer can't drive another's session — the error is identical
+   * for an unknown handle and a foreign one, leaking nothing), refreshes the idle timer, and keeps
+   * the session open. The guard installed at open persists on the context, so every action stays
+   * policy-checked.
+   */
+  async useConsumerSession<T>(
+    token: string,
+    handle: string,
+    fn: (session: Session, consumer: Consumer) => Promise<T>,
+  ): Promise<T> {
+    const policy = this.#requirePolicy();
+    const consumer = policy.authenticate(token);
+    const session = this.#sessions.get(handle);
+    if (!session || session.consumerId !== consumer.id) {
+      throw new Error(`no open session for handle ${handle}`);
+    }
+    session.touch();
+    return fn(session, consumer);
+  }
+
+  /** Close an open consumer session. Verifies ownership; a no-op for an unknown/foreign handle. */
+  async closeConsumerSession(token: string, handle: string): Promise<void> {
+    const policy = this.#requirePolicy();
+    const consumer = policy.authenticate(token);
+    const session = this.#sessions.get(handle);
+    if (session && session.consumerId === consumer.id) {
+      await this.#sessions.release(handle);
+    }
+  }
+
   /** Tear down every session — no orphaned browser processes. */
   async shutdown(): Promise<void> {
     await this.#sessions.shutdown();
