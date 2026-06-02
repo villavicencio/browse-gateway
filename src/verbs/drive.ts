@@ -56,17 +56,20 @@ export function navFailed(snap: PageSnapshot): boolean {
 }
 
 /**
- * Whether a failed first navigate warrants escalating to a residential proxy: a *Cloudflare* visible
- * challenge or a hard block (4xx/5xx + thin) — exactly retrieve's `shouldEscalateToProxy` scope (CF
- * challenge OR hard block), on the drive snapshot (title + accessibility tree + status). Narrower
- * than {@link navFailed} on purpose: a bare null-status / Chrome-error failure (off-allowlist abort,
- * unreachable host, reset socket) and a generic non-CF WAF block (e.g. "access denied" on a 200) are
- * NOT escalated — a fresh residential exit won't reliably fix those, so they're surfaced directly
- * instead of spending proxy budget.
+ * Whether a failed first navigate warrants escalating to a residential proxy: a *Cloudflare* signal
+ * — a visible CF challenge phrase OR a CF vendor hint in the page HTML (carried as the scrubbed
+ * {@link PageSnapshot.cfHint} boolean, so a CF interstitial that shows no visible CF phrase is still
+ * recognized) — or a hard block (4xx/5xx + thin). This is exactly retrieve's
+ * `shouldEscalateToProxy`/`isCloudflareBlock` scope (CF challenge OR hard block), on the drive
+ * snapshot. Narrower than {@link navFailed} on purpose: a bare null-status / Chrome-error failure
+ * (off-allowlist abort, unreachable host, reset socket) and a generic non-CF WAF block (e.g. "access
+ * denied" on a 200) are NOT escalated — a fresh residential exit won't reliably fix those.
  */
 export function shouldEscalateDrive(snap: PageSnapshot): boolean {
   const status = snap.status ?? null;
   return (
-    isCloudflareVisible({ title: snap.title, text: snap.tree }) || isHardBlock({ text: snap.tree }, status)
+    isCloudflareVisible({ title: snap.title, text: snap.tree }) ||
+    snap.cfHint === true ||
+    isHardBlock({ text: snap.tree }, status)
   );
 }

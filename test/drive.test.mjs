@@ -36,9 +36,21 @@ test("navFailed: fails on null status, a 4xx+thin page, or a visible interstitia
   assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 403 }), false);
 });
 
-test("shouldEscalateDrive: escalates on a CF challenge or a hard block; NOT a generic block or a dead nav", () => {
-  // CF challenge (visible) -> escalate
+test("shouldEscalateDrive: escalates on a CF challenge (visible OR vendor-hint) or a hard block; NOT a generic block or dead nav", () => {
+  // CF challenge (visible phrase) -> escalate
   assert.equal(shouldEscalateDrive({ url: "u", title: "Just a moment...", tree: REAL, status: 200 }), true);
+  // CF detected ONLY by the HTML vendor hint (cfHint), no CF visible phrase -> escalate, matching
+  // retrieve, which sees challenge-platform in the HTML. ("Enable JavaScript and cookies" is a generic
+  // BLOCK phrase, NOT a CF_BLOCK_PHRASE, so the visible check alone would miss it.)
+  assert.equal(
+    shouldEscalateDrive({ url: "u", title: "", tree: "Enable JavaScript and cookies to continue " + REAL, cfHint: true, status: 200 }),
+    true,
+  );
+  // ...the SAME page without the CF hint -> generic block, NOT escalated
+  assert.equal(
+    shouldEscalateDrive({ url: "u", title: "", tree: "Enable JavaScript and cookies to continue " + REAL, status: 200 }),
+    false,
+  );
   // hard reputation block (4xx + thin) -> escalate
   assert.equal(shouldEscalateDrive({ url: "u", title: "t", tree: "Forbidden", status: 403 }), true);
   // generic NON-CF visible block on a non-thin 200 (e.g. "Access denied") -> NOT escalated (matches
@@ -74,6 +86,7 @@ function makeProxyGateway(sessionNavLists) {
               title: "t",
               tree: out.tree === undefined ? REAL : out.tree,
               status: out.status === undefined ? 200 : out.status,
+              cfHint: out.cfHint, // a scrubbed CF vendor-hint flag, undefined unless the spec sets it
             };
           },
           async snapshot() { return { url: "u", title: "t", tree: REAL, status: 200 }; },
@@ -108,6 +121,19 @@ test("controller: direct blocked -> escalates to a proxied exit, retrying fresh 
   assert.equal(open.size, 1, "only the healthy session remains open");
   await c.navigate("https://example.com/next"); // pinned -> no re-roll
   assert.equal(opened.length, 3, "no re-open after pinning");
+});
+
+test("controller: a CF page detected only by a vendor hint (no visible CF phrase) escalates, matching retrieve", async () => {
+  const { gateway, opened } = makeProxyGateway([
+    [{ status: 200, tree: "Enable JavaScript and cookies to continue", cfHint: true }], // s0 direct: CF via hint only
+    [{ status: 200, tree: REAL }], //                                                      s1 proxied: healthy
+  ]);
+  const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
+  const snap = await c.navigate("https://example.com/");
+  assert.equal(snap.status, 200);
+  assert.equal(opened.length, 2, "escalated to a proxied exit on the CF vendor-hint signal");
+  assert.equal(opened[0].overrides, undefined, "direct attempt first");
+  assert.ok(opened[1].overrides?.proxy, "escalated to the proxy");
 });
 
 test("controller: direct that clears (no block) pins direct and never opens the proxy", async () => {

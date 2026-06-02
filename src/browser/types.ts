@@ -90,6 +90,13 @@ export interface PageSnapshot {
   status?: number | null;
   /** Accessibility tree text with `[ref=eN]` annotations the drive verbs target. */
   tree: string;
+  /**
+   * Scrubbed Cloudflare-hint flag: `true` when the page's HTML carried a CF challenge marker
+   * (`challenge-platform` etc.). The HTML half of retrieve's CF detection, surfaced as a boolean so
+   * no page content is carried. Set on `navigate()`; absent on a pure `snapshot()`. Lets drive's
+   * escalation recognize a CF interstitial that shows no visible CF phrase, matching retrieve.
+   */
+  cfHint?: boolean;
 }
 
 export type NavigationDecision = "allow" | "block";

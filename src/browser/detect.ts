@@ -107,6 +107,16 @@ export function isCloudflareVisible(signal: Pick<PageSignal, "title" | "text">):
 }
 
 /**
+ * True when the page HTML carries a Cloudflare challenge script/cookie hint (`challenge-platform`,
+ * `cf-chl`, `cf_chl_opt`) — the HTML half of {@link isCloudflareBlock}'s CF detection. Surfaced as a
+ * scrubbed boolean so a drive {@link PageSnapshot} can carry the CF signal without the raw HTML, and
+ * its escalation can match retrieve on a CF interstitial that shows no visible CF phrase.
+ */
+export function hasCloudflareHint(html: string): boolean {
+  return CF_VENDOR_HINTS.some((re) => re.test(html));
+}
+
+/**
  * A "hard block" — a server error status with no real content rendered. This is the
  * IP/WAF-reputation block (F1, 2026-06-01): hammering one CF target from the prod datacenter
  * IP returns a bare `403 Forbidden` (body ~9 chars) that the stealth core CANNOT clear, because

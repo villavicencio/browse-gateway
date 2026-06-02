@@ -5,7 +5,7 @@
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
 import { hostFromUrl } from "../security/url.js";
-import { isCleared, isVisiblyBlocked, type PageSignal } from "./detect.js";
+import { isCleared, isVisiblyBlocked, hasCloudflareHint, type PageSignal } from "./detect.js";
 import {
   buildLaunchOptions,
   resolveCoreOptions,
@@ -208,7 +208,10 @@ export class PatchrightBrowserCore implements BrowserCore {
     // still blocked after the budget is surfaced by navFailed (the snapshot tree still carries the
     // phrase), so a proxied first navigate rotates to a fresh exit instead of pinning the blocked one.
     await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
-    return { ...(await this.#snapshotOf(page)), status };
+    // Carry the CF vendor-hint signal (the HTML half of retrieve's CF detection) as a scrubbed
+    // boolean, so drive's escalation recognizes a CF interstitial that shows no visible CF phrase.
+    const html = String(await page.content().catch(() => ""));
+    return { ...(await this.#snapshotOf(page)), status, cfHint: hasCloudflareHint(html) };
   }
 
   async snapshot(): Promise<PageSnapshot> {
