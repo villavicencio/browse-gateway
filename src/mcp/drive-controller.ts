@@ -14,9 +14,8 @@
 import { isHttpUrl, redactSecrets } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
-import { isVisiblyBlocked } from "../browser/index.js";
 import type { BrowserCoreOptions, DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
-import { proxyOverrideFor, navFailed, PROXY_OPEN_ATTEMPTS } from "../verbs/index.js";
+import { proxyOverrideFor, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "../verbs/index.js";
 import type { DriveController } from "./server.js";
 
 export class GatewayDriveController implements DriveController {
@@ -100,15 +99,18 @@ export class GatewayDriveController implements DriveController {
       this.#pinned = true; // direct works → commit it (no residential GB spent)
       return direct;
     }
-    // Direct blocked. Escalate to a proxied exit if one is available; otherwise surface the block.
+    // Direct failed. Escalate to a proxied exit ONLY on a qualifying block — a visible challenge or a
+    // hard reputation block, the two a clean residential exit can clear. A bare null-status failure
+    // (an off-allowlist abort or an unreachable host) is surfaced directly: a fresh exit won't fix it,
+    // so it must not spend the proxy budget (matches retrieve's escalation gate).
     const override = this.#resolveProxyOverride();
     await this.#discardSession(); // drop the blocked direct session before escalating
-    if (!override) {
-      throw new Error(
-        `navigation failed (status=${direct.status ?? "n/a"}): the page was blocked or could not be reached`,
-      );
+    if (override && shouldEscalateDrive(direct)) {
+      return this.#openHealthyAndNavigate(url, override);
     }
-    return this.#openHealthyAndNavigate(url, override);
+    throw new Error(
+      `navigation failed (status=${direct.status ?? "n/a"}): the page was blocked or could not be reached`,
+    );
   }
 
   async snapshot(): Promise<PageSnapshot> {
@@ -217,7 +219,10 @@ export class GatewayDriveController implements DriveController {
     return this.#run(async (s) => {
       await act(s);
       const snap = await s.core.snapshot();
-      if (isVisiblyBlocked({ title: snap.title, text: snap.tree })) {
+      // The snapshot carries the active page's last navigation status, so navFailed catches a bare
+      // reputation block (4xx + thin) reached by the action as well as a visible challenge — neither
+      // is handed back as success.
+      if (navFailed(snap)) {
         throw new Error(
           "the action landed on a blocked/challenge page that did not clear — close and reopen the " +
             "drive session, then retry the flow",

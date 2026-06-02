@@ -51,3 +51,18 @@ export function navFailed(snap: PageSnapshot): boolean {
     isHardBlock({ text: snap.tree }, status)
   );
 }
+
+/**
+ * Whether a failed first navigate warrants escalating to a residential proxy: a visible block (a
+ * CF/WAF challenge) or a hard block (4xx/5xx + thin) — the two a clean residential exit can clear.
+ * A bare null-status failure (an off-allowlist abort or an unreachable host) is NOT escalated: a
+ * fresh exit won't fix it, so it's surfaced directly. Mirrors retrieve's `shouldEscalateToProxy`
+ * gate, evaluated on the drive snapshot (title + accessibility tree + status). Narrower than
+ * {@link navFailed}, which also treats a bare null status as failed.
+ */
+export function shouldEscalateDrive(snap: PageSnapshot): boolean {
+  const status = snap.status ?? null;
+  return (
+    isVisiblyBlocked({ title: snap.title, text: snap.tree }) || isHardBlock({ text: snap.tree }, status)
+  );
+}

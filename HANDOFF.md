@@ -22,7 +22,7 @@ feature branch — now **PR #2**, 98 tests green + an end-to-end browser proof p
 - `aa61f00` **U3** — 10 `browser_*` MCP tools + `GatewayDriveController` (`src/mcp/{server,drive-controller,main}.ts`); `retrieve` description strengthened (read-vs-act).
 - `ebd4139` **U4** — proxied drive with healthy-exit retry (`src/verbs/drive.ts`: `proxyOverrideFor`/`navFailed`; first navigate retries fresh exits then pins; mid-flow failure → restart error).
 - `faada8b` **U5** — `scripts/validate-drive.mjs` in-container end-to-end proof.
-- **98 unit tests green; `validate-drive.mjs` → PASS (0/0)** against a real browser (navigate+snapshot, off-allowlist-blocked-on-drive, type+submit state change, idle reap, clean close).
+- **Full unit suite green; `validate-drive.mjs` → PASS in-container** (navigate+snapshot, off-allowlist-blocked-on-drive, anti-bot clearance, type+submit state change, idle reap, clean close).
 - ce-compound architecture doc `docs/solutions/architecture-patterns/interactive-drive-verbs-over-policy-guard.md`.
 
 Also: dogfooded `retrieve`+`drive` on a proxy vendor's JS pricing page to answer a PAYG question (and proved retrieve-vs-drive in the process — see What Didn't Work).
@@ -43,12 +43,12 @@ Also: dogfooded `retrieve`+`drive` on a proxy vendor's JS pricing page to answer
 2. **Set `BGW_MAX_SESSIONS` high enough that a held drive session doesn't starve `retrieve`** — they share one global session pool (code default is 2). The deployment value lives in `CUTOVER.local.md`; confirm it there before enabling drive.
 3. **U7** — capped-deploy tuning vs measured headroom, observability/retention, and the NET_ADMIN egress sidecar (also unblocks Approach B / CDP-attach).
 4. **(Optional) alternative-provider A/B** — buy a few GB PAYG, run `validate-proxy-escalation.mjs` against it, compare exit reliability/latency to the current provider; switch is a `BGW_PROXY_*` creds-only change if it holds up.
-5. **Confirm all prod runtimes are on the new `:latest` image** — not every runtime was confirmed on it yet; some may still hold an older container until restarted. (Fleet/runtime specifics: `CUTOVER.local.md`.)
+5. **Confirm the prod-runtime image rollout is complete** before relying on the new behavior everywhere — current rollout status + per-runtime specifics live in `CUTOVER.local.md`.
 
 ## Gotchas & Watch-outs
 - **PUBLIC repo** — never commit fleet detail (host / agent / path / vendor / exit-IP names) in source, comments, commit messages, or fixtures (incl. this file). Pre-commit scrub-grep gated on exit status; fleet specifics live in gitignored `CUTOVER.local.md` / `CONTEXT.local.md` and agent memory.
-- **`BGW_MAX_SESSIONS=1` in prod** will starve `retrieve` once a drive session is held — bump before enabling drive (#2).
-- **Drive sessions are DIRECT** (no proxy) unless `BGW_ON_DATACENTER_IP=1` + proxy configured. Proxied drive retries a healthy exit at the **first navigate only**; a mid-flow block → clean restart error (no live exit swap, which would lose page state).
+- **A too-low `BGW_MAX_SESSIONS` starves `retrieve`** once a drive session is held (shared global pool; code default 2). Confirm the deployment value in `CUTOVER.local.md` before enabling drive (#2).
+- **Drive is escalate-on-block:** the first navigate goes DIRECT; it escalates to a residential exit only if direct is blocked (a CF/WAF challenge or a hard reputation block) AND `BGW_ON_DATACENTER_IP=1` + a proxy is configured — and only on that first navigate. A mid-flow block → clean restart error (no live exit swap, which would lose page state).
 - **Proxy reliability, not price, decides** provider choice (a meaningful fraction of exits are dead/slow, so the 3-retry brings effective success to near-certain). A cheaper, dirtier pool can cost more per *successful* fetch. (Measured exit-health figures: `CUTOVER.local.md` / memory.)
 - **IP reputation is real** — don't hammer one CF target from the prod DC IP; it 403s and the stealth core can't recover it (only a clean residential exit does).
 - **Patchright API:** `ariaSnapshot({mode:"ai"})` is the ref-snapshot path (`_snapshotForAI` is gone in 1.60); `aria-ref=<ref>` resolves a ref to a locator.

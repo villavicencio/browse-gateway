@@ -84,6 +84,13 @@ export class PatchrightBrowserCore implements BrowserCore {
   #routeHandler?: RouteHandler;
   /** The single persistent page the interactive `drive` verbs act on (absent until navigate()). */
   #activePage?: PatchrightPage;
+  /**
+   * HTTP status of the active page's last main-frame navigation, kept current by a response listener
+   * so it reflects click/submit-triggered navigations too — not just navigate(). Lets a post-action
+   * snapshot carry a status, so a bare reputation block (4xx + thin) reached by an action is
+   * detectable, not only a visible challenge phrase. `undefined` until the first navigation.
+   */
+  #lastDocStatus?: number | null;
 
   private constructor(context: PatchrightContext, resolved: ResolvedCoreOptions) {
     this.#context = context;
@@ -196,6 +203,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       // A challenge/redirect/dead-exit may abort the navigation; snapshot whatever rendered and
       // leave status null so the drive layer treats it as a failed nav.
     }
+    this.#lastDocStatus = status; // keep a subsequent snapshot()/action consistent with this nav
     // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does. A page
     // still blocked after the budget is surfaced by navFailed (the snapshot tree still carries the
     // phrase), so a proxied first navigate rotates to a fresh exit instead of pinning the blocked one.
@@ -260,11 +268,29 @@ export class PatchrightBrowserCore implements BrowserCore {
   async closeActivePage(): Promise<void> {
     await this.#activePage?.close().catch(() => {});
     this.#activePage = undefined;
+    this.#lastDocStatus = undefined;
   }
 
-  /** Open (lazily) the single active page used by the drive verbs. */
+  /**
+   * Open (lazily) the single active page used by the drive verbs, with a listener that tracks its
+   * last main-frame navigation status — so every snapshot (including post-action) can carry a status
+   * for hard-block detection, even though only navigate() returns a goto response directly.
+   */
   async #ensureActivePage(): Promise<PatchrightPage> {
-    if (!this.#activePage) this.#activePage = await this.#context.newPage();
+    if (!this.#activePage) {
+      const page = await this.#context.newPage();
+      this.#lastDocStatus = undefined;
+      page.on("response", (resp) => {
+        try {
+          if (resp.request().isNavigationRequest() && resp.frame() === page.mainFrame()) {
+            this.#lastDocStatus = resp.status();
+          }
+        } catch {
+          // a superseded/aborted response can throw on access — ignore; the next nav updates status
+        }
+      });
+      this.#activePage = page;
+    }
     return this.#activePage;
   }
 
@@ -307,6 +333,9 @@ export class PatchrightBrowserCore implements BrowserCore {
     clearanceTimeoutMs: number = DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS,
     pollIntervalMs: number = DEFAULT_POLL_INTERVAL_MS,
   ): Promise<void> {
+    // Let any navigation the prior action triggered reach domcontentloaded, so its response status is
+    // captured and the snapshot reflects the landed page (resolves immediately if nothing navigated).
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
     let signal = await pollSignal(page);
     let waited = 0;
     while (isVisiblyBlocked(signal) && waited < clearanceTimeoutMs) {
@@ -333,7 +362,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     ) => Promise<string>;
     const tree = String(await aria.call(root, { mode: "ai" }).catch(() => ""));
     const title = await page.title().catch(() => "");
-    return { url: page.url(), title, tree };
+    return { url: page.url(), title, tree, status: this.#lastDocStatus ?? null };
   }
 
   /**

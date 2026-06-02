@@ -118,6 +118,15 @@ test("controller: a direct-only session (no proxy) surfaces a failed navigation 
   await assert.rejects(c.navigate("https://example.com/"), /navigation failed/);
 });
 
+test("controller: a null-status direct failure (off-allowlist/unreachable) is surfaced, NOT escalated to the proxy", async () => {
+  // Direct returns null status (an off-allowlist abort or an unreachable host) — no visible block,
+  // no hard-block status. A fresh residential exit won't fix it, so it must not spend proxy retries.
+  const { gateway, opened } = makeProxyGateway([[{ status: null, tree: "" }]]);
+  const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
+  await assert.rejects(c.navigate("https://example.com/"), /navigation failed/);
+  assert.equal(opened.length, 1, "only the direct attempt — a null-status failure does not escalate");
+});
+
 test("controller: resolves the proxy override per open, so a secret rotation takes effect (no cached creds)", async () => {
   let env = { BGW_PROXY_URL: "http://old-exit:1111" };
   const secrets = new SecretStore(() => env);

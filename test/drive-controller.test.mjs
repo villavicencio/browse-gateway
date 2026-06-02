@@ -14,7 +14,7 @@ function makeFakeGateway() {
   const events = [];
   const core = {
     async navigate(url) { events.push(["navigate", url]); return { url, title: "t", tree: "- x [ref=e1]", status: 200 }; },
-    async snapshot() { events.push(["snapshot"]); return { url: "u", title: "t", tree: "- x [ref=e1]" }; },
+    async snapshot() { events.push(["snapshot"]); return { url: "u", title: "t", tree: "- x [ref=e1]", status: 200 }; },
     async click(t) { events.push(["click", t]); },
     async type(t, text, opts) { events.push(["type", t, text, opts]); },
     async selectOption(t, v) { events.push(["selectOption", t, v]); },
@@ -73,13 +73,14 @@ test("controller: acting before navigate errors clearly (no active session)", as
   await assert.rejects(c.click({ target: "e1" }), /no active drive session/);
 });
 
-test("controller: a navigating action that lands on a challenge surfaces an error, not a blocked snapshot", async () => {
+/** A fake whose first navigate succeeds, then the next action's snapshot returns `blockedSnap`. */
+function makePostActionBlockGateway(blockedSnap) {
   let nextId = 1;
   const open = new Map();
   const core = {
     async navigate() { return { url: "u", title: "ok", tree: "form [ref=e1]", status: 200 }; },
-    async click() {}, // the click triggers a navigation into a challenge page
-    async snapshot() { return { url: "u", title: "Just a moment...", tree: "Verifying you are human [ref=e1]" }; },
+    async click() {}, // the click triggers a navigation into a blocked page
+    async snapshot() { return blockedSnap; },
   };
   const gateway = {
     sessions: { get: (h) => open.get(h) },
@@ -91,8 +92,26 @@ test("controller: a navigating action that lands on a challenge surfaces an erro
     },
     async closeConsumerSession(_t, h) { open.delete(h); },
   };
+  return { gateway };
+}
+
+test("controller: a navigating action that lands on a visible challenge surfaces an error, not a blocked snapshot", async () => {
+  const { gateway } = makePostActionBlockGateway({
+    url: "u", title: "Just a moment...", tree: "Verifying you are human [ref=e1]", status: 200,
+  });
   const c = new GatewayDriveController(gateway, noSecrets(), "tok");
   await c.navigate("https://example.com/"); // opens; post-nav snapshot is a real page
+  await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
+});
+
+test("controller: a navigating action that lands on a bare reputation block (4xx + thin) surfaces an error", async () => {
+  // No visible challenge phrase — only a hard-block status + thin body. The status the snapshot
+  // carries is what lets navFailed catch it (the bug was checking visible phrases alone).
+  const { gateway } = makePostActionBlockGateway({
+    url: "u", title: "403 Forbidden", tree: "Forbidden", status: 403,
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
   await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
 });
 
