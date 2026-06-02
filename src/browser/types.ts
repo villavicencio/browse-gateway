@@ -73,6 +73,32 @@ export interface RenderOptions {
   clearedTextLength?: number;
 }
 
+/**
+ * A ref-annotated accessibility snapshot of the active page — Patchright's
+ * `ariaSnapshot({ mode: "ai" })`, which emits a YAML-ish tree with `[ref=eN]` markers. The
+ * `drive` verbs reference those refs (resolved via the `aria-ref=<ref>` selector engine), so the
+ * consumer never needs raw selectors or CDP. Mirrors the Playwright-MCP snapshot/ref model.
+ */
+export interface PageSnapshot {
+  url: string;
+  title: string;
+  /**
+   * HTTP status of the navigation that produced this page, or `null` when the navigation failed
+   * (dead proxy exit, timeout, off-allowlist block). Present on `navigate()`; absent on a pure
+   * `snapshot()`. The drive layer keys exit-health on this.
+   */
+  status?: number | null;
+  /** Accessibility tree text with `[ref=eN]` annotations the drive verbs target. */
+  tree: string;
+  /**
+   * Scrubbed Cloudflare-hint flag: `true` when the page's HTML carried a CF challenge marker
+   * (`challenge-platform` etc.). The HTML half of retrieve's CF detection, surfaced as a boolean so
+   * no page content is carried. Set on `navigate()`; absent on a pure `snapshot()`. Lets drive's
+   * escalation recognize a CF interstitial that shows no visible CF phrase, matching retrieve.
+   */
+  cfHint?: boolean;
+}
+
 export type NavigationDecision = "allow" | "block";
 
 /** The fields the navigation guard sees for each intercepted request. */
@@ -91,10 +117,28 @@ export interface NavigationRequest {
  */
 export type NavigationGuard = (req: NavigationRequest) => NavigationDecision;
 
+/**
+ * How a `drive` verb identifies an element: a `ref` from a {@link PageSnapshot} (the primary
+ * path) or a raw `selector` as an escape hatch. `element` is a human-readable description
+ * carried for audit/logging only (mirrors Playwright-MCP's `target` + `element` split).
+ */
+export interface DriveTarget {
+  /** A `ref` id from a snapshot (e.g. `"e4"`) OR a unique selector (e.g. `"#submit"`). */
+  target: string;
+  /** Human-readable description of the element, for audit/logging only. */
+  element?: string;
+}
+
+/** Condition for {@link BrowserCore.waitFor}: text to appear, or a fixed delay. */
+export interface WaitCondition {
+  text?: string;
+  timeMs?: number;
+}
+
 export interface BrowserCore {
   /** Identifies the concrete vehicle, e.g. `"patchright"`. */
   readonly kind: string;
-  /** Navigate to `url`, wait for clearance, and return a DOM snapshot. */
+  /** Navigate to `url`, wait for clearance, and return a DOM snapshot (stateless `retrieve` path). */
   render(url: string, opts?: RenderOptions): Promise<RenderResult>;
   /**
    * Install a guard consulted for every request via network-layer interception. Replaces
@@ -106,4 +150,28 @@ export interface BrowserCore {
   setNavigationGuard(guard: NavigationGuard): Promise<void>;
   /** Tear down the browser and release all processes. */
   close(): Promise<void>;
+
+  // --- Interactive `drive` surface (stateful path) -------------------------------------------
+  // These act on a single persistent "active page" within the core's guarded context, so every
+  // request a click/navigation triggers still passes the installed navigation guard — the
+  // consumer drives high-level verbs only, never raw CDP, and so cannot remove the guard.
+
+  /** Open (or reuse) the active page, navigate to `url`, and return a ref-annotated snapshot. */
+  navigate(url: string, opts?: RenderOptions): Promise<PageSnapshot>;
+  /** Capture a ref-annotated accessibility snapshot of the active page. */
+  snapshot(): Promise<PageSnapshot>;
+  /** Click the element identified by `target` (a snapshot ref or a selector). */
+  click(target: DriveTarget): Promise<void>;
+  /** Fill `text` into the element; `submit` presses Enter afterward. */
+  type(target: DriveTarget, text: string, opts?: { submit?: boolean }): Promise<void>;
+  /** Select option(s) by value/label on a `<select>`-like element. */
+  selectOption(target: DriveTarget, values: string[]): Promise<void>;
+  /** Press a key (e.g. `"Enter"`, `"Escape"`, `"ArrowDown"`) on the active page. */
+  pressKey(key: string): Promise<void>;
+  /** Wait for `text` to appear, or for a fixed delay. */
+  waitFor(condition: WaitCondition): Promise<void>;
+  /** PNG screenshot of the active page, base64-encoded (for MCP image content). */
+  screenshot(): Promise<string>;
+  /** Close the active page (ends the drive interaction; the context/core stays alive). */
+  closeActivePage(): Promise<void>;
 }
