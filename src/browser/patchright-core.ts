@@ -289,18 +289,6 @@ export class PatchrightBrowserCore implements BrowserCore {
           // a superseded/aborted response can throw on access — ignore; the next nav updates status
         }
       });
-      page.on("requestfailed", (req) => {
-        try {
-          if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
-            // A main-frame navigation that got NO response (dead exit, reset socket, unreachable)
-            // lands on chrome-error:// — null the status so it doesn't inherit the prior page's, and
-            // the snapshot reads as a failed nav.
-            this.#lastDocStatus = null;
-          }
-        } catch {
-          // ignore — the next navigation updates status
-        }
-      });
       this.#activePage = page;
     }
     return this.#activePage;
