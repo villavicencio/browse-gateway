@@ -95,6 +95,18 @@ export function isVisiblyBlocked(signal: Pick<PageSignal, "title" | "text">): bo
 }
 
 /**
+ * True when a *Cloudflare-specific* visible challenge phrase is present (title + visible text) — the
+ * CF subset of {@link isVisiblyBlocked}. This is the visible-marker half of retrieve's proxy-
+ * escalation gate (`isCloudflareBlock`), so the residential proxy is engaged for CF challenges (and
+ * hard blocks) but NOT for generic WAF "access denied" pages — keeping drive's escalation scope
+ * identical to retrieve's.
+ */
+export function isCloudflareVisible(signal: Pick<PageSignal, "title" | "text">): boolean {
+  const haystack = `${signal.title}\n${signal.text}`;
+  return CF_BLOCK_PHRASES.some((re) => re.test(haystack));
+}
+
+/**
  * A "hard block" — a server error status with no real content rendered. This is the
  * IP/WAF-reputation block (F1, 2026-06-01): hammering one CF target from the prod datacenter
  * IP returns a bare `403 Forbidden` (body ~9 chars) that the stealth core CANNOT clear, because

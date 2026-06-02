@@ -8,7 +8,7 @@
  * failure is surfaced as a restart-the-session error rather than swapping exits live (which would
  * lose page state). Pure helpers — no I/O.
  */
-import { isHardBlock, isVisiblyBlocked } from "../browser/index.js";
+import { isHardBlock, isVisiblyBlocked, isCloudflareVisible } from "../browser/index.js";
 import type { BrowserCoreOptions, PageSnapshot } from "../browser/index.js";
 import type { SecretStore } from "../security/index.js";
 import { proxyFromSecrets, PROXY_MAX_ATTEMPTS, PROXY_NAV_TIMEOUT_MS } from "./retrieve.js";
@@ -36,33 +36,37 @@ export function proxyOverrideFor(
 }
 
 /**
- * True when a navigation did not land real content: no response captured (dead exit / nav error /
- * off-allowlist block), a still-visible anti-bot interstitial (a CF/WAF challenge that did NOT clear
- * within navigate()'s poll — a 200, non-thin page that is nonetheless blocked), or a hard block
- * (4xx/5xx + thin page). Drives the retry-fresh-exit decision on the first navigate and the restart
- * error on a pinned/direct session. A real page that returns a 4xx but renders full content (rare)
- * is NOT failed — mirrors retrieve's isHardBlock nuance.
+ * True when a navigation did not land real content: no response captured (`status === null`), a
+ * Chrome error page (`chrome-error://…` — a dead exit / reset socket / unreachable host that
+ * produced no response, so the snapshot can inherit a stale status), a still-visible anti-bot
+ * interstitial (a CF/WAF challenge that did NOT clear within navigate()'s poll — a 200, non-thin page
+ * that is nonetheless blocked), or a hard block (4xx/5xx + thin page). Drives the failed-nav decision
+ * on the first navigate, the pinned/direct restart error, and the post-action block check. A real
+ * page that returns a 4xx but renders full content (rare) is NOT failed — mirrors retrieve's
+ * isHardBlock nuance.
  */
 export function navFailed(snap: PageSnapshot): boolean {
   const status = snap.status ?? null;
   return (
     status === null ||
+    snap.url.startsWith("chrome-error://") ||
     isVisiblyBlocked({ title: snap.title, text: snap.tree }) ||
     isHardBlock({ text: snap.tree }, status)
   );
 }
 
 /**
- * Whether a failed first navigate warrants escalating to a residential proxy: a visible block (a
- * CF/WAF challenge) or a hard block (4xx/5xx + thin) — the two a clean residential exit can clear.
- * A bare null-status failure (an off-allowlist abort or an unreachable host) is NOT escalated: a
- * fresh exit won't fix it, so it's surfaced directly. Mirrors retrieve's `shouldEscalateToProxy`
- * gate, evaluated on the drive snapshot (title + accessibility tree + status). Narrower than
- * {@link navFailed}, which also treats a bare null status as failed.
+ * Whether a failed first navigate warrants escalating to a residential proxy: a *Cloudflare* visible
+ * challenge or a hard block (4xx/5xx + thin) — exactly retrieve's `shouldEscalateToProxy` scope (CF
+ * challenge OR hard block), on the drive snapshot (title + accessibility tree + status). Narrower
+ * than {@link navFailed} on purpose: a bare null-status / Chrome-error failure (off-allowlist abort,
+ * unreachable host, reset socket) and a generic non-CF WAF block (e.g. "access denied" on a 200) are
+ * NOT escalated — a fresh residential exit won't reliably fix those, so they're surfaced directly
+ * instead of spending proxy budget.
  */
 export function shouldEscalateDrive(snap: PageSnapshot): boolean {
   const status = snap.status ?? null;
   return (
-    isVisiblyBlocked({ title: snap.title, text: snap.tree }) || isHardBlock({ text: snap.tree }, status)
+    isCloudflareVisible({ title: snap.title, text: snap.tree }) || isHardBlock({ text: snap.tree }, status)
   );
 }

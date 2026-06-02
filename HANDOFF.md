@@ -3,7 +3,7 @@
 Picked up from the U6 cutover and ran two arcs. **Arc 1:** finished the residential-proxy
 escalation work (escalate-on-hard-block + rotating-exit retry) and got it **verified live in
 prod**. **Arc 2:** built the entire interactive **`drive` verb set** (Approach A, U1–U5) on a
-feature branch — now **PR #2**, 98 tests green + an end-to-end browser proof passing.
+feature branch — now **PR #2**, full unit suite green + an end-to-end browser proof passing.
 
 > Provider names and per-host/agent specifics are deliberately kept out of this public file —
 > they live in agent memory `retrieve-403-and-proxy-gaps` and gitignored `CUTOVER.local.md`.

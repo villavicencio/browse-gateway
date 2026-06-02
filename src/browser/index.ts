@@ -24,6 +24,7 @@ export {
   assess,
   isCleared,
   isVisiblyBlocked,
+  isCloudflareVisible,
   isHardBlock,
   matchedBlockPhrases,
   vendorHints,

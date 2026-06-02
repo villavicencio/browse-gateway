@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { proxyOverrideFor, navFailed } from "../dist/verbs/index.js";
+import { proxyOverrideFor, navFailed, shouldEscalateDrive } from "../dist/verbs/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { SecretStore } from "../dist/security/index.js";
 
@@ -29,8 +29,25 @@ test("navFailed: fails on null status, a 4xx+thin page, or a visible interstitia
   // CF interstitial: 200 + non-thin content, but a visible block phrase -> still failed, so a
   // proxied first navigate rotates past the blocked exit instead of pinning it.
   assert.equal(navFailed({ url: "u", title: "Just a moment...", tree: REAL, status: 200 }), true);
+  // A dead navigation (reset socket / unreachable) lands on chrome-error:// and can inherit the
+  // PRIOR page's status via the response listener — the url must still mark it failed.
+  assert.equal(navFailed({ url: "chrome-error://chromewebdata/", title: "", tree: "", status: 200 }), true);
   assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 200 }), false);
   assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 403 }), false);
+});
+
+test("shouldEscalateDrive: escalates on a CF challenge or a hard block; NOT a generic block or a dead nav", () => {
+  // CF challenge (visible) -> escalate
+  assert.equal(shouldEscalateDrive({ url: "u", title: "Just a moment...", tree: REAL, status: 200 }), true);
+  // hard reputation block (4xx + thin) -> escalate
+  assert.equal(shouldEscalateDrive({ url: "u", title: "t", tree: "Forbidden", status: 403 }), true);
+  // generic NON-CF visible block on a non-thin 200 (e.g. "Access denied") -> NOT escalated (matches
+  // retrieve's scope; surfaced via navFailed, but no residential proxy spent)
+  assert.equal(shouldEscalateDrive({ url: "u", title: "Access denied", tree: REAL, status: 200 }), false);
+  // dead navigation (chrome-error, stale status) -> NOT escalated; a fresh exit won't fix it
+  assert.equal(shouldEscalateDrive({ url: "chrome-error://chromewebdata/", title: "", tree: "", status: 200 }), false);
+  // healthy page -> no escalation
+  assert.equal(shouldEscalateDrive({ url: "u", title: "t", tree: REAL, status: 200 }), false);
 });
 
 /** Fake gateway: opened session N navigates through sessionNavLists[N] (each nav consumes the next). */

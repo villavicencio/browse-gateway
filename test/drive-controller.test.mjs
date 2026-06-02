@@ -115,6 +115,17 @@ test("controller: a navigating action that lands on a bare reputation block (4xx
   await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
 });
 
+test("controller: a navigating action that lands on a dead nav (chrome-error, stale status) surfaces an error", async () => {
+  // The reset-socket case: the navigation got no response, so the snapshot inherited the prior
+  // page's 200 status. The chrome-error:// url must still mark it failed (not returned as success).
+  const { gateway } = makePostActionBlockGateway({
+    url: "chrome-error://chromewebdata/", title: "", tree: "ERR_EMPTY_RESPONSE", status: 200,
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
+});
+
 test("controller: a reaped session resets the handle so the next navigate reopens", async () => {
   const { gateway, open } = makeFakeGateway();
   const c = new GatewayDriveController(gateway, noSecrets(), "tok");
