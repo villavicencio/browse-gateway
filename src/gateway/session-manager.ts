@@ -40,6 +40,9 @@ export class SessionManager {
   readonly #factory: CoreFactory;
   /** Slots claimed by in-flight `acquire()` calls before their core finishes launching. */
   #reserved = 0;
+  /** Per-consumer in-flight launch counts, so concurrent opens can't overshoot the per-consumer cap
+   *  in the window between the cap check and the new session landing in the map. */
+  readonly #reservedByConsumer = new Map<string, number>();
   #reaperTimer?: ReturnType<typeof setInterval>;
 
   constructor(opts: SessionManagerOptions) {
@@ -49,9 +52,13 @@ export class SessionManager {
     this.#factory = opts.coreFactory ?? createBrowserCore;
   }
 
-  /** Count of open sessions bound to `consumerId` (drive sessions; transient ones are untagged). */
+  /**
+   * Count of sessions bound to `consumerId` — registered ones PLUS in-flight launches. Counting
+   * reserved launches is what makes the per-consumer cap hold under concurrent opens (transient
+   * sessions are untagged and never counted here).
+   */
   #countForConsumer(consumerId: string): number {
-    let n = 0;
+    let n = this.#reservedByConsumer.get(consumerId) ?? 0;
     for (const s of this.#sessions.values()) if (s.consumerId === consumerId) n++;
     return n;
   }
@@ -93,6 +100,9 @@ export class SessionManager {
       );
     }
     this.#reserved++;
+    if (meta?.consumerId) {
+      this.#reservedByConsumer.set(meta.consumerId, (this.#reservedByConsumer.get(meta.consumerId) ?? 0) + 1);
+    }
     try {
       const coreOptions = overrides ? { ...this.#coreOptions, ...overrides } : this.#coreOptions;
       let core: BrowserCore;
@@ -108,6 +118,11 @@ export class SessionManager {
       return session;
     } finally {
       this.#reserved--;
+      if (meta?.consumerId) {
+        const remaining = (this.#reservedByConsumer.get(meta.consumerId) ?? 1) - 1;
+        if (remaining > 0) this.#reservedByConsumer.set(meta.consumerId, remaining);
+        else this.#reservedByConsumer.delete(meta.consumerId);
+      }
     }
   }
 

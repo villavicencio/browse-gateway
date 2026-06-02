@@ -21,6 +21,13 @@ export type SecretKey = (typeof SECRET_KEYS)[number];
 export class SecretStore {
   readonly #source: SecretSource;
   #values = new Map<SecretKey, string>();
+  /**
+   * Every secret value ever loaded, across reloads. Redaction scrubs against THIS set, not just the
+   * current values: after a rotation a retired credential can still be in flight — held by an open
+   * session opened before the rotation, or already embedded in an error in transit — and must stay
+   * redactable so it can never surface in logs/audit/consumer-facing output (R9).
+   */
+  #redactable = new Set<string>();
 
   constructor(source: SecretSource = () => process.env) {
     this.#source = source;
@@ -33,7 +40,10 @@ export class SecretStore {
     const next = new Map<SecretKey, string>();
     for (const key of SECRET_KEYS) {
       const value = env[key];
-      if (value) next.set(key, value);
+      if (value) {
+        next.set(key, value);
+        this.#redactable.add(value); // never forget a value, so rotation can't un-redact it
+      }
     }
     this.#values = next;
   }
@@ -46,9 +56,18 @@ export class SecretStore {
     return this.#values.has(key);
   }
 
-  /** Present secret values, for redaction. */
+  /** Present secret values. */
   secretValues(): string[] {
     return [...this.#values.values()];
+  }
+
+  /**
+   * Every secret value ever loaded — the set `redactSecrets` scrubs. Includes values rotated out of
+   * the store so a retired-but-in-flight credential is never leaked. (Process-lifetime set; a handful
+   * of values plus rotations — bounded.)
+   */
+  redactableValues(): string[] {
+    return [...this.#redactable];
   }
 
   /** Stringifies to redacted placeholders so a store can never leak via logging. */
@@ -62,16 +81,17 @@ function escapeRegExp(s: string): string {
 }
 
 /**
- * Replace every known secret value in `text` with `[REDACTED]`. Each secret is matched both
- * verbatim and in its URL-encoded form (proxy creds frequently surface percent-encoded in
- * driver error messages), and longer values are replaced first so a secret that contains
- * another isn't partially revealed. Values shorter than 3 chars are skipped so a 1–2 char
- * secret can't blanket-redact ordinary output.
+ * Replace every known secret value in `text` with `[REDACTED]`. Scrubs against every value the store
+ * has EVER loaded (see {@link SecretStore.redactableValues}) so a credential rotated out of the store
+ * but still in flight cannot leak. Each secret is matched both verbatim and in its URL-encoded form
+ * (proxy creds frequently surface percent-encoded in driver error messages), and longer values are
+ * replaced first so a secret that contains another isn't partially revealed. Values shorter than
+ * 3 chars are skipped so a 1–2 char secret can't blanket-redact ordinary output.
  */
 export function redactSecrets(text: string, store: SecretStore): string {
   let out = text;
   const variants = new Set<string>();
-  for (const value of store.secretValues()) {
+  for (const value of store.redactableValues()) {
     if (value.length < 3) continue;
     variants.add(value);
     const encoded = encodeURIComponent(value);

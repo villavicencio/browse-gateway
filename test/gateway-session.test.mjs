@@ -196,6 +196,22 @@ test("openConsumerSession: enforces the per-consumer cap (default 1) independent
   await gw.closeConsumerSession("tok-a", h2);
 });
 
+test("openConsumerSession: concurrent opens for one consumer never overshoot the per-consumer cap", async () => {
+  const { factory } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(5), factory, policy); // global cap generous; per-consumer cap is the limit
+  const results = await Promise.allSettled([
+    gw.openConsumerSession("tok-a"),
+    gw.openConsumerSession("tok-a"),
+  ]);
+  const ok = results.filter((r) => r.status === "fulfilled");
+  const limited = results.filter((r) => r.status === "rejected" && r.reason?.code === "SESSION_LIMIT");
+  assert.equal(ok.length, 1, "exactly one concurrent open for the consumer succeeded");
+  assert.equal(limited.length, 1, "the second concurrent open hit the per-consumer cap");
+  assert.equal(gw.sessions.activeCount, 1, "no per-consumer overshoot");
+  await gw.shutdown();
+});
+
 test("shutdown: closes open interactive sessions (no orphaned browsers)", async () => {
   const { factory, cores } = makeFactory();
   const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);

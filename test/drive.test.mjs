@@ -96,6 +96,20 @@ test("controller: a direct session surfaces a failed navigation as an error, not
   await assert.rejects(c.navigate("https://example.com/"), /navigation failed/);
 });
 
+test("controller: resolves the proxy override per open, so a secret rotation takes effect (no cached creds)", async () => {
+  let env = { BGW_PROXY_URL: "http://old-exit:1111" };
+  const secrets = new SecretStore(() => env);
+  const { gateway, opened } = makeProxyGateway([[{ status: 200, tree: REAL }], [{ status: 200, tree: REAL }]]);
+  const c = new GatewayDriveController(gateway, secrets, "tok", { onDatacenterIp: true });
+  await c.navigate("https://example.com/");
+  assert.match(opened[0].overrides?.proxy?.server ?? "", /old-exit/, "first session opened with the original proxy");
+  await c.close();
+  env = { BGW_PROXY_URL: "http://new-exit:2222" }; // rotate the proxy out from under the controller
+  secrets.reload();
+  await c.navigate("https://example.com/again");
+  assert.match(opened[1].overrides?.proxy?.server ?? "", /new-exit/, "next session used the rotated proxy, not a cached override");
+});
+
 test("controller: a pinned proxied session that fails mid-flow discards, so the next navigate re-rolls a fresh exit", async () => {
   // session 1: first nav healthy (pins), second nav fails (exit went bad mid-flow);
   // session 2: a fresh healthy exit on the auto-reopened navigate.

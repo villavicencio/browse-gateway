@@ -73,6 +73,29 @@ test("controller: acting before navigate errors clearly (no active session)", as
   await assert.rejects(c.click({ target: "e1" }), /no active drive session/);
 });
 
+test("controller: a navigating action that lands on a challenge surfaces an error, not a blocked snapshot", async () => {
+  let nextId = 1;
+  const open = new Map();
+  const core = {
+    async navigate() { return { url: "u", title: "ok", tree: "form [ref=e1]", status: 200 }; },
+    async click() {}, // the click triggers a navigation into a challenge page
+    async snapshot() { return { url: "u", title: "Just a moment...", tree: "Verifying you are human [ref=e1]" }; },
+  };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + nextId++; open.set(id, { core }); return id; },
+    async useConsumerSession(_t, h, fn) {
+      const s = open.get(h);
+      if (!s) throw new Error(`no open session for handle ${h}`);
+      return fn(s);
+    },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/"); // opens; post-nav snapshot is a real page
+  await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
+});
+
 test("controller: a reaped session resets the handle so the next navigate reopens", async () => {
   const { gateway, open } = makeFakeGateway();
   const c = new GatewayDriveController(gateway, noSecrets(), "tok");

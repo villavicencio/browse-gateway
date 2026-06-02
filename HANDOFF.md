@@ -14,7 +14,7 @@ feature branch — now **PR #2**, 98 tests green + an end-to-end browser proof p
 - `f2a566e` feat(verbs): escalate-on-hard-block — `isHardBlock` (4xx/5xx + thin) in `detect.ts`, broadened `shouldEscalateToProxy` (CF challenge **or** hard block), `retrieve.blocked` also true on `status===null`. (cutover findings #2/#3)
 - `bbe17da` fix(verbs): rotating-exit retry — session-level retry (3 attempts, 25s/attempt) in `retrieve.ts`. Root cause = rotating residential exit variance (~83% healthy/fail-fast), **not** route-interception-breaks-proxy-auth (disproven).
 - `0b8d742` `scripts/validate-proxy-escalation.mjs` proof; `4822c82` docs: `docs/solutions/runtime-errors/residential-proxy-rotating-exit-retry.md`.
-- **Verified end-to-end on prod** through the residential proxy (`browse-gateway:proxyretry` image): a hard reputation-403 target cleared via a fresh residential exit (~3KB markdown). Promoted `:proxyretry` → `:latest`, gateway-runtime restarted (one container confirmed on the new image; see #6 below).
+- **Verified end-to-end on prod** through the residential proxy: a hard reputation-403 target cleared via a fresh residential exit (~3KB markdown). Image-promotion + runtime-rollout specifics (tags, which runtimes were restarted) live in `CUTOVER.local.md`.
 
 **Arc 2 — drive feature (branch `feat/drive-interactive-verbs`, [PR #2](https://github.com/villavicencio/browse-gateway/pull/2)):**
 - `e4d85f4` **U1** — core interactive primitives (`navigate/snapshot/click/type/selectOption/pressKey/waitFor/screenshot/closeActivePage`) + aria-ref snapshot model (Patchright `ariaSnapshot({mode:"ai"})` + `aria-ref=`, verified on 1.60; `targetToSelector` in `patchright-core.ts`).
@@ -40,7 +40,7 @@ Also: dogfooded `retrieve`+`drive` on a proxy vendor's JS pricing page to answer
 
 ## What's Next
 1. **Review + merge [PR #2](https://github.com/villavicencio/browse-gateway/pull/2)** (drive feature) — the headline deliverable.
-2. **Before enabling drive in prod: bump `BGW_MAX_SESSIONS` > 1** — held drive sessions share the global session pool with `retrieve`; at 1, a held drive session starves `retrieve`.
+2. **Set `BGW_MAX_SESSIONS` high enough that a held drive session doesn't starve `retrieve`** — they share one global session pool (code default is 2). The deployment value lives in `CUTOVER.local.md`; confirm it there before enabling drive.
 3. **U7** — capped-deploy tuning vs measured headroom, observability/retention, and the NET_ADMIN egress sidecar (also unblocks Approach B / CDP-attach).
 4. **(Optional) alternative-provider A/B** — buy a few GB PAYG, run `validate-proxy-escalation.mjs` against it, compare exit reliability/latency to the current provider; switch is a `BGW_PROXY_*` creds-only change if it holds up.
 5. **Confirm all prod runtimes are on the new `:latest` image** — not every runtime was confirmed on it yet; some may still hold an older container until restarted. (Fleet/runtime specifics: `CUTOVER.local.md`.)

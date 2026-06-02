@@ -8,6 +8,7 @@
 import { isHttpUrl, redactSecrets } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
+import { isVisiblyBlocked } from "../browser/index.js";
 import type { BrowserCoreOptions, DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
 import { proxyOverrideFor, navFailed, PROXY_OPEN_ATTEMPTS } from "../verbs/index.js";
 import type { DriveController } from "./server.js";
@@ -19,8 +20,8 @@ export class GatewayDriveController implements DriveController {
   readonly #gateway: Gateway;
   readonly #secrets: SecretStore;
   readonly #token: string;
-  /** Core overrides used at open — the residential proxy when configured + on a datacenter IP. */
-  readonly #proxyOverride?: BrowserCoreOptions;
+  /** Whether we run on a datacenter IP — the gate (with a configured proxy) for proxied sessions. */
+  readonly #onDatacenterIp: boolean;
 
   constructor(
     gateway: Gateway,
@@ -31,7 +32,17 @@ export class GatewayDriveController implements DriveController {
     this.#gateway = gateway;
     this.#secrets = secrets;
     this.#token = token;
-    this.#proxyOverride = proxyOverrideFor(secrets, opts.onDatacenterIp ?? false);
+    this.#onDatacenterIp = opts.onDatacenterIp ?? false;
+  }
+
+  /**
+   * Resolve the proxy override fresh from the (possibly rotated) secret store on every session open,
+   * so a `SecretStore.reload()` takes effect on the next session instead of being frozen at
+   * construction. Returns the residential-proxy override when one is configured AND we're on a
+   * datacenter IP, else undefined (direct).
+   */
+  #resolveProxyOverride(): BrowserCoreOptions | undefined {
+    return proxyOverrideFor(this.#secrets, this.#onDatacenterIp);
   }
 
   async open(): Promise<void> {
@@ -44,8 +55,9 @@ export class GatewayDriveController implements DriveController {
     if (!isHttpUrl(url)) {
       throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
     }
+    const proxied = this.#resolveProxyOverride() !== undefined;
     // Proxied session, not yet pinned: retry across fresh exits until one lands the page (R7 / KTD-5).
-    if (this.#proxyOverride && !this.#pinned) {
+    if (proxied && !this.#pinned) {
       return this.#openHealthyAndNavigate(url);
     }
     // Pinned proxied session or a direct session: one shot. A failed nav is surfaced cleanly rather
@@ -54,7 +66,7 @@ export class GatewayDriveController implements DriveController {
     await this.#ensureOpen();
     const snap = await this.#run((s) => s.core.navigate(url));
     if (navFailed(snap)) {
-      if (this.#proxyOverride) {
+      if (proxied) {
         // The pinned exit went bad (or the page stayed blocked): discard + unpin so the NEXT
         // navigate transparently draws a fresh exit instead of stranding the caller on the known-bad
         // pinned exit. We still surface the failure rather than swap the exit live under the current
@@ -64,7 +76,7 @@ export class GatewayDriveController implements DriveController {
       }
       throw new Error(
         `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
-          `reached${this.#proxyOverride ? " — retry navigate for a fresh exit" : ""}`,
+          `reached${proxied ? " — retry navigate for a fresh exit" : ""}`,
       );
     }
     return snap;
@@ -106,10 +118,10 @@ export class GatewayDriveController implements DriveController {
     await this.#gateway.closeConsumerSession(this.#token, handle).catch(() => {});
   }
 
-  /** Open the session lazily on first use, with the proxy override when one is configured. */
+  /** Open the session lazily on first use, with a freshly-resolved proxy override (rotation-safe). */
   async #ensureOpen(): Promise<void> {
     if (!this.#handle) {
-      this.#handle = await this.#gateway.openConsumerSession(this.#token, this.#proxyOverride);
+      this.#handle = await this.#gateway.openConsumerSession(this.#token, this.#resolveProxyOverride());
     }
   }
 
@@ -152,11 +164,25 @@ export class GatewayDriveController implements DriveController {
     return this.#handle;
   }
 
-  /** Run a mutating action, then return the post-action snapshot (the verb's observable result). */
+  /**
+   * Run a mutating action, then return the post-action snapshot (the verb's observable result). A
+   * navigation-producing action (submit click, type+submit, Enter) can land on an anti-bot
+   * interstitial; the core waits out a client-side challenge first, but if the page is STILL blocked
+   * we surface it rather than hand back the interstitial as a successful result. The session is left
+   * intact (no discard) — a mid-flow block means the agent should close + reopen to restart the flow
+   * (KTD-5), not lose its page state to an exit re-roll.
+   */
   async #actAndSnap(act: (session: Session) => Promise<unknown>): Promise<PageSnapshot> {
     return this.#run(async (s) => {
       await act(s);
-      return s.core.snapshot();
+      const snap = await s.core.snapshot();
+      if (isVisiblyBlocked({ title: snap.title, text: snap.tree })) {
+        throw new Error(
+          "the action landed on a blocked/challenge page that did not clear — close and reopen the " +
+            "drive session, then retry the flow",
+        );
+      }
+      return snap;
     });
   }
 

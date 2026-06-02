@@ -196,18 +196,10 @@ export class PatchrightBrowserCore implements BrowserCore {
       // A challenge/redirect/dead-exit may abort the navigation; snapshot whatever rendered and
       // leave status null so the drive layer treats it as a failed nav.
     }
-    // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does — but
-    // poll ONLY while a visible block phrase is showing, so a clean or dead/blank page incurs no
-    // wait and only an actual interstitial costs latency. A page still blocked after the budget is
-    // surfaced by navFailed (the snapshot tree still carries the phrase), so a proxied first
-    // navigate rotates to a fresh exit instead of pinning the blocked one.
-    let signal = await pollSignal(page);
-    let waited = 0;
-    while (isVisiblyBlocked(signal) && waited < clearanceTimeoutMs) {
-      await page.waitForTimeout(pollIntervalMs);
-      waited += pollIntervalMs;
-      signal = await pollSignal(page);
-    }
+    // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does. A page
+    // still blocked after the budget is surfaced by navFailed (the snapshot tree still carries the
+    // phrase), so a proxied first navigate rotates to a fresh exit instead of pinning the blocked one.
+    await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
     return { ...(await this.#snapshotOf(page)), status };
   }
 
@@ -239,7 +231,10 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   async pressKey(key: string): Promise<void> {
-    await this.#requireActivePage().keyboard.press(key);
+    const page = this.#requireActivePage();
+    await page.keyboard.press(key);
+    // A key press (Enter) can submit a form / trigger navigation — wait out any challenge it lands on.
+    await this.#settle(page);
   }
 
   async waitFor(condition: WaitCondition): Promise<void> {
@@ -287,13 +282,37 @@ export class PatchrightBrowserCore implements BrowserCore {
     target: DriveTarget,
     fn: (loc: PatchrightLocator) => Promise<unknown>,
   ): Promise<void> {
-    const loc = this.#requireActivePage().locator(targetToSelector(target.target));
+    const page = this.#requireActivePage();
+    const loc = page.locator(targetToSelector(target.target));
     try {
       await fn(loc);
     } catch (err) {
       const first = (err instanceof Error ? err.message : String(err)).split("\n")[0];
       const label = target.element ? `${target.element} (${target.target})` : target.target;
       throw new Error(`drive ${op} failed for ${label}: ${first}`);
+    }
+    // A navigation-producing action (submit click, select with onchange) may land on a challenge —
+    // wait it out so the post-action snapshot is the cleared page, not the interstitial.
+    await this.#settle(page);
+  }
+
+  /**
+   * Poll the active page WHILE a visible anti-bot block phrase is showing, up to the clearance
+   * budget, so a client-side challenge (triggered by a goto or a navigation-producing action) can
+   * auto-solve before we snapshot. Runs only while a phrase is present — a clean or dead/blank page
+   * returns immediately, so only an actual interstitial costs latency.
+   */
+  async #settle(
+    page: PatchrightPage,
+    clearanceTimeoutMs: number = DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS,
+    pollIntervalMs: number = DEFAULT_POLL_INTERVAL_MS,
+  ): Promise<void> {
+    let signal = await pollSignal(page);
+    let waited = 0;
+    while (isVisiblyBlocked(signal) && waited < clearanceTimeoutMs) {
+      await page.waitForTimeout(pollIntervalMs);
+      waited += pollIntervalMs;
+      signal = await pollSignal(page);
     }
   }
 
