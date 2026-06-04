@@ -47,7 +47,9 @@ services:
       # --- Shared HTTP MCP surface (U7a, dist/mcp/http-main.js) ---
       # BGW_HTTP_BIND: "<tailnet-ip>"      # bind the listener Tailnet-only; default 127.0.0.1 (fail-closed)
       # BGW_HTTP_PORT: "8080"
-      # BGW_ALLOWED_HOSTS: "<host:port>"   # DNS-rebind allowlist; protection OFF if unset (warns)
+      # BGW_ALLOWED_HOSTS: "<host:port>"   # REQUIRED for http-main — DNS-rebind allowlist; the
+      #                                    # launcher refuses to boot without this (or BGW_ALLOWED_ORIGINS).
+      # BGW_ALLOWED_ORIGINS: "<origin>"    # alternative/additional DNS-rebind allowlist
       # BGW_CONSUMERS_MANIFEST: "/run/consumers.json"  # non-secret {id, allow}[] manifest path
       # BGW_ON_DATACENTER_IP: "1"
       # BYO proxy/CAPTCHA + per-consumer bearer tokens are injected at runtime from a store readable

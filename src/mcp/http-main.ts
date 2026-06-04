@@ -70,10 +70,16 @@ async function main(): Promise<void> {
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
+  // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without DNS-rebinding
+  // protection configured. The listener can be reached over the Tailnet, so an unguarded Host header
+  // is a rebinding vector — never start the launcher with protection OFF.
   const allowedHosts = splitCsv(process.env.BGW_ALLOWED_HOSTS);
   const allowedOrigins = splitCsv(process.env.BGW_ALLOWED_ORIGINS);
   if (allowedHosts.length === 0 && allowedOrigins.length === 0) {
-    log("WARNING: neither BGW_ALLOWED_HOSTS nor BGW_ALLOWED_ORIGINS is set — DNS-rebinding protection is OFF; set BGW_ALLOWED_HOSTS in deployment");
+    throw new Error(
+      "DNS-rebinding protection is required: set BGW_ALLOWED_HOSTS (the host:port the service is " +
+        "reached at over the Tailnet) and/or BGW_ALLOWED_ORIGINS. Refusing to boot with protection OFF.",
+    );
   }
 
   const handler = createHttpHandler({
