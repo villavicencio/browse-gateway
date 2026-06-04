@@ -24,6 +24,10 @@ export interface ConsumerManifestEntry {
  * consumer id upper-cased with every non-alphanumeric run collapsed to a single `_`. So id
  * `agent-1` → `BGW_CONSUMER_TOKEN_AGENT_1`. Two ids that normalize to the same key are rejected in
  * {@link buildConsumerSpecs} so a token can't be silently shared.
+ *
+ * STABILITY: this normalization is a frozen deployment contract — operators set token env vars by
+ * this exact formula. Changing it silently breaks authentication for every existing deployment.
+ * Do not alter without a migration path.
  */
 export function tokenEnvKey(id: string): string {
   return `BGW_CONSUMER_TOKEN_${id.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_|_$/g, "")}`;

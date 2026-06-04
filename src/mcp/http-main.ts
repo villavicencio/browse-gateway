@@ -10,7 +10,7 @@
  */
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
-import { Gateway, loadConfig } from "../gateway/index.js";
+import { Gateway, loadConfig, poolSizingError } from "../gateway/index.js";
 import {
   PolicyEngine,
   ConsumerRegistry,
@@ -33,6 +33,7 @@ const AUDIT_MAX_RECORDS = 10_000;
 const DRIVE_IDLE_TTL_MS = 5 * 60_000; // browser-session idle reap (frees Chrome)
 const DRIVE_REAPER_INTERVAL_MS = 60_000;
 const MCP_SESSION_REAPER_INTERVAL_MS = 60_000;
+const SHUTDOWN_DRAIN_MS = 5_000; // bounded wait for in-flight tool calls before force-closing
 const DEFAULT_PORT = 8080;
 const DEFAULT_BIND = "127.0.0.1"; // fail-closed: deployment sets the Tailnet address explicitly
 
@@ -58,13 +59,8 @@ async function main(): Promise<void> {
   // P0: with held drive sessions sharing the global pool, the cap must cover every consumer's
   // per-consumer share PLUS headroom for a concurrent transient `retrieve`. Refuse to boot
   // mis-sized rather than fail opaquely at the first retrieve under load (Skeptic C2).
-  const required = registry.size * config.perConsumerMax + 1;
-  if (config.maxSessions < required) {
-    throw new Error(
-      `BGW_MAX_SESSIONS=${config.maxSessions} is too low for ${registry.size} consumer(s): need >= ` +
-        `${required} (= ${registry.size} × perConsumerMax ${config.perConsumerMax} + 1 retrieve headroom)`,
-    );
-  }
+  const sizingError = poolSizingError(registry.size, config.perConsumerMax, config.maxSessions);
+  if (sizingError) throw new Error(sizingError);
 
   const policy = new PolicyEngine({
     registry,
@@ -75,8 +71,9 @@ async function main(): Promise<void> {
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
   const allowedHosts = splitCsv(process.env.BGW_ALLOWED_HOSTS);
-  if (allowedHosts.length === 0) {
-    log("WARNING: BGW_ALLOWED_HOSTS is unset — DNS-rebinding protection is OFF; set it in deployment");
+  const allowedOrigins = splitCsv(process.env.BGW_ALLOWED_ORIGINS);
+  if (allowedHosts.length === 0 && allowedOrigins.length === 0) {
+    log("WARNING: neither BGW_ALLOWED_HOSTS nor BGW_ALLOWED_ORIGINS is set — DNS-rebinding protection is OFF; set BGW_ALLOWED_HOSTS in deployment");
   }
 
   const handler = createHttpHandler({
@@ -101,6 +98,7 @@ async function main(): Promise<void> {
       return { server, dispose: () => drive.close() };
     },
     allowedHosts,
+    allowedOrigins,
     log,
   });
   handler.startReaper(MCP_SESSION_REAPER_INTERVAL_MS);
@@ -119,8 +117,10 @@ async function main(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    httpServer.close(); // stop accepting new connections; in-flight requests drain
+    httpServer.close(); // refuse new connections
+    await handler.drain(SHUTDOWN_DRAIN_MS); // let in-flight tool calls settle before force-closing
     await handler.closeAll().catch(() => {}); // close transports + dispose drive controllers
+    httpServer.closeAllConnections?.(); // drop any lingering sockets (e.g. idle SSE) so close() completes
     await gateway.shutdown().catch(() => {});
     process.exit(0);
   };
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
     log(
       `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
         `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
-        `dnsRebindProtection=${allowedHosts.length > 0}`,
+        `dnsRebindProtection=${allowedHosts.length > 0 || allowedOrigins.length > 0}`,
     );
   });
 }

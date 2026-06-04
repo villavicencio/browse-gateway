@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tokenEnvKey, parseConsumerManifest, buildConsumerSpecs } from "../dist/policy/index.js";
 import { SecretStore, redactSecrets } from "../dist/security/index.js";
+import { poolSizingError } from "../dist/gateway/index.js";
 
 test("tokenEnvKey normalizes ids to a BGW_CONSUMER_TOKEN_<ID> env key", () => {
   assert.equal(tokenEnvKey("atlas"), "BGW_CONSUMER_TOKEN_ATLAS");
@@ -55,6 +56,17 @@ test("buildConsumerSpecs joins tokens from env and fails closed on every gap", (
     () => buildConsumerSpecs([{ id: "a-b", allow: ["x"] }, { id: "a.b", allow: ["y"] }], { BGW_CONSUMER_TOKEN_A_B: "t" }),
     /collide on token env key/,
   );
+});
+
+test("poolSizingError refuses an under-sized pool (boot guard), passes a sized one", () => {
+  // 2 consumers × perConsumerMax 1 + 1 retrieve headroom = 3 required.
+  assert.match(poolSizingError(2, 1, 2), /too low for 2 consumer/);
+  assert.match(poolSizingError(2, 1, 2), /need >= 3/);
+  assert.equal(poolSizingError(2, 1, 3), null, "exactly sized pool boots");
+  assert.equal(poolSizingError(2, 1, 5), null, "over-sized pool boots");
+  // perConsumerMax scales the floor.
+  assert.match(poolSizingError(3, 2, 5), /need >= 7/);
+  assert.equal(poolSizingError(3, 2, 7), null);
 });
 
 test("SecretStore.addRedactable folds consumer tokens into redaction (R9) and survives rotation", () => {

@@ -144,8 +144,8 @@ test("HTTP: an idle session (disconnect without DELETE) is reaped and its contro
   }
 });
 
-test("HTTP: DNS-rebind protection rejects an init whose Host is not allow-listed", async () => {
-  const { deps } = makeDeps();
+test("HTTP: DNS-rebind protection rejects an init whose Host is not allow-listed, disposing the orphan", async () => {
+  const { deps, disposed } = makeDeps();
   const handler = createHttpHandler({ ...deps, allowedHosts: ["browse-gateway.example:9999"] });
   const { server, url } = await startServer(handler);
   try {
@@ -154,7 +154,142 @@ test("HTTP: DNS-rebind protection rejects an init whose Host is not allow-listed
     const { client, transport } = connect(url, "tok-alice");
     await assert.rejects(client.connect(transport));
     assert.equal(handler.sessionCount(), 0);
+    assert.deepEqual(disposed, ["alice"], "the orphaned per-consumer controller was disposed");
   } finally {
     await stop({ server, handler });
+  }
+});
+
+test("HTTP: a throw during session open disposes the controller (no leak)", async () => {
+  // server.connect throwing bypasses the normal orphan check; the catch in openSession must still
+  // dispose, or the per-consumer controller + its browser session leak (reliability finding #1).
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  const disposed = [];
+  const handler = createHttpHandler({
+    authenticate: (t) => policy.authenticate(t),
+    buildServer: (consumer) => ({
+      server: { connect: async () => { throw new Error("connect boom"); } },
+      dispose: async () => void disposed.push(consumer.id),
+    }),
+  });
+  const { server, url } = await startServer(handler);
+  try {
+    const { client, transport } = connect(url, "tok-alice");
+    await assert.rejects(client.connect(transport));
+    assert.deepEqual(disposed, ["alice"], "controller disposed even when open throws");
+    assert.equal(handler.sessionCount(), 0);
+  } finally {
+    await stop({ server, handler });
+  }
+});
+
+test("HTTP: an oversized request body is rejected with 413", async () => {
+  const { deps } = makeDeps();
+  const handler = createHttpHandler({ ...deps, maxBodyBytes: 16 });
+  const { server, url } = await startServer(handler);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer tok-alice" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { capabilities: {} } }),
+    });
+    assert.equal(r.status, 413);
+    assert.equal(handler.sessionCount(), 0);
+  } finally {
+    await stop({ server, handler });
+  }
+});
+
+test("HTTP: a malformed JSON body is rejected with 400", async () => {
+  const { deps } = makeDeps();
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer tok-alice" },
+      body: "not json",
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    await stop({ server, handler });
+  }
+});
+
+test("HTTP: a non-initialize POST with no session id is rejected with 400", async () => {
+  const { deps } = makeDeps();
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer tok-alice" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    await stop({ server, handler });
+  }
+});
+
+test("HTTP: a token that stops authenticating is rejected on the next request (per-request re-auth)", async () => {
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  let revoked = false;
+  const handler = createHttpHandler({
+    authenticate: (t) => {
+      if (revoked && t === "tok-alice") throw new Error("revoked");
+      return policy.authenticate(t);
+    },
+    buildServer: () => ({ server: createGatewayMcpServer({ retrieve: async () => outcome() }), dispose: async () => {} }),
+  });
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const c = connect(url, "tok-alice");
+    client = c.client;
+    await client.connect(c.transport);
+    const sid = c.transport.sessionId;
+    revoked = true; // simulate the token no longer resolving (e.g. removed from the registry on restart)
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "mcp-session-id": sid, Authorization: "Bearer tok-alice" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+    assert.equal(r.status, 401, "re-auth runs before session routing, so a now-invalid token is rejected");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("HTTP: the idle reaper does NOT close a session with an in-flight tool call, then reaps once it settles", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  const handler = createHttpHandler({
+    authenticate: (t) => policy.authenticate(t),
+    buildServer: () => ({
+      server: createGatewayMcpServer({ retrieve: async () => { await gate; return outcome(); } }),
+      dispose: async () => {},
+    }),
+    sessionIdleTtlMs: 1,
+  });
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const c = connect(url, "tok-alice");
+    client = c.client;
+    await client.connect(c.transport);
+    const callP = client.callTool({ name: "retrieve", arguments: { url: "https://example.com/" } }); // blocks on gate
+    await new Promise((r) => setTimeout(r, 50)); // let the POST reach the server and bump inFlight
+    assert.equal((await handler.reapIdle(Date.now() + 10_000)).length, 0, "in-flight session is not reaped");
+    assert.equal(handler.sessionCount(), 1);
+    release();
+    await callP;
+    assert.equal((await handler.reapIdle(Date.now() + 10_000)).length, 1, "reapable once the call settles");
+  } finally {
+    await stop({ server, handler, client });
   }
 });

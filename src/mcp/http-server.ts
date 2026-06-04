@@ -9,7 +9,10 @@
  *  - Auth routes through the injected `authenticate` (== `PolicyEngine.authenticate`), the SINGLE
  *    policy point — the transport never re-implements an allowlist/credential check (CLAUDE.md
  *    "policy in one place"). The bearer is re-checked on EVERY request and must still resolve to
- *    the consumer that opened the session, so a rotated/foreign token can't ride an open session.
+ *    the consumer that opened the session, so a FOREIGN token (one that maps to a different
+ *    consumer, or none) can't ride an open session → 403/401. Note this is foreign-token
+ *    rejection, NOT live revocation: the registry is built once at startup (no hot reload, by
+ *    design), so revoking a leaked token takes a process restart — which ends every session anyway.
  *  - The Authorization header / token is NEVER logged (R9): logs carry the consumer id only.
  *  - Stateful, session-id keyed: a `drive` session is stateful, so each MCP session maps to one
  *    consumer-bound `McpServer` + controller. The Streamable-HTTP transport fires `onsessionclosed`
@@ -54,6 +57,8 @@ export interface HttpHandler {
   reapIdle: (now?: number) => Promise<string[]>;
   startReaper: (intervalMs?: number) => void;
   stopReaper: () => void;
+  /** Wait (up to `timeoutMs`) for in-flight requests to settle. Used to drain before shutdown. */
+  drain: (timeoutMs: number) => Promise<void>;
   /** Graceful shutdown: close every transport and dispose every controller. */
   closeAll: () => Promise<void>;
   sessionCount: () => number;
@@ -64,6 +69,10 @@ interface SessionEntry {
   consumerId: string;
   dispose: () => Promise<void>;
   lastActivity: number;
+  /** Count of POST requests (tool calls) currently executing on this session. The idle reaper never
+   *  closes a session with an in-flight call, so a long-running verb (e.g. browser_wait_for) can't
+   *  have its transport reaped out from under it mid-response. */
+  inFlight: number;
 }
 
 const DEFAULT_IDLE_TTL_MS = 6 * 60_000; // a touch above the browser idle reaper, so Chrome frees first
@@ -103,7 +112,7 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       allowedHosts,
       allowedOrigins,
       onsessioninitialized: (sid) => {
-        sessions.set(sid, { transport, consumerId: consumer.id, dispose: built.dispose, lastActivity: now() });
+        sessions.set(sid, { transport, consumerId: consumer.id, dispose: built.dispose, lastActivity: now(), inFlight: 0 });
         log(`session ${sid} open (consumer=${consumer.id}); ${sessions.size} live`);
       },
       onsessionclosed: (sid) => void cleanup(sid), // explicit DELETE
@@ -114,8 +123,17 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       const sid = transport.sessionId;
       if (sid) void cleanup(sid);
     };
-    await built.server.connect(transport);
-    await transport.handleRequest(req, res, body);
+    try {
+      await built.server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } catch (err) {
+      // A throw from connect()/handleRequest() bypasses the orphan check below, so dispose here too —
+      // otherwise the per-consumer controller (and any browser session) leaks. If the session DID get
+      // registered before the throw, cleanup() owns disposal; only dispose the still-orphaned case.
+      if (!transport.sessionId) await built.dispose().catch(() => {});
+      await transport.close().catch(() => {});
+      throw err;
+    }
     // If the initialize was rejected (e.g. DNS-rebind block), no session id was assigned and no
     // entry was registered — dispose the orphaned controller/server so nothing leaks.
     if (!transport.sessionId) {
@@ -127,16 +145,19 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? "GET";
     if (method !== "POST" && method !== "GET" && method !== "DELETE") {
-      return sendError(res, 405, -32000, "method not allowed");
+      res.setHeader("Allow", "GET, POST, DELETE"); // RFC 9110 §15.5.6; matches the SDK's own 405
+      return sendError(res, 405, -32600, "method not allowed");
     }
 
-    // Auth FIRST, through the single policy point. Never log the header or the token.
+    // Auth FIRST, through the single policy point. Never log the header or the token. 401 carries a
+    // distinct JSON-RPC code from the 404 session-not-found case (-32001) so clients can tell
+    // "re-provision the token" apart from "re-initialize the session".
     let consumer: Consumer;
     try {
       consumer = deps.authenticate(parseBearer(req.headers["authorization"]));
     } catch {
       res.setHeader("WWW-Authenticate", "Bearer");
-      return sendError(res, 401, -32001, "unauthorized");
+      return sendError(res, 401, -32002, "unauthorized");
     }
 
     const sessionId = headerValue(req.headers["mcp-session-id"]);
@@ -153,17 +174,27 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       if (sessionId) {
         const entry = requireOwnedSession(sessionId, consumer, res);
         if (!entry) return;
+        // Mark the call in-flight so the idle reaper won't close this session mid-response (a long
+        // tool call can outlive the idle TTL); re-stamp activity on completion so a just-finished
+        // long call isn't reaped on the next tick.
         entry.lastActivity = now();
-        return entry.transport.handleRequest(req, res, body);
+        entry.inFlight++;
+        try {
+          await entry.transport.handleRequest(req, res, body);
+        } finally {
+          entry.inFlight--;
+          entry.lastActivity = now();
+        }
+        return;
       }
       if (!isInitializeRequest(body)) {
-        return sendError(res, 400, -32000, "missing mcp-session-id header (and not an initialize request)");
+        return sendError(res, 400, -32600, "missing mcp-session-id header (and not an initialize request)");
       }
       return openSession(consumer, req, res, body);
     }
 
     // GET (open the SSE stream) or DELETE (terminate the session) — both require an owned session.
-    if (!sessionId) return sendError(res, 400, -32000, "missing mcp-session-id header");
+    if (!sessionId) return sendError(res, 400, -32600, "missing mcp-session-id header");
     const entry = requireOwnedSession(sessionId, consumer, res);
     if (!entry) return;
     entry.lastActivity = now();
@@ -179,19 +210,26 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
     }
     if (entry.consumerId !== consumer.id) {
       // Don't distinguish "foreign" from "unknown" beyond the status — leak nothing about other
-      // consumers' sessions. Re-auth on every request is what revokes a rotated token mid-session.
+      // consumers' sessions. This rejects a token that maps to a DIFFERENT consumer; it is not live
+      // revocation (the registry is static until restart — see the header note).
       sendError(res, 403, -32003, "session does not belong to this consumer");
       return null;
     }
     return entry;
   }
 
+  /** Close a session's transport (fires onclose -> cleanup) with a belt-and-suspenders cleanup in
+   *  case onclose didn't fire. Shared by the idle reaper and graceful shutdown. */
+  async function closeSession(sid: string, entry: SessionEntry): Promise<void> {
+    await entry.transport.close().catch(() => {});
+    if (sessions.has(sid)) await cleanup(sid);
+  }
+
   async function reapIdle(nowTs: number = now()): Promise<string[]> {
-    const stale = [...sessions.entries()].filter(([, e]) => nowTs - e.lastActivity > idleTtlMs);
-    for (const [sid, entry] of stale) {
-      await entry.transport.close().catch(() => {}); // fires onclose -> cleanup
-      if (sessions.has(sid)) await cleanup(sid); // belt-and-suspenders if onclose didn't fire
-    }
+    // Never reap a session with an in-flight tool call — closing its transport mid-response would
+    // make the McpServer's send() throw and hand the consumer a corrupt/hung reply.
+    const stale = [...sessions.entries()].filter(([, e]) => e.inFlight === 0 && nowTs - e.lastActivity > idleTtlMs);
+    for (const [sid, entry] of stale) await closeSession(sid, entry);
     return stale.map(([sid]) => sid);
   }
 
@@ -209,17 +247,25 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
     }
   }
 
+  /** Wait up to `timeoutMs` for in-flight tool calls to settle (polling), so shutdown can drain
+   *  before force-closing transports. Resolves early once nothing is in flight. */
+  async function drain(timeoutMs: number): Promise<void> {
+    const deadline = now() + timeoutMs;
+    const busy = () => [...sessions.values()].some((e) => e.inFlight > 0);
+    while (busy() && now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
   async function closeAll(): Promise<void> {
     stopReaper();
     for (const sid of [...sessions.keys()]) {
       const entry = sessions.get(sid);
-      if (!entry) continue;
-      await entry.transport.close().catch(() => {});
-      if (sessions.has(sid)) await cleanup(sid);
+      if (entry) await closeSession(sid, entry);
     }
   }
 
-  return { handle, reapIdle, startReaper, stopReaper, closeAll, sessionCount: () => sessions.size };
+  return { handle, reapIdle, startReaper, stopReaper, drain, closeAll, sessionCount: () => sessions.size };
 }
 
 /** Extract the bearer token from an Authorization header; "" when absent/malformed. */
@@ -247,17 +293,27 @@ async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unk
   const chunks: Buffer[] = [];
   let total = 0;
   await new Promise<void>((resolve, reject) => {
+    // Guard against a double settle: on overflow we reject AND destroy the request, which then emits
+    // 'error' — without the flag that 'error' handler would reject a second time. (The Promise
+    // executor ignores the duplicate today; the flag makes the contract explicit and refactor-safe.)
+    let settled = false;
+    const done = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      err ? reject(err) : resolve();
+    };
     req.on("data", (chunk: Buffer) => {
       total += chunk.length;
       if (total > maxBytes) {
-        reject(new Error("body too large"));
-        req.destroy();
+        // Reject and stop buffering, but do NOT destroy the socket — the caller still needs to write
+        // the 413 response. Late 'data'/'error' events after this are no-ops via the `settled` guard.
+        done(new Error("body too large"));
         return;
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve());
-    req.on("error", reject);
+    req.on("end", () => done());
+    req.on("error", done);
   });
   const text = Buffer.concat(chunks).toString("utf8");
   if (!text) return undefined;

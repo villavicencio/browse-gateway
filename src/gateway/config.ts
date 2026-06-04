@@ -29,6 +29,31 @@ function positiveIntOr(value: string | undefined, fallback: number): number {
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
+/**
+ * Validate that the global session pool is large enough to serve `consumerCount` consumers without
+ * starving a concurrent `retrieve`. Held drive sessions share the global pool, so the floor is
+ * `consumerCount * perConsumerMax` (every consumer at its drive cap) PLUS 1 transient retrieve slot.
+ * Returns an error message when `maxSessions` is below that floor, else null. Pure, so the shared
+ * HTTP launcher's fail-closed boot check is unit-testable without standing up a gateway.
+ *
+ * The `+1` is a deadlock-prevention floor, NOT headroom for concurrent retrieves across consumers —
+ * N simultaneous retrieves still need a larger cap (tuned vs host headroom in U7).
+ */
+export function poolSizingError(
+  consumerCount: number,
+  perConsumerMax: number,
+  maxSessions: number,
+): string | null {
+  const required = consumerCount * perConsumerMax + 1;
+  if (maxSessions < required) {
+    return (
+      `BGW_MAX_SESSIONS=${maxSessions} is too low for ${consumerCount} consumer(s): need >= ` +
+      `${required} (= ${consumerCount} × perConsumerMax ${perConsumerMax} + 1 retrieve headroom)`
+    );
+  }
+  return null;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const core: BrowserCoreOptions = {};
   if (env.BGW_CHANNEL !== undefined) core.channel = env.BGW_CHANNEL;
