@@ -116,7 +116,19 @@ try {
   check("consumer B navigates a real page over HTTP (ref tree)", !navB.isError && /\[ref=/.test(navB.content[0].text));
   check("both consumers hold a live session concurrently", handler.sessionCount() === 2);
 
-  // 2) cross-consumer isolation: A's session id + B's bearer -> 403.
+  // 2) per-consumer cap holds ACROSS MCP sessions: B opens a 2nd MCP session and tries a 2nd drive
+  //    while its first is held. The cap is keyed by consumer in SessionManager, so the 2nd session's
+  //    open is refused with the PER-CONSUMER limit (asserted explicitly, not the global cap). Run on
+  //    B before the off-allowlist check below, which discards A's session.
+  const b2 = await connect(port, "tok-b");
+  const navB2 = await b2.client.callTool({ name: "browser_navigate", arguments: { url: PAGE } });
+  check(
+    "a consumer's 2nd concurrent drive session is refused (per-consumer cap)",
+    navB2.isError === true && /per-consumer session limit/i.test(navB2.content[0].text),
+  );
+  await b2.client.close().catch(() => {});
+
+  // 3) cross-consumer isolation: A's session id + B's bearer -> 403.
   const sidA = a.transport.sessionId;
   const foreign = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
@@ -130,15 +142,10 @@ try {
   });
   check("a foreign token cannot drive another consumer's session (403)", foreign.status === 403);
 
-  // 3) off-allowlist navigate is blocked over HTTP (same policy as stdio).
+  // 4) off-allowlist navigate is blocked over HTTP (same policy as stdio). NOTE: on a pinned session
+  //    this fails the guard and discards A's session — so it runs AFTER the per-consumer cap check.
   const off = await a.client.callTool({ name: "browser_navigate", arguments: { url: OFF_ALLOWLIST } });
   check("an off-allowlist navigate is blocked over HTTP", off.isError === true);
-
-  // 4) per-consumer cap holds across MCP sessions: A opens a 2nd MCP session and tries a 2nd drive.
-  const a2 = await connect(port, "tok-a");
-  const navA2 = await a2.client.callTool({ name: "browser_navigate", arguments: { url: PAGE } });
-  check("a consumer's 2nd concurrent drive session is refused (per-consumer cap)", navA2.isError === true && /limit/i.test(navA2.content[0].text));
-  await a2.client.close().catch(() => {});
 
   // 5) disconnect-without-DELETE: B "crashes" (no close); force the idle reaper -> session reaped + browser freed.
   const beforeReap = gateway.sessions.activeCount;
