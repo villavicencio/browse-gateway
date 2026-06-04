@@ -8,12 +8,15 @@ import type { BrowserCoreOptions } from "../browser/index.js";
 export interface GatewayConfig {
   /** Max concurrent browser sessions. Kept low by default — headful Chrome is heavy. */
   maxSessions: number;
+  /** Max concurrent consumer-bound (drive) sessions a single consumer may hold. Default 1. */
+  perConsumerMax: number;
   /** Browser-core options applied to every session (channel, sandbox, headless). */
   core: BrowserCoreOptions;
 }
 
 export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   maxSessions: 2,
+  perConsumerMax: 1,
   core: {}, // browser-core defaults: headful, real Chrome channel
 };
 
@@ -26,6 +29,31 @@ function positiveIntOr(value: string | undefined, fallback: number): number {
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
+/**
+ * Validate that the global session pool is large enough to serve `consumerCount` consumers without
+ * starving a concurrent `retrieve`. Held drive sessions share the global pool, so the floor is
+ * `consumerCount * perConsumerMax` (every consumer at its drive cap) PLUS 1 transient retrieve slot.
+ * Returns an error message when `maxSessions` is below that floor, else null. Pure, so the shared
+ * HTTP launcher's fail-closed boot check is unit-testable without standing up a gateway.
+ *
+ * The `+1` is a deadlock-prevention floor, NOT headroom for concurrent retrieves across consumers —
+ * N simultaneous retrieves still need a larger cap (tuned vs host headroom in U7).
+ */
+export function poolSizingError(
+  consumerCount: number,
+  perConsumerMax: number,
+  maxSessions: number,
+): string | null {
+  const required = consumerCount * perConsumerMax + 1;
+  if (maxSessions < required) {
+    return (
+      `BGW_MAX_SESSIONS=${maxSessions} is too low for ${consumerCount} consumer(s): need >= ` +
+      `${required} (= ${consumerCount} × perConsumerMax ${perConsumerMax} + 1 retrieve headroom)`
+    );
+  }
+  return null;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const core: BrowserCoreOptions = {};
   if (env.BGW_CHANNEL !== undefined) core.channel = env.BGW_CHANNEL;
@@ -34,6 +62,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
 
   return {
     maxSessions: positiveIntOr(env.BGW_MAX_SESSIONS, DEFAULT_GATEWAY_CONFIG.maxSessions),
+    perConsumerMax: positiveIntOr(env.BGW_PER_CONSUMER_MAX, DEFAULT_GATEWAY_CONFIG.perConsumerMax),
     core,
   };
 }

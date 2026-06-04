@@ -1,0 +1,146 @@
+/**
+ * HTTP MCP entry (U7a) — the shared service the fleet launcher runs in place of the per-consumer
+ * stdio launcher (`main.ts`, kept for one release as the rollback). Stands up one gateway + policy
+ * with ALL consumers loaded from the manifest, and serves them over Streamable HTTP. stdout is not
+ * the protocol channel here (HTTP is), but all logging still goes to stderr for parity.
+ *
+ * Reachability is Tailnet-only by deployment: the listener binds `BGW_HTTP_BIND` (default loopback,
+ * fail-closed) and is reached over the Tailnet — NOT published to the public internet. CDP stays
+ * over a pipe (R13/R17); this port is the MCP surface, not CDP.
+ */
+import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+import { Gateway, loadConfig, poolSizingError } from "../gateway/index.js";
+import {
+  PolicyEngine,
+  ConsumerRegistry,
+  InMemoryAuditSink,
+  RedactingAuditSink,
+  parseConsumerManifest,
+  buildConsumerSpecs,
+} from "../policy/index.js";
+import type { Consumer } from "../policy/index.js";
+import { SecretStore, redactSecrets } from "../security/index.js";
+import { retrieve } from "../verbs/index.js";
+import { createGatewayMcpServer } from "./server.js";
+import { GatewayDriveController } from "./drive-controller.js";
+import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
+import type { ConsumerServer } from "./http-server.js";
+
+const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
+
+const AUDIT_MAX_RECORDS = 10_000;
+const DRIVE_IDLE_TTL_MS = 5 * 60_000; // browser-session idle reap (frees Chrome)
+const DRIVE_REAPER_INTERVAL_MS = 60_000;
+const MCP_SESSION_REAPER_INTERVAL_MS = 60_000;
+const SHUTDOWN_DRAIN_MS = 5_000; // bounded wait for in-flight tool calls before force-closing
+const DEFAULT_PORT = 8080;
+const DEFAULT_BIND = "127.0.0.1"; // fail-closed: deployment sets the Tailnet address explicitly
+
+function loadConsumers(env: NodeJS.ProcessEnv, secrets: SecretStore) {
+  const path = env.BGW_CONSUMERS_MANIFEST;
+  if (!path) throw new Error("BGW_CONSUMERS_MANIFEST is required (path to the consumer manifest JSON)");
+  const manifest = parseConsumerManifest(readFileSync(path, "utf8"));
+  const { specs, tokens } = buildConsumerSpecs(manifest, env);
+  secrets.addRedactable(tokens); // tokens never surface in logs/audit/errors (R9)
+  return specs;
+}
+
+function splitCsv(value: string | undefined): string[] {
+  return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+async function main(): Promise<void> {
+  const config = loadConfig();
+  const secrets = new SecretStore();
+  const specs = loadConsumers(process.env, secrets);
+  const registry = new ConsumerRegistry(specs);
+
+  // P0: with held drive sessions sharing the global pool, the cap must cover every consumer's
+  // per-consumer share PLUS headroom for a concurrent transient `retrieve`. Refuse to boot
+  // mis-sized rather than fail opaquely at the first retrieve under load (Skeptic C2).
+  const sizingError = poolSizingError(registry.size, config.perConsumerMax, config.maxSessions);
+  if (sizingError) throw new Error(sizingError);
+
+  const policy = new PolicyEngine({
+    registry,
+    audit: new RedactingAuditSink(new InMemoryAuditSink(AUDIT_MAX_RECORDS), secrets),
+  });
+  const gateway = Gateway.create(config, undefined, policy);
+  const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
+  gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
+
+  // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without Host-based
+  // DNS-rebinding protection. The listener is reachable over the Tailnet and MCP clients send no
+  // Origin, so Host validation is the load-bearing guard; BGW_ALLOWED_ORIGINS is additive only.
+  const allowedHosts = splitCsv(process.env.BGW_ALLOWED_HOSTS);
+  const allowedOrigins = splitCsv(process.env.BGW_ALLOWED_ORIGINS);
+  const rebindError = dnsRebindBootError(allowedHosts);
+  if (rebindError) throw new Error(rebindError);
+
+  const handler = createHttpHandler({
+    authenticate: (token: string) => policy.authenticate(token),
+    buildServer: (consumer: Consumer): ConsumerServer => {
+      // One consumer-bound graph per connection: a fresh stateful drive controller + a retrieve
+      // closure pinned to this consumer's token. The session pool / per-consumer cap / reaper stay
+      // GLOBAL on the gateway (do not reintroduce the e431101 per-consumer-cap race).
+      const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp });
+      const server = createGatewayMcpServer({
+        version: "0.1.0",
+        drive,
+        retrieve: async ({ url }) => {
+          try {
+            return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp } });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            throw new Error(redactSecrets(message, secrets)); // never leak BYO secret material (R9)
+          }
+        },
+      });
+      return { server, dispose: () => drive.close() };
+    },
+    allowedHosts,
+    allowedOrigins,
+    log,
+  });
+  handler.startReaper(MCP_SESSION_REAPER_INTERVAL_MS);
+
+  const httpServer = createServer((req, res) => {
+    handler.handle(req, res).catch((err) => {
+      log(`handler error: ${err instanceof Error ? err.message : String(err)}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: "internal error" }, id: null }));
+      }
+    });
+  });
+
+  let shuttingDown = false;
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    httpServer.close(); // refuse new connections
+    await handler.drain(SHUTDOWN_DRAIN_MS); // let in-flight tool calls settle before force-closing
+    await handler.closeAll().catch(() => {}); // close transports + dispose drive controllers
+    httpServer.closeAllConnections?.(); // drop any lingering sockets (e.g. idle SSE) so close() completes
+    await gateway.shutdown().catch(() => {});
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  const port = Number(process.env.BGW_HTTP_PORT) || DEFAULT_PORT;
+  const bind = process.env.BGW_HTTP_BIND || DEFAULT_BIND;
+  httpServer.listen(port, bind, () => {
+    log(
+      `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
+        `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
+        `dnsRebindProtection=${allowedHosts.length > 0 || allowedOrigins.length > 0}`,
+    );
+  });
+}
+
+main().catch((err) => {
+  log(`fatal: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});

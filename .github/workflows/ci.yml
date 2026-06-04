@@ -1,0 +1,32 @@
+# CI — typecheck + unit suite. Runs on every PR and on pushes to main.
+#
+# Scope is the unit suite (`npm test` = tsc build + node --test). It needs no browser: the HTTP
+# tests run over loopback with fakes, and the policy/verb tests use injected cores. The in-container
+# stealth/drive/http kill-gates need real Chrome under Xvfb (amd64) and are intentionally NOT in CI —
+# they run against the Docker image at cutover time. No secrets are referenced.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22 # matches the Dockerfile (node:22-bookworm-slim)
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test

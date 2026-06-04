@@ -194,7 +194,7 @@ test("withConsumerSession: unknown consumer rejected before any session opens", 
     audit,
   });
   const { factory, cores } = makeFactory();
-  const gw = Gateway.create({ maxSessions: 2, core: {} }, factory, policy);
+  const gw = Gateway.create({ maxSessions: 2, perConsumerMax: 1, core: {} }, factory, policy);
   await assert.rejects(
     gw.withConsumerSession("bad", async () => {}),
     (e) => e instanceof PolicyError && e.code === "UNAUTHENTICATED",
@@ -210,7 +210,7 @@ test("withConsumerSession: installs the consumer guard and attributes the audit"
     audit,
   });
   const { factory, cores } = makeFactory();
-  const gw = Gateway.create({ maxSessions: 2, core: {} }, factory, policy);
+  const gw = Gateway.create({ maxSessions: 2, perConsumerMax: 1, core: {} }, factory, policy);
 
   const result = await gw.withConsumerSession("tok", async (session, consumer) => {
     assert.equal(consumer.id, "agent-1");
