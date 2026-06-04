@@ -48,6 +48,18 @@ export class SecretStore {
     this.#values = next;
   }
 
+  /**
+   * Register additional secret-grade values for redaction WITHOUT widening the typed key enum.
+   * Consumer bearer tokens (loaded from the manifest at startup, R18) are not BYO proxy/CAPTCHA
+   * keys, but they are credentials: this folds them into the same ever-loaded redaction set so a
+   * token can never surface in a log, audit record, or consumer-facing error (R9). Idempotent;
+   * values are never forgotten (rotation-safe, like {@link reload}). Keep the set bounded — register
+   * only durable consumer tokens, not ephemeral per-request values.
+   */
+  addRedactable(values: Iterable<string>): void {
+    for (const v of values) if (v) this.#redactable.add(v);
+  }
+
   get(key: SecretKey): string | undefined {
     return this.#values.get(key);
   }

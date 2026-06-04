@@ -52,13 +52,40 @@ export class GatewayDriveController implements DriveController {
     return proxyOverrideFor(this.#secrets, this.#onDatacenterIp);
   }
 
+  /**
+   * Serialize public verb calls on this stateful controller. One MCP session maps to one
+   * controller, and the transport can dispatch tool calls concurrently — two interleaved
+   * navigates would both pass the `!#pinned` check and both call `#openSession`, landing two
+   * browser sessions where one's handle is then lost (leak + per-consumer-cap drift). A promise
+   * chain runs verbs one at a time. Internal helpers (`#run`, `#firstNavigate`, `#ensureOpen`,
+   * `#openHealthyAndNavigate`, `#discardSession`) run INSIDE an already-held turn and must never
+   * re-acquire — the chain is not re-entrant.
+   */
+  #lock: Promise<unknown> = Promise.resolve();
+  #serialize<T>(fn: () => Promise<T>): Promise<T> {
+    // Run after the previous turn settles regardless of outcome; keep the chain pointer on a
+    // never-rejecting tail so one verb's failure can't wedge the queue.
+    const run = this.#lock.then(fn, fn);
+    this.#lock = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
   async open(): Promise<void> {
-    // Open a direct session lazily; escalation to a proxied exit (if needed) happens on the first
-    // navigate — the only point we know whether the target blocks the direct IP.
-    if (!this.#handle) await this.#openSession(undefined);
+    return this.#serialize(async () => {
+      // Open a direct session lazily; escalation to a proxied exit (if needed) happens on the first
+      // navigate — the only point we know whether the target blocks the direct IP.
+      if (!this.#handle) await this.#openSession(undefined);
+    });
   }
 
   async navigate(url: string): Promise<PageSnapshot> {
+    return this.#serialize(() => this.#navigate(url));
+  }
+
+  async #navigate(url: string): Promise<PageSnapshot> {
     // Scheme allowlist (R14-adjacent): only http(s), rejected before any session/navigation —
     // mirrors retrieve(), so a non-http target can't slip past the host-based guard.
     if (!isHttpUrl(url)) {
@@ -114,40 +141,42 @@ export class GatewayDriveController implements DriveController {
   }
 
   async snapshot(): Promise<PageSnapshot> {
-    return this.#run((s) => s.core.snapshot());
+    return this.#serialize(() => this.#run((s) => s.core.snapshot()));
   }
 
   async click(target: DriveTarget): Promise<PageSnapshot> {
-    return this.#actAndSnap((s) => s.core.click(target));
+    return this.#serialize(() => this.#actAndSnap((s) => s.core.click(target)));
   }
 
   async type(target: DriveTarget, text: string, submit?: boolean): Promise<PageSnapshot> {
-    return this.#actAndSnap((s) => s.core.type(target, text, { submit }));
+    return this.#serialize(() => this.#actAndSnap((s) => s.core.type(target, text, { submit })));
   }
 
   async selectOption(target: DriveTarget, values: string[]): Promise<PageSnapshot> {
-    return this.#actAndSnap((s) => s.core.selectOption(target, values));
+    return this.#serialize(() => this.#actAndSnap((s) => s.core.selectOption(target, values)));
   }
 
   async pressKey(key: string): Promise<PageSnapshot> {
-    return this.#actAndSnap((s) => s.core.pressKey(key));
+    return this.#serialize(() => this.#actAndSnap((s) => s.core.pressKey(key)));
   }
 
   async waitFor(condition: WaitCondition): Promise<PageSnapshot> {
-    return this.#actAndSnap((s) => s.core.waitFor(condition));
+    return this.#serialize(() => this.#actAndSnap((s) => s.core.waitFor(condition)));
   }
 
   async screenshot(): Promise<string> {
-    return this.#run((s) => s.core.screenshot());
+    return this.#serialize(() => this.#run((s) => s.core.screenshot()));
   }
 
   async close(): Promise<void> {
-    this.#pinned = false;
-    this.#proxiedSession = false;
-    const handle = this.#handle;
-    if (!handle) return;
-    this.#handle = undefined;
-    await this.#gateway.closeConsumerSession(this.#token, handle).catch(() => {});
+    return this.#serialize(async () => {
+      this.#pinned = false;
+      this.#proxiedSession = false;
+      const handle = this.#handle;
+      if (!handle) return;
+      this.#handle = undefined;
+      await this.#gateway.closeConsumerSession(this.#token, handle).catch(() => {});
+    });
   }
 
   /** Reopen the pinned session if an idle reap closed it, with the mode it committed to (direct or

@@ -38,6 +38,7 @@ export class Gateway {
   ): Gateway {
     const sessions = new SessionManager({
       maxSessions: config.maxSessions,
+      perConsumerMax: config.perConsumerMax,
       coreOptions: config.core,
       coreFactory,
     });
@@ -155,7 +156,7 @@ export class Gateway {
   }
 }
 
-export { loadConfig, DEFAULT_GATEWAY_CONFIG } from "./config.js";
+export { loadConfig, DEFAULT_GATEWAY_CONFIG, poolSizingError } from "./config.js";
 export type { GatewayConfig } from "./config.js";
 export { SessionManager, SessionManagerError } from "./session-manager.js";
 export type {

@@ -23,9 +23,13 @@ services:
       - ALL # Chrome runs --no-sandbox, so no Linux capabilities are needed
     security_opt:
       - no-new-privileges:true
-    # No `ports:` mapping — the browser CDP and the gateway are never published. Chromium is
-    # driven over a pipe (no TCP debugging port), so CDP stays local (R13/R17); reachability
-    # is Tailscale-only in deployment.
+    # No `ports:` mapping — and deliberately so even for the U7a shared HTTP MCP surface. The
+    # browser CDP is driven over a pipe (no TCP debugging port), so CDP stays local (R13/R17). The
+    # HTTP launcher (`dist/mcp/http-main.js`) DOES open a listener, but a Docker `ports:` publish
+    # binds ALL host interfaces — "Tailscale-only" is an overlay, not a Docker filter — so reaching
+    # the MCP surface over the Tailnet is done by binding the listener to the Tailnet interface
+    # (`BGW_HTTP_BIND`, default loopback / fail-closed) and routing via the Tailscale sidecar, NOT by
+    # publishing a port. DNS-rebind protection (`BGW_ALLOWED_HOSTS`) guards the Host header on top.
     #
     # Egress filtering (R19) has two layers: the browser-layer host filter
     # (src/security/egress.ts) blocks metadata/private destinations on every request, and the
@@ -35,11 +39,27 @@ services:
     environment:
       BGW_CHANNEL: chrome
       BGW_NO_SANDBOX: "1"
+      # U7a: with the shared HTTP service, held drive sessions share this global pool, so the cap
+      # MUST be >= (consumers × BGW_PER_CONSUMER_MAX) + 1 retrieve headroom or http-main refuses to
+      # boot. Raise from this placeholder for the real consumer count; tuned vs host headroom in U7.
       BGW_MAX_SESSIONS: "2"
-      # BYO proxy/CAPTCHA secrets are injected at runtime from a store readable only by this
-      # process (never baked into the image or committed). U5 consumes them.
+      # BGW_PER_CONSUMER_MAX: "1"   # max concurrent drive sessions a single consumer may hold
+      # --- Shared HTTP MCP surface (U7a, dist/mcp/http-main.js) ---
+      # BGW_HTTP_BIND: "<tailnet-ip>"      # bind the listener Tailnet-only; default 127.0.0.1 (fail-closed)
+      # BGW_HTTP_PORT: "8080"
+      # BGW_ALLOWED_HOSTS: "<host:port>"   # REQUIRED for http-main — Host-header DNS-rebind allowlist;
+      #                                    # the launcher refuses to boot without it (MCP clients send no
+      #                                    # Origin, so Host validation is the load-bearing guard).
+      # BGW_ALLOWED_ORIGINS: "<origin>"    # ADDITIONAL only (browser-origin defense) — never a substitute
+      # BGW_CONSUMERS_MANIFEST: "/run/consumers.json"  # non-secret {id, allow}[] manifest path
+      # BGW_ON_DATACENTER_IP: "1"
+      # BYO proxy/CAPTCHA + per-consumer bearer tokens are injected at runtime from a store readable
+      # only by this process (never baked into the image or committed). Tokens enter the redaction
+      # set so they never reach logs/audit/errors (R9).
       # BGW_PROXY_URL / BGW_PROXY_USERNAME / BGW_PROXY_PASSWORD / BGW_CAPTCHA_API_KEY
-    # Session-lifecycle bootstrap (U2). The image's ENTRYPOINT provisions Xvfb first, then
-    # exec's this. The U1 kill-gate (validate-stealth.mjs, the image default) and the U6 MCP
-    # launcher run other commands against the same image.
+      # BGW_CONSUMER_TOKEN_<ID>  (one per manifest entry, e.g. BGW_CONSUMER_TOKEN_ATLAS)
+    # Session-lifecycle bootstrap (U2). The image's ENTRYPOINT provisions Xvfb first, then exec's
+    # this. The U1 kill-gate (validate-stealth.mjs, the image default), the U6 stdio MCP launcher
+    # (dist/mcp/main.js), and the U7a shared HTTP launcher (dist/mcp/http-main.js) run other
+    # commands against the same image.
     command: ["node", "dist/gateway/main.js"]
