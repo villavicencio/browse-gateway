@@ -32,6 +32,24 @@ export interface ConsumerServer {
   dispose: () => Promise<void>;
 }
 
+/**
+ * The shared HTTP launcher's fail-closed DNS-rebinding boot check. `BGW_ALLOWED_HOSTS` is MANDATORY:
+ * MCP clients are non-browser, so they send no `Origin` header, and the SDK only validates the `Host`
+ * header when `allowedHosts` is non-empty. `allowedOrigins` is therefore ADDITIVE (browser-origin
+ * defense), never a substitute — an origins-only config would leave `Host` unvalidated. By not even
+ * accepting origins here, it is structurally impossible for them to satisfy the guard. Returns an
+ * error message when `allowedHosts` is empty, else null. Pure, so the launcher's guard is testable.
+ */
+export function dnsRebindBootError(allowedHosts: string[]): string | null {
+  if (allowedHosts.length === 0) {
+    return (
+      "BGW_ALLOWED_HOSTS is required (the host:port the service is reached at over the Tailnet): MCP " +
+      "clients send no Origin, so Host validation is the DNS-rebinding guard. Refusing to boot."
+    );
+  }
+  return null;
+}
+
 export interface HttpHandlerDeps {
   /** Resolve a bearer token to a consumer; MUST throw on an unknown/empty credential. */
   authenticate: (token: string) => Consumer;

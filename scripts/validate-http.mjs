@@ -16,7 +16,10 @@
  *
  * This is the kill-gate that must PASS before Atlas is cut over from stdio to HTTP (P6).
  */
-process.env.BGW_MAX_SESSIONS ??= "3"; // 2 consumers × perConsumerMax 1 + 1 retrieve headroom (P0)
+// This gate's fixed 2-consumer scenario needs >= 3 pool slots (2 × perConsumerMax 1 + 1 retrieve
+// headroom). FORCE it (>= 3) regardless of an inherited BGW_MAX_SESSIONS — e.g. compose's placeholder
+// 2 — so the gate proves the PER-CONSUMER cap rather than tripping the GLOBAL cap first and false-FAILing.
+process.env.BGW_MAX_SESSIONS = String(Math.max(3, Number(process.env.BGW_MAX_SESSIONS) || 0));
 
 import { createServer } from "node:http";
 import { Gateway, loadConfig } from "../dist/gateway/index.js";

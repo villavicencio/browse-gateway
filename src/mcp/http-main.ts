@@ -24,7 +24,7 @@ import { SecretStore, redactSecrets } from "../security/index.js";
 import { retrieve } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
-import { createHttpHandler } from "./http-server.js";
+import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
@@ -70,17 +70,13 @@ async function main(): Promise<void> {
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
-  // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without DNS-rebinding
-  // protection configured. The listener can be reached over the Tailnet, so an unguarded Host header
-  // is a rebinding vector — never start the launcher with protection OFF.
+  // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without Host-based
+  // DNS-rebinding protection. The listener is reachable over the Tailnet and MCP clients send no
+  // Origin, so Host validation is the load-bearing guard; BGW_ALLOWED_ORIGINS is additive only.
   const allowedHosts = splitCsv(process.env.BGW_ALLOWED_HOSTS);
   const allowedOrigins = splitCsv(process.env.BGW_ALLOWED_ORIGINS);
-  if (allowedHosts.length === 0 && allowedOrigins.length === 0) {
-    throw new Error(
-      "DNS-rebinding protection is required: set BGW_ALLOWED_HOSTS (the host:port the service is " +
-        "reached at over the Tailnet) and/or BGW_ALLOWED_ORIGINS. Refusing to boot with protection OFF.",
-    );
-  }
+  const rebindError = dnsRebindBootError(allowedHosts);
+  if (rebindError) throw new Error(rebindError);
 
   const handler = createHttpHandler({
     authenticate: (token: string) => policy.authenticate(token),

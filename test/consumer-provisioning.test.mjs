@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { tokenEnvKey, parseConsumerManifest, buildConsumerSpecs } from "../dist/policy/index.js";
 import { SecretStore, redactSecrets } from "../dist/security/index.js";
 import { poolSizingError } from "../dist/gateway/index.js";
+import { dnsRebindBootError } from "../dist/mcp/index.js";
 
 test("tokenEnvKey normalizes ids to a BGW_CONSUMER_TOKEN_<ID> env key", () => {
   assert.equal(tokenEnvKey("atlas"), "BGW_CONSUMER_TOKEN_ATLAS");
@@ -67,6 +68,15 @@ test("poolSizingError refuses an under-sized pool (boot guard), passes a sized o
   // perConsumerMax scales the floor.
   assert.match(poolSizingError(3, 2, 5), /need >= 7/);
   assert.equal(poolSizingError(3, 2, 7), null);
+});
+
+test("dnsRebindBootError requires allowedHosts — origins cannot satisfy it (fail-closed)", () => {
+  // The launcher's fail-closed guard: BGW_ALLOWED_HOSTS is mandatory because MCP clients send no
+  // Origin and the SDK only validates Host when allowedHosts is non-empty. The helper doesn't even
+  // accept origins, so it is structurally impossible for an origins-only config to pass.
+  assert.match(dnsRebindBootError([]), /BGW_ALLOWED_HOSTS is required/);
+  assert.equal(dnsRebindBootError(["127.0.0.1:8080"]), null);
+  assert.equal(dnsRebindBootError(["gw.tailnet:8080", "localhost:8080"]), null);
 });
 
 test("SecretStore.addRedactable folds consumer tokens into redaction (R9) and survives rotation", () => {
