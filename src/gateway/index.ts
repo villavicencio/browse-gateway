@@ -38,6 +38,7 @@ export class Gateway {
   ): Gateway {
     const sessions = new SessionManager({
       maxSessions: config.maxSessions,
+      perConsumerMax: config.perConsumerMax,
       coreOptions: config.core,
       coreFactory,
     });

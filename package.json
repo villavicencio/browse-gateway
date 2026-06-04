@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "validate:stealth": "npm run build && node scripts/validate-stealth.mjs",
+    "validate:http": "npm run build && node scripts/validate-http.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {

@@ -129,5 +129,7 @@ export class PolicyEngine {
 export { Allowlist, normalizeHost } from "./allowlist.js";
 export { ConsumerRegistry } from "./consumer.js";
 export type { Consumer, ConsumerSpec } from "./consumer.js";
+export { tokenEnvKey, parseConsumerManifest, buildConsumerSpecs } from "./consumer-config.js";
+export type { ConsumerManifestEntry, BuiltConsumers } from "./consumer-config.js";
 export { InMemoryAuditSink, consoleAuditSink, RedactingAuditSink } from "./audit.js";
 export type { AuditRecord, AuditSink, AuditDecision } from "./audit.js";

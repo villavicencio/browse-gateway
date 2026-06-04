@@ -206,3 +206,20 @@ test("controller: a pinned proxied session that fails mid-flow discards, so the 
   assert.equal(recovered.status, 200, "re-escalated to a fresh healthy exit");
   assert.equal(opened.length, 4, "a fresh direct attempt + a fresh proxied exit on recovery");
 });
+
+test("controller: concurrent navigate calls are serialized — no double-open (mutex, H3)", async () => {
+  // Session 0 is a healthy direct exit that pins. Two navigates fired with no await between them
+  // both reach the `!#pinned` / `!#handle` checks across the openConsumerSession await WITHOUT the
+  // mutex, opening two sessions and leaking one handle. The promise-chain mutex serializes them:
+  // the first opens+pins, the second runs on the pinned session — exactly one open.
+  const { gateway, opened, open } = makeProxyGateway([[{ status: 200, tree: REAL }]]);
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  const [a, b] = await Promise.all([
+    c.navigate("https://example.com/a"),
+    c.navigate("https://example.com/b"),
+  ]);
+  assert.equal(opened.length, 1, "exactly one session opened despite concurrent navigates");
+  assert.equal(open.size, 1, "no leaked session");
+  assert.equal(a.status, 200);
+  assert.equal(b.status, 200);
+});

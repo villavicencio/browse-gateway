@@ -8,12 +8,15 @@ import type { BrowserCoreOptions } from "../browser/index.js";
 export interface GatewayConfig {
   /** Max concurrent browser sessions. Kept low by default — headful Chrome is heavy. */
   maxSessions: number;
+  /** Max concurrent consumer-bound (drive) sessions a single consumer may hold. Default 1. */
+  perConsumerMax: number;
   /** Browser-core options applied to every session (channel, sandbox, headless). */
   core: BrowserCoreOptions;
 }
 
 export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   maxSessions: 2,
+  perConsumerMax: 1,
   core: {}, // browser-core defaults: headful, real Chrome channel
 };
 
@@ -34,6 +37,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
 
   return {
     maxSessions: positiveIntOr(env.BGW_MAX_SESSIONS, DEFAULT_GATEWAY_CONFIG.maxSessions),
+    perConsumerMax: positiveIntOr(env.BGW_PER_CONSUMER_MAX, DEFAULT_GATEWAY_CONFIG.perConsumerMax),
     core,
   };
 }
