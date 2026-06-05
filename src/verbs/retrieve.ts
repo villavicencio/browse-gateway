@@ -13,7 +13,7 @@ import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
-import { shouldEscalateToProxy } from "./escalation.js";
+import { shouldEscalateToProxy, isCloudflareBlock } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
 import { detectCaptcha } from "./captcha.js";
 import type { CaptchaSolver } from "./captcha.js";
@@ -40,6 +40,15 @@ export interface RetrieveOptions {
   clearanceTimeoutMs?: number;
 }
 
+/**
+ * Why the final render counts as blocked — a diagnostic surfaced to the caller so a failure says
+ * WHY instead of a silent "blocked": `nav-failed` (no response — off-allowlist/unreachable),
+ * `captcha` (an interactive CAPTCHA widget — needs a solver, not wired in v1), `cf-challenge`
+ * (a Cloudflare managed challenge), `hard-block` (4xx/5xx + thin body — IP/WAF reputation),
+ * `blocked` (some other visible block phrase). `null` when not blocked.
+ */
+export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "hard-block" | "blocked";
+
 export interface RetrieveResult {
   url: string;
   status: number | null;
@@ -49,6 +58,8 @@ export interface RetrieveResult {
   degraded: boolean;
   /** The final rendered page still looked blocked/challenged. */
   blocked: boolean;
+  /** Why it was blocked (diagnostic); `null` when not blocked. See {@link BlockReason}. */
+  reason: BlockReason | null;
   /** The residential proxy was engaged (scoped escalation fired). */
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the solver. */
@@ -128,18 +139,35 @@ export async function retrieve(
   }
 
   const extraction = extractMarkdown(render.html, url);
+  // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, or a hard
+  // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy
+  // retry where every exit was dead, is reported as blocked instead of returning the error/empty
+  // body as content (F1 finding #2). A thin *200* is still NOT blocked, so a legitimately short
+  // page isn't flagged.
+  const blocked = render.status === null || isVisiblyBlocked(render) || isHardBlock(render, render.status);
+  // Diagnostic reason for the block, most-actionable-first: nav-failed (off-allowlist/unreachable),
+  // then captcha (an interactive widget — needs a solver, the v1 gap), then cf-challenge, then a
+  // bare hard-block, else a generic visible block. Surfaced so a caller (and the agent) sees WHY a
+  // page failed rather than a silent "blocked". `null` when the page is not blocked.
+  const reason: BlockReason | null = !blocked
+    ? null
+    : render.status === null
+      ? "nav-failed"
+      : detectCaptcha(render, url)
+        ? "captcha"
+        : isCloudflareBlock(render)
+          ? "cf-challenge"
+          : isHardBlock(render, render.status)
+            ? "hard-block"
+            : "blocked";
   return {
     url,
     status: render.status,
     title: extraction.title || render.title,
     markdown: extraction.markdown,
     degraded: extraction.degraded,
-    // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, or a hard
-    // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy
-    // retry where every exit was dead, is reported as blocked instead of returning the error/empty
-    // body as content (F1 finding #2). A thin *200* is still NOT blocked, so a legitimately short
-    // page isn't flagged.
-    blocked: render.status === null || isVisiblyBlocked(render) || isHardBlock(render, render.status),
+    blocked,
+    reason,
     proxyUsed,
     captchaSolved,
   };
