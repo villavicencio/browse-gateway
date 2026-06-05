@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
+import type { BlockReason } from "../verbs/index.js";
 
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
@@ -15,8 +16,12 @@ export interface RetrieveOutcome {
   title: string;
   status: number | null;
   blocked: boolean;
+  /** Why it was blocked (diagnostic); `null` when not blocked. */
+  reason: BlockReason | null;
   degraded: boolean;
   proxyUsed: boolean;
+  /** A CAPTCHA was detected and handed to the (v1: no-op) solver. */
+  captchaSolved: boolean;
 }
 
 export type RetrieveFn = (input: { url: string }) => Promise<RetrieveOutcome>;
@@ -81,12 +86,17 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
         // is unaffected.
         const navFailed = result.status === null && result.markdown.length < MIN_CONTENT_LENGTH;
         if (result.blocked || !result.markdown || navFailed) {
+          // Surface WHY, plus whether escalation engaged, so a failure is diagnosable instead of a
+          // silent "blocked". `captcha` is the actionable one — it means an interactive challenge
+          // with no solver wired (v1), which no proxy can clear.
+          const why = result.reason ?? "empty-content";
+          const hint = result.reason === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
           return {
             isError: true,
             content: [
               {
                 type: "text",
-                text: `Could not retrieve readable content for ${url} (blocked=${result.blocked}, status=${result.status ?? "n/a"}).`,
+                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}`,
               },
             ],
           };

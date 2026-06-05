@@ -120,6 +120,7 @@ test("retrieve: AE1 happy path returns readable markdown, no proxy, not blocked"
   assert.match(r.markdown, /Headline/);
   assert.equal(r.degraded, false);
   assert.equal(r.blocked, false);
+  assert.equal(r.reason, null, "not blocked -> no reason");
   assert.equal(r.proxyUsed, false);
   assert.equal(calls.length, 1);
 });
@@ -153,6 +154,7 @@ test("retrieve: a bare 403 with thin body is reported as blocked, not returned a
   const { gateway, calls } = makeFakeGateway([renderOf({ status: 403, text: "Forbidden", html: "Forbidden" })]);
   const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://hard.example/" });
   assert.equal(r.blocked, true, "a 4xx + thin body is a hard block");
+  assert.equal(r.reason, "hard-block");
   assert.equal(r.proxyUsed, false, "no proxy configured");
   assert.equal(calls.length, 1);
 });
@@ -181,6 +183,7 @@ test("retrieve: a hard 403 the proxy still cannot clear stays blocked (exhausts 
   assert.equal(r.proxyUsed, true);
   assert.equal(calls.length, 4, "direct + 3 fresh-exit retries, all still blocked");
   assert.equal(r.blocked, true, "still blocked after escalation -> reported, not returned as content");
+  assert.equal(r.reason, "hard-block", "exhausted proxy on a reputation 403 -> hard-block");
 });
 
 test("retrieve: a dead proxy exit (failed nav) is retried on a fresh session, then clears", async () => {
@@ -209,6 +212,7 @@ test("retrieve: when every proxy exit fails (null status), the result is reporte
   assert.equal(r.proxyUsed, true);
   assert.equal(calls.length, 4, "direct + 3 dead-exit attempts");
   assert.equal(r.blocked, true, "a failed nav (null status) reports blocked, not empty success");
+  assert.equal(r.reason, "nav-failed", "every exit dead (null status) -> nav-failed");
 });
 
 test("retrieve: rejects non-http(s) URLs before any session opens (file:// local-read)", async () => {
@@ -229,6 +233,7 @@ test("retrieve: a short-but-valid page is not reported as blocked (false-block r
   const { gateway } = makeFakeGateway([renderOf({ status: 200, text: "A short but legitimate page body.", html: shortHtml })]);
   const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://small.example/" });
   assert.equal(r.blocked, false, "thin content must not be reported as a block");
+  assert.equal(r.reason, null, "a legit short page has no block reason");
   assert.ok(r.markdown.length > 0, "content returned");
 });
 
@@ -241,4 +246,22 @@ test("retrieve: a detected CAPTCHA is handed to the solver (no dead-end)", async
   assert.equal(r.captchaSolved, true);
   assert.equal(solvedWith?.kind, "recaptcha");
   assert.equal(solvedWith?.siteKey, "sk-1");
+});
+
+test("retrieve: a CF managed challenge with no proxy is reported blocked with reason=cf-challenge", async () => {
+  const { gateway } = makeFakeGateway([renderOf(cfBlockSignal)]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://hard.example/" });
+  assert.equal(r.blocked, true);
+  assert.equal(r.reason, "cf-challenge");
+  assert.equal(r.proxyUsed, false, "no proxy configured to escalate to");
+});
+
+test("retrieve: an interactive CAPTCHA block is reported with reason=captcha (most-actionable)", async () => {
+  // 403 + thin + a Turnstile widget: hard-block AND captcha both apply; captcha wins (it's the
+  // actionable signal — needs a solver, which no proxy substitutes for).
+  const turnstile = renderOf({ status: 403, title: "Verify", text: "Please verify you are a human", html: '<div class="cf-turnstile" data-sitekey="0x4"></div>' });
+  const { gateway } = makeFakeGateway([turnstile]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://captcha.example/" });
+  assert.equal(r.blocked, true);
+  assert.equal(r.reason, "captcha");
 });

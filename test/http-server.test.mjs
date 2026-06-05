@@ -13,7 +13,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { createHttpHandler, createGatewayMcpServer } from "../dist/mcp/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 
-const outcome = (over = {}) => ({ markdown: "# T\n\nbody", title: "T", status: 200, blocked: false, degraded: false, proxyUsed: false, ...over });
+const outcome = (over = {}) => ({ markdown: "# T\n\nbody", title: "T", status: 200, blocked: false, reason: null, degraded: false, proxyUsed: false, captchaSolved: false, ...over });
 
 function makeDeps(over = {}) {
   const registry = new ConsumerRegistry([
