@@ -4,7 +4,7 @@
  * (`dist/mcp/main.js`) as a subprocess and drives it with an MCP client over stdio —
  * the same protocol a consumer agent uses. Confirms, through the full stack with a real
  * headful browser:
- *   1. the `retrieve` tool is exposed
+ *   1. the `retrieve` tool + the 10 `browser_*` drive tools are exposed (main.js wires the drive controller)
  *   2. an allowlisted hard (Cloudflare) target round-trips to readable markdown
  *   3. an off-allowlist host does not leak real content (allowlist holds end-to-end)
  *   4. a non-http(s) scheme (file://) is refused (the scheme gate)
@@ -45,7 +45,11 @@ try {
   await client.connect(transport);
 
   const { tools } = await client.listTools();
-  check("retrieve tool exposed", tools.length === 1 && tools[0]?.name === "retrieve", tools.map((t) => t.name).join(","));
+  // main.js injects the GatewayDriveController, so the live surface is `retrieve` + the 10 `browser_*`
+  // drive verbs (since the U3 drive verb set, PR #2). Assert both, not `length === 1` (that drifted red).
+  const names = tools.map((t) => t.name);
+  const driveCount = names.filter((n) => n.startsWith("browser_")).length;
+  check("retrieve + browser_* drive tools exposed", names.includes("retrieve") && driveCount === 10, names.join(","));
 
   // 1) allowlisted hard (CF) target -> readable markdown
   const ok = await client.callTool({ name: "retrieve", arguments: { url: TARGET } }, undefined, { timeout: CALL_TIMEOUT_MS });
