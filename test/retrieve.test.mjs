@@ -265,3 +265,13 @@ test("retrieve: an interactive CAPTCHA block is reported with reason=captcha (mo
   assert.equal(r.blocked, true);
   assert.equal(r.reason, "captcha");
 });
+
+test("retrieve: a generic visible block (200, non-CF, non-captcha) reports reason=blocked (fallback arm)", async () => {
+  // status 200 (so not hard-block), a non-CF block phrase, no captcha widget, no CF HTML hint:
+  // exercises the final 'blocked' arm of the reason cascade — every other arm has its own test.
+  const denied = renderOf({ status: 200, title: "Denied", text: "Access denied. You have been blocked.", html: "<html><body>Access denied</body></html>" });
+  const { gateway } = makeFakeGateway([denied]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://waf.example/" });
+  assert.equal(r.blocked, true, "a visible block phrase is blocked even at status 200");
+  assert.equal(r.reason, "blocked", "not CF/captcha/hard-block -> generic blocked");
+});

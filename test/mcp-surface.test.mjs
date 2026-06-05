@@ -73,6 +73,15 @@ test("failed navigation (null status + thin content) surfaces a clean error, not
   assert.match(res.content[0].text, /Could not retrieve/i);
 });
 
+test("empty extraction (real status, no markdown, not blocked) names reason=empty-content", async () => {
+  // The page rendered with a real status but Readability produced nothing — not a block, but still
+  // an error. Exercises server.ts's `why = result.reason ?? "empty-content"` fallback.
+  const client = await connect(async () => outcome({ status: 200, markdown: "", blocked: false, reason: null }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://empty.example/" } });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /reason=empty-content/);
+});
+
 test("short-but-valid page (real status, thin content) is returned, not errored", async () => {
   const client = await connect(async () => outcome({ status: 200, markdown: "A short but legitimate page.", blocked: false }));
   const res = await client.callTool({ name: "retrieve", arguments: { url: "https://small.example/" } });
