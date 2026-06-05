@@ -3,7 +3,7 @@
  * low-level `drive()` escape hatch are v1.1.
  */
 export { retrieve, proxyFromSecrets } from "./retrieve.js";
-export type { RetrieveOptions, RetrieveResult } from "./retrieve.js";
+export type { RetrieveOptions, RetrieveResult, BlockReason } from "./retrieve.js";
 export { extractMarkdown } from "./extract.js";
 export type { Extraction } from "./extract.js";
 export { isCloudflareBlock, shouldEscalateToProxy } from "./escalation.js";

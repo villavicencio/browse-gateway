@@ -14,8 +14,10 @@ const outcome = (over = {}) => ({
   title: "Title",
   status: 200,
   blocked: false,
+  reason: null,
   degraded: false,
   proxyUsed: false,
+  captchaSolved: false,
   ...over,
 });
 
@@ -43,11 +45,24 @@ test("retrieve round-trips markdown content", async () => {
   assert.equal(res.content[0].text, "content for https://example.com/");
 });
 
-test("blocked page surfaces a clean tool error (not empty content)", async () => {
-  const client = await connect(async () => outcome({ blocked: true, markdown: "" }));
+test("blocked page surfaces a clean tool error with reason + escalation diagnostics", async () => {
+  const client = await connect(async () =>
+    outcome({ blocked: true, markdown: "", reason: "hard-block", status: 403, proxyUsed: true }));
   const res = await client.callTool({ name: "retrieve", arguments: { url: "https://blocked/" } });
   assert.equal(res.isError, true);
   assert.match(res.content[0].text, /Could not retrieve/i);
+  assert.match(res.content[0].text, /reason=hard-block/);
+  assert.match(res.content[0].text, /status=403/);
+  assert.match(res.content[0].text, /proxyUsed=true/);
+});
+
+test("a CAPTCHA block names the reason and hints the missing solver", async () => {
+  const client = await connect(async () =>
+    outcome({ blocked: true, markdown: "", reason: "captcha", status: 403 }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://captcha/" } });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /reason=captcha/);
+  assert.match(res.content[0].text, /no solver configured/i);
 });
 
 test("failed navigation (null status + thin content) surfaces a clean error, not the browser error page", async () => {
@@ -56,6 +71,15 @@ test("failed navigation (null status + thin content) surfaces a clean error, not
   const res = await client.callTool({ name: "retrieve", arguments: { url: "https://off-allowlist.example/" } });
   assert.equal(res.isError, true);
   assert.match(res.content[0].text, /Could not retrieve/i);
+});
+
+test("empty extraction (real status, no markdown, not blocked) names reason=empty-content", async () => {
+  // The page rendered with a real status but Readability produced nothing — not a block, but still
+  // an error. Exercises server.ts's `why = result.reason ?? "empty-content"` fallback.
+  const client = await connect(async () => outcome({ status: 200, markdown: "", blocked: false, reason: null }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://empty.example/" } });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /reason=empty-content/);
 });
 
 test("short-but-valid page (real status, thin content) is returned, not errored", async () => {
