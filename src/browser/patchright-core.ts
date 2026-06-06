@@ -260,7 +260,12 @@ export class PatchrightBrowserCore implements BrowserCore {
     const page = this.#requireActivePage();
     await page.keyboard.press(key);
     // A key press (Enter) can submit a form / trigger navigation — wait out any challenge it lands on.
-    await this.#settle(page);
+    // If a submit-gated CAPTCHA was solved, replay the key once so the submit completes with the token.
+    const replayNeeded = await this.#settle(page);
+    if (replayNeeded) {
+      await page.keyboard.press(key).catch(() => {});
+      await this.#settle(page);
+    }
   }
 
   async waitFor(condition: WaitCondition): Promise<void> {
@@ -337,7 +342,15 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
     // A navigation-producing action (submit click, select with onchange) may land on a challenge —
     // wait it out so the post-action snapshot is the cleared page, not the interstitial.
-    await this.#settle(page);
+    const replayNeeded = await this.#settle(page);
+    if (replayNeeded) {
+      // A CAPTCHA that appeared only on this action (e.g. a submit gated on reCAPTCHA) was rejected
+      // before a token existed; the solve injected one but did not re-submit. Replay the action ONCE
+      // so it completes with the token in place. Best-effort: a now-missing element just no-ops, and
+      // the following settle won't re-solve (the response field is filled). (AE3/R8: continue, don't fail.)
+      await fn(loc).catch(() => {});
+      await this.#settle(page);
+    }
   }
 
   /**
@@ -350,7 +363,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     page: PatchrightPage,
     clearanceTimeoutMs: number = DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS,
     pollIntervalMs: number = DEFAULT_POLL_INTERVAL_MS,
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Let any navigation the prior action triggered reach domcontentloaded, so its response status is
     // captured and the snapshot reflects the landed page (resolves immediately if nothing navigated).
     await page.waitForLoadState("domcontentloaded").catch(() => {});
@@ -362,8 +375,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       signal = await pollSignal(page);
     }
     // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
-    // may still be blocking the flow. Auto-solve it transparently when a solver is configured.
-    await this.#trySolveCaptcha(page);
+    // may still be blocking the flow. Auto-solve it transparently when a solver is configured. Returns
+    // true when the caller should replay the triggering action to complete a submit-gated flow.
+    return this.#trySolveCaptcha(page);
   }
 
   /**
@@ -374,14 +388,21 @@ export class PatchrightBrowserCore implements BrowserCore {
    * (the caller's existing navFailed path). Does NOT recurse into {@link #settle}; the response field
    * is populated on success, so a re-entry would no-op on the gate. Cost/rate limiting is the solver's
    * own budget (R8). render() (retrieve) never reaches here — its CF tier is cleared by proxy, not a solver.
+   *
+   * Returns `true` when a token was injected but the page did NOT advance on its own — i.e. the caller
+   * should REPLAY the triggering action to complete the flow. This is the mid-flow case: a form whose
+   * submit was rejected for lack of a token, where injecting the token alone re-submits nothing. When
+   * the widget's own `data-callback` advances the page (URL changes during the post-inject wait), this
+   * returns `false` so the caller does NOT replay — avoiding a double-submit. No solve / no token /
+   * stale page all return `false`.
    */
-  async #trySolveCaptcha(page: PatchrightPage): Promise<void> {
-    if (!this.#solver) return;
+  async #trySolveCaptcha(page: PatchrightPage): Promise<boolean> {
+    if (!this.#solver) return false;
     const live = (await page
       .evaluate(DETECT_LIVE_CAPTCHA_JS)
       .catch(() => null)) as LiveCaptcha | null;
     const challenge = liveCaptchaToChallenge(live, page.url());
-    if (!challenge) return;
+    if (!challenge) return false;
     let token: string;
     try {
       token = await this.#solver.solve(challenge);
@@ -391,18 +412,22 @@ export class PatchrightBrowserCore implements BrowserCore {
       // block-reason). Log the typed code only — never the message (vendor strings) or the key (R9).
       const code = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
       process.stderr.write(`[browse-gateway] captcha solve failed (${code}); page left challenged\n`);
-      return;
+      return false;
     }
-    if (!token) return;
+    if (!token) return false;
     // The solve can run up to the solver's deadline; if the page navigated or the widget changed in
     // the meantime, the token is bound to a now-stale (url, siteKey). Re-verify before injecting, so a
     // token minted for the old page isn't written into a different one.
     const after = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
-    if (!after || after.siteKey !== challenge.siteKey || page.url() !== challenge.url) return;
+    if (!after || after.siteKey !== challenge.siteKey || page.url() !== challenge.url) return false;
     await page.evaluate(injectTokenJs(challenge.kind, token)).catch(() => {});
-    // Give the site's continuation (callback / token re-validation) a moment to take effect before
-    // the caller snapshots; a fixed short wait, NOT a re-settle (which would re-enter this method).
+    // Give the site's own continuation (a data-callback) a moment to fire — a fixed wait, NOT a
+    // re-settle (which would re-enter this method).
     await page.waitForTimeout(DEFAULT_POLL_INTERVAL_MS).catch(() => {});
+    // If the page advanced on its own, the callback handled continuation — no replay (and no double
+    // submit). If it's unchanged, the triggering action (e.g. a submit) was rejected pre-token and
+    // must be replayed by the caller now that the token is in place.
+    return page.url() === challenge.url;
   }
 
   /**
