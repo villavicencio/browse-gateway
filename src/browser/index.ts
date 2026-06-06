@@ -46,3 +46,14 @@ export {
   type PatchrightLaunchOptions,
   type ResolvedCoreOptions,
 } from "./launch-options.js";
+export {
+  detectCaptcha,
+  NullCaptchaSolver,
+  liveCaptchaToChallenge,
+  injectTokenJs,
+  DETECT_LIVE_CAPTCHA_JS,
+  type CaptchaChallenge,
+  type CaptchaKind,
+  type CaptchaSolver,
+  type LiveCaptcha,
+} from "./captcha.js";

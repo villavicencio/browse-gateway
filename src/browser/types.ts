@@ -11,6 +11,8 @@
 /** Which anti-bot family a target exercises — used to gate per-category in the kill-gate. */
 export type Category = "cloudflare" | "datadome";
 
+import type { CaptchaSolver } from "./captcha.js";
+
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
 export interface ProxyConfig {
   server: string;
@@ -41,6 +43,14 @@ export interface BrowserCoreOptions {
   navigationTimeoutMs?: number;
   /** Upstream proxy for this session. Absent = direct connection. */
   proxy?: ProxyConfig;
+  /**
+   * Injected CAPTCHA solver for the interactive drive path: when set, the core auto-solves a
+   * detected, blocking interactive CAPTCHA (reCAPTCHA/Turnstile/hCaptcha) during its post-action
+   * settle. Absent = a detected CAPTCHA is left to fail. Not a launch option (a runtime dependency),
+   * so it is NOT mapped into the Chrome launch args. The stateless `render()` path does not use it
+   * (CF managed challenges are cleared by residential escalation, not a solver).
+   */
+  solver?: CaptchaSolver;
 }
 
 /** A point-in-time snapshot of a rendered page. */

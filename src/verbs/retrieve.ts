@@ -105,12 +105,13 @@ export async function retrieve(
   // 1) Direct render through an authenticated, allowlist-guarded session.
   let render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
 
-  // 2) CAPTCHA hook — detect a widget and hand it to an injected solver. NOTE (v1): token
-  //    injection and page-resume are NOT yet wired — the solver receives only the challenge
-  //    descriptor (kind/url/siteKey), not the live page, so a returned token does not yet
-  //    re-render the page. `captchaSolved` therefore means "detected and handed to the
-  //    solver", not "challenge cleared". Full solve+inject+resume belongs in the browser
-  //    core (which owns the page handle) and is tracked for v1.1.
+  // 2) CAPTCHA hook (retrieve path) — detect a widget for the block-reason diagnostic. Full
+  //    solve→inject→resume now lives in the browser core's DRIVE path (`#trySolveCaptcha`), which
+  //    owns the live page; the stateless render path here has no page to inject into, so a solved
+  //    token can't be applied. NO production caller wires `opts.solver` into retrieve — and it should
+  //    stay that way: wiring one here would spend (and bill) a solve with no effect on the page.
+  //    `captchaSolved` therefore stays false in production. (Removing `opts.solver` + `captchaSolved`
+  //    outright is a follow-up — it changes retrieve's result contract + the mcp surface.)
   const captcha = detectCaptcha(render, url);
   if (captcha && opts.solver) {
     await opts.solver.solve(captcha);

@@ -21,7 +21,7 @@ import {
 } from "../policy/index.js";
 import type { Consumer } from "../policy/index.js";
 import { SecretStore, redactSecrets } from "../security/index.js";
-import { retrieve } from "../verbs/index.js";
+import { retrieve, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
@@ -53,6 +53,11 @@ function splitCsv(value: string | undefined): string[] {
 async function main(): Promise<void> {
   const config = loadConfig();
   const secrets = new SecretStore();
+  // Interactive-CAPTCHA solver for the drive path, wired when BYO config is present (key in the
+  // SecretStore, endpoint in BGW_CAPTCHA_API_URL); absent = a detected CAPTCHA is left to fail.
+  config.core.solver = httpCaptchaSolverFromSecrets(secrets, process.env.BGW_CAPTCHA_API_URL, {
+    budget: DEFAULT_CAPTCHA_BUDGET,
+  });
   const specs = loadConsumers(process.env, secrets);
   const registry = new ConsumerRegistry(specs);
 
