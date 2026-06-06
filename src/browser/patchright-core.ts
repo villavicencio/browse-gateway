@@ -385,11 +385,20 @@ export class PatchrightBrowserCore implements BrowserCore {
     let token: string;
     try {
       token = await this.#solver.solve(challenge);
-    } catch {
-      // Vendor error / timeout / budget: leave the page challenged rather than throw under the verb.
+    } catch (err) {
+      // Vendor error / timeout / budget: leave the page challenged rather than throw under the verb,
+      // but emit a diagnostic so a left-challenged drive page has a WHY (parity with retrieve's
+      // block-reason). Log the typed code only — never the message (vendor strings) or the key (R9).
+      const code = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
+      process.stderr.write(`[browse-gateway] captcha solve failed (${code}); page left challenged\n`);
       return;
     }
     if (!token) return;
+    // The solve can run up to the solver's deadline; if the page navigated or the widget changed in
+    // the meantime, the token is bound to a now-stale (url, siteKey). Re-verify before injecting, so a
+    // token minted for the old page isn't written into a different one.
+    const after = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
+    if (!after || after.siteKey !== challenge.siteKey || page.url() !== challenge.url) return;
     await page.evaluate(injectTokenJs(challenge.kind, token)).catch(() => {});
     // Give the site's continuation (callback / token re-validation) a moment to take effect before
     // the caller snapshots; a fixed short wait, NOT a re-settle (which would re-enter this method).

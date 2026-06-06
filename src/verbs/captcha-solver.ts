@@ -1,25 +1,25 @@
 /**
  * Concrete {@link CaptchaSolver} backed by a hosted solving service that speaks the standard
- * `createTask` / `getTaskResult` protocol (the Anti-Captcha-style API that CapSolver, CapMonster,
- * and 2Captcha all implement). Vendor-NEUTRAL on purpose: the endpoint is configuration
- * (`BGW_CAPTCHA_API_URL`), the key is a BYO secret (`BGW_CAPTCHA_API_KEY`), and the task-type
- * vocabulary below is the shared protocol — so swapping providers (or adding a second one for a
- * captcha type the first doesn't serve) is a config change, not a code change. No provider is named
- * in this repo (public).
+ * `createTask` / `getTaskResult` request/poll task API (a protocol several hosted solving services
+ * implement). Vendor-NEUTRAL on purpose: the endpoint is configuration (`BGW_CAPTCHA_API_URL`), the
+ * key is a BYO secret (`BGW_CAPTCHA_API_KEY`), and the task-type vocabulary below is the shared
+ * protocol — so swapping providers (or adding a second one for a captcha type the first doesn't serve)
+ * is a config change, not a code change. No provider is named in this repo (public).
  *
  * Solves return a response TOKEN (reCAPTCHA `g-recaptcha-response`, Turnstile `cf-turnstile-response`,
  * hCaptcha `h-captcha-response`) — these are NOT IP-bound, so the solve is proxyless and the token
  * verifies after the page submits it. (CF *managed challenges* are a different tier handled by
- * residential-proxy escalation, not this solver — see the captcha-solver plan.)
+ * residential-proxy escalation, not this solver.)
  *
  * Failure discipline (R8): every failure is a typed {@link CaptchaSolveError}, never a hang — a hard
- * deadline bounds the poll. The API key is sent only in the request body and never appears in an error
- * message or log (R9).
+ * deadline bounds the whole solve AND each individual HTTP request (via AbortController), so a stalled
+ * vendor connection can't outlive the deadline. The API key is sent only in the request body and
+ * never appears in an error message or log (R9).
  */
 import type { SecretStore } from "../security/index.js";
-import type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "./captcha.js";
+import type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "../browser/captcha.js";
 
-/** Standard task-type vocabulary (shared across Anti-Captcha-protocol vendors); proxyless token solves. */
+/** Standard task-type vocabulary for the createTask/getTaskResult protocol; proxyless token solves. */
 const TASK_TYPE: Record<CaptchaKind, string | undefined> = {
   recaptcha: "ReCaptchaV2TaskProxyLess",
   turnstile: "AntiTurnstileTaskProxyLess",
@@ -106,7 +106,7 @@ export class HttpCaptchaSolver implements CaptchaSolver {
     this.#chargeBudget();
 
     const deadline = this.#now() + this.#timeoutMs;
-    const taskId = await this.#createTask(type, challenge);
+    const taskId = await this.#createTask(type, challenge, deadline);
     return this.#pollForToken(taskId, deadline);
   }
 
@@ -125,12 +125,12 @@ export class HttpCaptchaSolver implements CaptchaSolver {
     this.#starts.push(now);
   }
 
-  async #createTask(type: string, challenge: CaptchaChallenge): Promise<string> {
+  async #createTask(type: string, challenge: CaptchaChallenge, deadline: number): Promise<string> {
     const body = {
       clientKey: this.#apiKey,
       task: { type, websiteURL: challenge.url, websiteKey: challenge.siteKey },
     };
-    const json = await this.#post("createTask", body);
+    const json = await this.#post("createTask", body, deadline);
     if (json.errorId) {
       throw new CaptchaSolveError("vendor-error", `createTask failed: ${json.errorCode ?? "?"} ${json.errorDescription ?? ""}`.trim());
     }
@@ -145,8 +145,9 @@ export class HttpCaptchaSolver implements CaptchaSolver {
       if (this.#now() >= deadline) {
         throw new CaptchaSolveError("timeout", `solve did not complete within ${this.#timeoutMs}ms`);
       }
-      await this.#sleep(this.#pollMs);
-      const json = await this.#post("getTaskResult", { clientKey: this.#apiKey, taskId });
+      // Clamp the wait to the remaining budget so the loop can't overshoot the deadline by a full poll.
+      await this.#sleep(Math.min(this.#pollMs, Math.max(0, deadline - this.#now())));
+      const json = await this.#post("getTaskResult", { clientKey: this.#apiKey, taskId }, deadline);
       if (json.errorId) {
         throw new CaptchaSolveError("vendor-error", `getTaskResult failed: ${json.errorCode ?? "?"} ${json.errorDescription ?? ""}`.trim());
       }
@@ -160,18 +161,35 @@ export class HttpCaptchaSolver implements CaptchaSolver {
     }
   }
 
-  /** POST JSON to a protocol endpoint. Network/parse errors become a typed vendor-error (never a raw throw). */
-  async #post(path: string, body: unknown): Promise<{ errorId?: number; errorCode?: string; errorDescription?: string; taskId?: string | number; status?: string; solution?: Record<string, unknown> }> {
+  /**
+   * POST JSON to a protocol endpoint, hard-bounded by `deadline`. A per-request AbortController fires
+   * at the remaining budget so a stalled/black-holed vendor connection can't hang past the deadline
+   * (fetch's own defaults are minutes-long) — without it, a single hung request would wedge the
+   * awaiting drive action indefinitely. Network/abort/parse errors become a typed error (never a raw
+   * throw); the request body (which carries the key) is never put in a message.
+   */
+  async #post(path: string, body: unknown, deadline: number): Promise<{ errorId?: number; errorCode?: string; errorDescription?: string; taskId?: string | number; status?: string; solution?: Record<string, unknown> }> {
+    const remaining = deadline - this.#now();
+    if (remaining <= 0) throw new CaptchaSolveError("timeout", `solve did not complete within ${this.#timeoutMs}ms`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remaining);
     let resp: Response;
     try {
       resp = await this.#fetch(`${this.#apiUrl}/${path}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
     } catch (err) {
-      // Never surface the request (it carries the key); report only the transport failure shape.
+      // Abort = we hit the deadline mid-request; otherwise a transport failure. Never surface the
+      // request (it carries the key) — report only the failure shape.
+      if (controller.signal.aborted) {
+        throw new CaptchaSolveError("timeout", `${path}: exceeded the ${this.#timeoutMs}ms solve deadline`);
+      }
       throw new CaptchaSolveError("vendor-error", `${path}: request failed (${err instanceof Error ? err.name : "network error"})`);
+    } finally {
+      clearTimeout(timer);
     }
     if (!resp.ok) {
       throw new CaptchaSolveError("vendor-error", `${path}: HTTP ${resp.status}`);

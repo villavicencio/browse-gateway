@@ -128,3 +128,70 @@ test("factory: absent without key or url, present with both", () => {
   assert.equal(httpCaptchaSolverFromSecrets(withKey, undefined), undefined);
   assert.ok(httpCaptchaSolverFromSecrets(withKey, URL_BASE) instanceof HttpCaptchaSolver);
 });
+
+// ── Review-hardening: gaps surfaced by the code review ────────────────────────────────────────
+
+test("solves hCaptcha → HCaptchaTaskProxyLess + captchaResponse solution field", async () => {
+  const f = fakeFetch([
+    { body: { errorId: 0, taskId: "h1" } },
+    { body: { errorId: 0, status: "ready", solution: { captchaResponse: "HC-TOK" } } },
+  ]);
+  const token = await solverWith(f).solve({ kind: "hcaptcha", url: "https://h.example/", siteKey: "hk-1" });
+  assert.equal(token, "HC-TOK");
+  assert.equal(f.calls[0].body.task.type, "HCaptchaTaskProxyLess");
+});
+
+test("budget window expires → a later solve is allowed again", async () => {
+  let t = 0;
+  const f = fakeFetch([
+    { body: { errorId: 0, taskId: "a" } },
+    { body: { errorId: 0, status: "ready", solution: { gRecaptchaResponse: "OK1" } } },
+    { body: { errorId: 0, taskId: "b" } },
+    { body: { errorId: 0, status: "ready", solution: { gRecaptchaResponse: "OK2" } } },
+  ]);
+  const s = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: URL_BASE, pollMs: 0, timeoutMs: 100_000, fetchImpl: f, now: () => t, budget: { maxSolves: 1, windowMs: 1000 } });
+  assert.equal(await s.solve(recaptcha), "OK1");
+  t = 2000; // advance past the window so the first start ages out of #starts
+  assert.equal(await s.solve(recaptcha), "OK2");
+});
+
+test("vendor HTTP non-2xx → typed vendor-error with status", async () => {
+  const f = fakeFetch([{ ok: false, status: 429, body: {} }]);
+  await assert.rejects(solverWith(f).solve(recaptcha), (e) => {
+    assert.equal(e.code, "vendor-error");
+    assert.match(e.message, /HTTP 429/);
+    return true;
+  });
+});
+
+test("ready but empty solution → vendor-error (no token)", async () => {
+  const f = fakeFetch([
+    { body: { errorId: 0, taskId: "x" } },
+    { body: { errorId: 0, status: "ready", solution: {} } },
+  ]);
+  await assert.rejects(solverWith(f).solve(recaptcha), (e) => e.code === "vendor-error");
+});
+
+test("a hung request aborts at the deadline → typed timeout (never hangs)", async () => {
+  // A fetch that resolves nothing until the per-request AbortController fires.
+  const hanging = (_url, init) =>
+    new Promise((_, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    });
+  const s = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: URL_BASE, timeoutMs: 30, pollMs: 5, fetchImpl: hanging });
+  await assert.rejects(s.solve(recaptcha), (e) => e.code === "timeout");
+});
+
+test("not configured (empty url) → not-configured", async () => {
+  const f = fakeFetch([{ body: {} }]);
+  const s = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: "", fetchImpl: f });
+  await assert.rejects(s.solve(recaptcha), (e) => e.code === "not-configured");
+});
+
+test("vendor-error message never contains the API key (R9, createTask branch)", async () => {
+  const f = fakeFetch([{ body: { errorId: 1, errorCode: "ERR", errorDescription: "bad" } }]);
+  await assert.rejects(solverWith(f).solve(recaptcha), (e) => {
+    assert.ok(!e.message.includes(KEY), "vendor-error message must not contain the API key");
+    return true;
+  });
+});
