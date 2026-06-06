@@ -100,16 +100,22 @@ export function injectTokenJs(kind: CaptchaKind, token: string): string {
   const setVal = (sel: string) => `document.querySelectorAll(${JSON.stringify(sel)}).forEach((e) => { e.value = ${t}; e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); });`;
   let resume = "";
   if (kind === "recaptcha") {
+    // Set the response field, then invoke the site's data-callback so a callback-driven flow advances
+    // on its own. grecaptcha nests the callback at a version-dependent depth, so walk the config tree
+    // RECURSIVELY (depth-capped, cycle-guarded) rather than at a fixed depth — a fixed walk misses it,
+    // which both fails callback-driven sites AND defeats the caller's "did it advance?" replay guard.
     resume = `${setVal('[name="g-recaptcha-response"], #g-recaptcha-response')}
     try {
-      const cfg = window.___grecaptcha_cfg;
-      if (cfg && cfg.clients) Object.values(cfg.clients).forEach((client) => {
-        Object.values(client || {}).forEach((o) => {
-          if (o && typeof o === 'object') Object.values(o).forEach((v) => {
-            if (v && typeof v === 'object' && typeof v.callback === 'function') { try { v.callback(${t}); } catch (e) {} }
-          });
-        });
-      });
+      var __seen = [];
+      (function fire(o, d) {
+        if (!o || typeof o !== 'object' || d > 6 || __seen.indexOf(o) !== -1) return;
+        __seen.push(o);
+        for (var k in o) {
+          var v; try { v = o[k]; } catch (e) { continue; }
+          if (k === 'callback' && typeof v === 'function') { try { v(${t}); } catch (e) {} }
+          else if (v && typeof v === 'object') fire(v, d + 1);
+        }
+      })(window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients, 0);
     } catch (e) {}`;
   } else if (kind === "turnstile") {
     resume = setVal('[name="cf-turnstile-response"], #cf-turnstile-response');

@@ -60,6 +60,9 @@ const DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS = 15_000;
  */
 const REF_PATTERN = /^[a-z]?\d*e\d+$/i;
 
+/** Visible body text — the post-inject advancement signal (catches same-page/AJAX callback updates). */
+const BODY_TEXT_JS = "document.body ? document.body.innerText : ''";
+
 /** Resolve a {@link DriveTarget}'s `target` to a Playwright selector: a ref -> `aria-ref=`, else passthrough. */
 export function targetToSelector(target: string): string {
   const t = target.trim();
@@ -420,14 +423,26 @@ export class PatchrightBrowserCore implements BrowserCore {
     // token minted for the old page isn't written into a different one.
     const after = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
     if (!after || after.siteKey !== challenge.siteKey || page.url() !== challenge.url) return false;
-    await page.evaluate(injectTokenJs(challenge.kind, token)).catch(() => {});
+    // Snapshot the visible page state before injecting, so we can tell the site's own continuation
+    // (advance — do NOT replay) from a stalled submit (nothing happened — DO replay). The widget's own
+    // mutations (its iframe, the hidden response textarea) don't change main-document innerText, so it
+    // is a clean signal for site-driven advancement.
+    const beforeText = String(await page.evaluate(BODY_TEXT_JS).catch(() => ""));
+    // Inject in the page's MAIN world (a real <script>), NOT page.evaluate's isolated world: the field
+    // set works either way (shared DOM), but firing the site's data-callback needs the page's own
+    // `window` (e.g. grecaptcha's config), which the isolated world can't see. The script tag isn't
+    // rendered, so it doesn't perturb the body-text advance signal.
+    await page.addScriptTag({ content: injectTokenJs(challenge.kind, token) }).catch(() => {});
     // Give the site's own continuation (a data-callback) a moment to fire — a fixed wait, NOT a
     // re-settle (which would re-enter this method).
     await page.waitForTimeout(DEFAULT_POLL_INTERVAL_MS).catch(() => {});
-    // If the page advanced on its own, the callback handled continuation — no replay (and no double
-    // submit). If it's unchanged, the triggering action (e.g. a submit) was rejected pre-token and
-    // must be replayed by the caller now that the token is in place.
-    return page.url() === challenge.url;
+    // "Advanced" = the site already moved the flow forward, by navigating (URL change) OR by an
+    // in-place/AJAX update from the widget's data-callback (visible-text change). A URL-only check
+    // misses same-page callbacks and would double-submit them. If nothing advanced, the triggering
+    // action was rejected pre-token and the caller must replay it once.
+    if (page.url() !== challenge.url) return false;
+    const afterText = await page.evaluate(BODY_TEXT_JS).catch(() => null);
+    return afterText !== null && afterText === beforeText; // unchanged ⇒ stalled ⇒ replay needed
   }
 
   /**
