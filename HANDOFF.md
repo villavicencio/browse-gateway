@@ -1,88 +1,89 @@
-# HANDOFF — 2026-06-05 (afternoon)
+# HANDOFF — 2026-06-06 (afternoon)
 
-Picked up at the **U7a prod cutover** (the only "What's Next" from the prior handoff) and ran it
-end-to-end: both consumer instances are now migrated from the per-session **stdio** MCP launcher to
-the shared **Streamable-HTTP** transport. Then, prompted by a "shouldn't it use the proxy?" question,
-shipped + deployed a `retrieve` observability improvement (block-reason), fixed a stale test gate,
-and queued two plans (CAPTCHA solver, CI/CD). Prod is live on the new image; stdio is retired but kept
-as the one-release rollback.
+Picked up from the U7a cutover handoff with "go with the spike" on the CAPTCHA-solver feature, and ran
+the full arc: spike → re-scope → build → two review rounds → merge. The spike's real value was
+**inverting the premise**: the Cloudflare *managed-challenge* tier needs no solver (the stealth browser
+on a residential exit clears it on its own — that's the existing R7 escalation, screenshot-verified), so
+the solver was re-scoped to **interactive token-CAPTCHAs** (reCAPTCHA/Turnstile) on the **drive** path,
+where the browser genuinely can't pass an image grid. Feature shipped to `main` (PR #6), config-gated and
+dormant until enabled.
 
 ## What We Built
-- **U7a prod cutover COMPLETE** (you-run/I-guide). Verified the runtime speaks native HTTP MCP
-  (url + `--auth header`), built the amd64 image, passed the in-container `validate-http` deploy gate,
-  stood up the long-lived `browse-gateway-http` container (host-loopback `127.0.0.1:8080`, caps
-  `--cpus=1.5 --memory=3g --shm-size=1g`), registered + enabled the HTTP MCP entry, cut **both**
-  consumers over. Named runbook + the cutover gotchas live in `CUTOVER.local.md` (gitignored).
-- **PR #4** (`3017ba9`) — `retrieve` block-reason + escalation diagnostics. `RetrieveResult.reason`
-  (`nav-failed | captcha | cf-challenge | hard-block | blocked`, derived from the final
-  post-escalation render, captcha-first) + `proxyUsed`/`captchaSolved` now surface in the `retrieve`
-  MCP **error** text, with a "no solver configured" hint on a captcha block. `src/verbs/retrieve.ts`,
-  `src/mcp/server.ts`. 135 tests.
-- **PR #5** (`db61da0`) — `scripts/validate-mcp.mjs` stale-gate fix: asserted `tools.length === 1`,
-  but the live surface is `retrieve` + 10 `browser_*` since PR #2; now asserts both. (Was red on
-  `main` since 2026-06-02.)
-- **Prod redeployed** to image `db61da0` (`browse-gateway-http` now on `bcf9a50`; `:u7a` = rollback
-  anchor). `reason=` diagnostics are LIVE.
-- **docs/solutions** — `runtime-errors/retrieve-short-page-clearance-timeout.md` (`1dc4030`) and
-  `integration-issues/mcp-client-env-ref-bearer-false-negative.md` (`c24ba66`).
-- **Plans (local, gitignored `docs/plans/*.local.md`)** — `2026-06-05-001-feat-captcha-solver-plan`
-  and `2026-06-05-002-feat-cicd-build-deploy-plan`. Plus the retrieve short-page-clearance plan in
-  Proof ("Plan: 2026-06-05 retrieve short-page clearance fix").
+- **PR #6 (merged, `ff45413`) — interactive CAPTCHA solver on the drive path.** Five commits:
+  - `HttpCaptchaSolver` (`src/verbs/captcha-solver.ts`) — provider-neutral `createTask`/`getTaskResult`
+    client. Endpoint is config (`BGW_CAPTCHA_API_URL`), key is a BYO secret (`BGW_CAPTCHA_API_KEY`). Typed
+    failures (`CaptchaSolveError`), per-window solve budget (`DEFAULT_CAPTCHA_BUDGET` = 5/60s), a hard
+    deadline enforced **per HTTP request** (AbortController) so a stalled vendor call can't hang the caller,
+    R9 (key never reaches an error/log). 18 unit tests.
+  - **Seam moved to the browser layer** (`src/browser/captcha.ts`) — `CaptchaSolver`/`detectCaptcha`/
+    `NullCaptchaSolver` + new live helpers (`DETECT_LIVE_CAPTCHA_JS`, `liveCaptchaToChallenge`,
+    `injectTokenJs`); `src/verbs/captcha.ts` re-exports for back-compat.
+  - **Core auto-solve** (`src/browser/patchright-core.ts` `#trySolveCaptcha`, called from `#settle`) —
+    reads the live widget + real sitekey, gates on an empty response field (never speculative), solves,
+    re-verifies url+sitekey, injects the token **in the page's main world** (`addScriptTag`), and replays
+    the triggering action once for submit-gated forms (skipping replay when a callback advanced the page).
+  - Wired via `BrowserCoreOptions.solver` in both entrypoints (`src/mcp/main.ts`, `src/mcp/http-main.ts`).
+    `render()`/`retrieve` never invoke it.
+- **159 unit tests green; typecheck clean; `validate-drive/http/retrieve` pass.**
+- **Plan updated:** `docs/plans/2026-06-05-001-feat-captcha-solver-plan.local.md` (gitignored) carries the
+  spike conclusion, the re-scope, the review fixes, and the deferred follow-ups.
+- **Memory updated** (gitignored agent memory): captcha-solver conclusion, Evomi/sticky proxy research,
+  and a new **`patchright-evaluate-isolated-world`** learning.
 
 ## Decisions Made
-- **reason precedence captcha-first**, derived from the FINAL render so it stays consistent with
-  `blocked` (the residential-proxy learning requires post-retry derivation).
-- **Conservative container caps** (`1.5cpu/3g`, down from the runbook's `1.75/4g`) given the box's
-  headroom + don't-disturb-the-agents; revisit under measured load.
-- **Build images `--provenance=false --sbom=false`** for a clean single-arch tarball that `docker load`s
-  cleanly on the prod rootless daemon.
-- **CI/CD shape**: build→GHCR auto on `main`; deploy is a **manual** `workflow_dispatch` over the
-  **Tailnet** (no public SSH); **no self-hosted runner** (PUBLIC repo); keep the `validate-http` gate +
-  rollback; fleet detail stays in Actions secrets, never the YAML. (Plan 002.)
-- **Code-review pushback**: declined the "hoist detectCaptcha" finding — the two calls are on different
-  renders (direct vs final post-escalation); hoisting would misreport the reason.
-- **New standing rules saved to memory**: plans stay local (not Proof); always commit handoff +
-  solution docs straight to `main`; **authorized to merge PRs** (squash green+reviewed, delete branch).
+- **Solver tier = interactive reCAPTCHA/Turnstile on the drive path**, NOT CF managed challenges (those
+  are cleared by residential escalation). The original "scrapingcourse needs a solver" premise was an
+  artifact of testing from a non-residential IP — falsified by the spike.
+- **Mechanism = token path** (`*-response` inject + action replay), NOT a `cf_clearance` cookie. reCAPTCHA
+  tokens aren't IP-bound, so the solve is proxyless and no sticky proxy is needed (the sticky/cookie
+  analysis applied only to the descoped CF tier).
+- **Transparent auto-solve** (during settle), not an explicit agent verb — matches how proxy escalation /
+  clearance polling already work; satisfies agent-native parity for the "get past a CAPTCHA" capability.
+- **Provider-neutral by design** for public-repo hygiene: no provider/endpoint named in committed source;
+  provider is purely deployment config.
+- **Inject in the page MAIN world** (`addScriptTag`), because `page.evaluate` is isolated-world and can't
+  see the page's `window` (so firing a site's data-callback silently no-ops there).
+- **Action-replay continuation**: replay the triggering action once after a solve to complete a
+  submit-gated form; skip the replay when the page already advanced (URL **or** visible-body-text change)
+  to avoid double-submitting callback-driven flows.
 
 ## What Didn't Work
-- **~1hr lost** chasing the cutover `401` as an auth/scheme bug (raw token, `Bearer <token>`,
-  double-Bearer). Root cause: the MCP client expands `${MCP_<NAME>_API_KEY}` and its **inline add-time
-  connect-test runs in a stale-env process** → sends the literal `${...}` → 401. A fresh `mcp test`
-  passes. Fully documented in `docs/solutions/integration-issues/mcp-client-env-ref-bearer-false-negative.md`.
-- **scrapingcourse.com/cloudflare-challenge as a litmus test** — it's the stealth validator's own
-  *negative control* (an interactive CF managed challenge / Turnstile). The stealth core is healthy:
-  the kill-gate passed **4/4** (udemy, glassdoor, seloger, leboncoin, all `waited=0ms`). scrapingcourse
-  needs the CAPTCHA solver, which is detect-only in v1.
+- **A vendor `AntiCloudflareTask`-style call for the CF managed challenge** — fast-failed ($0) because,
+  once the stealth browser clears the interstitial, there's no challenge left to solve. Wrong tool/tier.
+- **hCaptcha via the chosen provider** — its proxyless hCaptcha task is rejected ("we don't support this
+  service"); hCaptcha is absent from its current supported-types list. Deferred to a second provider behind
+  the same seam (the browser DOES get stuck on hCaptcha, so the need is real).
+- **First continuation attempt (callback-only)** — left submit-gated forms stalled (PR review P1 #1).
+- **URL-only "did it advance" guard** — double-submitted callback-driven flows (PR review P1 #2). Root
+  cause was the isolated-world inject: the callback never fired, so the page never advanced, so the guard
+  always replayed. Fixed by main-world inject + body-text guard.
 
 ## What's Next
-1. **CAPTCHA solver** — the "all the web" unlock (interactive Turnstile/CAPTCHA tier). Plan
-   `2026-06-05-001-feat-captcha-solver-plan.local.md`, **spike-first** (prove a vendor can clear a CF
-   managed-challenge interstitial before building). The hook exists (`detectCaptcha` + `CaptchaSolver`
-   + `BGW_CAPTCHA_API_KEY`); missing = a real solver + solve→inject→resume in `patchright-core`.
-2. **retrieve short-page clearance fix** — own PR (Proof plan). `render()` polls the full ~20s on
-   legit short pages (`<200` chars) because `isCleared` gates on text length; mirror `navigate()`'s
-   block-phrase gating + a drive↔retrieve **parity test**.
-3. **Code-review follow-ups** (in the captcha plan Phase 4): mirror `reason` on the drive `navigate`
-   path (parity); structured MCP `content` item instead of free-text; `proxyUsed` on the success path.
-4. **CI/CD** — Phase 1 (build→GHCR on `main`) is pure upside, do first. Phase 2 (Tailscale manual
-   deploy) needs the GHCR-private + Tailscale-key + deploy-key decisions.
-5. **Wikipedia `render().goto` transient** — `retrieve` once timed out + reported blocked while
-   `navigate` got it in 3.1s. Separate from the length gate; re-test, investigate the silent goto catch.
-6. **Parked**: bump `@mozilla/readability` ≥ 0.6.0 (low-sev ReDoS GHSA-3p6v-hrg8-8qj7), own PR.
+1. **(When ready) Activate in prod** — set `BGW_CAPTCHA_API_URL` + `BGW_CAPTCHA_API_KEY` in the deployment
+   secrets, rebuild the amd64 image, redeploy `browse-gateway-http` (the `validate-http` gate + rollback tag
+   still apply, per the cutover runbook). Dormant until then.
+2. **Deferred follow-ups** (documented in the captcha plan, non-blocking): per-consumer budget keying (the
+   budget is per-process — http-main noisy-neighbor); tighten live detection so invisible/v3/enterprise
+   reCAPTCHA isn't solved as v2; add a `captchaSolved` signal to the drive snapshot (retrieve has one —
+   observability parity); wire a second provider for hCaptcha; remove `retrieve`'s vestigial solver hook
+   (changes its result contract).
+3. **CI/CD Phase 1** (build→GHCR on `main`) — still the pure-upside next infra step (plan 002).
+4. **retrieve short-page clearance fix** + the Wikipedia transient — pre-existing backlog from prior handoff.
 
 ## Gotchas & Watch-outs
-- **The `${ENV_VAR}` false-negative** (above) is the #1 thing to not re-learn — capture request
-  headers EARLY when debugging an MCP auth 401, before theorizing about scheme/format.
-- **drive↔retrieve parity is load-bearing** — `reason` now exists on retrieve but NOT drive; the
-  parity learnings flag this. Change both sides together + a parity test (tracked in the captcha plan).
-- **PUBLIC repo** — no fleet detail (host/agent/path/vendor/pricing/exit-IP) in source, comments,
-  commit messages, committed docs, or this file. Named detail lives in `CUTOVER.local.md` /
-  `CONTEXT.local.md` / agent memory. Proof plan/doc share-links carry tokens — reference by title.
-- **Container caps are conservative** (`1.5cpu/3g`) — watch `docker stats browse-gateway-http` under a
-  real 2-concurrent-session load before trusting/raising.
-- **Redeploy = ~10–20s browse blip** (container recreate); agents stay up, reconnect on next turn.
-  Pick a quiet moment. `validate-http` gates the NEW image before the swap; `:u7a` is the rollback tag.
-- **Prod image cruft** accreting on the rootless daemon (`u1`, `hardblock`, `proxyretry`, `u7a`,
-  `db61da0`) — prune later (a step in CI/CD plan 002).
-- **Untracked `AGENTS.md` + `.claude/`** left as-is (not created by these sessions; `.claude/` holds the
-  local SSH/recon allow-rules).
+- **`page.evaluate` is isolated-world** (Patchright/Playwright) — shares the DOM but NOT page `window`
+  globals. To reach page globals or fire a site's callback, inject main-world JS via `addScriptTag`. This
+  cost two debugging passes; see memory `patchright-evaluate-isolated-world`.
+- **PUBLIC repo** — no provider/proxy/endpoint/exit-IP/pricing in source, comments, commit messages, this
+  file, or PR bodies. Named detail lives only in `*.local.md` / agent memory.
+- **The solver is config-gated** — absent `BGW_CAPTCHA_API_URL`+key, it's simply not constructed and a
+  detected CAPTCHA is left to fail. Enabling it has no effect until a redeploy carries the new image AND
+  the config.
+- **Budget is per-process** (5 solves/60s on one shared instance) — fine for the stdio-per-agent model;
+  under the HTTP multi-consumer transport it's a shared bucket (noisy-neighbor). Key per consumer before
+  leaning on it at scale.
+- **Replay is bounded to once** and skipped on same-page/AJAX advance; if a site reads the widget's JS
+  response API rather than the form field, neither inject nor replay helps (known limitation — needs deeper
+  widget integration).
+- **Untracked `.claude/` + `AGENTS.md`** left as-is (not created this session). Gitignored spike harnesses
+  (`scripts/spike-*.local.mjs`) + `.env.spike` remain as repro/verification artifacts.
