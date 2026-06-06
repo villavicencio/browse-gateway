@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Gateway, loadConfig } from "../gateway/index.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink } from "../policy/index.js";
 import { SecretStore, redactSecrets } from "../security/index.js";
-import { retrieve } from "../verbs/index.js";
+import { retrieve, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 
@@ -38,7 +38,14 @@ async function main(): Promise<void> {
     // secret-scrubbing sink (R9) so BYO proxy/CAPTCHA material can never reach the audit log.
     audit: new RedactingAuditSink(new InMemoryAuditSink(AUDIT_MAX_RECORDS), secrets),
   });
-  const gateway = Gateway.create(loadConfig(), undefined, policy);
+  const config = loadConfig();
+  // Wire the interactive-CAPTCHA solver onto the drive path when BYO config is present (key in the
+  // SecretStore, endpoint in BGW_CAPTCHA_API_URL). Absent = a detected CAPTCHA is left to fail. The
+  // solver is shared across the consumer's drive sessions; render() (retrieve) never invokes it.
+  config.core.solver = httpCaptchaSolverFromSecrets(secrets, process.env.BGW_CAPTCHA_API_URL, {
+    budget: DEFAULT_CAPTCHA_BUDGET,
+  });
+  const gateway = Gateway.create(config, undefined, policy);
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
   // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);

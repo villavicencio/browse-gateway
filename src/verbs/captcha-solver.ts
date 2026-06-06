@@ -64,6 +64,13 @@ export interface HttpCaptchaSolverConfig {
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_POLL_MS = 3_000;
 
+/**
+ * Conservative default solve budget — a cost guard so a hostile/looping page can't run up spend. A
+ * legitimate drive flow rarely hits more than one or two CAPTCHAs; 5 per minute leaves headroom while
+ * capping a runaway. Shared by both entrypoints so the two can't drift.
+ */
+export const DEFAULT_CAPTCHA_BUDGET = { maxSolves: 5, windowMs: 60_000 } as const;
+
 export class HttpCaptchaSolver implements CaptchaSolver {
   readonly #apiUrl: string;
   readonly #apiKey: string;

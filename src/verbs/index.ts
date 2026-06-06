@@ -11,5 +11,5 @@ export type { EscalationContext } from "./escalation.js";
 export { proxyOverrideFor, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "./drive.js";
 export { detectCaptcha, NullCaptchaSolver } from "./captcha.js";
 export type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "./captcha.js";
-export { HttpCaptchaSolver, CaptchaSolveError, httpCaptchaSolverFromSecrets } from "./captcha-solver.js";
+export { HttpCaptchaSolver, CaptchaSolveError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "./captcha-solver.js";
 export type { HttpCaptchaSolverConfig, CaptchaSolveErrorCode } from "./captcha-solver.js";

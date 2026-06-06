@@ -7,6 +7,13 @@ import { assertLocalCdpOnly } from "../security/cdp.js";
 import { hostFromUrl } from "../security/url.js";
 import { isCleared, isVisiblyBlocked, hasCloudflareHint, type PageSignal } from "./detect.js";
 import {
+  DETECT_LIVE_CAPTCHA_JS,
+  injectTokenJs,
+  liveCaptchaToChallenge,
+  type CaptchaSolver,
+  type LiveCaptcha,
+} from "./captcha.js";
+import {
   buildLaunchOptions,
   resolveCoreOptions,
   type ResolvedCoreOptions,
@@ -81,6 +88,8 @@ export class PatchrightBrowserCore implements BrowserCore {
   readonly kind = "patchright";
   readonly #context: PatchrightContext;
   readonly #resolved: ResolvedCoreOptions;
+  /** Injected solver for the drive path; absent = a detected CAPTCHA is left to fail. */
+  readonly #solver?: CaptchaSolver;
   #routeHandler?: RouteHandler;
   /** The single persistent page the interactive `drive` verbs act on (absent until navigate()). */
   #activePage?: PatchrightPage;
@@ -92,9 +101,14 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   #lastDocStatus?: number | null;
 
-  private constructor(context: PatchrightContext, resolved: ResolvedCoreOptions) {
+  private constructor(
+    context: PatchrightContext,
+    resolved: ResolvedCoreOptions,
+    solver?: CaptchaSolver,
+  ) {
     this.#context = context;
     this.#resolved = resolved;
+    this.#solver = solver;
   }
 
   static async launch(
@@ -109,7 +123,8 @@ export class PatchrightBrowserCore implements BrowserCore {
       resolved.userDataDir,
       launchOptions,
     );
-    return new PatchrightBrowserCore(context, resolved);
+    // The solver is a runtime dependency (not a launch arg) — pass it through to the instance.
+    return new PatchrightBrowserCore(context, resolved, opts.solver);
   }
 
   async render(url: string, opts: RenderOptions = {}): Promise<RenderResult> {
@@ -346,6 +361,39 @@ export class PatchrightBrowserCore implements BrowserCore {
       waited += pollIntervalMs;
       signal = await pollSignal(page);
     }
+    // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
+    // may still be blocking the flow. Auto-solve it transparently when a solver is configured.
+    await this.#trySolveCaptcha(page);
+  }
+
+  /**
+   * Transparent interactive-CAPTCHA solve on the drive path. Runs after the block-phrase settle.
+   * Spends a solve ONLY on a genuine, blocking widget (a rendered widget whose response-token field
+   * is still empty) — never speculatively. A solve/inject failure is swallowed so it can never break
+   * the action: the page is simply left challenged and the post-action snapshot reports it as blocked
+   * (the caller's existing navFailed path). Does NOT recurse into {@link #settle}; the response field
+   * is populated on success, so a re-entry would no-op on the gate. Cost/rate limiting is the solver's
+   * own budget (R8). render() (retrieve) never reaches here — its CF tier is cleared by proxy, not a solver.
+   */
+  async #trySolveCaptcha(page: PatchrightPage): Promise<void> {
+    if (!this.#solver) return;
+    const live = (await page
+      .evaluate(DETECT_LIVE_CAPTCHA_JS)
+      .catch(() => null)) as LiveCaptcha | null;
+    const challenge = liveCaptchaToChallenge(live, page.url());
+    if (!challenge) return;
+    let token: string;
+    try {
+      token = await this.#solver.solve(challenge);
+    } catch {
+      // Vendor error / timeout / budget: leave the page challenged rather than throw under the verb.
+      return;
+    }
+    if (!token) return;
+    await page.evaluate(injectTokenJs(challenge.kind, token)).catch(() => {});
+    // Give the site's continuation (callback / token re-validation) a moment to take effect before
+    // the caller snapshots; a fixed short wait, NOT a re-settle (which would re-enter this method).
+    await page.waitForTimeout(DEFAULT_POLL_INTERVAL_MS).catch(() => {});
   }
 
   /**
