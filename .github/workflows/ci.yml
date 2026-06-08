@@ -1,9 +1,18 @@
-# CI — typecheck + unit suite. Runs on every PR and on pushes to main.
+# CI — typecheck + unit suite, then (on main only) build + publish the image.
 #
-# Scope is the unit suite (`npm test` = tsc build + node --test). It needs no browser: the HTTP
-# tests run over loopback with fakes, and the policy/verb tests use injected cores. The in-container
-# stealth/drive/http kill-gates need real Chrome under Xvfb (amd64) and are intentionally NOT in CI —
-# they run against the Docker image at cutover time. No secrets are referenced.
+# `test` runs on every PR and on pushes to main: the unit suite (`npm test` = tsc build +
+# node --test). It needs no browser — the HTTP tests run over loopback with fakes, and the
+# policy/verb tests use injected cores. The in-container stealth/drive/http kill-gates need real
+# Chrome under Xvfb (amd64) and are intentionally NOT in CI; they run against the image at deploy.
+#
+# `build-image` runs ONLY on push to main, gated on `test` passing: it builds docker/Dockerfile
+# natively on an amd64 runner (no QEMU/Rosetta — real Google Chrome is amd64-only) and pushes to
+# GHCR, tagged with the short commit SHA and `latest`. Deploy stays manual (see the deploy plan);
+# this job only produces a pullable, SHA-pinned image.
+#
+# Secrets: none configured. The only credential is the automatically-provisioned GITHUB_TOKEN,
+# scoped to `packages: write` on the build-image job for the GHCR push. The repo is PUBLIC — no
+# fleet/host/path detail appears here; the image name derives from github.repository.
 name: ci
 
 on:
@@ -30,3 +39,50 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm test
+
+  # Build the amd64 image and publish it to GHCR. Main-branch pushes only, after `test` passes.
+  # PRs (incl. forks) skip this entirely — they neither need nor are allowed to push packages.
+  build-image:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest # amd64; builds Chrome's amd64 .deb natively
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/<owner>/browse-gateway
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Single-arch image consumed by a plain `docker pull :latest` on prod — skip the
+          # provenance/SBOM attestations so the published manifest stays a clean single image
+          # (no extra index / "unknown/unknown" platform entries).
+          provenance: false
+          sbom: false
