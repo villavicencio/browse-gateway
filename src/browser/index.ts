@@ -43,6 +43,7 @@ export {
   buildLaunchOptions,
   resolveCoreOptions,
   DEFAULT_CORE_OPTIONS,
+  WEBRTC_IP_HANDLING_ARG,
   type PatchrightLaunchOptions,
   type ResolvedCoreOptions,
 } from "./launch-options.js";

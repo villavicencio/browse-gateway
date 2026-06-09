@@ -22,6 +22,7 @@ import {
   buildLaunchOptions,
   resolveCoreOptions,
   DEFAULT_CORE_OPTIONS,
+  WEBRTC_IP_HANDLING_ARG,
   targetToSelector,
 } from "../dist/browser/index.js";
 
@@ -157,16 +158,37 @@ test("buildLaunchOptions: headful real-chrome, no sandbox arg by default", () =>
   const opts = buildLaunchOptions(resolveCoreOptions());
   assert.equal(opts.headless, false);
   assert.equal(opts.channel, "chrome");
-  assert.equal(opts.args, undefined);
+  assert.deepEqual(opts.args, [WEBRTC_IP_HANDLING_ARG]);
 });
 
 test("buildLaunchOptions: empty channel omitted (patched chromium), --no-sandbox added", () => {
   const opts = buildLaunchOptions(resolveCoreOptions({ channel: "", noSandbox: true }));
   assert.ok(!("channel" in opts), "channel should be omitted when empty");
-  assert.deepEqual(opts.args, ["--no-sandbox"]);
+  assert.deepEqual(opts.args, [WEBRTC_IP_HANDLING_ARG, "--no-sandbox"]);
 });
 
 test("buildLaunchOptions: headless negative-control config maps through", () => {
   const opts = buildLaunchOptions(resolveCoreOptions({ headless: true }));
   assert.equal(opts.headless, true);
+});
+
+test("buildLaunchOptions: WebRTC IP-handling policy is pinned in every config", () => {
+  // Stealth-critical: without it, STUN leaks the host IP past the proxy and CF
+  // refuses clearance from datacenter hosts (the prod-VPS Indexxx failure).
+  assert.equal(
+    WEBRTC_IP_HANDLING_ARG,
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  );
+  for (const coreOpts of [
+    {},
+    { headless: true },
+    { channel: "", noSandbox: true },
+    { proxy: { server: "http://proxy.example:1080" } },
+  ]) {
+    const opts = buildLaunchOptions(resolveCoreOptions(coreOpts));
+    assert.ok(
+      opts.args.includes(WEBRTC_IP_HANDLING_ARG),
+      `missing WebRTC arg for ${JSON.stringify(coreOpts)}`,
+    );
+  }
 });
