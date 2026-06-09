@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Gateway, loadConfig } from "../gateway/index.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink } from "../policy/index.js";
 import { SecretStore, redactSecrets } from "../security/index.js";
-import { retrieve, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { retrieve, stickySuffixBootError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 
@@ -47,18 +47,22 @@ async function main(): Promise<void> {
   });
   const gateway = Gateway.create(config, undefined, policy);
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
+  // Sticky-session suffix template for proxied escalation (parity with http-main; see there).
+  const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
+  const stickyErr = stickySuffixBootError(stickySuffix);
+  if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
   // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
   // The interactive `drive` surface: a persistent, consumer-bound session driven via browser_* tools.
   // Proxied (with healthy-exit retry) when a residential proxy is configured and we're on a DC IP.
-  const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp });
+  const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix });
 
   const server = createGatewayMcpServer({
     version: "0.1.0",
     drive,
     retrieve: async ({ url }) => {
       try {
-        return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp } });
+        return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix });
       } catch (err) {
         // Never let a proxy/browser error message carry BYO secret material to the consumer (R9).
         const message = err instanceof Error ? err.message : String(err);
@@ -75,7 +79,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 
   await server.connect(new StdioServerTransport());
-  log(`connected over stdio — consumer=${consumer.id} allow=[${consumer.allow.join(", ")}] datacenter=${onDatacenterIp}`);
+  log(`connected over stdio — consumer=${consumer.id} allow=[${consumer.allow.join(", ")}] datacenter=${onDatacenterIp} sticky=${stickySuffix !== undefined}`);
 }
 
 main().catch((err) => {
