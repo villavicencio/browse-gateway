@@ -9,6 +9,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   liveCaptchaToChallenge,
+  liveCaptchaPendingRender,
+  awaitSolvableCaptcha,
   injectTokenJs,
   DETECT_LIVE_CAPTCHA_JS,
 } from "../dist/browser/index.js";
@@ -17,15 +19,85 @@ const URL = "https://site.example/login";
 
 test("liveCaptchaToChallenge: nothing to solve → null", () => {
   assert.equal(liveCaptchaToChallenge(null, URL), null);
-  // already solved (response field non-empty)
-  assert.equal(liveCaptchaToChallenge({ kind: "recaptcha", siteKey: "k", responseEmpty: false }, URL), null);
+  // already solved (response field filled, respLen > 0)
+  assert.equal(liveCaptchaToChallenge({ kind: "recaptcha", siteKey: "k", respLen: 14 }, URL), null);
+  // not rendered yet (response field absent, respLen -1) — solvable only once it renders empty
+  assert.equal(liveCaptchaToChallenge({ kind: "recaptcha", siteKey: "k", respLen: -1 }, URL), null);
   // no sitekey to solve against
-  assert.equal(liveCaptchaToChallenge({ kind: "recaptcha", siteKey: "", responseEmpty: true }, URL), null);
+  assert.equal(liveCaptchaToChallenge({ kind: "recaptcha", siteKey: "", respLen: 0 }, URL), null);
 });
 
-test("liveCaptchaToChallenge: rendered, unsolved widget → a challenge carrying kind/url/siteKey", () => {
-  const challenge = liveCaptchaToChallenge({ kind: "recaptcha", siteKey: "sk-7", responseEmpty: true }, URL);
+test("liveCaptchaToChallenge: rendered, unsolved widget (respLen 0) → a challenge carrying kind/url/siteKey", () => {
+  const challenge = liveCaptchaToChallenge({ kind: "recaptcha", siteKey: "sk-7", respLen: 0 }, URL);
   assert.deepEqual(challenge, { kind: "recaptcha", url: URL, siteKey: "sk-7" });
+});
+
+test("liveCaptchaPendingRender: container present but field absent (respLen -1) → true (wait, don't skip)", () => {
+  assert.equal(liveCaptchaPendingRender({ kind: "recaptcha", siteKey: "k", respLen: -1 }), true);
+});
+
+test("liveCaptchaPendingRender: empty/filled field, no sitekey, or no widget → false (nothing to wait for)", () => {
+  assert.equal(liveCaptchaPendingRender({ kind: "recaptcha", siteKey: "k", respLen: 0 }), false); // solvable now
+  assert.equal(liveCaptchaPendingRender({ kind: "recaptcha", siteKey: "k", respLen: 9 }), false); // already solved
+  assert.equal(liveCaptchaPendingRender({ kind: "recaptcha", siteKey: "", respLen: -1 }), false); // no sitekey
+  assert.equal(liveCaptchaPendingRender(null), false);
+});
+
+test("awaitSolvableCaptcha: solves a widget that renders its response field LATE (the navigate-at-DCL race)", async () => {
+  // Container present immediately (sitekey known) but the response field is injected by an async
+  // script: respLen -1 (absent) on the first two reads, then 0 (rendered, empty). The gate must WAIT
+  // across the un-rendered reads, not skip on the first miss — that was the prod render-race bug.
+  const reads = [
+    { kind: "recaptcha", siteKey: "sk-late", respLen: -1 },
+    { kind: "recaptcha", siteKey: "sk-late", respLen: -1 },
+    { kind: "recaptcha", siteKey: "sk-late", respLen: 0 },
+  ];
+  let i = 0;
+  let waits = 0;
+  const challenge = await awaitSolvableCaptcha(
+    async () => reads[Math.min(i++, reads.length - 1)],
+    () => URL,
+    async () => { waits++; },
+    { pollMs: 5, timeoutMs: 1000 },
+  );
+  assert.deepEqual(challenge, { kind: "recaptcha", url: URL, siteKey: "sk-late" });
+  assert.equal(waits, 2); // waited across the two un-rendered reads, then solved on the third
+});
+
+test("awaitSolvableCaptcha: no widget → null immediately, no waiting", async () => {
+  let waits = 0;
+  const challenge = await awaitSolvableCaptcha(
+    async () => null,
+    () => URL,
+    async () => { waits++; },
+    { pollMs: 5, timeoutMs: 1000 },
+  );
+  assert.equal(challenge, null);
+  assert.equal(waits, 0);
+});
+
+test("awaitSolvableCaptcha: already-solved widget (filled field) → null immediately, no speculative solve", async () => {
+  let waits = 0;
+  const challenge = await awaitSolvableCaptcha(
+    async () => ({ kind: "turnstile", siteKey: "k", respLen: 22 }),
+    () => URL,
+    async () => { waits++; },
+    { pollMs: 5, timeoutMs: 1000 },
+  );
+  assert.equal(challenge, null);
+  assert.equal(waits, 0);
+});
+
+test("awaitSolvableCaptcha: a container that never renders its field → null after the render budget", async () => {
+  let waits = 0;
+  const challenge = await awaitSolvableCaptcha(
+    async () => ({ kind: "recaptcha", siteKey: "k", respLen: -1 }), // perpetually un-rendered
+    () => URL,
+    async () => { waits++; },
+    { pollMs: 100, timeoutMs: 300 },
+  );
+  assert.equal(challenge, null);
+  assert.ok(waits >= 3, `expected ~3 polls before giving up, got ${waits}`);
 });
 
 test("injectTokenJs: reCAPTCHA sets the response field + best-effort callback", () => {
