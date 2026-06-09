@@ -110,7 +110,12 @@ export class GatewayDriveController implements DriveController {
     // re-runs the direct-first escalation rather than stranding the caller on a known-bad exit. We
     // surface the failure rather than swap the exit live under the page (that would lose state, KTD-5).
     await this.#ensureOpen();
-    const snap = await this.#run((s) => s.core.navigate(url));
+    // A reopened PROXIED session (e.g. after an idle reap) lands a fresh exit + empty profile and can
+    // re-hit the CF interstitial — which needs the escalated clearance budget. The default would time
+    // out mid-challenge, the very failure this feature fixes.
+    const snap = await this.#run((s) =>
+      s.core.navigate(url, this.#proxiedSession ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}),
+    );
     if (navFailed(snap)) {
       await this.#discardSession();
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
@@ -220,7 +225,13 @@ export class GatewayDriveController implements DriveController {
     let last: PageSnapshot | undefined;
     for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
       const override = this.#resolveProxyOverride();
-      if (!override) break; // proxy secrets rotated away mid-retry — surface the failure below
+      if (!override) {
+        // Proxy secrets rotated away mid-retry: a distinct error, not the exhausted-exits message
+        // below — so ops sees "config removed", not "all exits unhealthy".
+        throw new Error(
+          `proxy escalation unavailable for ${url}: residential proxy configuration was removed mid-retry`,
+        );
+      }
       await this.#openSession(override);
       const snap = await this.#run((s) =>
         s.core.navigate(url, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),

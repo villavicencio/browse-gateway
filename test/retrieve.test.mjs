@@ -13,6 +13,7 @@ import {
   detectCaptcha,
   proxyFromSecrets,
   mintStickyProxy,
+  stickySuffixBootError,
   retrieve,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../dist/verbs/index.js";
@@ -158,6 +159,23 @@ test("mintStickyProxy: a fresh random id per call (distinct exits across attempt
   const a = mintStickyProxy(base, "_s-{id}");
   const b = mintStickyProxy(base, "_s-{id}");
   assert.notEqual(a.password, b.password, "two mints must land two different sticky sessions");
+});
+
+test("mintStickyProxy: a suffix with no {id} is a static no-op append → all attempts pin one exit", () => {
+  // The silent rotation-collapse footgun: replaceAll('{id}') matches nothing, so two mints are
+  // IDENTICAL. stickySuffixBootError() rejects this config at startup (asserted below).
+  const base = { server: "s", password: "pw" };
+  const a = mintStickyProxy(base, "_static-hold");
+  const b = mintStickyProxy(base, "_static-hold");
+  assert.equal(a.password, "pw_static-hold");
+  assert.equal(a.password, b.password, "no {id} → same exit every attempt");
+});
+
+test("stickySuffixBootError: rejects a non-empty suffix lacking {id}; passes valid/absent", () => {
+  assert.equal(stickySuffixBootError(undefined), null, "absent → ok");
+  assert.equal(stickySuffixBootError(""), null, "empty → ok (treated as unset)");
+  assert.equal(stickySuffixBootError("_session-{id}_lifetime-30m"), null, "has {id} → ok");
+  assert.match(stickySuffixBootError("_session-static"), /\{id\}/, "no {id} → boot error mentioning {id}");
 });
 
 test("retrieve: sticky escalation mints a FRESH held exit per proxied attempt + raised clearance", async () => {

@@ -21,7 +21,7 @@ import {
 } from "../policy/index.js";
 import type { Consumer } from "../policy/index.js";
 import { SecretStore, redactSecrets } from "../security/index.js";
-import { retrieve, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { retrieve, stickySuffixBootError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
@@ -77,6 +77,8 @@ async function main(): Promise<void> {
   // config, NOT a secret (the proxy password it appends to is). Absent = rotating exits, which
   // cannot clear a CF interstitial (the challenge is IP-bound; rotation moves the IP mid-handshake).
   const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
+  const stickyErr = stickySuffixBootError(stickySuffix);
+  if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
   // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without Host-based
@@ -144,6 +146,7 @@ async function main(): Promise<void> {
     log(
       `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
         `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
+        `sticky=${stickySuffix !== undefined} ` +
         `dnsRebindProtection=${allowedHosts.length > 0 || allowedOrigins.length > 0}`,
     );
   });

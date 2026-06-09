@@ -34,9 +34,10 @@ export const PROXY_NAV_TIMEOUT_MS = 25_000;
 /**
  * Clearance budget for PROXIED attempts (both verbs). A CF interstitial on a held residential exit
  * was measured clearing at ~22s (probe, 2026-06-09) — over both defaults (render 20s, drive 15s), so
- * escalated attempts were timing out mid-challenge even on a healthy exit. Cheap to raise: the
- * clearance poll only keeps waiting while a block phrase is visibly showing, so clean pages and
- * hard-403s still return immediately; only an in-progress challenge consumes this budget.
+ * escalated attempts were timing out mid-challenge even on a healthy exit. A page that renders real
+ * content returns as soon as it clears (the poll exits on cleared content, not at the deadline); a
+ * still-blocked, thin, or dead exit consumes the budget — so the worst case is PROXY_MAX_ATTEMPTS x
+ * (nav timeout + this) ≈ 210s, bounded under the 5-min drive idle-reaper TTL.
  */
 export const PROXY_CLEARANCE_TIMEOUT_MS = 45_000;
 
@@ -105,10 +106,25 @@ export function proxyFromSecrets(secrets: SecretStore): ProxyConfig | undefined 
 export function mintStickyProxy(
   proxy: ProxyConfig,
   suffixTemplate: string | undefined,
-  id: string = randomBytes(4).toString("hex"),
+  id: string = randomBytes(8).toString("hex"),
 ): ProxyConfig {
   if (!suffixTemplate || !proxy.password) return proxy;
   return { ...proxy, password: proxy.password + suffixTemplate.replaceAll("{id}", id) };
+}
+
+/**
+ * Boot-time validation for `BGW_PROXY_STICKY_SUFFIX`: a non-empty template MUST contain the `{id}`
+ * placeholder, or {@link mintStickyProxy}'s `replaceAll` is a no-op and every escalation attempt
+ * pins the SAME sticky exit — silently collapsing the rotate-across-retries property with no runtime
+ * error. Returns an error string so entrypoints fail closed at startup (matching the gateway's other
+ * boot guards), or null when the suffix is absent or valid.
+ */
+export function stickySuffixBootError(suffix: string | undefined): string | null {
+  if (!suffix) return null;
+  if (!suffix.includes("{id}")) {
+    return "BGW_PROXY_STICKY_SUFFIX must contain the '{id}' placeholder, else every escalation attempt pins one exit and rotation is silently lost";
+  }
+  return null;
 }
 
 export async function retrieve(
