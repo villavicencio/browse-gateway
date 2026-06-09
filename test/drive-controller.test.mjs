@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
+import { PROXY_CLEARANCE_TIMEOUT_MS } from "../dist/verbs/index.js";
 import { SecretStore } from "../dist/security/index.js";
 
 function makeFakeGateway() {
@@ -136,6 +137,59 @@ test("controller: a reaped session resets the handle so the next navigate reopen
   await c.navigate("https://example.com/again"); // transparently reopens a fresh session
   assert.equal(open.size, 1);
   assert.notEqual([...open.keys()][0], firstHandle, "a new session handle");
+});
+
+test("controller: sticky escalation mints a FRESH held exit per proxied attempt + raised clearance", async () => {
+  // Direct navigate lands a CF interstitial → escalate. First proxied attempt is still challenged
+  // (discarded), second clears. Each proxied OPEN must carry a different sticky password (fresh
+  // exit per attempt — reusing one would pin every retry to the same possibly-dirty exit), and the
+  // proxied navigates must run with the escalated clearance budget (an interstitial clears at ~22s
+  // on a held exit — over the 15s drive default, which timed out mid-challenge and burned exits).
+  const cfSnap = { url: "https://hard.example/", title: "Just a moment...", tree: "Verifying you are human", status: 403, cfHint: true };
+  const okSnap = { url: "https://hard.example/", title: "ok", tree: "- heading [ref=e1]", status: 200 };
+  const opens = []; // coreOverrides per openConsumerSession
+  const navOpts = []; // RenderOptions per navigate
+  let navs = 0;
+  let nextId = 1;
+  const open = new Map();
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession(_token, coreOverrides) {
+      opens.push(coreOverrides);
+      const id = "h" + nextId++;
+      open.set(id, {
+        core: {
+          async navigate(_url, opts) {
+            navOpts.push(opts);
+            navs++;
+            return navs === 1 ? cfSnap : navs === 2 ? cfSnap : okSnap; // direct CF, proxied CF, proxied ok
+          },
+        },
+      });
+      return id;
+    },
+    async useConsumerSession(_t, handle, fn) {
+      const s = open.get(handle);
+      if (!s) throw new Error(`no open session for handle ${handle}`);
+      return fn(s);
+    },
+    async closeConsumerSession(_t, h) {
+      open.delete(h);
+    },
+  };
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const c = new GatewayDriveController(gateway, secrets, "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  const snap = await c.navigate("https://hard.example/");
+  assert.equal(snap.status, 200, "escalation landed the page");
+  assert.equal(opens.length, 3, "1 direct open + 2 proxied attempts");
+  assert.equal(opens[0], undefined, "first open is direct (no override)");
+  const proxiedPw = opens.slice(1).map((o) => o?.proxy?.password);
+  for (const pw of proxiedPw) assert.match(pw, /^pw_s-[0-9a-f]+$/, "sticky suffix applied per proxied open");
+  assert.equal(new Set(proxiedPw).size, 2, "each proxied attempt minted its own sticky session");
+  assert.equal(navOpts[0], undefined, "direct navigate keeps the default clearance");
+  for (const o of navOpts.slice(1)) {
+    assert.equal(o?.clearanceTimeoutMs, PROXY_CLEARANCE_TIMEOUT_MS, "escalated clearance on proxied navigates");
+  }
 });
 
 test("controller: a driver error carrying proxy credentials is redacted before reaching the consumer (R9)", async () => {

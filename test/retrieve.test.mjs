@@ -12,7 +12,9 @@ import {
   shouldEscalateToProxy,
   detectCaptcha,
   proxyFromSecrets,
+  mintStickyProxy,
   retrieve,
+  PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../dist/verbs/index.js";
 import { SecretStore } from "../dist/security/index.js";
 
@@ -40,11 +42,13 @@ function makeFakeGateway(results) {
     async withConsumerSession(token, fn, coreOverrides) {
       const result = results[Math.min(idx, results.length - 1)];
       idx++;
-      calls.push({ token, coreOverrides });
+      const call = { token, coreOverrides };
+      calls.push(call);
       const session = {
         core: {
           kind: "fake",
-          async render() {
+          async render(_url, renderOpts) {
+            call.renderOpts = renderOpts;
             return renderOf(result);
           },
           async setNavigationGuard() {},
@@ -132,6 +136,83 @@ test("retrieve: AE2 soft target from datacenter IP does NOT engage the proxy", a
   assert.equal(r.proxyUsed, false, "no escalation for a non-CF target");
   assert.equal(calls.length, 1, "only the direct render happened");
   assert.equal(calls[0].coreOverrides, undefined);
+});
+
+test("mintStickyProxy: appends the suffix template with {id} substituted; base config untouched", () => {
+  const base = { server: "http://proxy:8080", username: "u", password: "pw" };
+  const minted = mintStickyProxy(base, "_sticky-{id}-hold", "abc123");
+  assert.equal(minted.password, "pw_sticky-abc123-hold");
+  assert.equal(minted.server, base.server);
+  assert.equal(base.password, "pw", "base config is not mutated");
+});
+
+test("mintStickyProxy: no template or no password → the base config unchanged (rotating behavior)", () => {
+  const base = { server: "http://proxy:8080", password: "pw" };
+  assert.equal(mintStickyProxy(base, undefined), base, "no template → same object, password untouched");
+  const noPw = { server: "s", username: "u" };
+  assert.equal(mintStickyProxy(noPw, "_sticky-{id}"), noPw, "no password to suffix → same object");
+});
+
+test("mintStickyProxy: a fresh random id per call (distinct exits across attempts)", () => {
+  const base = { server: "s", password: "pw" };
+  const a = mintStickyProxy(base, "_s-{id}");
+  const b = mintStickyProxy(base, "_s-{id}");
+  assert.notEqual(a.password, b.password, "two mints must land two different sticky sessions");
+});
+
+test("retrieve: sticky escalation mints a FRESH held exit per proxied attempt + raised clearance", async () => {
+  // Direct blocked, then two proxied attempts still blocked, third clears: each proxied attempt
+  // must carry a DIFFERENT sticky password (fresh exit per retry) and the escalated clearance
+  // budget (an interstitial clears at ~22s on a held exit — over the 20s default).
+  const { gateway, calls } = makeFakeGateway([
+    renderOf(cfBlockSignal),
+    renderOf(cfBlockSignal),
+    renderOf(cfBlockSignal),
+    renderOf({ text: "x".repeat(1000), html: articleHtml }),
+  ]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const r = await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    stickySuffix: "_s-{id}",
+  });
+  assert.equal(r.proxyUsed, true);
+  assert.equal(calls.length, 4); // 1 direct + 3 proxied
+  const proxied = calls.slice(1).map((c) => c.coreOverrides?.proxy?.password);
+  for (const pw of proxied) assert.match(pw, /^pw_s-[0-9a-f]+$/, "sticky suffix applied over the base password");
+  assert.equal(new Set(proxied).size, 3, "every proxied attempt minted its own sticky session");
+  for (const c of calls.slice(1)) {
+    assert.equal(c.renderOpts?.clearanceTimeoutMs, PROXY_CLEARANCE_TIMEOUT_MS, "escalated clearance on proxied attempts");
+  }
+  assert.equal(calls[0].renderOpts?.clearanceTimeoutMs, undefined, "direct render keeps the default budget");
+  assert.equal(r.blocked, false);
+});
+
+test("retrieve: no stickySuffix → proxied attempts keep the base password (prior rotating behavior)", async () => {
+  const { gateway, calls } = makeFakeGateway([
+    renderOf(cfBlockSignal),
+    renderOf({ text: "x".repeat(1000), html: articleHtml }),
+  ]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyUsed, true);
+  assert.equal(calls[1].coreOverrides?.proxy?.password, "pw");
+});
+
+test("retrieve: an explicit clearanceTimeoutMs wins over the escalated default on proxied attempts", async () => {
+  const { gateway, calls } = makeFakeGateway([
+    renderOf(cfBlockSignal),
+    renderOf({ text: "x".repeat(1000), html: articleHtml }),
+  ]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080" }));
+  await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    clearanceTimeoutMs: 7_000,
+  });
+  assert.equal(calls[1].renderOpts?.clearanceTimeoutMs, 7_000, "caller's explicit budget is respected");
 });
 
 test("retrieve: CF block from datacenter IP escalates to the proxy and then succeeds", async () => {

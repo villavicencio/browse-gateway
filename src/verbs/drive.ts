@@ -11,7 +11,12 @@
 import { isHardBlock, isVisiblyBlocked, isCloudflareVisible } from "../browser/index.js";
 import type { BrowserCoreOptions, PageSnapshot } from "../browser/index.js";
 import type { SecretStore } from "../security/index.js";
-import { proxyFromSecrets, PROXY_MAX_ATTEMPTS, PROXY_NAV_TIMEOUT_MS } from "./retrieve.js";
+import {
+  proxyFromSecrets,
+  mintStickyProxy,
+  PROXY_MAX_ATTEMPTS,
+  PROXY_NAV_TIMEOUT_MS,
+} from "./retrieve.js";
 
 /**
  * Max fresh proxied sessions to try when landing a healthy exit for a drive session. Sourced from
@@ -24,14 +29,21 @@ export const PROXY_OPEN_ATTEMPTS = PROXY_MAX_ATTEMPTS;
  * we're on a datacenter IP (matching retrieve's escalation gate). Otherwise undefined (direct). The
  * nav timeout is bounded (same value as retrieve) so a dead/slow exit fails fast and one hung exit
  * can't eat the whole retry budget.
+ *
+ * When `stickySuffix` is configured, EACH CALL mints a fresh sticky session — a fresh exit that is
+ * then HELD for that session's lifetime (a CF challenge needs one stable IP to complete). Callers
+ * must therefore resolve a NEW override per attempt/reopen, never reuse one across attempts: reuse
+ * would pin every retry to the same possibly-dirty exit and defeat the rotate-across-retries
+ * property the reputation-403 path needs.
  */
 export function proxyOverrideFor(
   secrets: SecretStore,
   onDatacenterIp: boolean,
+  stickySuffix?: string,
 ): BrowserCoreOptions | undefined {
   const proxy = proxyFromSecrets(secrets);
   return proxy && onDatacenterIp
-    ? { proxy, navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS }
+    ? { proxy: mintStickyProxy(proxy, stickySuffix), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS }
     : undefined;
 }
 

@@ -15,7 +15,13 @@ import { isHttpUrl, redactSecrets } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
 import type { BrowserCoreOptions, DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
-import { proxyOverrideFor, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "../verbs/index.js";
+import {
+  proxyOverrideFor,
+  navFailed,
+  shouldEscalateDrive,
+  PROXY_OPEN_ATTEMPTS,
+  PROXY_CLEARANCE_TIMEOUT_MS,
+} from "../verbs/index.js";
 import type { DriveController } from "./server.js";
 
 export class GatewayDriveController implements DriveController {
@@ -29,27 +35,31 @@ export class GatewayDriveController implements DriveController {
   readonly #token: string;
   /** Whether we run on a datacenter IP — the gate (with a configured proxy) for proxied sessions. */
   readonly #onDatacenterIp: boolean;
+  /** Sticky-session suffix template (deployment config) — each resolve mints a fresh held exit. */
+  readonly #stickySuffix?: string;
 
   constructor(
     gateway: Gateway,
     secrets: SecretStore,
     token: string,
-    opts: { onDatacenterIp?: boolean } = {},
+    opts: { onDatacenterIp?: boolean; stickySuffix?: string } = {},
   ) {
     this.#gateway = gateway;
     this.#secrets = secrets;
     this.#token = token;
     this.#onDatacenterIp = opts.onDatacenterIp ?? false;
+    this.#stickySuffix = opts.stickySuffix;
   }
 
   /**
    * Resolve the proxy override fresh from the (possibly rotated) secret store on every session open,
    * so a `SecretStore.reload()` takes effect on the next session instead of being frozen at
    * construction. Returns the residential-proxy override when one is configured AND we're on a
-   * datacenter IP, else undefined (direct).
+   * datacenter IP, else undefined (direct). With a sticky suffix configured, every call also mints a
+   * FRESH sticky session (a fresh held exit) — so resolve per attempt, never cache across attempts.
    */
   #resolveProxyOverride(): BrowserCoreOptions | undefined {
-    return proxyOverrideFor(this.#secrets, this.#onDatacenterIp);
+    return proxyOverrideFor(this.#secrets, this.#onDatacenterIp, this.#stickySuffix);
   }
 
   /**
@@ -130,10 +140,9 @@ export class GatewayDriveController implements DriveController {
     // hard reputation block, the two a clean residential exit can clear. A bare null-status failure
     // (an off-allowlist abort or an unreachable host) is surfaced directly: a fresh exit won't fix it,
     // so it must not spend the proxy budget (matches retrieve's escalation gate).
-    const override = this.#resolveProxyOverride();
     await this.#discardSession(); // drop the blocked direct session before escalating
-    if (override && shouldEscalateDrive(direct)) {
-      return this.#openHealthyAndNavigate(url, override);
+    if (this.#resolveProxyOverride() !== undefined && shouldEscalateDrive(direct)) {
+      return this.#openHealthyAndNavigate(url);
     }
     throw new Error(
       `navigation failed (status=${direct.status ?? "n/a"}): the page was blocked or could not be reached`,
@@ -195,17 +204,27 @@ export class GatewayDriveController implements DriveController {
   }
 
   /**
-   * Escalation path: open a proxied session (each a fresh rotating exit) and navigate, retrying fresh
-   * exits until one lands the page, then pin it. A dead/blocked exit fails fast (bounded proxy nav
-   * timeout), so retries stay cheap; the per-consumer cap is respected because the unhealthy session
-   * is discarded before the next opens. Worst case PROXY_OPEN_ATTEMPTS × the bounded proxy nav timeout
-   * (~25s) — well under the idle-reaper TTL so an in-progress retry isn't reclaimed mid-flight.
+   * Escalation path: open a proxied session and navigate, retrying fresh exits until one lands the
+   * page, then pin it. The override is resolved FRESH per attempt — with a sticky suffix configured
+   * each attempt mints its own held exit (one stable IP for the attempt's whole challenge — a CF
+   * interstitial cannot complete across rotating per-request IPs), while retries still draw fresh
+   * exits past dead/dirty ones. The proxied navigate runs with the raised escalated clearance budget:
+   * an interstitial clears in ~22s on a held exit, over the 15s drive default (probe, 2026-06-09) —
+   * with the default, even a healthy exit timed out mid-challenge, was discarded as navFailed, and
+   * the retry burned a fresh exit re-starting the challenge from zero. A dead/blocked exit still
+   * fails fast (bounded proxy nav timeout); the per-consumer cap is respected because the unhealthy
+   * session is discarded before the next opens. Worst case PROXY_OPEN_ATTEMPTS × (nav timeout +
+   * clearance budget) — still under the idle-reaper TTL so an in-progress retry isn't reclaimed.
    */
-  async #openHealthyAndNavigate(url: string, override: BrowserCoreOptions): Promise<PageSnapshot> {
+  async #openHealthyAndNavigate(url: string): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
     for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
+      const override = this.#resolveProxyOverride();
+      if (!override) break; // proxy secrets rotated away mid-retry — surface the failure below
       await this.#openSession(override);
-      const snap = await this.#run((s) => s.core.navigate(url));
+      const snap = await this.#run((s) =>
+        s.core.navigate(url, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
+      );
       if (!navFailed(snap)) {
         this.#pinned = true;
         return snap;

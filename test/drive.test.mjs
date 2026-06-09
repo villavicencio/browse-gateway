@@ -23,6 +23,16 @@ test("proxyOverrideFor: {proxy} only with a proxy configured AND on a datacenter
   assert.equal(proxyOverrideFor(noSecrets(), true), undefined, "no proxy -> no override");
 });
 
+test("proxyOverrideFor: with a sticky suffix, EACH CALL mints a fresh held exit", () => {
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  const a = proxyOverrideFor(secrets, true, "_s-{id}");
+  const b = proxyOverrideFor(secrets, true, "_s-{id}");
+  assert.match(a?.proxy?.password, /^pw_s-[0-9a-f]+$/);
+  assert.notEqual(a?.proxy?.password, b?.proxy?.password, "fresh sticky session per resolve");
+  // No suffix → base password untouched (prior rotating behavior).
+  assert.equal(proxyOverrideFor(secrets, true)?.proxy?.password, "pw");
+});
+
 test("navFailed: fails on null status, a 4xx+thin page, or a visible interstitial; a real cleared page does not", () => {
   assert.equal(navFailed({ url: "u", title: "t", tree: "", status: null }), true);
   assert.equal(navFailed({ url: "u", title: "t", tree: "Forbidden", status: 403 }), true);

@@ -7,6 +7,7 @@
  * datacenter IP (R7), retried across fresh rotating exits -> extract readable markdown. Proxy
  * creds come from the U4 SecretStore; the CAPTCHA solver is injected (R8).
  */
+import { randomBytes } from "node:crypto";
 import { isVisiblyBlocked, isHardBlock, MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions } from "../browser/index.js";
 import type { Gateway } from "../gateway/index.js";
@@ -30,6 +31,15 @@ import type { CaptchaSolver } from "./captcha.js";
 export const PROXY_MAX_ATTEMPTS = 3;
 export const PROXY_NAV_TIMEOUT_MS = 25_000;
 
+/**
+ * Clearance budget for PROXIED attempts (both verbs). A CF interstitial on a held residential exit
+ * was measured clearing at ~22s (probe, 2026-06-09) — over both defaults (render 20s, drive 15s), so
+ * escalated attempts were timing out mid-challenge even on a healthy exit. Cheap to raise: the
+ * clearance poll only keeps waiting while a block phrase is visibly showing, so clean pages and
+ * hard-403s still return immediately; only an in-progress challenge consumes this budget.
+ */
+export const PROXY_CLEARANCE_TIMEOUT_MS = 45_000;
+
 export interface RetrieveOptions {
   token: string;
   url: string;
@@ -38,6 +48,13 @@ export interface RetrieveOptions {
   /** Injected CAPTCHA solver; omitted = no solving (a detected CAPTCHA is left to fail). */
   solver?: CaptchaSolver;
   clearanceTimeoutMs?: number;
+  /**
+   * Sticky-session suffix template for proxied attempts (deployment config,
+   * `BGW_PROXY_STICKY_SUFFIX`; the provider-specific syntax lives only in the deployment env — see
+   * {@link mintStickyProxy}). Absent = rotating exits (prior behavior), which cannot clear a CF
+   * interstitial: the challenge binds to one IP and per-request rotation moves it mid-handshake.
+   */
+  stickySuffix?: string;
 }
 
 /**
@@ -73,6 +90,25 @@ export function proxyFromSecrets(secrets: SecretStore): ProxyConfig | undefined 
   const username = secrets.get("BGW_PROXY_USERNAME");
   const password = secrets.get("BGW_PROXY_PASSWORD");
   return { server, ...(username ? { username } : {}), ...(password ? { password } : {}) };
+}
+
+/**
+ * Derive a STICKY-session proxy from a base config: append `suffixTemplate` (with `{id}` replaced by
+ * a fresh random token) to the password. Residential providers encode stickiness in the password, so
+ * this stays provider-neutral — the literal suffix syntax is deployment config, never in source
+ * (public repo). One sticky id = one held exit IP: a fresh id per ATTEMPT preserves the
+ * rotate-across-retries property the reputation-403 path needs, while each attempt keeps the single
+ * stable IP a CF challenge requires to complete (cf_clearance is IP-bound; per-request rotation
+ * moves the IP mid-challenge, which is why rotating exits can never clear an interstitial).
+ * No template or no password → the base config unchanged (prior rotating behavior).
+ */
+export function mintStickyProxy(
+  proxy: ProxyConfig,
+  suffixTemplate: string | undefined,
+  id: string = randomBytes(4).toString("hex"),
+): ProxyConfig {
+  if (!suffixTemplate || !proxy.password) return proxy;
+  return { ...proxy, password: proxy.password + suffixTemplate.replaceAll("{id}", id) };
 }
 
 export async function retrieve(
@@ -121,15 +157,22 @@ export async function retrieve(
   // 3) Scoped proxy escalation — a CF managed challenge OR a hard IP/WAF-reputation block
   //    (4xx/5xx + thin body), from a datacenter IP. The proxy's clean residential IP is what
   //    clears a reputation block; the local datacenter IP cannot (F1, 2026-06-01). Each attempt
-  //    is a fresh proxied session => a fresh rotating exit IP, so we retry past dead/slow exits
-  //    until a real page lands or attempts run out (see PROXY_MAX_ATTEMPTS note above).
+  //    mints a fresh STICKY session (when configured) => a fresh exit per retry that is then HELD
+  //    for the whole attempt — a CF challenge needs one stable IP to complete, while the retry
+  //    still rotates past dead/slow/dirty exits (see PROXY_MAX_ATTEMPTS note above). The clearance
+  //    budget is raised on proxied attempts: an interstitial clears in ~22s on a held exit, over
+  //    the 20s default (probe, 2026-06-09).
   if (proxy && shouldEscalateToProxy(render, render.status, escalation)) {
     proxyUsed = true;
+    const proxiedRenderOpts: RenderOptions = {
+      ...renderOpts,
+      clearanceTimeoutMs: opts.clearanceTimeoutMs ?? PROXY_CLEARANCE_TIMEOUT_MS,
+    };
     for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
       render = await gateway.withConsumerSession(
         token,
-        (s) => s.core.render(url, renderOpts),
-        { proxy, navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS },
+        (s) => s.core.render(url, proxiedRenderOpts),
+        { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS },
       );
       // A fresh exit landed a real page -> done. Retry on a failed nav (null status) or a
       // still-blocked result (dead exit / proxy error page); a thin-but-OK 200 is not retried.
