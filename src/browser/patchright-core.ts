@@ -9,7 +9,7 @@ import { isCleared, isVisiblyBlocked, hasCloudflareHint, type PageSignal } from 
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
-  liveCaptchaToChallenge,
+  awaitSolvableCaptcha,
   type CaptchaSolver,
   type LiveCaptcha,
 } from "./captcha.js";
@@ -53,6 +53,11 @@ const MAX_WAIT_MS = 60_000;
  * drive-tuned budget; overridable per call via `RenderOptions.clearanceTimeoutMs`.
  */
 const DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS = 15_000;
+// Interactive-CAPTCHA widgets inject their response field from an async script that runs AFTER
+// navigate() resolves (waitUntil "domcontentloaded"). Poll up to this long for the field to render
+// before concluding there's nothing to solve — otherwise a one-shot detect always loses the race.
+const CAPTCHA_RENDER_POLL_MS = 250;
+const CAPTCHA_RENDER_TIMEOUT_MS = 2_000;
 
 /**
  * A snapshot ref looks like `e4` (top frame) or a frame-prefixed `f1e2`; anything else is a raw
@@ -401,10 +406,15 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   async #trySolveCaptcha(page: PatchrightPage): Promise<boolean> {
     if (!this.#solver) return false;
-    const live = (await page
-      .evaluate(DETECT_LIVE_CAPTCHA_JS)
-      .catch(() => null)) as LiveCaptcha | null;
-    const challenge = liveCaptchaToChallenge(live, page.url());
+    // Resolve the widget, polling out its render race: navigate() resolves at domcontentloaded, but
+    // the response field is injected by a later async script, so a one-shot detect sees the container
+    // with no field yet and would skip forever (the next detect pass re-navigates and re-races).
+    const challenge = await awaitSolvableCaptcha(
+      async () => (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null,
+      () => page.url(),
+      (ms) => page.waitForTimeout(ms).catch(() => {}),
+      { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: CAPTCHA_RENDER_TIMEOUT_MS },
+    );
     if (!challenge) return false;
     let token: string;
     try {

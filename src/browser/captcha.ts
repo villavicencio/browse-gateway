@@ -56,36 +56,82 @@ export function detectCaptcha(signal: PageSignal, url: string): CaptchaChallenge
 export interface LiveCaptcha {
   kind: Exclude<CaptchaKind, "unknown">;
   siteKey: string;
-  /** The widget's response-token field exists and is empty — i.e. rendered but not yet solved. */
-  responseEmpty: boolean;
+  /**
+   * Response-token field length, as a tri-state: `-1` the field is ABSENT (the widget's async script
+   * hasn't injected it yet — i.e. not rendered), `0` present-and-EMPTY (rendered, unsolved → solvable),
+   * `>0` present-and-FILLED (already self-solved). Distinguishing absent from filled is what lets the
+   * caller wait out the render race instead of skipping a widget that just hasn't drawn its field yet.
+   */
+  respLen: number;
 }
 
 /**
  * In-page script (evaluated on the live page) that returns a {@link LiveCaptcha} or null. Detects the
- * three interactive token-CAPTCHA families by their widget container's `data-sitekey`, and reports
- * whether the response field is present-and-empty. `responseEmpty` is true ONLY when the field exists
- * and is empty (=== 0 length) — a missing field (-1) means the widget hasn't rendered yet, so we skip
- * rather than spend a solve on a half-loaded page; a non-empty field means it already self-solved.
+ * three interactive token-CAPTCHA families by their widget container's `data-sitekey` and reports the
+ * response field's token length as a tri-state `respLen` (`-1` absent / `0` empty / `>0` filled) — see
+ * {@link LiveCaptcha.respLen}. It reports `respLen` raw rather than collapsing it to a boolean so the
+ * caller can tell "not rendered yet" (wait) from "already solved" (skip); collapsing the two is what
+ * made an async-rendered widget look permanently unsolvable to a gate that runs at domcontentloaded.
  */
 export const DETECT_LIVE_CAPTCHA_JS = `(() => {
   const tokLen = (sel) => { const e = document.querySelector(sel); return e ? (e.value || '').length : -1; };
   const re = document.querySelector('.g-recaptcha[data-sitekey]');
-  if (re) return { kind: 'recaptcha', siteKey: re.getAttribute('data-sitekey') || '', responseEmpty: tokLen('[name="g-recaptcha-response"]') === 0 };
+  if (re) return { kind: 'recaptcha', siteKey: re.getAttribute('data-sitekey') || '', respLen: tokLen('[name="g-recaptcha-response"]') };
   const ts = document.querySelector('.cf-turnstile[data-sitekey]');
-  if (ts) return { kind: 'turnstile', siteKey: ts.getAttribute('data-sitekey') || '', responseEmpty: tokLen('[name="cf-turnstile-response"]') === 0 };
+  if (ts) return { kind: 'turnstile', siteKey: ts.getAttribute('data-sitekey') || '', respLen: tokLen('[name="cf-turnstile-response"]') };
   const hc = document.querySelector('.h-captcha[data-sitekey]');
-  if (hc) return { kind: 'hcaptcha', siteKey: hc.getAttribute('data-sitekey') || '', responseEmpty: tokLen('[name="h-captcha-response"]') === 0 };
+  if (hc) return { kind: 'hcaptcha', siteKey: hc.getAttribute('data-sitekey') || '', respLen: tokLen('[name="h-captcha-response"]') };
   return null;
 })()`;
 
 /**
  * Pure decision: turn a {@link LiveCaptcha} reading into a solvable {@link CaptchaChallenge}, or null
- * when there's nothing worth solving (no widget, already solved, or no sitekey to solve against).
- * Keeping the gate pure makes the "never speculatively solve" rule unit-testable without a browser.
+ * when there's nothing worth solving (no widget, already solved, not rendered yet, or no sitekey to
+ * solve against). Solvable means the response field is present and EMPTY (`respLen === 0`). Keeping the
+ * gate pure makes the "never speculatively solve" rule unit-testable without a browser.
  */
 export function liveCaptchaToChallenge(live: LiveCaptcha | null, url: string): CaptchaChallenge | null {
-  if (!live || !live.responseEmpty || !live.siteKey) return null;
+  if (!live || live.respLen !== 0 || !live.siteKey) return null;
   return { kind: live.kind, url, siteKey: live.siteKey };
+}
+
+/**
+ * The widget container exists (sitekey known) but its response field has not rendered yet
+ * (`respLen === -1`) — the widget's async script hasn't injected the field. This is the ONE state
+ * worth waiting on: a gate that fires at `domcontentloaded` (before that script runs) sees exactly
+ * this, and skipping it permanently is the render-race bug. A filled field (already solved), an empty
+ * one (solvable now), no sitekey, or no widget at all are NOT pending — there's nothing to wait for.
+ */
+export function liveCaptchaPendingRender(live: LiveCaptcha | null): boolean {
+  return !!live && !!live.siteKey && live.respLen === -1;
+}
+
+/**
+ * Resolve a solvable challenge, polling out the widget's render race. `navigate()` resolves at
+ * `domcontentloaded`, but reCAPTCHA/Turnstile/hCaptcha inject their response field from an async
+ * script that runs LATER — so a one-shot detect right after settle sees the container with no field
+ * (`respLen -1`) and {@link liveCaptchaToChallenge} returns null. The only other detect pass is the
+ * next action, which for a submit re-navigates and re-races — so without this poll an async-rendered
+ * widget is never solved. Returns as soon as the field renders empty (solvable); stops immediately
+ * when there's no widget or it's already filled; gives up after `timeoutMs` if a container is present
+ * but never draws its field. Pure: the I/O (`detect`/`urlOf`/`wait`) is injected, so it unit-tests
+ * without a browser.
+ */
+export async function awaitSolvableCaptcha(
+  detect: () => Promise<LiveCaptcha | null>,
+  urlOf: () => string,
+  wait: (ms: number) => Promise<void>,
+  opts: { pollMs: number; timeoutMs: number },
+): Promise<CaptchaChallenge | null> {
+  let waited = 0;
+  for (;;) {
+    const live = await detect();
+    const challenge = liveCaptchaToChallenge(live, urlOf());
+    if (challenge) return challenge;
+    if (!liveCaptchaPendingRender(live) || waited >= opts.timeoutMs) return null;
+    await wait(opts.pollMs);
+    waited += opts.pollMs;
+  }
 }
 
 /**

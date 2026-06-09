@@ -50,6 +50,8 @@ export {
   detectCaptcha,
   NullCaptchaSolver,
   liveCaptchaToChallenge,
+  liveCaptchaPendingRender,
+  awaitSolvableCaptcha,
   injectTokenJs,
   DETECT_LIVE_CAPTCHA_JS,
   type CaptchaChallenge,
