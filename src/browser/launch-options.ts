@@ -37,6 +37,16 @@ export function resolveCoreOptions(
   };
 }
 
+/**
+ * WebRTC must never gather candidates outside the proxy: during an anti-bot challenge,
+ * STUN over plain UDP reveals the host's real IP alongside the proxied one — on a
+ * datacenter VPS that mismatch reads as "proxy detected" and the challenge never clears.
+ * `disable_non_proxied_udp` restricts ICE to proxied transports without disabling the
+ * WebRTC API itself (the same behavior as common WebRTC-leak-protection settings).
+ */
+export const WEBRTC_IP_HANDLING_ARG =
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp";
+
 /** The subset of Patchright's launch options this core sets. */
 export interface PatchrightLaunchOptions {
   headless: boolean;
@@ -54,7 +64,8 @@ export function buildLaunchOptions(
 ): PatchrightLaunchOptions {
   const launch: PatchrightLaunchOptions = { headless: resolved.headless };
   if (resolved.channel) launch.channel = resolved.channel;
-  if (resolved.noSandbox) launch.args = ["--no-sandbox"];
+  launch.args = [WEBRTC_IP_HANDLING_ARG];
+  if (resolved.noSandbox) launch.args.push("--no-sandbox");
   if (resolved.proxy) launch.proxy = resolved.proxy;
   return launch;
 }
