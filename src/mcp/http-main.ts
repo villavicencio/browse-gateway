@@ -21,7 +21,7 @@ import {
 } from "../policy/index.js";
 import type { Consumer } from "../policy/index.js";
 import { SecretStore, redactSecrets } from "../security/index.js";
-import { retrieve, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { retrieve, stickySuffixBootError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
@@ -73,6 +73,12 @@ async function main(): Promise<void> {
   });
   const gateway = Gateway.create(config, undefined, policy);
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
+  // Sticky-session suffix template for proxied escalation ({id} minted per attempt). Deployment
+  // config, NOT a secret (the proxy password it appends to is). Absent = rotating exits, which
+  // cannot clear a CF interstitial (the challenge is IP-bound; rotation moves the IP mid-handshake).
+  const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
+  const stickyErr = stickySuffixBootError(stickySuffix);
+  if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
   // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without Host-based
@@ -89,13 +95,13 @@ async function main(): Promise<void> {
       // One consumer-bound graph per connection: a fresh stateful drive controller + a retrieve
       // closure pinned to this consumer's token. The session pool / per-consumer cap / reaper stay
       // GLOBAL on the gateway (do not reintroduce the e431101 per-consumer-cap race).
-      const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp });
+      const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix });
       const server = createGatewayMcpServer({
         version: "0.1.0",
         drive,
         retrieve: async ({ url }) => {
           try {
-            return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp } });
+            return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix });
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             throw new Error(redactSecrets(message, secrets)); // never leak BYO secret material (R9)
@@ -140,6 +146,7 @@ async function main(): Promise<void> {
     log(
       `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
         `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
+        `sticky=${stickySuffix !== undefined} ` +
         `dnsRebindProtection=${allowedHosts.length > 0 || allowedOrigins.length > 0}`,
     );
   });
