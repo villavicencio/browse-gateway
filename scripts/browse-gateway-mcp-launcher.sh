@@ -26,6 +26,6 @@ exec docker run --rm -i --init --shm-size=1g \
   -e BGW_MCP_ALLOWLIST \
   -e BGW_ON_DATACENTER_IP \
   -e BGW_PROXY_URL -e BGW_PROXY_USERNAME -e BGW_PROXY_PASSWORD -e BGW_PROXY_STICKY_SUFFIX \
-  -e BGW_CAPTCHA_API_KEY \
+  -e BGW_CAPTCHA_API_URL -e BGW_CAPTCHA_API_KEY \
   "$IMAGE" \
   node dist/mcp/main.js
