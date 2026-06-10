@@ -54,12 +54,14 @@ echo "deploy: target = ${IMAGE}"
 # 2 — pull the immutable digest (package is public → anonymous pull).
 docker pull "$IMAGE"
 
-# 3 — GATE: run the HTTP kill-gate on the pulled image in the real rootless daemon. MAX_SESSIONS is
-# forced ≥3 (it false-FAILs at the inherited 2). Abort with the live container UNTOUCHED on failure.
+# 3 — GATE: run the HTTP kill-gate on the pulled image in the real rootless daemon. validate-http
+# is SELF-CONTAINED — it stands up its own server and sets its OWN test config, including the
+# per-consumer cap it asserts ("2nd concurrent session refused"). Pass NO BGW_* overrides: an
+# injected BGW_PER_CONSUMER_MAX would let the 2nd session through and false-FAIL that check (it
+# already forces MAX_SESSIONS≥3 internally). Abort with the live container UNTOUCHED on failure.
 echo "deploy: running validate-http gate → $GATE_LOG"
 set +e
 docker run --rm --init --shm-size="${BGW_SHM_SIZE:-1g}" \
-  -e BGW_MAX_SESSIONS=3 -e BGW_PER_CONSUMER_MAX=2 \
   "$IMAGE" node scripts/validate-http.mjs >"$GATE_LOG" 2>&1
 gate_rc=$?
 set -e
