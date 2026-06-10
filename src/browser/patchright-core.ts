@@ -5,7 +5,7 @@
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
 import { hostFromUrl } from "../security/url.js";
-import { isCleared, isVisiblyBlocked, hasCloudflareHint, type PageSignal } from "./detect.js";
+import { isCleared, isVisiblyBlocked, hasCloudflareHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
@@ -215,26 +215,30 @@ export class PatchrightBrowserCore implements BrowserCore {
     const clearanceTimeoutMs = opts.clearanceTimeoutMs ?? DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const page = await this.#ensureActivePage();
-    let status: number | null = null;
+    // Reset the tracked status; the active-page response listener (#ensureActivePage) repopulates it
+    // from THIS nav's main-frame responses — INCLUDING a post-clearance reload. We deliberately do
+    // NOT freeze status at the goto's first response: a CF interstitial answers 403 then reloads to
+    // 200 once the challenge auto-solves, and capturing the 403 made navFailed misread the cleared
+    // page as a hard block (4xx + thin tree), so proxied escalation discarded a working exit and
+    // eventually reported "could not land a working proxied exit (403)".
+    this.#lastDocStatus = null;
     try {
-      const resp = await page.goto(url, {
+      await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: this.#resolved.navigationTimeoutMs,
       });
-      status = resp ? resp.status() : null;
     } catch {
-      // A challenge/redirect/dead-exit may abort the navigation; snapshot whatever rendered and
-      // leave status null so the drive layer treats it as a failed nav.
+      // A challenge/redirect/dead-exit may abort the navigation; settle on whatever rendered. With no
+      // main-frame response the listener leaves status null, so the drive layer treats it as a failed nav.
     }
-    this.#lastDocStatus = status; // keep a subsequent snapshot()/action consistent with this nav
-    // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does. A page
-    // still blocked after the budget is surfaced by navFailed (the snapshot tree still carries the
-    // phrase), so a proxied first navigate rotates to a fresh exit instead of pinning the blocked one.
+    // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does, and —
+    // once it clears via a full reload — wait for the real document to land content rather than the
+    // blank inter-navigation moment. A page still blocked after the budget is surfaced by navFailed.
     await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
     // Carry the CF vendor-hint signal (the HTML half of retrieve's CF detection) as a scrubbed
     // boolean, so drive's escalation recognizes a CF interstitial that shows no visible CF phrase.
     const html = String(await page.content().catch(() => ""));
-    return { ...(await this.#snapshotOf(page)), status, cfHint: hasCloudflareHint(html) };
+    return { ...(await this.#snapshotOf(page)), cfHint: hasCloudflareHint(html) };
   }
 
   async snapshot(): Promise<PageSnapshot> {
@@ -377,7 +381,19 @@ export class PatchrightBrowserCore implements BrowserCore {
     await page.waitForLoadState("domcontentloaded").catch(() => {});
     let signal = await pollSignal(page);
     let waited = 0;
-    while (isVisiblyBlocked(signal) && waited < clearanceTimeoutMs) {
+    let sawBlock = false;
+    while (waited < clearanceTimeoutMs) {
+      const blocked = isVisiblyBlocked(signal);
+      if (blocked) sawBlock = true;
+      // A never-blocked page settles the moment it isn't blocked (a clean/dead/blank page returns
+      // fast — only an actual challenge costs latency). A page that WAS blocked must wait for the
+      // REAL post-clearance document to land NON-THIN content (isCleared past MIN_CONTENT_LENGTH —
+      // the same thinness bar navFailed's isHardBlock uses), not the blank/residual transitional
+      // window a CF 403→200 reload leaves. Otherwise #settle exits on the transition, the snapshot
+      // is thin, and (with the interstitial's status) navFailed misreads the cleared page as a hard
+      // block. Bounded by the clearance budget, so a genuinely-thin cleared page still returns.
+      const settled = sawBlock ? isCleared(signal, MIN_CONTENT_LENGTH) : !blocked;
+      if (settled) break;
       await page.waitForTimeout(pollIntervalMs);
       waited += pollIntervalMs;
       signal = await pollSignal(page);
