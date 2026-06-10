@@ -87,6 +87,61 @@ async function runGroup(category, urls) {
   return passed;
 }
 
+/**
+ * WebRTC leak check: the managed policy baked into the image (WebRtcIPHandling =
+ * disable_non_proxied_udp, docker/policies/) must prevent any server-reflexive ICE
+ * candidate — `typ srflx` is STUN over plain UDP carrying the HOST's real IP, which
+ * bypasses any configured proxy and reads as "proxy detected" to anti-bot vendors.
+ * No proxy is needed for the check: under the policy no non-proxied UDP is allowed at
+ * all, so a compliant image gathers no srflx candidate even direct. The launch switch
+ * alone does NOT pass this (ignored by Chrome 149) — the policy file is load-bearing.
+ */
+async function runWebrtcLeakCheck() {
+  console.log(`\n── webrtc: no non-proxied ICE candidates (managed policy) ──`);
+  const core = await createBrowserCore({ ...coreOpts });
+  try {
+    const page = await core.context.newPage();
+    await page
+      .goto("https://example.com/", { waitUntil: "domcontentloaded", timeout: 30_000 })
+      .catch(() => {}); // any document works; ICE gathering needs no page network
+    const candidates = await page.evaluate(async () => {
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      });
+      pc.createDataChannel("probe");
+      const out = [];
+      pc.onicecandidate = (e) => {
+        if (e.candidate && e.candidate.candidate) out.push(e.candidate.candidate);
+      };
+      await pc.setLocalDescription(await pc.createOffer());
+      await new Promise((resolve) => {
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === "complete") resolve();
+        };
+        setTimeout(resolve, 8_000); // cap; gathering normally completes well before
+      });
+      pc.close();
+      return out;
+    });
+    // Gate on ANY UDP candidate, not just srflx: under the policy (and with no proxy
+    // configured, as in this gate) no non-proxied UDP is allowed at all, so even mDNS
+    // host candidates over UDP must be absent. Host candidates gather without any
+    // network reachability, so a policy-less image FAILS here even if STUN is
+    // unreachable — no vacuous pass.
+    const udp = candidates.filter((c) => / udp /i.test(c));
+    const srflx = candidates.filter((c) => c.includes("typ srflx"));
+    const passed = udp.length === 0;
+    console.log(
+      `  candidates=${candidates.length} udp=${udp.length} srflx=${srflx.length} — ` +
+        `${passed ? "PASS" : "FAIL (non-proxied UDP escaped — policy file missing/ignored)"}`,
+    );
+    for (const c of udp) console.log(`    ${c}`);
+    return passed;
+  } finally {
+    await core.close();
+  }
+}
+
 /** Negative control: strict headless on the CF target must be blocked (proves Xvfb works). */
 async function runNegativeControl() {
   console.log(`\n── negative control: strict headless must be blocked ──`);
@@ -110,14 +165,16 @@ async function main() {
 
   const cloudflare = await runGroup("cloudflare", GROUPS.cloudflare);
   const datadome = await runGroup("datadome", GROUPS.datadome);
+  const webrtc = await runWebrtcLeakCheck();
   const negative = SKIP_NEGATIVE_CONTROL ? true : await runNegativeControl();
   if (SKIP_NEGATIVE_CONTROL) console.log("\n(negative control skipped)");
 
-  const passed = cloudflare && datadome && negative;
+  const passed = cloudflare && datadome && webrtc && negative;
   console.log(`\n=== GATE: ${passed ? "PASS ✅" : "FAIL ❌"} ===`);
   console.log(
     `  cloudflare=${cloudflare ? "PASS" : "FAIL"} ` +
       `datadome=${datadome ? "PASS" : "FAIL"} ` +
+      `webrtc=${webrtc ? "PASS" : "FAIL"} ` +
       `negative-control=${negative ? "PASS" : "FAIL"}`,
   );
   process.exit(passed ? 0 : 1);
