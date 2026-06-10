@@ -5,7 +5,7 @@
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
 import { hostFromUrl } from "../security/url.js";
-import { isCleared, isVisiblyBlocked, hasCloudflareHint, type PageSignal } from "./detect.js";
+import { isCleared, isVisiblyBlocked, hasCloudflareHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
@@ -385,13 +385,15 @@ export class PatchrightBrowserCore implements BrowserCore {
     while (waited < clearanceTimeoutMs) {
       const blocked = isVisiblyBlocked(signal);
       if (blocked) sawBlock = true;
-      // Keep polling while blocked, OR — after a block cleared — while the page is momentarily
-      // blank: a CF interstitial clears via a full main-frame reload (403→200) with a brief blank
-      // inter-navigation window. Exiting there would snapshot the blank transitional page (empty
-      // tree) and miss the real document that lands a beat later. Clean pages (no block ever seen)
-      // still return immediately, so only an actual challenge costs the extra wait.
-      const blankAfterClear = sawBlock && !blocked && signal.text.trim().length === 0;
-      if (!blocked && !blankAfterClear) break;
+      // A never-blocked page settles the moment it isn't blocked (a clean/dead/blank page returns
+      // fast — only an actual challenge costs latency). A page that WAS blocked must wait for the
+      // REAL post-clearance document to land NON-THIN content (isCleared past MIN_CONTENT_LENGTH —
+      // the same thinness bar navFailed's isHardBlock uses), not the blank/residual transitional
+      // window a CF 403→200 reload leaves. Otherwise #settle exits on the transition, the snapshot
+      // is thin, and (with the interstitial's status) navFailed misreads the cleared page as a hard
+      // block. Bounded by the clearance budget, so a genuinely-thin cleared page still returns.
+      const settled = sawBlock ? isCleared(signal, MIN_CONTENT_LENGTH) : !blocked;
+      if (settled) break;
       await page.waitForTimeout(pollIntervalMs);
       waited += pollIntervalMs;
       signal = await pollSignal(page);
