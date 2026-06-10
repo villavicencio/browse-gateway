@@ -11,6 +11,13 @@
 #
 # Fleet config is sourced from $BGW_DEPLOY_CONFIG (host-local, NOT committed); it sets the paths
 # launch-http.sh needs plus BGW_BIND_ADDR/BGW_HOST_PORT for the verify curl. This file is fleet-clean.
+#
+# REQUIRED on-host hardening — the validation below is NOT sufficient on its own; the deploy key
+# MUST be locked in ~/.ssh/authorized_keys, or this script never runs and the key is a full shell:
+#   command="/path/to/deploy-on-host.sh",restrict,from="<tailnet-CIDR>" ssh-ed25519 AAAA…
+# (`restrict` = no-pty/-port/-agent/-X11-forwarding; `from=` confines a leaked key to the tailnet.)
+# The tailnet ACL MUST scope tag:ci-deploy to this host's SSH port only, and the deploy key must be
+# dedicated to this purpose. Without these, the forced-command trust boundary does not hold.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,12 +32,21 @@ BIND_ADDR="${BGW_BIND_ADDR:-127.0.0.1}"
 HOST_PORT="${BGW_HOST_PORT:-8080}"
 GATE_LOG="${GATE_LOG:-$HOME/validate-http-deploy.log}"   # ~/ not /tmp (a root-owned /tmp log false-PASSes)
 
-# 1 — accept the digest only (forced-command boundary). The runner passes the resolved ref; the
-# interactive request, if any, is in SSH_ORIGINAL_COMMAND. Reject anything that isn't our digest.
+# 1 — accept a pinned digest of THIS PROJECT'S package only (forced-command boundary). The runner
+# passes the resolved ref; the request arrives in SSH_ORIGINAL_COMMAND. Pinning the package — not
+# just "some ghcr digest" — is load-bearing: a leaked key must NOT be able to deploy an arbitrary
+# attacker-owned image, which would run as the live container with every BGW_* secret forwarded.
+: "${BGW_EXPECTED_REPO:?set BGW_EXPECTED_REPO in the deploy config (e.g. ghcr.io/<owner>/browse-gateway)}"
 REQ="${1:-${SSH_ORIGINAL_COMMAND:-}}"
 IMAGE="$(printf '%s' "$REQ" | tr -d '[:space:]')"
-if ! printf '%s' "$IMAGE" | grep -Eq '^ghcr\.io/[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$'; then
-  echo "deploy: refused — expected a pinned ghcr.io/<repo>@sha256:<digest>, got: '${IMAGE}'" >&2
+# Structural floor: lowercase ghcr path ending in our package name + a full sha256 digest.
+if ! printf '%s' "$IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9._-]+/browse-gateway@sha256:[0-9a-f]{64}$'; then
+  echo "deploy: refused — expected ${BGW_EXPECTED_REPO}@sha256:<64-hex>, got: '${IMAGE}'" >&2
+  exit 2
+fi
+# Exact repo match (incl. owner) against on-host config — no foreign repo can satisfy both checks.
+if [ "${IMAGE%@sha256:*}" != "$BGW_EXPECTED_REPO" ]; then
+  echo "deploy: refused — repo '${IMAGE%@sha256:*}' != expected '${BGW_EXPECTED_REPO}'" >&2
   exit 2
 fi
 echo "deploy: target = ${IMAGE}"
