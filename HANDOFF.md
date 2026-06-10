@@ -8,8 +8,10 @@ software-WebGL + US-timezone + richer-fonts hardening → Indexxx cleared via th
 → but Gooner (drive verb) still failed "could not land a working proxied exit (403)" → traced
 to a **drive-path bug**: `navigate()` froze status at the CF interstitial's 403 and `#settle`
 snapshotted the blank transition, so `navFailed` misread the *cleared* page as a hard block →
-fixed → drive path now lands Indexxx (status 200, navFailed false). **Five PRs merged (#10–#14);
-prod is on `7855d4b`** (full stack: WebRTC policy + software WebGL + US TZ + fonts + drive fix).
+fixed → drive path now lands Indexxx (status 200, navFailed false) → **confirmed end-to-end via
+Gooner's live drive path** (navigate → age-gate → click "I AGREE" → real `/home` content). **Five
+PRs merged (#10–#14); prod is on `7855d4b`** (full stack: WebRTC policy + software WebGL + US TZ +
+fonts + drive fix). The Indexxx saga is closed.
 
 > Fleet detail (host/IP/tailnet/proxy-provider names) stays in `*.local.md` + agent memory,
 > never here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, the
@@ -65,16 +67,19 @@ prod is on `7855d4b`** (full stack: WebRTC policy + software WebGL + US TZ + fon
   escalation ladder rotates past a bad exit, so prod resilience is ≥ the raw probe ratio.
 
 ## What's Next
-1. **Gooner must reconnect, THEN re-test Indexxx.** The gateway-side bug is fixed and `7855d4b`
-   is live — but Gooner's failure today was compounded by a **dead SSH tunnel** (its `ssh -L`
-   process died; gateway was healthy throughout). Gooner needs to: restart the tunnel
-   (`ssh -N -L 8080:127.0.0.1:8080 root@<prod-host>` — harden with autossh so a redeploy gap
-   doesn't kill it), reconnect its MCP (`mcp__browse-gateway__*`), then drive Indexxx. With the
-   drive fix it should land the age-gate (status 200) instead of "could not land a working
-   proxied exit". This is the last end-to-end confirmation — I validated the drive path via the
-   in-container probe (navFailed=false), not yet through a live consumer.
-2. **Update Gooner's `CLAUDE.md` Indexxx caveat** — the old "could not land a working proxied
-   exit … 403" signature is now stale (that was the drive bug, fixed). Do it in Gooner's repo.
+1. **Indexxx — CONFIRMED END-TO-END 2026-06-10 via Gooner's live drive path.** ✅ `browser_navigate`
+   → 200 real age-gate → click "I AGREE" → `/home` (255 links, live 2026-06-10 content). navFailed
+   false on the consumer side too. The whole saga is closed: WebRTC policy + software WebGL + US TZ
+   + fonts + the drive stale-status fix, all live on `7855d4b`. (Gooner's outage earlier that day was
+   a dead SSH tunnel, not the gateway — gateway was healthy throughout; harden Gooner's tunnel with
+   autossh so a redeploy gap doesn't kill it.)
+   - **Access pattern (record in consumers' notes):** interactive-gated sites (age-gates, click-through
+     consent) need the `browser_*` drive path (`navigate` → click), NOT `retrieve` — retrieve is
+     one-shot and can't click the gate. The gate cookie persists within a drive session (clears once).
+2. **Update Gooner's `CLAUDE.md` Indexxx caveat** (Gooner's repo) — the old "Don't retry Indexxx via
+   browser_*; not reachable / could not land a working proxied exit … 403" is now stale. New line:
+   "Indexxx ✅ via browser_* drive (navigate → click 'I AGREE' age-gate → real content); retrieve
+   alone won't." Gooner makes this edit in its own repo, not here.
    That's Gooner's repo (separate project) — do it there, not here.
 3. **Optional deeper hardening (follow-ups, not needed for Indexxx):** spoof the SwiftShader
    renderer string to a plausible consumer GPU; spoof `hardwareConcurrency`/`deviceMemory`
