@@ -85,15 +85,21 @@ fonts + drive fix). The Indexxx saga is closed.
    renderer string to a plausible consumer GPU; spoof `hardwareConcurrency`/`deviceMemory`
    (VPS reports 2/8 vs desktop 10/16); dynamic per-exit-geo timezone (only if exits broaden
    beyond US). Re-run the parity harness after any of these to confirm the axis closed.
-4. **CI/CD Phase 2 — engineering SHIPPED (PR #15, `c8df8ad`), ACTIVATION PENDING.** Manual
-   deploy-over-Tailscale: `workflow_dispatch` resolves tag→digest → tailnet (OAuth) → ssh to the
-   forced-command on-host wrapper that gates (validate-http), swaps, verifies, auto-rolls-back.
-   Files: `scripts/deploy/{launch-http,deploy-on-host}.sh`, `.github/workflows/{deploy-http,ghcr-cleanup}.yml`.
-   Security-reviewed (P0 package-pin, P1 template-injection, P1 required-authz-keys-doc, P2 action-SHA-pins
-   all fixed). **Inert until out-of-band setup** — the full checklist (Tailscale OAuth+ACL, Actions
-   secrets, on-host deploy key + locked authorized_keys + deploy config, dry-run) is in
-   `docs/plans/2026-06-10-001-cicd-phase2-setup.local.md`. `launch-http.sh` also collapses the MANUAL
-   deploy to one command. GHCR is public → anonymous pull.
+4. **CI/CD Phase 2 — ACTIVATED 2026-06-10. First green deploy via
+   `gh workflow run deploy-http.yml -f image_tag=latest`.** Manual deploy-over-Tailscale: resolve
+   tag→immutable digest → tailnet (OAuth, `tag:ci-deploy`) → ssh to the forced-command on-host
+   wrapper that gates (validate-http), swaps, verifies, auto-rolls-back. Engineering PR #15
+   (`c8df8ad`); dry-run found 3 fixes (#16 action v4, #17 gate-env, #18 verify RestartCount).
+   Security-reviewed (P0 package-pin etc. all fixed). Setup + operational notes in
+   `docs/plans/2026-06-10-001-cicd-phase2-setup.local.md`. **Dry-run proved gate-abort (gate fail →
+   live container untouched) + rollback machinery.** Key ops facts:
+   - **Tailscale SSH DISABLED on prod** (`RunSSH:false`) — it intercepted tailnet:22, bypassed the
+     forced command, and presented its own host key. Interactive prod access stays on the public-IP
+     `openclaw-prod` alias. (If you close public SSH later, move the deploy to a 2nd non-22 sshd port.)
+   - **On-host `~/deploy/*.sh` are STATIC COPIES** — re-`scp` them when the repo scripts change (the
+     workflow can't self-update its own mechanism; bit us 3× in the dry-run).
+   - `launch-http.sh` also collapses the MANUAL deploy to one command. GHCR public → anonymous pull.
+   - Each deploy recreates the container (~10-20s) → **one Vault MCP reconnect** after.
 5. **Carryovers (unchanged):** per-consumer solve budget; success-path solve/escalation
    observability; GHCR retention now handled by `ghcr-cleanup.yml` (keep 10).
 
