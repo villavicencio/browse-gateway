@@ -1,107 +1,93 @@
-# HANDOFF — 2026-06-09 (evening, same-day continuation)
+# HANDOFF — 2026-06-10
 
-Continued from the marathon session's open thread: the WebRTC-leak fix. It shipped,
-deployed, and **verified the leak is closed in prod** — but re-testing Indexxx surfaced a
-finding that **reframes the whole Indexxx story**: it's an *interactive* Cloudflare
-Turnstile, not a passive interstitial, and it still blocks from the VPS after the leak was
-closed. The WebRTC leak was a real defect (now fixed) but NOT the determining gate for
-Indexxx.
+Indexxx is **solved**, and the win came from a reusable tool rather than another one-off
+patch. Arc this session: WebRTC-leak fix (managed policy, not the ignored switch) → discovered
+Indexxx is an *interactive* Turnstile that the leak fix didn't clear → built a
+**fingerprint-parity harness** to measure Mac↔VPS divergence → it named the cause (**WebGL
+absent under Xvfb**) → shipped software-WebGL + US-timezone + richer-fonts hardening → Indexxx
+flipped from **0/15 to ~3/4** clears from the prod VPS. Four PRs merged (#10, #11, #12, #13);
+prod is on the hardened image `f3618b5`.
 
 > Fleet detail (host/IP/tailnet/proxy-provider names) stays in `*.local.md` + agent memory,
 > never here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, the
 > residential proxy, the CAPTCHA provider.
 
-## What We Built / Shipped
-- **PR #10 (`d2554c7`) — WebRTC IP-handling launch switch.** Pinned
-  `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` unconditionally in
-  `buildLaunchOptions` (`WEBRTC_IP_HANDLING_ARG` exported), unit-tested across every config.
-  **This turned out to be insufficient on its own** — see PR #11.
-- **PR #11 (`fa1b57c`) — WebRtcIPHandling managed-policy file (the actual fix).** An on-host
-  ICE probe through the prod proxy proved the launch switch is **silently ignored by Chrome
-  149**: the flag was verified present on the browser-process cmdline, yet STUN still gathered
-  a `typ srflx` candidate carrying the VPS's real IP. The mechanism that works is the
-  enterprise **managed policy** baked into the image:
-  `docker/policies/webrtc-ip-handling.json` → `/etc/opt/chrome/policies/managed/` (+ the
-  `/etc/chromium/` fallback). With it, the same probe gathers **zero** non-proxied candidates.
-  Also added a **webrtc leg to the stealth kill-gate** (`validate-stealth.mjs`): gathers ICE
-  candidates in the shipping image, FAILs on any UDP candidate, needs no proxy creds — catches
-  the silent-rot case the switch-only image would have shipped. Review fixes: gate on ANY UDP
-  candidate (not just srflx, which could pass vacuously if STUN were unreachable) + resolve on
-  `icegatheringstatechange=complete` with an 8s cap. 178 unit tests.
-- **Deployed to prod (`fa1b57c` live).** Full redeploy: pull GHCR sha → `tag latest` →
-  `validate-http` gate PASS → recreate `browse-gateway-http` with all `-e` vars → boot log
-  `sticky=true … consumers=[atlas, gooner]`, `/mcp` returns 401. Baked-policy leak-closed
-  verified on the live image via the ICE probe (0 candidates through the proxy). Atlas + Gooner
-  both served (the container they share was recreated cleanly).
-- **Learning:** `docs/solutions/runtime-errors/webrtc-ip-leak-needs-managed-policy-not-launch-switch.md`.
+## What We Shipped
+- **PR #10 (`d2554c7`) + PR #11 (`fa1b57c`) — WebRTC leak closed.** The
+  `--force-webrtc-ip-handling-policy` launch switch is **ignored by Chrome 149** (verified: on
+  the cmdline, srflx still leaked). The fix is the **`WebRtcIPHandling` managed-policy file**
+  baked into the image (`docker/policies/webrtc-ip-handling.json` →
+  `/etc/opt/chrome/policies/managed/`). ICE probe through the proxy: zero non-proxied
+  candidates. Learning: `docs/solutions/runtime-errors/webrtc-ip-leak-needs-managed-policy-not-launch-switch.md`.
+- **PR #12 (`836a59e`) — fingerprint-parity harness.** `src/browser/fingerprint.ts` (collector
+  + pure, unit-tested flatten/classify/diff), `scripts/fingerprint-snapshot.mjs` (capture one
+  host through the shipping core), `scripts/fingerprint-diff.mjs` (diff two snapshots, ranked
+  high/geo/info). Snapshots carry the egress IP → `*.fp.json`/`fingerprint-*.json` gitignored.
+  This is the durable artifact: "Mac clears / VPS blocks" is now a measurement, not a spike.
+- **PR #13 (`f3618b5`) — stealth hardening, driven by the harness diff.** The measured top
+  divergences, all fixed:
+  - **WebGL absent (`webgl: null`)** under Xvfb → `WEBGL_SWIFTSHADER_ARGS`
+    (`--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader`) in
+    `buildLaunchOptions`. Chrome 149 gates the software fallback behind
+    `--enable-unsafe-swiftshader`; found empirically with an in-container flag-finder.
+    **This was the determining Indexxx tell.**
+  - **Timezone UTC → `TZ=America/New_York`** (+ tzdata + `/etc/localtime`) to match the
+    `_country-us` exit. Static US (per the deploy decision).
+  - **Sparse fonts → `fonts-{dejavu,freefont-ttf,croscore,noto-core}`** (croscore is
+    metric-compatible with Arial/Times/Courier).
+  - **Gate:** `validate-stealth` gained a **webgl leg** (FAIL on a null context), mirroring the
+    webrtc leg — regression to null is caught at build.
+  - Learning: `docs/solutions/runtime-errors/webgl-absent-under-xvfb-trips-interactive-turnstile.md`.
 
-## The Indexxx finding that changes everything
-Re-tested Indexxx from prod via the held-exit spike (`spike-cf-interstitial.local.mjs`) on
-the fixed image, **3 attempts, 0/3 cleared**. But a **screenshot** (saved this session, sent
-to the user) reveals what it actually is:
+## Verification (real, on the prod VPS)
+- Hardened image `f3618b5` deployed: `validate-http` PASS; live container recreated
+  (`consumers=[atlas, gooner]`, `sticky=true`, `/mcp`→401). Atlas + Gooner both served.
+- Fingerprint snapshot of the baked image through the proxy: `webgl` non-null (SwiftShader),
+  `timezone=America/New_York`, fontCount 7, `webrtc.udp=0`.
+- **Indexxx held-exit spike: ~3/4 CLEARED** (was 0/15). Screenshot confirms the real age-gate
+  page, no Turnstile. The one miss is exit-quality variance on a held dirty exit — the verdict
+  text itself concludes "exit reputation/rotation was the whole problem"; the production
+  escalation ladder rotates past a bad exit, so prod resilience is ≥ the raw probe ratio.
 
-> **An interactive Cloudflare Turnstile** — "www.indexxx.com / Performing security
-> verification / **[ ] Verify you are human**" with the Cloudflare widget. NOT the passive
-> "Just a moment…" auto-interstitial we assumed.
-
-This falsifies two earlier conclusions:
-1. **"The VPS WebRTC leak is why Indexxx fails"** — the leak is now closed (probe-proven) and
-   Indexxx still blocks. The leak was a real tell worth fixing, but not the determining gate.
-2. **"Branch A (sticky + held clean exit) clears Indexxx unaided"** — that probe result was
-   **macOS-only**. The same spike from the VPS lands a clean held exit and still sits on the
-   interactive Turnstile for 45s. Locally the Turnstile auto-passes (clean residential desktop
-   env); on the VPS it demands interaction.
-
-So the real Mac-vs-VPS gap is whatever still trips Turnstile into **interactive** mode on the
-VPS (a fingerprint/environment tell that survives the proxy + the WebRTC fix), OR Indexxx
-simply requires actually solving the interactive challenge.
-
-## What's Next (user decision — this is a scope fork, not a continuation)
-1. **Most promising: solve the interactive managed-challenge ("Branch B").** The captcha
-   solver already DETECTS Turnstile and can inject a `cf-turnstile-response` token
-   (`src/browser/captcha.ts`), and it's wired on the **drive path** — but Indexxx is a
-   *full-page managed-challenge* interstitial (hidden/dynamic sitekey, IP-bound `cf_clearance`
-   cookie), which is NOT the same as an embedded `.cf-turnstile[data-sitekey]` widget the
-   current token-inject path handles. CapSolver has a dedicated Cloudflare-challenge /
-   `cf_clearance` task type for exactly this (solve-from-the-exit-IP + cookie inject). This is
-   a **new build**, descoped twice before. **Key cheap experiment first:** drive Indexxx
-   through the *actual gateway drive verb* (not the raw spike) so the existing captcha hook
-   runs — confirm whether the embedded-widget path already does anything before building the
-   cf_clearance tier.
-2. **If chasing the fingerprint instead:** the VPS still differs from the Mac in ways the
-   WebRTC fix didn't touch — Chrome 149 in-container vs the Mac's Chrome, software GL under
-   Xvfb (llvmpipe canvas/WebGL fingerprint), timezone/locale vs the proxy geo. Capture what the
-   VPS browser renders/fingerprints on a Turnstile demo page vs the Mac. Lower-confidence,
-   higher-effort.
-3. **Update the remote consumer's `CLAUDE.md` Indexxx caveat:** the *reason* is now "interactive
-   CF Turnstile requiring the unbuilt managed-challenge solve tier", NOT a WebRTC leak (fixed)
-   and NOT pool/proxy. The drive signature it lists (`could not land a working proxied exit …
-   403`) is now slightly off — it lands the exit fine and gets a 403-equivalent interactive
-   challenge.
-4. **Non-blocking carryovers:** per-consumer solve budget; success-path solve/escalation
-   observability; CI/CD Phase 2 (deploy-over-Tailscale, decisions doc
+## What's Next
+1. **Confirm Indexxx through the real drive verb from a consumer** (not just the raw held-exit
+   spike). The spike holds one exit by design; the gateway's escalation rotates on failure, so
+   a consumer-driven retrieve/drive of Indexxx should clear reliably. This is the last
+   end-to-end confirmation.
+2. **Update the remote consumer's (Gooner) `CLAUDE.md` Indexxx caveat** — it now clears after
+   the hardening; the old "could not land a working proxied exit … 403" signature is stale.
+   That's Gooner's repo (separate project) — do it there, not here.
+3. **Optional deeper hardening (follow-ups, not needed for Indexxx):** spoof the SwiftShader
+   renderer string to a plausible consumer GPU; spoof `hardwareConcurrency`/`deviceMemory`
+   (VPS reports 2/8 vs desktop 10/16); dynamic per-exit-geo timezone (only if exits broaden
+   beyond US). Re-run the parity harness after any of these to confirm the axis closed.
+4. **Carryovers (unchanged):** per-consumer solve budget; success-path solve/escalation
+   observability; CI/CD Phase 2 (deploy-over-Tailscale,
    `docs/plans/2026-06-08-001-*.local.md`); GHCR retention/pruning.
 
 ## Gotchas & Watch-outs
-- **The WebRTC launch switch is a decoy on Chrome 149** — only the managed-policy file works.
-  If the `srflx` leak ever returns, check the policy file is in the image
-  (`/etc/opt/chrome/policies/managed/`), not the launch arg. The new `validate-stealth` webrtc
-  leg is the guard.
-- **Prod redeploy (unchanged):** pull GHCR sha → `tag … latest` → `validate-http` gate (log to
-  `~/`, not `/tmp`) → `docker rm -f` → recreate with ALL `-e` vars incl. `BGW_PROXY_STICKY_SUFFIX`
-  + `BGW_CAPTCHA_API_URL`. Don't skip the pull. Confirm `sticky=true` in the boot log.
-- **The gateway env file sources clean under `sudo -iu node`** but the proxy vars are NOT
-  auto-forwarded into a *nested* `docker run -e NAME` unless you re-source inside the same
-  `bash -lc`. The spike runner (`/home/node/run-spike-prod.local.sh`, staged) does this and
-  maps `BGW_PROXY_* → SPIKE_PROXY_*`. (An earlier inline attempt saw the vars as unset because
-  the source and the `docker run` were in different shell invocations.)
-- **Prod throwaway repro artifacts staged in `/home/node/`** (gitignored-style, like the
-  existing `/root/bgw-spike/`): `probe-webrtc.local.mjs`, `probe-cmdline.local.mjs`,
-  `spike-cf-interstitial.local.mjs`, `run-spike-prod.local.sh`, `webrtc-policy.json` (now
-  redundant — baked into the image). Validate-http logs: `~/validate-http-<sha>.log`.
+- **Stealth flags can be silently gated/ignored across Chrome versions.** Two cases this arc:
+  the WebRTC launch switch (ignored on 149 → use the managed-policy file) and SwiftShader-WebGL
+  (gated behind `--enable-unsafe-swiftshader` on 149). The `validate-stealth` webrtc + webgl
+  legs guard both at build. Re-run the parity harness after a Chrome bump.
+- **Run the parity harness to diagnose any "clears locally / blocks in prod":**
+  `FP_LABEL=mac FP_OUT=mac.fp.json node scripts/fingerprint-snapshot.mjs` on the Mac (load
+  `.env.spike` first for the proxy), and in-container on the VPS
+  (`-e FP_OUT=/out/vps.fp.json -v /home/node:/out … node scripts/fingerprint-snapshot.mjs`),
+  then `node scripts/fingerprint-diff.mjs mac.fp.json vps.fp.json`. Snapshots carry the egress
+  IP — keep them out of git (already gitignored) and off the public repo.
+- **WebGL forced to SwiftShader everywhere, incl. local dev** — intentional (dev mirrors prod).
+  A real-GPU host would want the flags dropped to keep real hardware WebGL.
+- **Prod redeploy (unchanged):** pull GHCR sha → `tag … latest` → `validate-http` (log to `~/`,
+  not `/tmp`) → `docker rm -f` → recreate with ALL `-e` vars incl. `BGW_PROXY_STICKY_SUFFIX` +
+  `BGW_CAPTCHA_API_URL`. Don't skip the pull. Confirm `sticky=true` in the boot log.
+- **The gateway env file** sources clean under `sudo -iu node` but its proxy vars aren't
+  auto-forwarded into a *nested* `docker run -e NAME` unless re-sourced in the same `bash -lc`.
+  `/home/node/run-spike-prod.local.sh` (staged) handles this + maps `BGW_PROXY_* → SPIKE_PROXY_*`.
 - **rootless port race** after `docker rm -f`: `export XDG_RUNTIME_DIR=/run/user/1000` then
   `systemctl --user restart docker`.
+- **Prod throwaway repro artifacts** in `/home/node/`: `probe-webrtc.local.mjs`,
+  `probe-cmdline.local.mjs`, `spike-cf-interstitial.local.mjs`, `run-spike-prod.local.sh`,
+  `webrtc-policy.json` (redundant — baked in). The WebGL flag-finder + IP-bearing snapshots were
+  cleaned up. Validate logs: `~/validate-http-<sha>.log`.
 - **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
-- **Local probe ≠ prod env** is now the *whole* Indexxx story: macOS residential desktop Chrome
-  vs Linux Chrome 149 under Xvfb on a datacenter VPS. A clear locally proved nothing about prod
-  — exactly how the "Branch A clears it" conclusion went wrong.
