@@ -23,6 +23,7 @@ import {
   resolveCoreOptions,
   DEFAULT_CORE_OPTIONS,
   WEBRTC_IP_HANDLING_ARG,
+  WEBGL_SWIFTSHADER_ARGS,
   targetToSelector,
 } from "../dist/browser/index.js";
 
@@ -158,13 +159,13 @@ test("buildLaunchOptions: headful real-chrome, no sandbox arg by default", () =>
   const opts = buildLaunchOptions(resolveCoreOptions());
   assert.equal(opts.headless, false);
   assert.equal(opts.channel, "chrome");
-  assert.deepEqual(opts.args, [WEBRTC_IP_HANDLING_ARG]);
+  assert.deepEqual(opts.args, [WEBRTC_IP_HANDLING_ARG, ...WEBGL_SWIFTSHADER_ARGS]);
 });
 
 test("buildLaunchOptions: empty channel omitted (patched chromium), --no-sandbox added", () => {
   const opts = buildLaunchOptions(resolveCoreOptions({ channel: "", noSandbox: true }));
   assert.ok(!("channel" in opts), "channel should be omitted when empty");
-  assert.deepEqual(opts.args, [WEBRTC_IP_HANDLING_ARG, "--no-sandbox"]);
+  assert.deepEqual(opts.args, [WEBRTC_IP_HANDLING_ARG, ...WEBGL_SWIFTSHADER_ARGS, "--no-sandbox"]);
 });
 
 test("buildLaunchOptions: headless negative-control config maps through", () => {
@@ -190,5 +191,21 @@ test("buildLaunchOptions: WebRTC IP-handling policy is pinned in every config", 
       opts.args.includes(WEBRTC_IP_HANDLING_ARG),
       `missing WebRTC arg for ${JSON.stringify(coreOpts)}`,
     );
+  }
+});
+
+test("buildLaunchOptions: software-WebGL args are pinned in every config", () => {
+  // Stealth-critical: without them Chrome 149 under Xvfb has NO WebGL context at all
+  // ("webgl: null"), the top fingerprint divergence vs a real desktop.
+  assert.deepEqual(WEBGL_SWIFTSHADER_ARGS, [
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+  ]);
+  for (const coreOpts of [{}, { headless: true }, { channel: "", noSandbox: true }]) {
+    const opts = buildLaunchOptions(resolveCoreOptions(coreOpts));
+    for (const arg of WEBGL_SWIFTSHADER_ARGS) {
+      assert.ok(opts.args.includes(arg), `missing ${arg} for ${JSON.stringify(coreOpts)}`);
+    }
   }
 });

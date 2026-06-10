@@ -142,6 +142,49 @@ async function runWebrtcLeakCheck() {
   }
 }
 
+/**
+ * WebGL presence check: the software-GL launch args (--use-gl=angle --use-angle=swiftshader
+ * --enable-unsafe-swiftshader) must produce a real WebGL context. Under Xvfb with no GPU,
+ * Chrome 149 otherwise returns NO context (`getContext('webgl')` === null) — "WebGL absent"
+ * is a strong anti-bot tell and was the top divergence vs a real desktop. A non-null renderer
+ * (SwiftShader is expected and fine) passes; null fails.
+ */
+async function runWebglCheck() {
+  console.log(`\n── webgl: a real context exists (software-GL args) ──`);
+  const core = await createBrowserCore({ ...coreOpts });
+  try {
+    const page = await core.context.newPage();
+    await page
+      .goto("https://example.com/", { waitUntil: "domcontentloaded", timeout: 30_000 })
+      .catch(() => {});
+    const webgl = await page.evaluate(() => {
+      try {
+        const c = document.createElement("canvas");
+        const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+        if (!gl) return null;
+        const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+        return {
+          renderer: gl.getParameter(gl.RENDERER),
+          unmaskedRenderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null,
+        };
+      } catch (e) {
+        return { error: String(e) };
+      }
+    });
+    // Pass = a context EXISTS (webgl non-null, no exception). The renderer string is
+    // informational — some privacy configs mask it to "" even with a live context, so
+    // gating on its truthiness would false-FAIL a browser that actually has WebGL.
+    const passed = Boolean(webgl && !webgl.error);
+    console.log(
+      `  webgl=${JSON.stringify(webgl)} — ` +
+        `${passed ? "PASS" : "FAIL (no WebGL context — software-GL args missing/ineffective)"}`,
+    );
+    return passed;
+  } finally {
+    await core.close();
+  }
+}
+
 /** Negative control: strict headless on the CF target must be blocked (proves Xvfb works). */
 async function runNegativeControl() {
   console.log(`\n── negative control: strict headless must be blocked ──`);
@@ -166,15 +209,17 @@ async function main() {
   const cloudflare = await runGroup("cloudflare", GROUPS.cloudflare);
   const datadome = await runGroup("datadome", GROUPS.datadome);
   const webrtc = await runWebrtcLeakCheck();
+  const webgl = await runWebglCheck();
   const negative = SKIP_NEGATIVE_CONTROL ? true : await runNegativeControl();
   if (SKIP_NEGATIVE_CONTROL) console.log("\n(negative control skipped)");
 
-  const passed = cloudflare && datadome && webrtc && negative;
+  const passed = cloudflare && datadome && webrtc && webgl && negative;
   console.log(`\n=== GATE: ${passed ? "PASS ✅" : "FAIL ❌"} ===`);
   console.log(
     `  cloudflare=${cloudflare ? "PASS" : "FAIL"} ` +
       `datadome=${datadome ? "PASS" : "FAIL"} ` +
       `webrtc=${webrtc ? "PASS" : "FAIL"} ` +
+      `webgl=${webgl ? "PASS" : "FAIL"} ` +
       `negative-control=${negative ? "PASS" : "FAIL"}`,
   );
   process.exit(passed ? 0 : 1);
