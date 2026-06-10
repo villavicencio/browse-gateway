@@ -60,3 +60,14 @@ export {
   type CaptchaSolver,
   type LiveCaptcha,
 } from "./captcha.js";
+export {
+  FINGERPRINT_COLLECTOR_JS,
+  collectFingerprint,
+  flattenFingerprint,
+  classifyAxis,
+  diffFingerprints,
+  AXIS_SEVERITY,
+  type FingerprintSnapshot,
+  type FingerprintDiff,
+  type AxisSeverity,
+} from "./fingerprint.js";

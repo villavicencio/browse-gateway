@@ -41,6 +41,10 @@ yarn-error.log*
 playwright-report/
 test-results/
 
+# Fingerprint-parity snapshots (carry egress IPs / per-host detail — never commit; public repo)
+*.fp.json
+fingerprint-*.json
+
 # Compound Engineering machine-local config
 .compound-engineering/*.local.yaml
 # ...but keep the committed example (the broad *.local.* rule above would hide it)
