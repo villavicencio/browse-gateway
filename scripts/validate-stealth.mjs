@@ -114,17 +114,28 @@ async function runWebrtcLeakCheck() {
         if (e.candidate && e.candidate.candidate) out.push(e.candidate.candidate);
       };
       await pc.setLocalDescription(await pc.createOffer());
-      await new Promise((r) => setTimeout(r, 8_000));
+      await new Promise((resolve) => {
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === "complete") resolve();
+        };
+        setTimeout(resolve, 8_000); // cap; gathering normally completes well before
+      });
       pc.close();
       return out;
     });
+    // Gate on ANY UDP candidate, not just srflx: under the policy (and with no proxy
+    // configured, as in this gate) no non-proxied UDP is allowed at all, so even mDNS
+    // host candidates over UDP must be absent. Host candidates gather without any
+    // network reachability, so a policy-less image FAILS here even if STUN is
+    // unreachable — no vacuous pass.
+    const udp = candidates.filter((c) => / udp /i.test(c));
     const srflx = candidates.filter((c) => c.includes("typ srflx"));
-    const passed = srflx.length === 0;
+    const passed = udp.length === 0;
     console.log(
-      `  candidates=${candidates.length} srflx=${srflx.length} — ` +
+      `  candidates=${candidates.length} udp=${udp.length} srflx=${srflx.length} — ` +
         `${passed ? "PASS" : "FAIL (non-proxied UDP escaped — policy file missing/ignored)"}`,
     );
-    for (const c of srflx) console.log(`    ${c}`);
+    for (const c of udp) console.log(`    ${c}`);
     return passed;
   } finally {
     await core.close();
