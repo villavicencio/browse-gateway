@@ -167,7 +167,7 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       pc.createDataChannel('fp');
       pc.onicecandidate = function (e) { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); };
       pc.onicegatheringstatechange = function () { if (pc.iceGatheringState === 'complete') finish(); };
-      pc.createOffer().then(function (o) { return pc.setLocalDescription(o); });
+      pc.createOffer().then(function (o) { return pc.setLocalDescription(o); }).catch(function () { finish(); });
       setTimeout(finish, 8000);
     });
   } catch (e) { out.webrtc = { error: String(e) }; }

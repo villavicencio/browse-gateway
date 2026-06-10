@@ -18,6 +18,14 @@ test("FINGERPRINT_COLLECTOR_JS: a self-contained async IIFE expression", () => {
   for (const probe of ["WEBGL_debug_renderer_info", "srflx", "canvasHash", "fonts", "timeZone"]) {
     assert.ok(FINGERPRINT_COLLECTOR_JS.includes(probe), `collector should reference ${probe}`);
   }
+  // The canvas-text escape must reach the browser as the literal source `✨` (which the
+  // page's JS engine then decodes), NOT as a raw sparkle char. Guards a tempting "cleanup"
+  // of the double backslash that would change what the canvas draws.
+  assert.ok(
+    FINGERPRINT_COLLECTOR_JS.includes("\\u2728"),
+    "collector must carry the literal escape sequence backslash-u2728",
+  );
+  assert.ok(!FINGERPRINT_COLLECTOR_JS.includes("✨"), "collector must not embed a raw sparkle char");
 });
 
 test("flattenFingerprint: nested objects become dot-paths; arrays stay whole leaves", () => {

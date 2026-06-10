@@ -49,8 +49,11 @@ const core = await createBrowserCore({
   noSandbox: NO_SANDBOX,
   ...(proxy ? { proxy } : {}),
 });
-const page = await core.context.newPage();
+let page;
 try {
+  // newPage is inside the try so a context-spawn failure still reaches the finally and
+  // closes the core (no orphaned headful-Chrome-under-Xvfb process tree).
+  page = await core.context.newPage();
   // Secure origin so the canvas-hash (crypto.subtle) works; also a realistic document.
   await page.goto("https://example.com/", { waitUntil: "domcontentloaded", timeout: 30_000 });
   const fingerprint = await collectFingerprint(page);
@@ -84,6 +87,6 @@ try {
     console.error(`[fingerprint-snapshot] wrote ${OUT} (label=${LABEL}, egressIp=${egressIp})`);
   }
 } finally {
-  await page.close().catch(() => {});
+  if (page) await page.close().catch(() => {});
   await core.close();
 }
