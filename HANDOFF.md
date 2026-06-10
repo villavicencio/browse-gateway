@@ -1,131 +1,101 @@
-# HANDOFF — 2026-06-10
+# HANDOFF — 2026-06-10 (evening)
 
-Indexxx is **solved end-to-end**, and the wins came from reusable tools + a real bug fix, not
-one-off patches. Arc this session: WebRTC-leak fix (managed policy, not the ignored switch) →
-discovered Indexxx is an *interactive* Turnstile the leak fix didn't clear → built a
-**fingerprint-parity harness** → it named the cause (**WebGL absent under Xvfb**) → shipped
-software-WebGL + US-timezone + richer-fonts hardening → Indexxx cleared via the held-exit spike
-→ but Vault (drive verb) still failed "could not land a working proxied exit (403)" → traced
-to a **drive-path bug**: `navigate()` froze status at the CF interstitial's 403 and `#settle`
-snapshotted the blank transition, so `navFailed` misread the *cleared* page as a hard block →
-fixed → drive path now lands Indexxx (status 200, navFailed false) → **confirmed end-to-end via
-Vault's live drive path** (navigate → age-gate → click "I AGREE" → real `/home` content). **Five
-PRs merged (#10–#14); prod is on `7855d4b`** (full stack: WebRTC policy + software WebGL + US TZ +
-fonts + drive fix). The Indexxx saga is closed.
+Long multi-arc session. Picked up from the WebRTC-leak open thread and ran through: closing the
+WebRTC leak (managed policy, not the ignored switch) → discovering Indexxx is an interactive
+Turnstile the leak didn't fix → **building a fingerprint-parity harness** that named the real cause
+(**WebGL absent under Xvfb**) → stealth hardening → a **drive-path stale-status bug** that was the
+last mile → **Indexxx solved end-to-end** → characterizing StashDB (auth-walled) → hardening the
+Vault SSH tunnel (plist written, NOT activated — user has concerns, deferred) → **building +
+ACTIVATING CI/CD Phase 2** (one-button deploy-over-Tailscale). **Nine PRs merged (#10–#18); prod is
+on the latest `main` image, deployed via the new pipeline.**
 
-> Fleet detail (host/IP/tailnet/proxy-provider names) stays in `*.local.md` + agent memory,
-> never here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, the
-> residential proxy, the CAPTCHA provider.
+> Fleet detail (host/IP/tailnet/proxy/CAPTCHA names) stays in `*.local.md` + agent memory, never
+> here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, `<prod-tailnet-ip>`,
+> the residential proxy, the CAPTCHA provider.
 
-## What We Shipped
-- **PR #10 (`d2554c7`) + PR #11 (`fa1b57c`) — WebRTC leak closed.** The
-  `--force-webrtc-ip-handling-policy` launch switch is **ignored by Chrome 149** (verified: on
-  the cmdline, srflx still leaked). The fix is the **`WebRtcIPHandling` managed-policy file**
-  baked into the image (`docker/policies/webrtc-ip-handling.json` →
-  `/etc/opt/chrome/policies/managed/`). ICE probe through the proxy: zero non-proxied
-  candidates. Learning: `docs/solutions/runtime-errors/webrtc-ip-leak-needs-managed-policy-not-launch-switch.md`.
-- **PR #12 (`836a59e`) — fingerprint-parity harness.** `src/browser/fingerprint.ts` (collector
-  + pure, unit-tested flatten/classify/diff), `scripts/fingerprint-snapshot.mjs` (capture one
-  host through the shipping core), `scripts/fingerprint-diff.mjs` (diff two snapshots, ranked
-  high/geo/info). Snapshots carry the egress IP → `*.fp.json`/`fingerprint-*.json` gitignored.
-  This is the durable artifact: "Mac clears / VPS blocks" is now a measurement, not a spike.
-- **PR #13 (`f3618b5`) — stealth hardening, driven by the harness diff.** The measured top
-  divergences, all fixed:
-  - **WebGL absent (`webgl: null`)** under Xvfb → `WEBGL_SWIFTSHADER_ARGS`
-    (`--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader`) in
-    `buildLaunchOptions`. Chrome 149 gates the software fallback behind
-    `--enable-unsafe-swiftshader`; found empirically with an in-container flag-finder.
-    **This was the determining Indexxx tell.**
-  - **Timezone UTC → `TZ=America/New_York`** (+ tzdata + `/etc/localtime`) to match the
-    `_country-us` exit. Static US (per the deploy decision).
-  - **Sparse fonts → `fonts-{dejavu,freefont-ttf,croscore,noto-core}`** (croscore is
-    metric-compatible with Arial/Times/Courier).
-  - **Gate:** `validate-stealth` gained a **webgl leg** (FAIL on a null context), mirroring the
-    webrtc leg — regression to null is caught at build.
-  - Learning: `docs/solutions/runtime-errors/webgl-absent-under-xvfb-trips-interactive-turnstile.md`.
-- **PR #14 (`7855d4b`) — drive-path stale-status fix (the last mile for Vault).** After the
-  hardening, the held-exit spike cleared Indexxx but Vault's *drive verb* still failed "could
-  not land a working proxied exit (403)". Probes (main-frame responses `307→403→200`) showed
-  `navigate()` froze `status` at the CF interstitial's first 403 (overwriting the active-page
-  response listener that already tracked the last status), and `#settle` exited on the blank
-  inter-navigation window — so `navFailed`'s `isHardBlock(403, thin)` misread the *cleared* page
-  as a hard block and the escalation discarded a working exit. Fix: `navigate()` resets
-  `#lastDocStatus` and lets the listener track the post-clearance 200; `#settle` waits (after a
-  block) until the page is non-thin (`isCleared` past `MIN_CONTENT_LENGTH` — the same bar
-  `isHardBlock` uses), not just non-blank. Verified on prod (baked image, US sticky exit):
-  status 200, tree ~3.1k with refs, `navFailed=false` — was 403 / tree 10 / true. Preserves the
-  dead-exit (null → fail), hard-block (403 no-clear → fail), and CF-escalation invariants.
+## What We Built
+- **WebRTC leak CLOSED (PR #10 + #11).** The `--force-webrtc-ip-handling-policy` launch switch is
+  **ignored by Chrome 149** (proven: on the cmdline, srflx still leaked the VPS IP). The fix is the
+  **`WebRtcIPHandling` managed-policy file** baked into the image (`docker/policies/…` →
+  `/etc/opt/chrome/policies/managed/`). ICE probe through the proxy: zero non-proxied candidates.
+- **Fingerprint-parity harness (PR #12).** `src/browser/fingerprint.ts` (collector + pure,
+  unit-tested flatten/classify/diff, ranks axes high/geo/info), `scripts/fingerprint-snapshot.mjs`,
+  `scripts/fingerprint-diff.mjs`. Turns "Mac clears / VPS blocks" into a measurement. Snapshots carry
+  the egress IP → `*.fp.json` gitignored. **The durable diagnostic for any future divergence.**
+- **Stealth hardening (PR #13).** Harness diff named the top tells, all fixed: **WebGL absent**
+  (`webgl: null`) → `WEBGL_SWIFTSHADER_ARGS` (`--use-gl=angle --use-angle=swiftshader
+  --enable-unsafe-swiftshader`; Chrome 149 gates the fallback behind the last flag); **TZ=America/
+  New_York** (+tzdata) to match the US exit; **richer fonts**; a **webgl leg** added to
+  `validate-stealth` (FAIL on null context).
+- **Drive stale-status fix (PR #14).** `navigate()` froze status at the CF interstitial's first 403
+  (CF reloads 403→200 on clear) and `#settle` snapshotted the blank transition, so `navFailed`
+  misread the *cleared* page as a hard block ("could not land a working proxied exit"). Fix: let the
+  active-page response listener track the post-clearance 200; `#settle` waits for non-thin content.
+- **CI/CD Phase 2 — ACTIVATED (PR #15 + dry-run fixes #16/#17/#18).** One-button manual deploy:
+  `gh workflow run deploy-http.yml -f image_tag=latest` → resolve tag→immutable digest → tailnet
+  (OAuth, `tag:ci-deploy`) → ssh to a forced-command on-host wrapper that gates (validate-http),
+  swaps, verifies, auto-rolls-back. `scripts/deploy/{launch-http,deploy-on-host}.sh` (fleet-clean) +
+  `.github/workflows/{deploy-http,ghcr-cleanup}.yml`. Security-reviewed (P0 package-pin, P1
+  template-injection, P2 action-SHA-pins all fixed).
+- **Learnings (committed):** `docs/solutions/runtime-errors/{webrtc-ip-leak-needs-managed-policy-not-launch-switch,
+  webgl-absent-under-xvfb-trips-interactive-turnstile,drive-nav-status-frozen-at-cf-interstitial-403}.md`.
 
-## Verification (real, on the prod VPS)
-- Hardened image `f3618b5` deployed: `validate-http` PASS; live container recreated
-  (`consumers=[atlas, vault]`, `sticky=true`, `/mcp`→401). Atlas + Vault both served.
-- Fingerprint snapshot of the baked image through the proxy: `webgl` non-null (SwiftShader),
-  `timezone=America/New_York`, fontCount 7, `webrtc.udp=0`.
-- **Indexxx held-exit spike: ~3/4 CLEARED** (was 0/15). Screenshot confirms the real age-gate
-  page, no Turnstile. The one miss is exit-quality variance on a held dirty exit — the verdict
-  text itself concludes "exit reputation/rotation was the whole problem"; the production
-  escalation ladder rotates past a bad exit, so prod resilience is ≥ the raw probe ratio.
+## Decisions Made
+- **WebGL software-GL applied UNCONDITIONALLY** (like the WebRTC policy) — prod is GPU-less; keeps
+  local dev a faithful fingerprint mirror. A real-GPU host should drop the flags.
+- **Static US timezone** (America/New_York), not dynamic per-exit-geo (revisit only if exits broaden).
+- **CI/CD #1 (pull auth) = public package** → anonymous pull, no auth plumbing (reality overtook the
+  doc's private+ephemeral recommendation). **#2 = OAuth + `tag:ci-deploy`.** **#6 = retain 5 host/10 GHCR.**
+- **Tailscale SSH DISABLED on prod** (`RunSSH:false`) — it intercepted tailnet:22, **bypassed the
+  authorized_keys forced command**, and presented its own host key. Interactive prod access stays on
+  the public-IP `<prod-host>` alias. (If public SSH is ever closed, move the deploy to a 2nd non-22
+  sshd port — "Option C" — so the forced-command security survives.)
+- **Indexxx needs the `browser_*` drive path, not `retrieve`** (retrieve is one-shot, can't click the
+  18+ age-gate). General rule for interactive-gated sites.
+
+## What Didn't Work / Ruled Out
+- **WebRTC launch switch** — a decoy on Chrome 149; only the managed-policy file works.
+- **"VPS WebRTC leak is why Indexxx fails"** — falsified; leak closed, Indexxx still blocked. The real
+  cause was WebGL-absent (fingerprint), found by the harness.
+- **"Branch B cf_clearance solver tier"** — briefly hypothesized for Indexxx, disproven (it was
+  fingerprint + a drive bug, not a missing solver).
+- **Geo pin as Indexxx's blocker** — tested: US-pinned exits clear ~2/3, non-US ~3/3; minor, not the
+  cause. (The cause was the drive stale-status bug + fingerprint.)
+- **Deploy gate with `-e BGW_*` overrides** — broke validate-http's self-contained per-consumer-cap
+  assertion (#17). **`{{.State.RestartCount}}`** in verify — errors; it's top-level `{{.RestartCount}}` (#18).
 
 ## What's Next
-1. **Indexxx — CONFIRMED END-TO-END 2026-06-10 via Vault's live drive path.** ✅ `browser_navigate`
-   → 200 real age-gate → click "I AGREE" → `/home` (255 links, live 2026-06-10 content). navFailed
-   false on the consumer side too. The whole saga is closed: WebRTC policy + software WebGL + US TZ
-   + fonts + the drive stale-status fix, all live on `7855d4b`. (Vault's outage earlier that day was
-   a dead SSH tunnel, not the gateway — gateway was healthy throughout; harden Vault's tunnel with
-   autossh so a redeploy gap doesn't kill it.)
-   - **Access pattern (record in consumers' notes):** interactive-gated sites (age-gates, click-through
-     consent) need the `browser_*` drive path (`navigate` → click), NOT `retrieve` — retrieve is
-     one-shot and can't click the gate. The gate cookie persists within a drive session (clears once).
-2. **Update Vault's `CLAUDE.md` Indexxx caveat** (Vault's repo) — the old "Don't retry Indexxx via
-   browser_*; not reachable / could not land a working proxied exit … 403" is now stale. New line:
-   "Indexxx ✅ via browser_* drive (navigate → click 'I AGREE' age-gate → real content); retrieve
-   alone won't." Vault makes this edit in its own repo, not here.
-   That's Vault's repo (separate project) — do it there, not here.
-3. **Optional deeper hardening (follow-ups, not needed for Indexxx):** spoof the SwiftShader
-   renderer string to a plausible consumer GPU; spoof `hardwareConcurrency`/`deviceMemory`
-   (VPS reports 2/8 vs desktop 10/16); dynamic per-exit-geo timezone (only if exits broaden
-   beyond US). Re-run the parity harness after any of these to confirm the axis closed.
-4. **CI/CD Phase 2 — ACTIVATED 2026-06-10. First green deploy via
-   `gh workflow run deploy-http.yml -f image_tag=latest`.** Manual deploy-over-Tailscale: resolve
-   tag→immutable digest → tailnet (OAuth, `tag:ci-deploy`) → ssh to the forced-command on-host
-   wrapper that gates (validate-http), swaps, verifies, auto-rolls-back. Engineering PR #15
-   (`c8df8ad`); dry-run found 3 fixes (#16 action v4, #17 gate-env, #18 verify RestartCount).
-   Security-reviewed (P0 package-pin etc. all fixed). Setup + operational notes in
-   `docs/plans/2026-06-10-001-cicd-phase2-setup.local.md`. **Dry-run proved gate-abort (gate fail →
-   live container untouched) + rollback machinery.** Key ops facts:
-   - **Tailscale SSH DISABLED on prod** (`RunSSH:false`) — it intercepted tailnet:22, bypassed the
-     forced command, and presented its own host key. Interactive prod access stays on the public-IP
-     `openclaw-prod` alias. (If you close public SSH later, move the deploy to a 2nd non-22 sshd port.)
-   - **On-host `~/deploy/*.sh` are STATIC COPIES** — re-`scp` them when the repo scripts change (the
-     workflow can't self-update its own mechanism; bit us 3× in the dry-run).
-   - `launch-http.sh` also collapses the MANUAL deploy to one command. GHCR public → anonymous pull.
-   - Each deploy recreates the container (~10-20s) → **one Vault MCP reconnect** after.
-5. **Carryovers (unchanged):** per-consumer solve budget; success-path solve/escalation
-   observability; GHCR retention now handled by `ghcr-cleanup.yml` (keep 10).
+1. **Tunnel hardening (autossh/LaunchAgent) — DEFERRED, user has concerns to discuss.** The
+   LaunchAgent plist is WRITTEN at `~/Library/LaunchAgents/com.dvillavicencio.browse-gateway-tunnel.plist`
+   (validated, matched to the working tunnel) but **NOT activated** — the manual `ssh -L 8080` tunnel
+   is still what Vault uses. Activating means killing the manual tunnel (one Vault reconnect) then
+   `launchctl bootstrap`. **Pick this up next session and talk through the concerns before activating.**
+2. **Reconnect Vault's MCP** — it was blipped several times by the Phase 2 dry-run recreates. One
+   `mcp__browse-gateway__*` reconnect when next used.
+3. **Optional: clean-rollback test** for Phase 2 — force a verify failure (e.g. wrong port in the
+   on-host deploy config) and confirm it restores the prior digest GREEN. The dry-run proved gate-abort
+   and exercised the rollback machinery, but a green rollback wasn't explicitly captured.
+4. **StashDB** — auth-walled (account or API key), not a render-timing issue: `retrieve` → "Loading…"
+   shell; `browser_*` drive + `wait_for` → renders but to a LOGIN page; GraphQL needs an `ApiKey`
+   header (a direct call, outside the gateway). Record in Vault's notes if pursuing.
+5. **Carryovers:** per-consumer solve budget; success-path solve/escalation observability; GHCR
+   retention now handled by `ghcr-cleanup.yml`.
 
 ## Gotchas & Watch-outs
-- **Stealth flags can be silently gated/ignored across Chrome versions.** Two cases this arc:
-  the WebRTC launch switch (ignored on 149 → use the managed-policy file) and SwiftShader-WebGL
-  (gated behind `--enable-unsafe-swiftshader` on 149). The `validate-stealth` webrtc + webgl
-  legs guard both at build. Re-run the parity harness after a Chrome bump.
-- **Run the parity harness to diagnose any "clears locally / blocks in prod":**
-  `FP_LABEL=mac FP_OUT=mac.fp.json node scripts/fingerprint-snapshot.mjs` on the Mac (load
-  `.env.spike` first for the proxy), and in-container on the VPS
-  (`-e FP_OUT=/out/vps.fp.json -v /home/node:/out … node scripts/fingerprint-snapshot.mjs`),
-  then `node scripts/fingerprint-diff.mjs mac.fp.json vps.fp.json`. Snapshots carry the egress
-  IP — keep them out of git (already gitignored) and off the public repo.
-- **WebGL forced to SwiftShader everywhere, incl. local dev** — intentional (dev mirrors prod).
-  A real-GPU host would want the flags dropped to keep real hardware WebGL.
-- **Prod redeploy (unchanged):** pull GHCR sha → `tag … latest` → `validate-http` (log to `~/`,
-  not `/tmp`) → `docker rm -f` → recreate with ALL `-e` vars incl. `BGW_PROXY_STICKY_SUFFIX` +
-  `BGW_CAPTCHA_API_URL`. Don't skip the pull. Confirm `sticky=true` in the boot log.
-- **The gateway env file** sources clean under `sudo -iu node` but its proxy vars aren't
-  auto-forwarded into a *nested* `docker run -e NAME` unless re-sourced in the same `bash -lc`.
-  `/home/node/run-spike-prod.local.sh` (staged) handles this + maps `BGW_PROXY_* → SPIKE_PROXY_*`.
-- **rootless port race** after `docker rm -f`: `export XDG_RUNTIME_DIR=/run/user/1000` then
-  `systemctl --user restart docker`.
-- **Prod throwaway repro artifacts** in `/home/node/`: `probe-webrtc.local.mjs`,
-  `probe-cmdline.local.mjs`, `spike-cf-interstitial.local.mjs`, `run-spike-prod.local.sh`,
-  `webrtc-policy.json` (redundant — baked in). The WebGL flag-finder + IP-bearing snapshots were
-  cleaned up. Validate logs: `~/validate-http-<sha>.log`.
-- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
+- **⚠️ Fleet leak in git history:** `<prod-host>`'s alias name slipped into commit `f169caf`'s HANDOFF
+  (one line, now scrubbed at HEAD). It's a local SSH alias (not the real hostname/IP), low-sensitivity,
+  but it's in public history. Decide whether to history-scrub (force-push main) — I did NOT do it
+  unilaterally.
+- **On-host `~/deploy/*.sh` are STATIC COPIES** — when `deploy-on-host.sh`/`launch-http.sh` change in
+  the repo, **re-`scp` them to `<prod-host>:/home/node/deploy/`** (the workflow can't self-update the
+  mechanism it runs). This bit us 3× in the dry-run.
+- **Stealth flags get silently gated/ignored across Chrome versions** — WebRTC switch (use the policy
+  file) and SwiftShader-WebGL (needs `--enable-unsafe-swiftshader`) on 149. The `validate-stealth`
+  webrtc + webgl legs guard the build; re-run the parity harness after a Chrome bump.
+- **Diagnose any "clears locally / blocks in prod" with the parity harness**, not by guessing flags.
+- **Each Phase 2 (or manual) deploy recreates the container (~10-20s)** → MCP-over-HTTP sessions don't
+  survive a server restart → consumers reconnect after every deploy.
+- **Manual deploy is now one command too:** `BGW_DEPLOY_IMAGE=<digest> BGW_ENV_FILE=… BGW_CONSUMERS_HOST_PATH=…
+  ~/deploy/launch-http.sh` (still pull + `validate-http` first; `CUTOVER.local.md` is the fallback runbook).
+- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing). Prod throwaway probes/runners live
+  in `<prod-host>:/home/node/*.local.*` (gitignored-style).
