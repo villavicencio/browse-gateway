@@ -53,6 +53,28 @@ export function resolveCoreOptions(
 export const WEBRTC_IP_HANDLING_ARG =
   "--force-webrtc-ip-handling-policy=disable_non_proxied_udp";
 
+/**
+ * Force a software (SwiftShader) WebGL backend so the browser actually HAS WebGL.
+ *
+ * Under Xvfb with no GPU, Chrome 149 produces NO WebGL context at all (`getContext('webgl')`
+ * returns null) — a real desktop browser always has WebGL, so "WebGL absent" is a strong
+ * anti-bot tell (measured: it was the top divergence between the prod VPS and a desktop, and
+ * the likely interactive-Turnstile trigger). Chrome gates the software fallback behind
+ * `--enable-unsafe-swiftshader`; `--use-gl=angle --use-angle=swiftshader` pins the backend
+ * explicitly rather than relying on the default GL picker. Verified in-container: this turns
+ * `webgl: null` into a valid `ANGLE (… SwiftShader driver)` context.
+ *
+ * Applied unconditionally (like the WebRTC policy) — the production surface is the GPU-less
+ * Xvfb container, and forcing it everywhere keeps local dev a faithful fingerprint mirror of
+ * prod. A host with a REAL GPU should drop these (real hardware WebGL is the better signal).
+ * Spoofing the SwiftShader renderer string to a plausible consumer GPU is a possible follow-up.
+ */
+export const WEBGL_SWIFTSHADER_ARGS = [
+  "--use-gl=angle",
+  "--use-angle=swiftshader",
+  "--enable-unsafe-swiftshader",
+];
+
 /** The subset of Patchright's launch options this core sets. */
 export interface PatchrightLaunchOptions {
   headless: boolean;
@@ -70,7 +92,7 @@ export function buildLaunchOptions(
 ): PatchrightLaunchOptions {
   const launch: PatchrightLaunchOptions = { headless: resolved.headless };
   if (resolved.channel) launch.channel = resolved.channel;
-  launch.args = [WEBRTC_IP_HANDLING_ARG];
+  launch.args = [WEBRTC_IP_HANDLING_ARG, ...WEBGL_SWIFTSHADER_ARGS];
   if (resolved.noSandbox) launch.args.push("--no-sandbox");
   if (resolved.proxy) launch.proxy = resolved.proxy;
   return launch;

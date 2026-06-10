@@ -10,13 +10,17 @@
 #   docker run --rm --platform linux/amd64 --shm-size=1g browse-gateway:u1
 FROM node:22-bookworm-slim
 
-# System dependencies: real Google Chrome, Xvfb (virtual display), and fonts so pages
-# render realistically. Chrome's transitive deps are resolved by installing the .deb.
+# System dependencies: real Google Chrome, Xvfb (virtual display), tzdata (so the wall
+# clock can match the proxy exit geo), and a desktop-realistic font set so pages render —
+# and fingerprint — like a real machine, not a server. A sparse font list is an anti-bot
+# tell; fonts-{dejavu,freefont,croscore,noto-core} add common desktop families (croscore
+# is metric-compatible with Arial/Times/Courier). Chrome's transitive deps resolve via the .deb.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates wget gnupg \
+        ca-certificates wget gnupg tzdata \
         xvfb xauth \
         fonts-liberation fonts-noto-color-emoji fonts-unifont \
+        fonts-dejavu fonts-freefont-ttf fonts-croscore fonts-noto-core \
     && wget -q -O /tmp/chrome.deb \
         https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
@@ -53,9 +57,14 @@ COPY docker/policies/webrtc-ip-handling.json /etc/opt/chrome/policies/managed/we
 COPY docker/policies/webrtc-ip-handling.json /etc/chromium/policies/managed/webrtc-ip-handling.json
 
 # Headful under Xvfb; running as root in the container, so Chrome needs --no-sandbox.
+# TZ: a US (Eastern) wall clock to match the residential proxy's `_country-us` exit — a
+# UTC browser behind a US IP is a geo mismatch. ICU/V8 read TZ; the symlink keeps glibc
+# consistent. (Static US per the deploy decision; revisit if exits broaden beyond US.)
 ENV BGW_CHANNEL=chrome \
     BGW_NO_SANDBOX=1 \
+    TZ=America/New_York \
     DISPLAY=:99
+RUN ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime && echo "America/New_York" > /etc/timezone
 
 # The entrypoint provisions the Xvfb display, then exec's the command (the kill-gate by
 # default). Run with `--init` so a proper init reaps the browser's child processes.
