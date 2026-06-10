@@ -43,6 +43,12 @@ export function resolveCoreOptions(
  * datacenter VPS that mismatch reads as "proxy detected" and the challenge never clears.
  * `disable_non_proxied_udp` restricts ICE to proxied transports without disabling the
  * WebRTC API itself (the same behavior as common WebRTC-leak-protection settings).
+ *
+ * CAUTION: this switch is NOT honored by current branded Chrome (verified on 149: switch
+ * on the cmdline, srflx still leaked). The load-bearing mechanism is the managed-policy
+ * file `docker/policies/webrtc-ip-handling.json` baked into the image (`WebRtcIPHandling`
+ * enterprise policy — verified to zero out non-proxied candidates). The switch stays as
+ * belt-and-braces for Chromium variants where it may still work.
  */
 export const WEBRTC_IP_HANDLING_ARG =
   "--force-webrtc-ip-handling-policy=disable_non_proxied_udp";

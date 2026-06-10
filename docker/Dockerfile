@@ -42,6 +42,16 @@ RUN npm run build
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# WebRTC must not gather ICE candidates outside the proxy (STUN over plain UDP reveals
+# the host's real IP alongside the proxied one — "proxy detected" to anti-bot vendors).
+# The managed-policy file is the mechanism that actually works on current Chrome: the
+# --force-webrtc-ip-handling-policy launch switch is on the cmdline but IGNORED as of
+# Chrome 149 (verified empirically: switch present, srflx still leaked; policy file
+# present, zero non-proxied candidates). Installed for both branded Chrome and the
+# Chromium fallback channels.
+COPY docker/policies/webrtc-ip-handling.json /etc/opt/chrome/policies/managed/webrtc-ip-handling.json
+COPY docker/policies/webrtc-ip-handling.json /etc/chromium/policies/managed/webrtc-ip-handling.json
+
 # Headful under Xvfb; running as root in the container, so Chrome needs --no-sandbox.
 ENV BGW_CHANNEL=chrome \
     BGW_NO_SANDBOX=1 \
