@@ -91,11 +91,18 @@ verify() {
 
 if verify; then
   echo "deploy: SUCCESS → ${IMAGE}"
-  # 7 — retention: keep the newest 5 browse-gateway SHA images + the running + the rollback anchor.
-  docker images 'ghcr.io/*/browse-gateway' --format '{{.ID}} {{.CreatedAt}}' \
+  # 7 — retention: keep the newest 5 project images; never the running or rollback-anchor image.
+  # Full (--no-trunc) IDs so they compare equal to inspect's sha256:… refs; a glob reference filter
+  # to scope to the project package; explicit skips (docker also refuses to rmi an in-use image).
+  local_keep="$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null || true)"
+  docker images --no-trunc --filter=reference='ghcr.io/*/browse-gateway' --format '{{.ID}} {{.CreatedAt}}' \
     | sort -rk2 | awk 'NR>5{print $1}' \
-    | grep -v -e "${ROLLBACK_IMAGE#sha256:}" 2>/dev/null \
-    | xargs -r -n1 docker rmi >/dev/null 2>&1 || true
+    | while read -r id; do
+        [ -n "$id" ] || continue
+        [ "$id" = "$local_keep" ] && continue
+        [ -n "$ROLLBACK_IMAGE" ] && [ "$id" = "$ROLLBACK_IMAGE" ] && continue
+        docker rmi "$id" >/dev/null 2>&1 || true
+      done
   exit 0
 fi
 
