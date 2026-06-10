@@ -86,7 +86,9 @@ verify() {
   state="$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
   docker logs "$CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true' || { echo "verify: dnsRebindProtection not true ($state)"; return 1; }
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
-  restarts="$(docker inspect "$CONTAINER" --format '{{.State.RestartCount}}' 2>/dev/null || echo '?')"
+  # RestartCount is a TOP-LEVEL field ({{.RestartCount}}), NOT {{.State.RestartCount}} (which errors
+  # "map has no entry"). The state line already captured it as the 3rd '/'-field — reuse that.
+  restarts="${state##*/}"
   [ "$code" = "401" ] && [ "$restarts" = "0" ] || { echo "verify: mcp=$code restarts=$restarts state=$state"; return 1; }
   echo "verify: OK (running, restarts=0, dnsRebind=true, /mcp=401)"
 }
