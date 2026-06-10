@@ -44,6 +44,7 @@ export {
   resolveCoreOptions,
   DEFAULT_CORE_OPTIONS,
   WEBRTC_IP_HANDLING_ARG,
+  WEBGL_SWIFTSHADER_ARGS,
   type PatchrightLaunchOptions,
   type ResolvedCoreOptions,
 } from "./launch-options.js";
