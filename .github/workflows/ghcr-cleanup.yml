@@ -1,0 +1,24 @@
+name: ghcr-cleanup
+
+# Weekly prune of the GHCR container package so versions don't accrete one-per-commit forever.
+# Keeps the newest N versions (the `latest` tag points at the newest, so it is retained); deletes
+# older + untagged. Manual dispatch available for an ad-hoc cleanup.
+on:
+  schedule:
+    - cron: "17 4 * * 0" # Sundays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old browse-gateway container versions (keep newest 10)
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: browse-gateway
+          package-type: container
+          min-versions-to-keep: 10
+          delete-only-untagged-versions: false
