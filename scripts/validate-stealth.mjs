@@ -171,7 +171,10 @@ async function runWebglCheck() {
         return { error: String(e) };
       }
     });
-    const passed = Boolean(webgl && !webgl.error && webgl.renderer);
+    // Pass = a context EXISTS (webgl non-null, no exception). The renderer string is
+    // informational — some privacy configs mask it to "" even with a live context, so
+    // gating on its truthiness would false-FAIL a browser that actually has WebGL.
+    const passed = Boolean(webgl && !webgl.error);
     console.log(
       `  webgl=${JSON.stringify(webgl)} — ` +
         `${passed ? "PASS" : "FAIL (no WebGL context — software-GL args missing/ineffective)"}`,
