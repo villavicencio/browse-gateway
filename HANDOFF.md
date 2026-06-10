@@ -1,12 +1,15 @@
 # HANDOFF — 2026-06-10
 
-Indexxx is **solved**, and the win came from a reusable tool rather than another one-off
-patch. Arc this session: WebRTC-leak fix (managed policy, not the ignored switch) → discovered
-Indexxx is an *interactive* Turnstile that the leak fix didn't clear → built a
-**fingerprint-parity harness** to measure Mac↔VPS divergence → it named the cause (**WebGL
-absent under Xvfb**) → shipped software-WebGL + US-timezone + richer-fonts hardening → Indexxx
-flipped from **0/15 to ~3/4** clears from the prod VPS. Four PRs merged (#10, #11, #12, #13);
-prod is on the hardened image `f3618b5`.
+Indexxx is **solved end-to-end**, and the wins came from reusable tools + a real bug fix, not
+one-off patches. Arc this session: WebRTC-leak fix (managed policy, not the ignored switch) →
+discovered Indexxx is an *interactive* Turnstile the leak fix didn't clear → built a
+**fingerprint-parity harness** → it named the cause (**WebGL absent under Xvfb**) → shipped
+software-WebGL + US-timezone + richer-fonts hardening → Indexxx cleared via the held-exit spike
+→ but Vault (drive verb) still failed "could not land a working proxied exit (403)" → traced
+to a **drive-path bug**: `navigate()` froze status at the CF interstitial's 403 and `#settle`
+snapshotted the blank transition, so `navFailed` misread the *cleared* page as a hard block →
+fixed → drive path now lands Indexxx (status 200, navFailed false). **Five PRs merged (#10–#14);
+prod is on `7855d4b`** (full stack: WebRTC policy + software WebGL + US TZ + fonts + drive fix).
 
 > Fleet detail (host/IP/tailnet/proxy-provider names) stays in `*.local.md` + agent memory,
 > never here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, the
@@ -38,6 +41,18 @@ prod is on the hardened image `f3618b5`.
   - **Gate:** `validate-stealth` gained a **webgl leg** (FAIL on a null context), mirroring the
     webrtc leg — regression to null is caught at build.
   - Learning: `docs/solutions/runtime-errors/webgl-absent-under-xvfb-trips-interactive-turnstile.md`.
+- **PR #14 (`7855d4b`) — drive-path stale-status fix (the last mile for Vault).** After the
+  hardening, the held-exit spike cleared Indexxx but Vault's *drive verb* still failed "could
+  not land a working proxied exit (403)". Probes (main-frame responses `307→403→200`) showed
+  `navigate()` froze `status` at the CF interstitial's first 403 (overwriting the active-page
+  response listener that already tracked the last status), and `#settle` exited on the blank
+  inter-navigation window — so `navFailed`'s `isHardBlock(403, thin)` misread the *cleared* page
+  as a hard block and the escalation discarded a working exit. Fix: `navigate()` resets
+  `#lastDocStatus` and lets the listener track the post-clearance 200; `#settle` waits (after a
+  block) until the page is non-thin (`isCleared` past `MIN_CONTENT_LENGTH` — the same bar
+  `isHardBlock` uses), not just non-blank. Verified on prod (baked image, US sticky exit):
+  status 200, tree ~3.1k with refs, `navFailed=false` — was 403 / tree 10 / true. Preserves the
+  dead-exit (null → fail), hard-block (403 no-clear → fail), and CF-escalation invariants.
 
 ## Verification (real, on the prod VPS)
 - Hardened image `f3618b5` deployed: `validate-http` PASS; live container recreated
@@ -50,12 +65,16 @@ prod is on the hardened image `f3618b5`.
   escalation ladder rotates past a bad exit, so prod resilience is ≥ the raw probe ratio.
 
 ## What's Next
-1. **Confirm Indexxx through the real drive verb from a consumer** (not just the raw held-exit
-   spike). The spike holds one exit by design; the gateway's escalation rotates on failure, so
-   a consumer-driven retrieve/drive of Indexxx should clear reliably. This is the last
-   end-to-end confirmation.
-2. **Update the remote consumer's (Vault) `CLAUDE.md` Indexxx caveat** — it now clears after
-   the hardening; the old "could not land a working proxied exit … 403" signature is stale.
+1. **Vault must reconnect, THEN re-test Indexxx.** The gateway-side bug is fixed and `7855d4b`
+   is live — but Vault's failure today was compounded by a **dead SSH tunnel** (its `ssh -L`
+   process died; gateway was healthy throughout). Vault needs to: restart the tunnel
+   (`ssh -N -L 8080:127.0.0.1:8080 root@<prod-host>` — harden with autossh so a redeploy gap
+   doesn't kill it), reconnect its MCP (`mcp__browse-gateway__*`), then drive Indexxx. With the
+   drive fix it should land the age-gate (status 200) instead of "could not land a working
+   proxied exit". This is the last end-to-end confirmation — I validated the drive path via the
+   in-container probe (navFailed=false), not yet through a live consumer.
+2. **Update Vault's `CLAUDE.md` Indexxx caveat** — the old "could not land a working proxied
+   exit … 403" signature is now stale (that was the drive bug, fixed). Do it in Vault's repo.
    That's Vault's repo (separate project) — do it there, not here.
 3. **Optional deeper hardening (follow-ups, not needed for Indexxx):** spoof the SwiftShader
    renderer string to a plausible consumer GPU; spoof `hardwareConcurrency`/`deviceMemory`
