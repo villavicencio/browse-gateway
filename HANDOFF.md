@@ -1,118 +1,107 @@
-# HANDOFF — 2026-06-09
+# HANDOFF — 2026-06-09 (evening, same-day continuation)
 
-Marathon session. Started on CI/CD Phase 1, then onboarded the first **remote** consumer, then
-chased a CAPTCHA-solver activation that surfaced a real bug, then built CF-interstitial escalation —
-and ended deep in an investigation of why one anti-bot site (an interactive-CAPTCHA target) clears
-locally but not from the prod VPS. Three PRs merged (#7, #8, #9); the open thread is a one-line
-stealth fix, fully diagnosed and ready to implement.
+Continued from the marathon session's open thread: the WebRTC-leak fix. It shipped,
+deployed, and **verified the leak is closed in prod** — but re-testing Indexxx surfaced a
+finding that **reframes the whole Indexxx story**: it's an *interactive* Cloudflare
+Turnstile, not a passive interstitial, and it still blocks from the VPS after the leak was
+closed. The WebRTC leak was a real defect (now fixed) but NOT the determining gate for
+Indexxx.
 
-> Fleet detail (host/IP/tailnet/proxy-provider names) stays in `*.local.md` + agent memory, never
-> here — this file is committed to a PUBLIC repo. Placeholders below: `<prod-host>`, the residential
-> proxy, the CAPTCHA provider.
+> Fleet detail (host/IP/tailnet/proxy-provider names) stays in `*.local.md` + agent memory,
+> never here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, the
+> residential proxy, the CAPTCHA provider.
 
-## What We Built
-- **PR #7 (`846e70f`) — CI/CD Phase 1: build→GHCR on `main`.** A `build-image` job in
-  `.github/workflows/ci.yml`, `needs: test`, main-push-gated; native amd64; pushes
-  `ghcr.io/<owner>/browse-gateway` tagged short-SHA + `latest`; `provenance/sbom: false`. Retired the
-  local Rosetta build→save→scp→load. GHCR package is **public** (flipped during the CAPTCHA deploy so
-  prod can `docker pull` anonymously).
-- **First REMOTE consumer onboarded** (a second project, the gateway's first off-box consumer).
-  Reached via an **SSH tunnel** (`ssh -N -L 8080:127.0.0.1:8080 root@<prod-host>`), NOT a tailnet
-  bind — rootless Docker can't dual-publish one container port to two host IPs, and the tunnel keeps
-  the gateway loopback-only. Consumer provisioned (`consumers.json` + `BGW_CONSUMER_TOKEN_*`,
-  `BGW_MAX_SESSIONS` 3→5); MCP registered local-scope; its `CLAUDE.md` fetch policy cut over to
-  `mcp__browse-gateway__*` (Browserbase dropped). Learnings:
-  `docs/solutions/runtime-errors/rootless-docker-port-republish-and-remote-reach.md`.
-- **CAPTCHA solver ACTIVATED in prod + render-race fixed.** It was dormant (prod ran a pre-PR-#6
-  image AND the launch never passed `-e BGW_CAPTCHA_API_URL`). Activating it surfaced **PR #8
-  (`e7970fc`)** — a render-race: `navigate()` resolves at `domcontentloaded`, but the widget's
-  response field is injected by a later async script, so the one-shot detect saw the container with no
-  field (`respLen -1`) and never solved. Fixed with a tri-state `respLen` + `awaitSolvableCaptcha`
-  (polls out the render race; pure + unit-tested). Verified live: Google reCAPTCHA-v2 demo →
-  "Verification Success". Learning:
-  `docs/solutions/runtime-errors/captcha-solver-render-race-domcontentloaded.md`.
-- **PR #9 (`967b688`) — sticky held exits + raised clearance for CF-interstitial escalation.**
-  `mintStickyProxy()` appends a deployment-config password suffix (`BGW_PROXY_STICKY_SUFFIX`,
-  `{id}` minted fresh per attempt — provider-neutral, no proxy syntax in source); each escalation
-  attempt holds ONE exit (a CF challenge is IP-bound) while retries still rotate; `PROXY_CLEARANCE_TIMEOUT_MS`
-  (45s) on proxied attempts both verbs. Plus review fixes: escalated clearance on the proxied
-  pinned-reopen path, `stickySuffixBootError` (fail-closed on a missing `{id}`), `sticky=` in the boot
-  log, distinct mid-retry error, `randomBytes(8)` id, and a `fix(deploy)` forwarding
-  `BGW_PROXY_STICKY_SUFFIX` + `BGW_CAPTCHA_API_URL` in the committed stdio launcher. 177 unit tests.
-  Plan: `docs/plans/2026-06-09-001-feat-sticky-cf-escalation-plan.local.md`.
-- **Reviews:** PR #9 got an in-repo multi-agent `ce-code-review` (10 personas) + an external review;
-  all findings resolved (one P1 dropped as a verified false positive — the reaper can't reap mid-op
-  because `touch()` fires at op-start, `gateway/index.ts:139`).
+## What We Built / Shipped
+- **PR #10 (`d2554c7`) — WebRTC IP-handling launch switch.** Pinned
+  `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` unconditionally in
+  `buildLaunchOptions` (`WEBRTC_IP_HANDLING_ARG` exported), unit-tested across every config.
+  **This turned out to be insufficient on its own** — see PR #11.
+- **PR #11 (`fa1b57c`) — WebRtcIPHandling managed-policy file (the actual fix).** An on-host
+  ICE probe through the prod proxy proved the launch switch is **silently ignored by Chrome
+  149**: the flag was verified present on the browser-process cmdline, yet STUN still gathered
+  a `typ srflx` candidate carrying the VPS's real IP. The mechanism that works is the
+  enterprise **managed policy** baked into the image:
+  `docker/policies/webrtc-ip-handling.json` → `/etc/opt/chrome/policies/managed/` (+ the
+  `/etc/chromium/` fallback). With it, the same probe gathers **zero** non-proxied candidates.
+  Also added a **webrtc leg to the stealth kill-gate** (`validate-stealth.mjs`): gathers ICE
+  candidates in the shipping image, FAILs on any UDP candidate, needs no proxy creds — catches
+  the silent-rot case the switch-only image would have shipped. Review fixes: gate on ANY UDP
+  candidate (not just srflx, which could pass vacuously if STUN were unreachable) + resolve on
+  `icegatheringstatechange=complete` with an 8s cap. 178 unit tests.
+- **Deployed to prod (`fa1b57c` live).** Full redeploy: pull GHCR sha → `tag latest` →
+  `validate-http` gate PASS → recreate `browse-gateway-http` with all `-e` vars → boot log
+  `sticky=true … consumers=[atlas, vault]`, `/mcp` returns 401. Baked-policy leak-closed
+  verified on the live image via the ICE probe (0 candidates through the proxy). Atlas + Vault
+  both served (the container they share was recreated cleanly).
+- **Learning:** `docs/solutions/runtime-errors/webrtc-ip-leak-needs-managed-policy-not-launch-switch.md`.
 
-## Decisions Made
-- **Remote reach = SSH tunnel, not a tailnet/0.0.0.0 bind** (rootless can't dual-publish; tunnel keeps
-  loopback-only on a public box — safer).
-- **GHCR package = public** (image bakes no secrets; source already public; lets prod pull
-  anonymously without an on-host token). Phase-2 private-pull deferred.
-- **Sticky id per ATTEMPT** (not per session) — keeps the rotate-past-dirty-exits property the
-  reputation-403 path needs, while each attempt holds one IP for its challenge.
-- **CF-interstitial Branch A (sticky+wait); Branch B (cf_clearance solver) descoped** — a probe proved
-  a clean held exit clears the interstitial unaided, so no solver tier needed.
-- **Indexxx root cause is NOT the proxy/pool/config** — ruled out methodically (see below). It's the
-  **VPS browser environment**, almost certainly a WebRTC IP leak.
+## The Indexxx finding that changes everything
+Re-tested Indexxx from prod via the held-exit spike (`spike-cf-interstitial.local.mjs`) on
+the fixed image, **3 attempts, 0/3 cleared**. But a **screenshot** (saved this session, sent
+to the user) reveals what it actually is:
 
-## What Didn't Work
-- **Indexxx (interactive-CAPTCHA target) still ❌ from prod** — but the *reason* is now pinned. The
-  sticky feature deployed correctly (`sticky=true`), yet Vault drives 403 at the exit layer. Ruled
-  out, in order:
-  1. **Deploy** — first tests ran on the OLD image (the pull/`tag latest` step was skipped). Re-pulled
-     `967b688`, confirmed `sticky=true` in the boot log.
-  2. **Env config** — masked dump of the prod env file is structurally correct; the suffix
-     `'_country-us_session-{id}_lifetime-30m'` produces the same final password the local probe used.
-     (Lone drift: `BGW_PROXY_URL` lacked the `http://` scheme — now added; harmless, Playwright treats
-     schemeless as http.)
-  3. **Proxy account** — scheme-normalized `sha256(url|username)` hashes **match** between prod and the
-     local probe → identical residential-proxy account + endpoint.
-  4. **Pool quality** — the local probe (same creds) cleared Indexxx **6/6**. Clean exits are the norm;
-     prod is **0/15**. So it is NOT variance and NOT pool quality.
-- That leaves only the **VPS browser environment** (same proxy, same clean pool, Mac clears / VPS not).
+> **An interactive Cloudflare Turnstile** — "www.indexxx.com / Performing security
+> verification / **[ ] Verify you are human**" with the Cloudflare widget. NOT the passive
+> "Just a moment…" auto-interstitial we assumed.
 
-## What's Next
-1. **Implement the WebRTC-leak fix (the open thread).** Add
-   `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` to the browser launch args in
-   `src/browser/launch-options.ts` (`buildLaunchOptions` currently sets only `--no-sandbox`). Theory,
-   fully reasoned: the `403` is the CF *challenge* status; it CLEARS on the Mac but not the VPS because
-   during the challenge JS, WebRTC/STUN leaks the host IP — residential on the Mac (matches the proxy,
-   CF clears), **datacenter on the VPS** (CF sees residential-proxy-IP + datacenter-IP = proxy detected
-   → refuses `cf_clearance` → stays 403). The flag forces WebRTC through the proxy only. Add a stealth
-   test, rebuild via CI, redeploy, re-test Indexxx from Vault. A clear = leak confirmed + fixed.
-   - Optional confirm-first: a from-VPS WebRTC-leak probe (load a leak detector through the prod proxy,
-     check whether the host IP appears) before deploying.
-2. **If the flag doesn't fully fix it** — next suspects are the Docker-Chrome fingerprint (version vs
-   the Mac's Chrome) or other Xvfb/headless tells; capture what the VPS browser actually renders on
-   Indexxx (stuck "Just a moment…" vs a hard block page) via a containerized probe + screenshot.
-3. **Update the remote consumer's `CLAUDE.md` Indexxx caveat** once the fix lands — the *reason* is a
-   VPS WebRTC leak (now fixable), not the cf_clearance tier or pool. The drive signature it lists
-   (`could not land a working proxied exit … 403`) stays accurate.
-4. **Deferred (non-blocking):** per-consumer solve budget (currently shared 5/60s per process);
-   success-path escalation/solve observability (agent-native review flag); CI/CD Phase 2 (manual
-   deploy over Tailscale — decisions doc at `docs/plans/2026-06-08-001-*.local.md`); GHCR
-   retention/pruning.
+This falsifies two earlier conclusions:
+1. **"The VPS WebRTC leak is why Indexxx fails"** — the leak is now closed (probe-proven) and
+   Indexxx still blocks. The leak was a real tell worth fixing, but not the determining gate.
+2. **"Branch A (sticky + held clean exit) clears Indexxx unaided"** — that probe result was
+   **macOS-only**. The same spike from the VPS lands a clean held exit and still sits on the
+   interactive Turnstile for 45s. Locally the Turnstile auto-passes (clean residential desktop
+   env); on the VPS it demands interaction.
+
+So the real Mac-vs-VPS gap is whatever still trips Turnstile into **interactive** mode on the
+VPS (a fingerprint/environment tell that survives the proxy + the WebRTC fix), OR Indexxx
+simply requires actually solving the interactive challenge.
+
+## What's Next (user decision — this is a scope fork, not a continuation)
+1. **Most promising: solve the interactive managed-challenge ("Branch B").** The captcha
+   solver already DETECTS Turnstile and can inject a `cf-turnstile-response` token
+   (`src/browser/captcha.ts`), and it's wired on the **drive path** — but Indexxx is a
+   *full-page managed-challenge* interstitial (hidden/dynamic sitekey, IP-bound `cf_clearance`
+   cookie), which is NOT the same as an embedded `.cf-turnstile[data-sitekey]` widget the
+   current token-inject path handles. CapSolver has a dedicated Cloudflare-challenge /
+   `cf_clearance` task type for exactly this (solve-from-the-exit-IP + cookie inject). This is
+   a **new build**, descoped twice before. **Key cheap experiment first:** drive Indexxx
+   through the *actual gateway drive verb* (not the raw spike) so the existing captcha hook
+   runs — confirm whether the embedded-widget path already does anything before building the
+   cf_clearance tier.
+2. **If chasing the fingerprint instead:** the VPS still differs from the Mac in ways the
+   WebRTC fix didn't touch — Chrome 149 in-container vs the Mac's Chrome, software GL under
+   Xvfb (llvmpipe canvas/WebGL fingerprint), timezone/locale vs the proxy geo. Capture what the
+   VPS browser renders/fingerprints on a Turnstile demo page vs the Mac. Lower-confidence,
+   higher-effort.
+3. **Update the remote consumer's `CLAUDE.md` Indexxx caveat:** the *reason* is now "interactive
+   CF Turnstile requiring the unbuilt managed-challenge solve tier", NOT a WebRTC leak (fixed)
+   and NOT pool/proxy. The drive signature it lists (`could not land a working proxied exit …
+   403`) is now slightly off — it lands the exit fine and gets a 403-equivalent interactive
+   challenge.
+4. **Non-blocking carryovers:** per-consumer solve budget; success-path solve/escalation
+   observability; CI/CD Phase 2 (deploy-over-Tailscale, decisions doc
+   `docs/plans/2026-06-08-001-*.local.md`); GHCR retention/pruning.
 
 ## Gotchas & Watch-outs
-- **Prod redeploy = pull GHCR SHA → `tag … latest` → gate (`validate-http`) → recreate** via the
-  inline `docker run` in `CUTOVER.local.md` (the committed stdio launcher is a separate artifact; the
-  live path is HTTP). Every redeploy must carry ALL `-e` vars incl. `-e BGW_PROXY_STICKY_SUFFIX` and
-  `-e BGW_CAPTCHA_API_URL` (both were silently missing at different points this session and cost hours
-  — the boot log now prints `sticky=true` to catch it).
-- **Don't skip the pull.** A recreate without `docker pull <sha>` + `tag latest` runs the OLD image —
-  two Indexxx tests this session were invalid for exactly this.
-- **rootless port race:** after `docker rm -f`, an immediate `docker run` can hit `address already in
-  use` (rootlesskit forward lingers; `ss` can't see it). Fix: `export XDG_RUNTIME_DIR=/run/user/<uid>`
-  then `systemctl --user restart docker`. `systemctl --user` fails `No medium found` without
-  XDG_RUNTIME_DIR set.
-- **`validate-http` gate:** write its log to `~/` not `/tmp` (a root-owned `/tmp/validate-http.log`
-  from a prior run causes a `Permission denied` redirect that silently shows a STALE prior PASS).
-- **`BGW_PROXY_STICKY_SUFFIX` MUST contain `{id}`** or the gateway fails closed at boot. Quote it in
-  the env file so bash doesn't touch `{id}`.
-- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing). Spike harnesses
-  `scripts/spike-*.local.mjs` (incl. `spike-cf-interstitial.local.mjs`, the held-exit probe) are
-  gitignored repro artifacts; the local probe reads creds from `.env.spike`.
-- **Local probe ≠ prod env:** macOS windowed Chrome on a residential host vs Linux Chrome under Xvfb
-  on a datacenter VPS — that gap is the whole Indexxx story. A clear locally is necessary but not
-  sufficient proof for prod.
+- **The WebRTC launch switch is a decoy on Chrome 149** — only the managed-policy file works.
+  If the `srflx` leak ever returns, check the policy file is in the image
+  (`/etc/opt/chrome/policies/managed/`), not the launch arg. The new `validate-stealth` webrtc
+  leg is the guard.
+- **Prod redeploy (unchanged):** pull GHCR sha → `tag … latest` → `validate-http` gate (log to
+  `~/`, not `/tmp`) → `docker rm -f` → recreate with ALL `-e` vars incl. `BGW_PROXY_STICKY_SUFFIX`
+  + `BGW_CAPTCHA_API_URL`. Don't skip the pull. Confirm `sticky=true` in the boot log.
+- **The gateway env file sources clean under `sudo -iu node`** but the proxy vars are NOT
+  auto-forwarded into a *nested* `docker run -e NAME` unless you re-source inside the same
+  `bash -lc`. The spike runner (`/home/node/run-spike-prod.local.sh`, staged) does this and
+  maps `BGW_PROXY_* → SPIKE_PROXY_*`. (An earlier inline attempt saw the vars as unset because
+  the source and the `docker run` were in different shell invocations.)
+- **Prod throwaway repro artifacts staged in `/home/node/`** (gitignored-style, like the
+  existing `/root/bgw-spike/`): `probe-webrtc.local.mjs`, `probe-cmdline.local.mjs`,
+  `spike-cf-interstitial.local.mjs`, `run-spike-prod.local.sh`, `webrtc-policy.json` (now
+  redundant — baked into the image). Validate-http logs: `~/validate-http-<sha>.log`.
+- **rootless port race** after `docker rm -f`: `export XDG_RUNTIME_DIR=/run/user/1000` then
+  `systemctl --user restart docker`.
+- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
+- **Local probe ≠ prod env** is now the *whole* Indexxx story: macOS residential desktop Chrome
+  vs Linux Chrome 149 under Xvfb on a datacenter VPS. A clear locally proved nothing about prod
+  — exactly how the "Branch A clears it" conclusion went wrong.
