@@ -83,25 +83,35 @@ echo "deploy: gate PASS"
 # This runs before the rollback anchor + swap, so it has the same non-bypassable, no-side-effects
 # safety posture as the gate. Probe semantics mirror verify() (running, restarts=0, dnsRebind, /mcp=401).
 SMOKE_CONTAINER="${BGW_SMOKE_CONTAINER:-${CONTAINER}-presmoke}"
-SMOKE_PORT="${BGW_SMOKE_PORT:-18080}"
+SMOKE_PORT="${BGW_SMOKE_PORT:-18080}"               # off 8080 (live); override BGW_SMOKE_PORT if 18080 is already bound on the host
+SMOKE_BOOT_TIMEOUT="${BGW_SMOKE_BOOT_TIMEOUT:-30}"  # poll seconds for startup; a bad-config crash surfaces in 2-3s, so a generous budget only spares a slow cold boot from a false abort
+# Safety net: if the deploy is interrupted (CI cancel / SIGTERM) between launch and teardown, don't
+# leave the throwaway smoke container holding the port + RAM. (SIGKILL can't be trapped — the launch
+# below also pins --restart no, so even an unkillable orphan stays inert and is reclaimed next run.)
+trap 'docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true' EXIT
 
 preswap_smoke() {
-  docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true   # evict any stale smoke container from a prior crashed deploy
   # Reuse launch-http.sh (single source of truth for the `docker run`) with the REAL env + consumers
-  # from the sourced config, but a throwaway name/port and tiny caps. The app reads its listen port
+  # from the sourced config, but a throwaway name/port, --restart no, and tiny caps incl. a small shm
+  # (the smoke never opens a browser session, so it doesn't need the live 1g shm — keeps the live +
+  # smoke pair within the small box's RAM during the brief overlap). The app reads its listen port
   # from BGW_HTTP_PORT (not BGW_HOST_PORT), so it still listens on 8080 inside; BGW_HOST_PORT only
   # moves the host-side -p mapping. launch-http's own `docker rm -f` is scoped to $SMOKE_CONTAINER,
   # so the live container is never touched.
   if ! BGW_DEPLOY_IMAGE="$IMAGE" BGW_CONTAINER="$SMOKE_CONTAINER" BGW_HOST_PORT="$SMOKE_PORT" \
+       BGW_RESTART=no \
        BGW_CPUS="${BGW_SMOKE_CPUS:-0.5}" BGW_MEMORY="${BGW_SMOKE_MEMORY:-1g}" \
+       BGW_SHM_SIZE="${BGW_SMOKE_SHM_SIZE:-256m}" \
        BGW_PIDS_LIMIT="${BGW_SMOKE_PIDS_LIMIT:-256}" "$HERE/launch-http.sh" >/dev/null; then
     echo "smoke: new image failed to launch against the real config" >&2
     return 1
   fi
-  # Poll up to ~12s for the server to bind + emit its startup line; bail early on a boot crash
-  # (a bad env / unparseable consumers.json / failed cap assertion shows as not-running).
+  # Poll up to BGW_SMOKE_BOOT_TIMEOUT seconds for the server to bind + emit its startup line; bail
+  # early on a boot crash (a bad env / unparseable consumers.json / failed cap assertion shows as
+  # not-running, surfacing in 2-3s — well before the budget).
   local i=0 ready=""
-  while [ "$i" -lt 12 ]; do
+  while [ "$i" -lt "$SMOKE_BOOT_TIMEOUT" ]; do
     if docker logs "$SMOKE_CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true'; then ready=1; break; fi
     [ "$(docker inspect "$SMOKE_CONTAINER" --format '{{.State.Running}}' 2>/dev/null || echo false)" = "true" ] || break
     sleep 1; i=$((i + 1))
@@ -119,14 +129,14 @@ preswap_smoke() {
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --retry 3 --retry-connrefused --retry-delay 1 \
             -H "Host: ${BIND_ADDR}:${HOST_PORT}" "http://${BIND_ADDR}:${SMOKE_PORT}/mcp" || echo 000)"
   [ "$code" = "401" ] && [ "$restarts" = "0" ] \
-    || { echo "smoke: /mcp=$code restarts=$restarts (real-config probe failed)" >&2; return 1; }
+    || { echo "smoke: /mcp=$code restarts=$restarts (sent Host: ${BIND_ADDR}:${HOST_PORT}; a 403 means that host:port isn't in BGW_ALLOWED_HOSTS)" >&2; return 1; }
   echo "smoke: OK (real env+consumers boot clean, restarts=0, dnsRebind=true, /mcp=401)"
 }
 
 echo "deploy: running real-config pre-swap smoke ($SMOKE_CONTAINER on ${BIND_ADDR}:${SMOKE_PORT})"
 smoke_rc=0
 preswap_smoke || smoke_rc=$?
-docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true   # always tear down, pass or fail
+docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true   # tear down before the swap, pass or fail (the EXIT trap is only the interrupted-run backstop)
 if [ "$smoke_rc" -ne 0 ]; then
   echo "deploy: PRE-SWAP SMOKE FAILED — live container left running, aborting." >&2
   exit 1
