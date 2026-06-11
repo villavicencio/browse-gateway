@@ -5,9 +5,10 @@
 # image arrives as a fully-resolved digest in $SSH_ORIGINAL_COMMAND (the runner resolves tag→digest
 # first, decision #5) and is strictly validated here — no arbitrary command runs.
 #
-# Sequence: validate digest → pull → validate-http GATE (on-host, real daemon) → capture the
-# running digest for rollback → swap via launch-http.sh → verify → auto-rollback on any verify
-# failure. The gate abort and rollback are non-bypassable (no flags, no skips).
+# Sequence: validate digest → pull → validate-http GATE (on-host, real daemon) → real-config
+# pre-swap smoke (new image booted against the REAL env + consumers.json on a throwaway port) →
+# capture the running digest for rollback → swap via launch-http.sh → verify → auto-rollback on any
+# verify failure. The gate abort, the smoke abort, and the rollback are non-bypassable (no flags, no skips).
 #
 # Fleet config is sourced from $BGW_DEPLOY_CONFIG (host-local, NOT committed); it sets the paths
 # launch-http.sh needs plus BGW_BIND_ADDR/BGW_HOST_PORT for the verify curl. This file is fleet-clean.
@@ -72,14 +73,74 @@ if [ "$gate_rc" -ne 0 ]; then
 fi
 echo "deploy: gate PASS"
 
-# 4 — capture the currently-running image (by ID = runnable digest) for rollback.
+# 4 — REAL-CONFIG PRE-SWAP SMOKE: the gate (step 3) runs validate-http with its OWN test config and
+# NO BGW_* overrides, so it never sees the real env file or consumers.json. The likeliest bad deploy
+# — a malformed prod env var, a consumers.json typo, or a startup cap-assertion violation
+# (maxSessions < consumers×perConsumerMax+1) — would PASS the gate, go live, fail verify, and, being
+# config- not image-specific, take the auto-rollback down with it (rollback re-launches the prior
+# image against the SAME bad config). So boot the new image against the REAL env + consumers on a
+# throwaway container/port FIRST and abort — live container UNTOUCHED — if it can't come up clean.
+# This runs before the rollback anchor + swap, so it has the same non-bypassable, no-side-effects
+# safety posture as the gate. Probe semantics mirror verify() (running, restarts=0, dnsRebind, /mcp=401).
+SMOKE_CONTAINER="${BGW_SMOKE_CONTAINER:-${CONTAINER}-presmoke}"
+SMOKE_PORT="${BGW_SMOKE_PORT:-18080}"
+
+preswap_smoke() {
+  docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true
+  # Reuse launch-http.sh (single source of truth for the `docker run`) with the REAL env + consumers
+  # from the sourced config, but a throwaway name/port and tiny caps. The app reads its listen port
+  # from BGW_HTTP_PORT (not BGW_HOST_PORT), so it still listens on 8080 inside; BGW_HOST_PORT only
+  # moves the host-side -p mapping. launch-http's own `docker rm -f` is scoped to $SMOKE_CONTAINER,
+  # so the live container is never touched.
+  if ! BGW_DEPLOY_IMAGE="$IMAGE" BGW_CONTAINER="$SMOKE_CONTAINER" BGW_HOST_PORT="$SMOKE_PORT" \
+       BGW_CPUS="${BGW_SMOKE_CPUS:-0.5}" BGW_MEMORY="${BGW_SMOKE_MEMORY:-1g}" \
+       BGW_PIDS_LIMIT="${BGW_SMOKE_PIDS_LIMIT:-256}" "$HERE/launch-http.sh" >/dev/null; then
+    echo "smoke: new image failed to launch against the real config" >&2
+    return 1
+  fi
+  # Poll up to ~12s for the server to bind + emit its startup line; bail early on a boot crash
+  # (a bad env / unparseable consumers.json / failed cap assertion shows as not-running).
+  local i=0 ready=""
+  while [ "$i" -lt 12 ]; do
+    if docker logs "$SMOKE_CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true'; then ready=1; break; fi
+    [ "$(docker inspect "$SMOKE_CONTAINER" --format '{{.State.Running}}' 2>/dev/null || echo false)" = "true" ] || break
+    sleep 1; i=$((i + 1))
+  done
+  local state restarts code
+  state="$(docker inspect "$SMOKE_CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
+  restarts="${state##*/}"
+  if [ -z "$ready" ] || ! printf '%s' "$state" | grep -q '^running/true/'; then
+    echo "smoke: new image did not boot clean against the real config (state=$state)" >&2
+    docker logs "$SMOKE_CONTAINER" 2>&1 | tail -8 >&2 || true
+    return 1
+  fi
+  # Connection is to the smoke port, but Host MUST equal the real bind:port the env whitelists in
+  # BGW_ALLOWED_HOSTS, or the SDK's DNS-rebind Host check rejects a perfectly good image.
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --retry 3 --retry-connrefused --retry-delay 1 \
+            -H "Host: ${BIND_ADDR}:${HOST_PORT}" "http://${BIND_ADDR}:${SMOKE_PORT}/mcp" || echo 000)"
+  [ "$code" = "401" ] && [ "$restarts" = "0" ] \
+    || { echo "smoke: /mcp=$code restarts=$restarts (real-config probe failed)" >&2; return 1; }
+  echo "smoke: OK (real env+consumers boot clean, restarts=0, dnsRebind=true, /mcp=401)"
+}
+
+echo "deploy: running real-config pre-swap smoke ($SMOKE_CONTAINER on ${BIND_ADDR}:${SMOKE_PORT})"
+smoke_rc=0
+preswap_smoke || smoke_rc=$?
+docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true   # always tear down, pass or fail
+if [ "$smoke_rc" -ne 0 ]; then
+  echo "deploy: PRE-SWAP SMOKE FAILED — live container left running, aborting." >&2
+  exit 1
+fi
+echo "deploy: smoke PASS"
+
+# 5 — capture the currently-running image (by ID = runnable digest) for rollback.
 ROLLBACK_IMAGE="$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null || true)"
 echo "deploy: rollback anchor = ${ROLLBACK_IMAGE:-<none running>}"
 
-# 5 — swap to the new digest.
+# 6 — swap to the new digest.
 BGW_DEPLOY_IMAGE="$IMAGE" "$HERE/launch-http.sh"
 
-# 6 — verify; on any miss, auto-rollback to the captured digest and re-verify.
+# 7 — verify; on any miss, auto-rollback to the captured digest and re-verify.
 verify() {
   sleep 4
   local state restarts code
@@ -95,7 +156,7 @@ verify() {
 
 if verify; then
   echo "deploy: SUCCESS → ${IMAGE}"
-  # 7 — retention: keep the newest 5 project images; never the running or rollback-anchor image.
+  # 8 — retention: keep the newest 5 project images; never the running or rollback-anchor image.
   # Full (--no-trunc) IDs so they compare equal to inspect's sha256:… refs; a glob reference filter
   # to scope to the project package; explicit skips (docker also refuses to rmi an in-use image).
   local_keep="$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null || true)"
