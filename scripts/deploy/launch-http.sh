@@ -18,6 +18,8 @@
 #   BGW_HOST_PORT           host port (default: 8080)
 #   BGW_CPUS / BGW_MEMORY / BGW_PIDS_LIMIT / BGW_SHM_SIZE   resource caps
 #                           (defaults: 1.75 / 4g / 512 / 1g — matches the tuned live container)
+#   BGW_RESTART             docker restart policy (default: unless-stopped; the pre-swap smoke uses 'no'
+#                           so a throwaway container can't self-resurrect if a deploy is interrupted)
 set -euo pipefail
 
 : "${BGW_DEPLOY_IMAGE:?set BGW_DEPLOY_IMAGE (image digest or tag to run)}"
@@ -48,7 +50,7 @@ echo "launch-http: (re)creating ${CONTAINER} on ${BIND_ADDR}:${HOST_PORT} from $
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 docker run -d --name "$CONTAINER" \
-  --restart unless-stopped --init \
+  --restart "${BGW_RESTART:-unless-stopped}" --init \
   --cpus="${BGW_CPUS:-1.75}" --memory="${BGW_MEMORY:-4g}" --memory-swap="${BGW_MEMORY:-4g}" \
   --pids-limit="${BGW_PIDS_LIMIT:-512}" --shm-size="${BGW_SHM_SIZE:-1g}" \
   -p "${BIND_ADDR}:${HOST_PORT}:8080" \
