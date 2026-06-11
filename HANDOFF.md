@@ -1,101 +1,85 @@
-# HANDOFF — 2026-06-10 (evening)
+# HANDOFF — 2026-06-11 (afternoon PT)
 
-Long multi-arc session. Picked up from the WebRTC-leak open thread and ran through: closing the
-WebRTC leak (managed policy, not the ignored switch) → discovering Indexxx is an interactive
-Turnstile the leak didn't fix → **building a fingerprint-parity harness** that named the real cause
-(**WebGL absent under Xvfb**) → stealth hardening → a **drive-path stale-status bug** that was the
-last mile → **Indexxx solved end-to-end** → characterizing StashDB (auth-walled) → hardening the
-Vault SSH tunnel (plist written, NOT activated — user has concerns, deferred) → **building +
-ACTIVATING CI/CD Phase 2** (one-button deploy-over-Tailscale). **Nine PRs merged (#10–#18); prod is
-on the latest `main` image, deployed via the new pipeline.**
+Picked up from the 2026-06-10 handoff (tunnel hardening deferred pending discussion). This session: adopted a
+public-safe **codename "Vault"** for the remote consumer and scrubbed the old nickname out of the working tree,
+memory, and **all git history** (force-pushed); **activated the hardened durable tunnel**; built + merged a
+**real-config pre-swap smoke** into the deploy pipeline (PR #19); pruned 20 stale local branches; and ran a
+**brainstorm + implementation plan for "Obscura"** — a boutique brand + one-command-connect CLI over the gateway —
+backed by two market-research scans. Obscura design docs are local-only (gitignored); nothing of it is built yet.
 
-> Fleet detail (host/IP/tailnet/proxy/CAPTCHA names) stays in `*.local.md` + agent memory, never
-> here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, `<prod-tailnet-ip>`,
-> the residential proxy, the CAPTCHA provider.
+> Fleet detail (host/IP/tailnet/proxy/CAPTCHA/consumer identities) stays in `*.local.md` + agent memory, never
+> here — this file is committed to a PUBLIC repo. Placeholders: `<prod-host>`, the residential proxy, the CAPTCHA
+> provider. "Vault" is the public-safe consumer codename; "Obscura" is the brand-in-progress.
 
 ## What We Built
-- **WebRTC leak CLOSED (PR #10 + #11).** The `--force-webrtc-ip-handling-policy` launch switch is
-  **ignored by Chrome 149** (proven: on the cmdline, srflx still leaked the VPS IP). The fix is the
-  **`WebRtcIPHandling` managed-policy file** baked into the image (`docker/policies/…` →
-  `/etc/opt/chrome/policies/managed/`). ICE probe through the proxy: zero non-proxied candidates.
-- **Fingerprint-parity harness (PR #12).** `src/browser/fingerprint.ts` (collector + pure,
-  unit-tested flatten/classify/diff, ranks axes high/geo/info), `scripts/fingerprint-snapshot.mjs`,
-  `scripts/fingerprint-diff.mjs`. Turns "Mac clears / VPS blocks" into a measurement. Snapshots carry
-  the egress IP → `*.fp.json` gitignored. **The durable diagnostic for any future divergence.**
-- **Stealth hardening (PR #13).** Harness diff named the top tells, all fixed: **WebGL absent**
-  (`webgl: null`) → `WEBGL_SWIFTSHADER_ARGS` (`--use-gl=angle --use-angle=swiftshader
-  --enable-unsafe-swiftshader`; Chrome 149 gates the fallback behind the last flag); **TZ=America/
-  New_York** (+tzdata) to match the US exit; **richer fonts**; a **webgl leg** added to
-  `validate-stealth` (FAIL on null context).
-- **Drive stale-status fix (PR #14).** `navigate()` froze status at the CF interstitial's first 403
-  (CF reloads 403→200 on clear) and `#settle` snapshotted the blank transition, so `navFailed`
-  misread the *cleared* page as a hard block ("could not land a working proxied exit"). Fix: let the
-  active-page response listener track the post-clearance 200; `#settle` waits for non-thin content.
-- **CI/CD Phase 2 — ACTIVATED (PR #15 + dry-run fixes #16/#17/#18).** One-button manual deploy:
-  `gh workflow run deploy-http.yml -f image_tag=latest` → resolve tag→immutable digest → tailnet
-  (OAuth, `tag:ci-deploy`) → ssh to a forced-command on-host wrapper that gates (validate-http),
-  swaps, verifies, auto-rolls-back. `scripts/deploy/{launch-http,deploy-on-host}.sh` (fleet-clean) +
-  `.github/workflows/{deploy-http,ghcr-cleanup}.yml`. Security-reviewed (P0 package-pin, P1
-  template-injection, P2 action-SHA-pins all fixed).
-- **Learnings (committed):** `docs/solutions/runtime-errors/{webrtc-ip-leak-needs-managed-policy-not-launch-switch,
-  webgl-absent-under-xvfb-trips-interactive-turnstile,drive-nav-status-frozen-at-cf-interstitial-403}.md`.
+- **Codename Vault + full scrub.** Replaced the remote consumer's old nickname with **Vault** in `HANDOFF.md`,
+  the agent memory store, and **every commit (content + messages) across all of `main`** via `git-filter-repo`,
+  then force-pushed (`00627b2…3d818a4`). Backup bundle at `~/bgw-pre-scrub.bundle`. Live operational ids (prod
+  consumer id, the local vault folder) intentionally unchanged — private, not in the repo.
+- **Hardened durable tunnel ACTIVATED.** The Mac→prod gateway tunnel is now a LaunchAgent
+  (`com.dvillavicencio.browse-gateway-tunnel`) running a self-disabling keeper over a **restricted, non-root
+  `bgwtunnel` SSH user** (key pinned to `permitopen=127.0.0.1:8080` — forward-only, no shell). Self-disables
+  after ~10 fast-fail reconnects so a dead/changed prod can't reconnect-storm. Verified live (gateway 401 through
+  the tunnel). Ops note: `TUNNEL.local.md` (gitignored); memory `durable-tunnel-launchagent`.
+- **PR #19 — real-config pre-swap smoke (MERGED, `6512525`).** Adds a step to `scripts/deploy/deploy-on-host.sh`:
+  between the isolated `validate-http` gate and the live swap, boot the new image against the REAL on-host env +
+  `consumers.json` on a throwaway container/port, probe `/mcp` (running, RestartCount=0, dnsRebind=true, 401 with
+  the live `Host:` header), tear down, abort with the live container untouched on failure. Plus review hardening:
+  `--restart no` + EXIT trap (no orphan smoke container), `BGW_SMOKE_SHM_SIZE` cap, configurable boot poll, and a
+  `Host`-header hint in the failure message. Touches `deploy-on-host.sh` **and** `launch-http.sh`
+  (new `BGW_RESTART` knob). Independently verified by a fake-Docker sim of both pass/abort paths.
+- **Branch prune.** Removed 20 stale local branches (all merged PRs #1–#19 + `pr/*` mirrors); only `main` remains.
+  Corrected the stale "PR #1 OPEN" note in memory — all of #1–#19 are merged.
+- **Obscura brainstorm + plan (LOCAL, gitignored).** `docs/brainstorms/2026-06-11-obscura-brand-and-connect-experience-requirements.local.md`
+  and `docs/plans/2026-06-11-001-feat-obscura-cli-brand-plan.local.md`. First cut = `obscura connect`/`keys`/`status`
+  CLI (automates the manual key+tunnel+`mcp add`+verify dance), a reactive ASCII owl mascot, and an Obscura README;
+  brand rides on top of the unchanged `BGW_`/`browse-gateway`/`mcp__browse-gateway__*` plumbing.
 
 ## Decisions Made
-- **WebGL software-GL applied UNCONDITIONALLY** (like the WebRTC policy) — prod is GPU-less; keeps
-  local dev a faithful fingerprint mirror. A real-GPU host should drop the flags.
-- **Static US timezone** (America/New_York), not dynamic per-exit-geo (revisit only if exits broaden).
-- **CI/CD #1 (pull auth) = public package** → anonymous pull, no auth plumbing (reality overtook the
-  doc's private+ephemeral recommendation). **#2 = OAuth + `tag:ci-deploy`.** **#6 = retain 5 host/10 GHCR.**
-- **Tailscale SSH DISABLED on prod** (`RunSSH:false`) — it intercepted tailnet:22, **bypassed the
-  authorized_keys forced command**, and presented its own host key. Interactive prod access stays on
-  the public-IP `<prod-host>` alias. (If public SSH is ever closed, move the deploy to a 2nd non-22
-  sshd port — "Option C" — so the forced-command security survives.)
-- **Indexxx needs the `browser_*` drive path, not `retrieve`** (retrieve is one-shot, can't click the
-  18+ age-gate). General rule for interactive-gated sites.
+- **Brand = Obscura** (camera-obscura optics + "obscured"/stealth; owl mascot, Athena-pantheon-adjacent). The
+  technical handle (`BGW_`, image, MCP prefix) is **NOT** renamed in the first cut — experiential rename first;
+  full technical rename is a deferred, staged migration (it touches the just-hardened deploy pipeline + live
+  consumer re-registration).
+- **Connect model = key + tunnel + register + verify** (the "Browserbase split"), reusing the operator's SSH
+  trust; **no new gateway enroll/admin API** (keeps the public box's surface minimal). `obscura keys` mutates
+  prod files over admin SSH; `obscura connect` is Mac-local. Literal bearer token via `claude mcp add` (avoids the
+  documented env-ref verify false-negative); tunnel local port hardcoded 8080 (Host-header/allowed-hosts rule).
+- **Pre-swap smoke over a live rollback drill.** Judged a full green-rollback rehearsal low-value (narrow
+  scenario, prod-disruption cost); built the real-config smoke instead — it *prevents* the config-specific bad
+  deploy the auto-rollback can't recover from, rather than recovering after the swap.
+- **Market research → the moat is governance, not stealth.** Two cited scans confirmed: MCP-native browser tools
+  are commoditized and Steel/Browserless already self-host the browser, but **no player ships owned
+  navigation-allowlist policy + per-consumer auth + audit/retention** — exactly this gateway's architecture. If
+  ever productized, lead with that wedge (open-core). Detail in the local brainstorm's Positioning section.
 
-## What Didn't Work / Ruled Out
-- **WebRTC launch switch** — a decoy on Chrome 149; only the managed-policy file works.
-- **"VPS WebRTC leak is why Indexxx fails"** — falsified; leak closed, Indexxx still blocked. The real
-  cause was WebGL-absent (fingerprint), found by the harness.
-- **"Branch B cf_clearance solver tier"** — briefly hypothesized for Indexxx, disproven (it was
-  fingerprint + a drive bug, not a missing solver).
-- **Geo pin as Indexxx's blocker** — tested: US-pinned exits clear ~2/3, non-US ~3/3; minor, not the
-  cause. (The cause was the drive stale-status bug + fingerprint.)
-- **Deploy gate with `-e BGW_*` overrides** — broke validate-http's self-contained per-consumer-cap
-  assertion (#17). **`{{.State.RestartCount}}`** in verify — errors; it's top-level `{{.RestartCount}}` (#18).
+## What Didn't Work
+- **Full live green-rollback drill** — staging a *clean* one needs a purpose-built gate-passing-but-verify-failing
+  image or script instrumentation, and a real prod swap/rollback window; ruled out as disproportionate. The
+  pre-swap smoke is the higher-value substitute (now shipped).
+- **A gateway enroll/admin HTTP API for `keys`** — ruled out; adds a privileged surface to a public-IP box. SSH
+  file-orchestration reuses existing trust instead.
+- **Literal `-base` brand compounds** (Fetchbase/Glassbase) — avoided as derivative of the very inspiration
+  (Browserbase).
 
 ## What's Next
-1. **Tunnel hardening (autossh/LaunchAgent) — DEFERRED, user has concerns to discuss.** The
-   LaunchAgent plist is WRITTEN at `~/Library/LaunchAgents/com.dvillavicencio.browse-gateway-tunnel.plist`
-   (validated, matched to the working tunnel) but **NOT activated** — the manual `ssh -L 8080` tunnel
-   is still what Vault uses. Activating means killing the manual tunnel (one Vault reconnect) then
-   `launchctl bootstrap`. **Pick this up next session and talk through the concerns before activating.**
-2. **Reconnect Vault's MCP** — it was blipped several times by the Phase 2 dry-run recreates. One
-   `mcp__browse-gateway__*` reconnect when next used.
-3. **Optional: clean-rollback test** for Phase 2 — force a verify failure (e.g. wrong port in the
-   on-host deploy config) and confirm it restores the prior digest GREEN. The dry-run proved gate-abort
-   and exercised the rollback machinery, but a green rollback wasn't explicitly captured.
-4. **StashDB** — auth-walled (account or API key), not a render-timing issue: `retrieve` → "Loading…"
-   shell; `browser_*` drive + `wait_for` → renders but to a LOGIN page; GraphQL needs an `ApiKey`
-   header (a direct call, outside the gateway). Record in Vault's notes if pursuing.
-5. **Carryovers:** per-consumer solve budget; success-path solve/escalation observability; GHCR
-   retention now handled by `ghcr-cleanup.yml`.
+1. **Build the Obscura first cut** — `/ce-work docs/plans/2026-06-11-001-feat-obscura-cli-brand-plan.local.md`.
+   6 dependency-ordered units (CLI scaffold + owl/brand kernel → README → `keys` → tunnel module → `connect` →
+   `status`), each with file paths + test scenarios.
+2. **Next deploy validates PR #19 on-host.** Before the next `gh workflow run deploy-http.yml`, **re-`scp` BOTH
+   `scripts/deploy/deploy-on-host.sh` and `scripts/deploy/launch-http.sh`** to `<prod-host>:~/deploy/` (static
+   copies). The deploy will then run the smoke against the real config — the on-host confidence step.
+3. **Optional:** the clean green-rollback rehearsal against a throwaway container/port (zero live blast radius),
+   if you still want rollback proven end-to-end. Lower priority now that the smoke prevents the common case.
 
 ## Gotchas & Watch-outs
-- **⚠️ Fleet leak in git history:** `<prod-host>`'s alias name slipped into commit `f169caf`'s HANDOFF
-  (one line, now scrubbed at HEAD). It's a local SSH alias (not the real hostname/IP), low-sensitivity,
-  but it's in public history. Decide whether to history-scrub (force-push main) — I did NOT do it
-  unilaterally.
-- **On-host `~/deploy/*.sh` are STATIC COPIES** — when `deploy-on-host.sh`/`launch-http.sh` change in
-  the repo, **re-`scp` them to `<prod-host>:/home/node/deploy/`** (the workflow can't self-update the
-  mechanism it runs). This bit us 3× in the dry-run.
-- **Stealth flags get silently gated/ignored across Chrome versions** — WebRTC switch (use the policy
-  file) and SwiftShader-WebGL (needs `--enable-unsafe-swiftshader`) on 149. The `validate-stealth`
-  webrtc + webgl legs guard the build; re-run the parity harness after a Chrome bump.
-- **Diagnose any "clears locally / blocks in prod" with the parity harness**, not by guessing flags.
-- **Each Phase 2 (or manual) deploy recreates the container (~10-20s)** → MCP-over-HTTP sessions don't
-  survive a server restart → consumers reconnect after every deploy.
-- **Manual deploy is now one command too:** `BGW_DEPLOY_IMAGE=<digest> BGW_ENV_FILE=… BGW_CONSUMERS_HOST_PATH=…
-  ~/deploy/launch-http.sh` (still pull + `validate-http` first; `CUTOVER.local.md` is the fallback runbook).
-- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing). Prod throwaway probes/runners live
-  in `<prod-host>:/home/node/*.local.*` (gitignored-style).
+- **History was force-pushed** (the scrub rewrote `main`). Any old clone/fork diverges; the pre-rewrite objects
+  linger on GitHub until GC. Recovery bundle: `~/bgw-pre-scrub.bundle`.
+- **On-host `~/deploy/*.sh` are STATIC COPIES.** PR #19 changed *two* deploy scripts — re-`scp` both, or the
+  smoke step does nothing on prod.
+- **Tunnel LaunchAgent is active + self-disabling.** If Vault's MCP can't reach the gateway, check
+  `launchctl print gui/$(id -u)/com.dvillavicencio.browse-gateway-tunnel` and
+  `~/Library/Logs/browse-gateway-tunnel.log`; stop with `launchctl bootout …`. Each prod deploy recreates the
+  container (~10–20s) → the tunnel drops + launchd reconnects → MCP consumers reconnect.
+- **Obscura docs are gitignored `.local.md`** (they name consumers, tunnel internals, prod-admin SSH, and private
+  productization/market context) — they are NOT in the repo and must not be committed or pushed to Proof.
+- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
