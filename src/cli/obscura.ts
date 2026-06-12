@@ -5,7 +5,52 @@
  * the system's health at a glance (`status`). Dispatch only — each command lives in its module.
  */
 import { parseCliArgs, usage } from "./args.js";
+import type { Invocation } from "./args.js";
 import { fail } from "./brand.js";
+import { loadObscuraConfig, requireConfig } from "./config.js";
+import { keysNew, keysList, keysRevoke } from "./keys.js";
+import type { KeysDeps } from "./keys.js";
+import { macKeychain } from "./keychain.js";
+import { sshShell } from "./prod-ssh.js";
+
+function keysDeps(): KeysDeps {
+  const config = loadObscuraConfig();
+  return {
+    shell: sshShell(requireConfig(config, "adminSsh")),
+    keychain: macKeychain(),
+    manifestPath: requireConfig(config, "remoteManifest"),
+    envFilePath: requireConfig(config, "remoteEnvFile"),
+    container: config.container,
+    gatewayHost: config.gatewayHost,
+    out: (line) => console.log(line),
+  };
+}
+
+function onePositional(invocation: Invocation, what: string): string {
+  const [id, ...extra] = invocation.positionals;
+  if (id === undefined || extra.length > 0) {
+    throw new Error(`obscura keys ${invocation.subcommand} takes exactly one ${what}`);
+  }
+  return id;
+}
+
+async function runKeys(invocation: Invocation): Promise<void> {
+  const deps = keysDeps();
+  switch (invocation.subcommand) {
+    case "new":
+      return keysNew(deps, onePositional(invocation, "consumer id"), {
+        ...(invocation.flags.allow ? { allow: invocation.flags.allow } : {}),
+        ...(invocation.flags.apply ? { apply: true } : {}),
+      });
+    case "list":
+      await keysList(deps);
+      return;
+    case "revoke":
+      return keysRevoke(deps, onePositional(invocation, "consumer id"), invocation.flags.apply ? { apply: true } : {});
+    default:
+      throw new Error("keys: missing subcommand");
+  }
+}
 
 async function main(): Promise<void> {
   const parsed = parseCliArgs(process.argv.slice(2));
@@ -18,9 +63,7 @@ async function main(): Promise<void> {
   const { invocation } = parsed;
   switch (invocation.command) {
     case "keys":
-      console.error(fail("keys: not implemented yet"));
-      process.exitCode = 1;
-      return;
+      return runKeys(invocation);
     case "connect":
       console.error(fail("connect: not implemented yet"));
       process.exitCode = 1;
