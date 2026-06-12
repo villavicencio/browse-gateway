@@ -14,3 +14,17 @@ export { macKeychain, memoryKeychain, KEYCHAIN_SERVICE } from "./keychain.js";
 export type { Keychain } from "./keychain.js";
 export { keysNew, keysList, keysRevoke } from "./keys.js";
 export type { KeysDeps, KeysNewOptions, KeysRevokeOptions, KeysListResult, KeysListEntry } from "./keys.js";
+export {
+  tunnelSpec,
+  keeperScript,
+  launchAgentPlist,
+  sshConfigBlock,
+  authorizedKeysLine,
+  classifyAgentState,
+  classifyPortOwner,
+  tunnelState,
+  ensureTunnel,
+  bootoutTunnel,
+  SELF_DISABLE_MARKER,
+} from "./tunnel.js";
+export type { TunnelSpec, TunnelSpecOptions, TunnelState, AgentState, PortOwner, EnsureResult, Exec } from "./tunnel.js";
