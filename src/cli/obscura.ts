@@ -8,13 +8,12 @@ import { parseCliArgs, usage } from "./args.js";
 import type { Invocation } from "./args.js";
 import { fail } from "./brand.js";
 import { loadObscuraConfig, requireConfig } from "./config.js";
-import { keysNew, keysList, keysRevoke } from "./keys.js";
+import { keysNew, keysList, keysRevoke, inspectConsumers } from "./keys.js";
 import type { KeysDeps } from "./keys.js";
 import { macKeychain } from "./keychain.js";
 import { sshShell } from "./prod-ssh.js";
 import { connect, sshStealthGate } from "./connect.js";
 import type { ConnectDeps } from "./connect.js";
-import { inspectConsumers } from "./keys.js";
 import { status } from "./status.js";
 import type { StatusDeps } from "./status.js";
 import { tunnelSpec } from "./tunnel.js";
@@ -58,7 +57,7 @@ async function runConnect(invocation: Invocation): Promise<void> {
       ? { stealth: sshStealthGate(sshShell(requireConfig(config, "adminSsh")), config.container) }
       : {}),
   };
-  await connect(deps, invocation.flags.full ? { full: true } : {});
+  await connect(deps, { full: invocation.flags.full });
 }
 
 async function runStatus(invocation: Invocation): Promise<void> {
@@ -69,26 +68,23 @@ async function runStatus(invocation: Invocation): Promise<void> {
     hostName: config.tunnelHostName ?? "(unconfigured)",
     gatewayHost: config.gatewayHost,
   });
-  const haveAdmin = config.adminSsh && config.remoteManifest && config.remoteEnvFile;
+  const adminShell = config.adminSsh ? sshShell(config.adminSsh) : undefined;
+  const { remoteManifest, remoteEnvFile } = config;
   const deps: StatusDeps = {
     spec,
     gatewayHost: config.gatewayHost,
     out: (line) => console.log(line),
-    ...(haveAdmin
+    ...(adminShell && remoteManifest && remoteEnvFile
       ? {
           consumers: () =>
-            inspectConsumers({
-              shell: sshShell(config.adminSsh as string),
-              manifestPath: config.remoteManifest as string,
-              envFilePath: config.remoteEnvFile as string,
-            }),
+            inspectConsumers({ shell: adminShell, manifestPath: remoteManifest, envFilePath: remoteEnvFile }),
         }
       : {}),
     ...(invocation.flags.stealth
-      ? { stealth: sshStealthGate(sshShell(requireConfig(config, "adminSsh")), config.container) }
+      ? { stealth: sshStealthGate(adminShell ?? sshShell(requireConfig(config, "adminSsh")), config.container) }
       : {}),
   };
-  const report = await status(deps, invocation.flags.stealth ? { stealth: true } : {});
+  const report = await status(deps, { stealth: invocation.flags.stealth });
   if (!report.healthy) process.exitCode = 1;
 }
 

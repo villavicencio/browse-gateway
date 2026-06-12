@@ -5,6 +5,8 @@
  */
 import { randomBytes } from "node:crypto";
 
+// Both lines are intentional under verbatimModuleSyntax: the export re-surfaces the policy
+// contract on the CLI barrel; the import makes it usable locally. Don't "clean up" into one.
 export { tokenEnvKey } from "../policy/consumer-config.js";
 import { tokenEnvKey } from "../policy/consumer-config.js";
 

@@ -10,6 +10,7 @@
 import { owl, ok, fail, note } from "./brand.js";
 import type { OwlState } from "./brand.js";
 import type { KeysListResult } from "./keys.js";
+import { formatConsumerLine } from "./keys.js";
 import type { TunnelSpec, TunnelState } from "./tunnel.js";
 import { tunnelState } from "./tunnel.js";
 import type { VerifyProbe, VerifyState } from "./verify.js";
@@ -113,8 +114,7 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
     try {
       consumers = await deps.consumers();
       for (const c of consumers.consumers) {
-        const tags = c.tags?.length ? `  tags=${c.tags.join(",")}` : "";
-        out(note(`consumer ${c.id}  allow=${c.allow.join(",")}  token=${c.tokenSet ? "set" : "MISSING"}${tags}`));
+        out(note(formatConsumerLine(c, "consumer ")));
       }
       for (const orphan of consumers.orphanEnvKeys) {
         out(fail(`env token ${orphan} has no manifest entry (desync)`));

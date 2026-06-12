@@ -12,8 +12,11 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
-import type { ExecResult } from "./exec.js";
+import { escapeRegExp } from "../security/secrets.js";
+import type { Exec } from "./exec.js";
 import { execCapture } from "./exec.js";
+
+export type { Exec } from "./exec.js";
 
 /** Matches the live hand-built LaunchAgent label scheme (already public in this repo's HANDOFF). */
 const LAUNCH_AGENT_LABEL_PREFIX = "com.dvillavicencio";
@@ -229,8 +232,6 @@ export interface TunnelState {
   selfDisableReason?: string;
 }
 
-export type Exec = (cmd: string, args: string[]) => Promise<ExecResult>;
-
 function readLogTail(spec: TunnelSpec): string {
   try {
     return readFileSync(spec.logPath, "utf8");
@@ -242,8 +243,10 @@ function readLogTail(spec: TunnelSpec): string {
 /** Collect live state (launchctl + lsof + log) and classify it. */
 export async function tunnelState(spec: TunnelSpec, exec: Exec = execCapture): Promise<TunnelState> {
   const uid = process.getuid?.() ?? 0;
-  const print = await exec("launchctl", ["print", `gui/${uid}/${spec.label}`]).catch(() => null);
-  const lsof = await exec("lsof", ["-nP", `-iTCP:${spec.localPort}`, "-sTCP:LISTEN"]).catch(() => null);
+  const [print, lsof] = await Promise.all([
+    exec("launchctl", ["print", `gui/${uid}/${spec.label}`]).catch(() => null),
+    exec("lsof", ["-nP", `-iTCP:${spec.localPort}`, "-sTCP:LISTEN"]).catch(() => null),
+  ]);
   const logTail = readLogTail(spec);
   const agent = classifyAgentState(print && print.code === 0 ? print.stdout : null, logTail);
   const port = classifyPortOwner(lsof && lsof.code === 0 ? lsof.stdout : null);
@@ -289,7 +292,7 @@ export async function ensureTunnel(spec: TunnelSpec, exec: Exec = execCapture): 
     installLine = authorizedKeysLine(spec, readFileSync(`${spec.keyPath}.pub`, "utf8"));
   }
 
-  const aliasRe = new RegExp(`^Host[ \\t]+${spec.alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*$`, "m");
+  const aliasRe = new RegExp(`^Host[ \\t]+${escapeRegExp(spec.alias)}[ \\t]*$`, "m");
   const sshConfig = existsSync(spec.sshConfigPath) ? readFileSync(spec.sshConfigPath, "utf8") : null;
   if (sshConfig === null) {
     mkdirSync(dirname(spec.sshConfigPath), { recursive: true, mode: 0o700 });

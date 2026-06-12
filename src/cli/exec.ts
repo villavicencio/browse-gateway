@@ -11,6 +11,9 @@ export interface ExecResult {
   stderr: string;
 }
 
+/** The injectable subprocess seam every side-effecting CLI module accepts. */
+export type Exec = (cmd: string, args: string[]) => Promise<ExecResult>;
+
 /**
  * Run `cmd` with `args` (no shell), feeding `input` on stdin when given. Resolves with the exit
  * code rather than throwing on nonzero — callers decide what a failure means. Rejects only when

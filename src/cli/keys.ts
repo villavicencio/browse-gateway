@@ -161,13 +161,18 @@ export async function inspectConsumers(deps: ProdFilesDeps): Promise<KeysListRes
   return { consumers, orphanEnvKeys };
 }
 
+/** One consumer as a display line — id, scope, token-present flag, never a token value. */
+export function formatConsumerLine(c: KeysListEntry, prefix = ""): string {
+  const tags = c.tags?.length ? `  tags=${c.tags.join(",")}` : "";
+  return `${prefix}${c.id}  allow=${c.allow.join(",")}  token=${c.tokenSet ? "set" : "MISSING"}${tags}`;
+}
+
 /** Configured consumers — ids, scopes, and a token-present flag. Never a token value. */
 export async function keysList(deps: KeysDeps): Promise<KeysListResult> {
   const { consumers, orphanEnvKeys } = await inspectConsumers(deps);
 
   for (const c of consumers) {
-    const tags = c.tags?.length ? `  tags=${c.tags.join(",")}` : "";
-    deps.out(note(`${c.id}  allow=${c.allow.join(",")}  token=${c.tokenSet ? "set" : "MISSING"}${tags}`));
+    deps.out(note(formatConsumerLine(c)));
   }
   for (const orphan of orphanEnvKeys) {
     deps.out(fail(`env token ${orphan} has no manifest entry (desync) — revoke or re-add it`));
@@ -202,7 +207,8 @@ export async function keysRevoke(deps: KeysDeps, id: string, opts: KeysRevokeOpt
     await writeRemoteFileAtomic(deps.shell, deps.manifestPath, manifestJson(entries.filter((e) => e.id !== id)), "0644");
   }
   if (inEnv) {
-    const kept = envText.split("\n").filter((line) => !tokenLineRe(envKey).test(line));
+    const lineRe = tokenLineRe(envKey);
+    const kept = envText.split("\n").filter((line) => !lineRe.test(line));
     await writeRemoteFileAtomic(deps.shell, deps.envFilePath, kept.join("\n"), "0600");
   }
   await deps.keychain.remove(id);

@@ -88,7 +88,8 @@ export class SecretStore {
   }
 }
 
-function escapeRegExp(s: string): string {
+/** Escape a literal string for embedding in a RegExp. */
+export function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 

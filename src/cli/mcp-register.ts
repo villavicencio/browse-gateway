@@ -8,7 +8,7 @@
  * The server name stays `browse-gateway` — consumers already speak `mcp__browse-gateway__*`
  * and the technical handle does not rename in the first cut (R1).
  */
-import type { Exec } from "./tunnel.js";
+import type { Exec } from "./exec.js";
 import { execCapture } from "./exec.js";
 
 export const MCP_SERVER_NAME = "browse-gateway";
