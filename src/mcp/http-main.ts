@@ -29,6 +29,10 @@ import type { ConsumerServer } from "./http-server.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
 
+// The Obscura wordmark, inlined: the gateway must not depend on the CLI subtree (layer
+// direction), and one banner string doesn't justify a shared module.
+const OBSCURA_BOOT_BANNER = "(o,o) OBSCURA — see without being seen";
+
 const AUDIT_MAX_RECORDS = 10_000;
 const DRIVE_IDLE_TTL_MS = 5 * 60_000; // browser-session idle reap (frees Chrome)
 const DRIVE_REAPER_INTERVAL_MS = 60_000;
@@ -51,6 +55,7 @@ function splitCsv(value: string | undefined): string[] {
 }
 
 async function main(): Promise<void> {
+  log(OBSCURA_BOOT_BANNER); // the brand on the experiential surface only — env/ports/tool names unchanged
   const config = loadConfig();
   const secrets = new SecretStore();
   // Interactive-CAPTCHA solver for the drive path, wired when BYO config is present (key in the
