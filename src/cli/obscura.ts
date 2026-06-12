@@ -14,6 +14,9 @@ import { macKeychain } from "./keychain.js";
 import { sshShell } from "./prod-ssh.js";
 import { connect, sshStealthGate } from "./connect.js";
 import type { ConnectDeps } from "./connect.js";
+import { inspectConsumers } from "./keys.js";
+import { status } from "./status.js";
+import type { StatusDeps } from "./status.js";
 import { tunnelSpec } from "./tunnel.js";
 
 function keysDeps(): KeysDeps {
@@ -58,6 +61,37 @@ async function runConnect(invocation: Invocation): Promise<void> {
   await connect(deps, invocation.flags.full ? { full: true } : {});
 }
 
+async function runStatus(invocation: Invocation): Promise<void> {
+  const config = loadObscuraConfig();
+  const spec = tunnelSpec({
+    alias: config.tunnelAlias,
+    // status only READS state; the host name is needed solely when generating artifacts.
+    hostName: config.tunnelHostName ?? "(unconfigured)",
+    gatewayHost: config.gatewayHost,
+  });
+  const haveAdmin = config.adminSsh && config.remoteManifest && config.remoteEnvFile;
+  const deps: StatusDeps = {
+    spec,
+    gatewayHost: config.gatewayHost,
+    out: (line) => console.log(line),
+    ...(haveAdmin
+      ? {
+          consumers: () =>
+            inspectConsumers({
+              shell: sshShell(config.adminSsh as string),
+              manifestPath: config.remoteManifest as string,
+              envFilePath: config.remoteEnvFile as string,
+            }),
+        }
+      : {}),
+    ...(invocation.flags.stealth
+      ? { stealth: sshStealthGate(sshShell(requireConfig(config, "adminSsh")), config.container) }
+      : {}),
+  };
+  const report = await status(deps, invocation.flags.stealth ? { stealth: true } : {});
+  if (!report.healthy) process.exitCode = 1;
+}
+
 async function runKeys(invocation: Invocation): Promise<void> {
   const deps = keysDeps();
   switch (invocation.subcommand) {
@@ -91,9 +125,7 @@ async function main(): Promise<void> {
     case "connect":
       return runConnect(invocation);
     case "status":
-      console.error(fail("status: not implemented yet"));
-      process.exitCode = 1;
-      return;
+      return runStatus(invocation);
   }
 }
 

@@ -12,8 +12,10 @@ export type { RemoteShell } from "./prod-ssh.js";
 export { mintToken, tokenEnvKey, envKeyCollision } from "./token.js";
 export { macKeychain, memoryKeychain, KEYCHAIN_SERVICE } from "./keychain.js";
 export type { Keychain } from "./keychain.js";
-export { keysNew, keysList, keysRevoke } from "./keys.js";
-export type { KeysDeps, KeysNewOptions, KeysRevokeOptions, KeysListResult, KeysListEntry } from "./keys.js";
+export { keysNew, keysList, keysRevoke, inspectConsumers } from "./keys.js";
+export type { KeysDeps, KeysNewOptions, KeysRevokeOptions, KeysListResult, KeysListEntry, ProdFilesDeps } from "./keys.js";
+export { status } from "./status.js";
+export type { StatusDeps, StatusOptions, StatusReport } from "./status.js";
 export {
   tunnelSpec,
   keeperScript,

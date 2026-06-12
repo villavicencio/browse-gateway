@@ -42,13 +42,16 @@ function tokenLineRe(envKey: string): RegExp {
   return new RegExp(`^(export[ \\t]+)?${envKey}=`, "m");
 }
 
+/** The read-only slice of {@link KeysDeps} that consumer inspection needs (shared with status). */
+export type ProdFilesDeps = Pick<KeysDeps, "shell" | "manifestPath" | "envFilePath">;
+
 interface ProdFiles {
   entries: ConsumerManifestEntry[];
   envText: string;
 }
 
 /** Read + validate both prod files. Fail-loud on absence: the fleet always has them. */
-async function readProdFiles(deps: KeysDeps): Promise<ProdFiles> {
+async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
   const manifestText = await readRemoteFile(deps.shell, deps.manifestPath);
   if (manifestText === null) throw new Error(`remote manifest not found at ${deps.manifestPath}`);
   const envText = await readRemoteFile(deps.shell, deps.envFilePath);
@@ -142,8 +145,8 @@ export interface KeysListResult {
   orphanEnvKeys: string[];
 }
 
-/** Configured consumers — ids, scopes, and a token-present flag. Never a token value. */
-export async function keysList(deps: KeysDeps): Promise<KeysListResult> {
+/** Quiet consumer inspection — the data without the printing (status composes this too). */
+export async function inspectConsumers(deps: ProdFilesDeps): Promise<KeysListResult> {
   const { entries, envText } = await readProdFiles(deps);
   const consumers = entries.map((e) => ({
     id: e.id,
@@ -155,6 +158,12 @@ export async function keysList(deps: KeysDeps): Promise<KeysListResult> {
   const orphanEnvKeys = [...envText.matchAll(/^(?:export[ \t]+)?(BGW_CONSUMER_TOKEN_[A-Z0-9_]+)=/gm)]
     .map((m) => m[1])
     .filter((k): k is string => k !== undefined && !knownKeys.has(k));
+  return { consumers, orphanEnvKeys };
+}
+
+/** Configured consumers — ids, scopes, and a token-present flag. Never a token value. */
+export async function keysList(deps: KeysDeps): Promise<KeysListResult> {
+  const { consumers, orphanEnvKeys } = await inspectConsumers(deps);
 
   for (const c of consumers) {
     const tags = c.tags?.length ? `  tags=${c.tags.join(",")}` : "";
