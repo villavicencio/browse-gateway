@@ -36,8 +36,13 @@ export function classifyProbeCode(code: string): VerifyState {
   }
 }
 
-/** One real GET against the local tunnel mouth, Host header spoofed to what prod whitelists. */
-export function httpProbe(localPort: number, hostHeader: string): VerifyProbe {
+/**
+ * One real GET against the local tunnel mouth, Host header spoofed to what prod whitelists.
+ * With `bearerToken` the probe authenticates: the gateway answers 401 to a REJECTED bearer and
+ * something else (typically 400, missing mcp-session-id) to an accepted one — which is exactly
+ * the signal `connect` needs to catch a stale/revoked key instead of printing a false ✓.
+ */
+export function httpProbe(localPort: number, hostHeader: string, bearerToken?: string): VerifyProbe {
   return () =>
     new Promise((resolve) => {
       const req = request(
@@ -46,7 +51,10 @@ export function httpProbe(localPort: number, hostHeader: string): VerifyProbe {
           port: localPort,
           path: "/mcp",
           method: "GET",
-          headers: { Host: hostHeader },
+          headers: {
+            Host: hostHeader,
+            ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
+          },
           timeout: PROBE_TIMEOUT_MS,
         },
         (res) => {

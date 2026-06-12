@@ -24,18 +24,29 @@ export interface KeysDeps {
   manifestPath: string;
   /** Prod path to the BGW_* env file. */
   envFilePath: string;
-  /** Gateway container name (for `--apply` and the restart instruction). */
+  /** Gateway container name (for the post-apply activation check). */
   container: string;
   /** Gateway bind as prod loopback sees it — the `--apply` health probe target. */
   gatewayHost: string;
+  /**
+   * On-host command that RE-CREATES the gateway container, re-reading env + manifest (config
+   * `applyCmd`). `docker restart` is NOT a substitute: container env is frozen at `docker run`,
+   * so a restarted gateway boots the new manifest against the old env and crash-loops on the
+   * fail-closed missing-token check — downing every consumer. Absent → `--apply` refuses.
+   */
+  applyCmd?: string;
   out: (line: string) => void;
   /** Injectable for tests; defaults to a real sleep. */
   wait?: (ms: number) => Promise<void>;
+  /** Test seam for the post-apply health deadline. */
+  applyTimeoutMs?: number;
 }
 
 const CONSUMER_ID_RE = /^[a-z0-9][a-z0-9._-]*$/i;
 const APPLY_TIMEOUT_MS = 60_000;
 const APPLY_POLL_MS = 2_000;
+/** The re-create command itself gets a longer leash than the default ssh watchdog. */
+const APPLY_CMD_TIMEOUT_MS = 120_000;
 
 /** Match this consumer's token line in the env file (with or without `export`). */
 function tokenLineRe(envKey: string): RegExp {
@@ -64,34 +75,64 @@ function manifestJson(entries: ConsumerManifestEntry[]): string {
 }
 
 function restartInstruction(deps: KeysDeps): string {
-  return `staged only — the gateway loads consumers at restart; re-run with --apply, or restart ${deps.container} on the host`;
+  return (
+    "staged only — the gateway loads consumers when the container is RE-CREATED " +
+    "(a plain `docker restart` keeps the old env); re-run with --apply once `applyCmd` is configured, " +
+    "or re-create via your launch script on the host"
+  );
 }
 
-/** Restart the gateway container and wait for /mcp to answer 401 again (the liveness signal). */
-async function applyRestart(deps: KeysDeps): Promise<void> {
-  const wait = deps.wait ?? sleep;
-  deps.out(note(`restarting ${deps.container} — every consumer's session drops for ~10–20s while it recreates`));
-  // Mirror launch-http.sh: default DOCKER_HOST to the rootless socket when the login shell lacks it.
-  const restart = await deps.shell.run(
-    `set -e; export DOCKER_HOST="\${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"; docker restart ${shQuote(deps.container)} >/dev/null`,
-  );
-  if (restart.code !== 0) {
-    throw new Error(`docker restart ${deps.container} failed (exit ${restart.code}): ${restart.stderr.trim()}`);
+/**
+ * Re-create the gateway container via the operator's `applyCmd`, wait for /mcp to answer 401
+ * (the liveness signal), then confirm the consumer's token env actually changed inside the new
+ * container — liveness alone can't tell a real reload from a stale-env no-op.
+ */
+async function applyRecreate(deps: KeysDeps, expectEnvKey: { key: string; present: boolean }): Promise<void> {
+  if (!deps.applyCmd) {
+    throw new Error(
+      "--apply needs the `applyCmd` config key (or OBSCURA_APPLY_CMD): the on-host command that re-creates " +
+        "the gateway container re-reading env + manifest (e.g. your launch-http.sh wrapper). " +
+        "A plain `docker restart` cannot activate env changes, so obscura refuses to fake it. " +
+        "The change is staged — apply it manually or configure applyCmd and re-run.",
+    );
   }
-  const deadline = Date.now() + APPLY_TIMEOUT_MS;
+  const wait = deps.wait ?? sleep;
+  deps.out(note(`re-creating ${deps.container} via applyCmd — every consumer's session drops for ~10–20s`));
+  const recreate = await deps.shell.run(
+    `set -e; export DOCKER_HOST="\${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"; ${deps.applyCmd}`,
+    undefined,
+    { timeoutMs: APPLY_CMD_TIMEOUT_MS },
+  );
+  if (recreate.code !== 0) {
+    throw new Error(`applyCmd failed (exit ${recreate.code}): ${recreate.stderr.trim() || recreate.stdout.trim()}`);
+  }
+  const timeoutMs = deps.applyTimeoutMs ?? APPLY_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const probe = await deps.shell.run(
-      `curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://${deps.gatewayHost}/mcp || echo 000`,
+      `curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://${shQuote(deps.gatewayHost)}/mcp || echo 000`,
     );
-    if (probe.stdout.trim() === "401") {
-      deps.out(ok("gateway healthy after restart"));
-      return;
-    }
+    if (probe.stdout.trim() === "401") break;
     if (Date.now() >= deadline) {
-      throw new Error(`gateway did not come back healthy within ${APPLY_TIMEOUT_MS / 1000}s of the restart`);
+      throw new Error(`gateway did not come back healthy within ${timeoutMs / 1000}s of the re-create`);
     }
     await wait(APPLY_POLL_MS);
   }
+  // Activation check: the env var must be present (new) / gone (revoke) INSIDE the container.
+  // printenv's exit code carries the answer; the value never leaves the container.
+  const check = await deps.shell.run(
+    `export DOCKER_HOST="\${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"; ` +
+      `docker exec ${shQuote(deps.container)} printenv ${expectEnvKey.key} >/dev/null 2>&1`,
+  );
+  const isPresent = check.code === 0;
+  if (isPresent !== expectEnvKey.present) {
+    throw new Error(
+      expectEnvKey.present
+        ? `gateway is up but ${expectEnvKey.key} is NOT in the container env — applyCmd did not re-read the env file`
+        : `gateway is up but ${expectEnvKey.key} is STILL in the container env — applyCmd did not re-read the env file`,
+    );
+  }
+  deps.out(ok(`gateway healthy after re-create — ${expectEnvKey.key} ${expectEnvKey.present ? "active" : "retired"}`));
 }
 
 export interface KeysNewOptions {
@@ -128,7 +169,7 @@ export async function keysNew(deps: KeysDeps, id: string, opts: KeysNewOptions =
   // Deliberately NOT through ok/note (they redact token shapes): shown once, by design.
   deps.out(`  ${token}`);
   deps.out(note("shown once — also stored in the macOS Keychain for `obscura connect`"));
-  if (opts.apply) await applyRestart(deps);
+  if (opts.apply) await applyRecreate(deps, { key: envKey, present: true });
   else deps.out(note(restartInstruction(deps)));
 }
 
@@ -196,6 +237,14 @@ export async function keysRevoke(deps: KeysDeps, id: string, opts: KeysRevokeOpt
   const inManifest = entries.some((e) => e.id === id);
   const inEnv = tokenLineRe(envKey).test(envText);
   if (!inManifest && !inEnv) throw new Error(`unknown consumer "${id}" (not in the manifest, no ${envKey} in the env file)`);
+  // Reverse of keysNew's collision guard: an id that merely NORMALIZES onto another consumer's
+  // env key must not delete that consumer's token (which would brick the next gateway boot).
+  if (!inManifest && inEnv) {
+    const aliasOf = envKeyCollision(id, entries.map((e) => e.id));
+    if (aliasOf) {
+      throw new Error(`"${id}" is not a consumer, but env key ${envKey} belongs to "${aliasOf}" — did you mean: obscura keys revoke ${aliasOf}?`);
+    }
+  }
   if (inManifest !== inEnv) {
     deps.out(
       fail(
@@ -213,7 +262,7 @@ export async function keysRevoke(deps: KeysDeps, id: string, opts: KeysRevokeOpt
   }
   await deps.keychain.remove(id);
   deps.out(ok(`revoked ${id}`));
-  deps.out(note("the old token stays valid until the gateway restarts (static registry)"));
-  if (opts.apply) await applyRestart(deps);
+  deps.out(note("the old token stays valid until the gateway is re-created (static registry)"));
+  if (opts.apply) await applyRecreate(deps, { key: envKey, present: false });
   else deps.out(note(restartInstruction(deps)));
 }

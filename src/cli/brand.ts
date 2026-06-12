@@ -56,8 +56,3 @@ export function fail(message: string): string {
 export function note(message: string): string {
   return `· ${redactTokenLike(message)}`;
 }
-
-/** The single-line boot banner the gateway logs at startup (U2) — wordmark only, no config. */
-export function bootBannerLine(): string {
-  return `${owl("rest")} OBSCURA — see without being seen`;
-}

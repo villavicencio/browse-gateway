@@ -24,8 +24,17 @@ export interface ObscuraConfig {
   gatewayHost: string;
   /** ssh_config alias the tunnel artifacts are generated under. */
   tunnelAlias: string;
-  /** Gateway container name on prod (for `--apply` restarts and the stealth gate). */
+  /** Gateway container name on prod (for the activation check and the stealth gate). */
   container: string;
+  /**
+   * The on-host command `keys --apply` runs (over admin SSH) to RE-CREATE the gateway container.
+   * It must re-read the env file and manifest — e.g. a wrapper around scripts/deploy/launch-http.sh.
+   * A plain `docker restart` can NOT do this (container env is frozen at `docker run`), which is
+   * why there is no default: without this key, `--apply` refuses rather than faking a reload.
+   */
+  applyCmd?: string;
+  /** LaunchAgent label prefix for generated tunnel artifacts (reverse-DNS style). */
+  labelPrefix: string;
   /**
    * Optional literal consumer token — a fallback discovery source for `connect` when the
    * Keychain has no copy (KTD4). The Keychain is the preferred home; this exists so a token can
@@ -44,16 +53,24 @@ const ENV_OVERRIDES = {
   gatewayHost: "OBSCURA_GATEWAY_HOST",
   tunnelAlias: "OBSCURA_TUNNEL_ALIAS",
   container: "OBSCURA_CONTAINER",
+  applyCmd: "OBSCURA_APPLY_CMD",
+  labelPrefix: "OBSCURA_LABEL_PREFIX",
   token: "OBSCURA_TOKEN",
 } as const satisfies Record<keyof ObscuraConfig, string>;
 
 type ConfigKey = keyof typeof ENV_OVERRIDES;
 
-/** Protocol constants, not fleet values: these literals are already public in this repo. */
-const DEFAULTS: Pick<ObscuraConfig, "gatewayHost" | "tunnelAlias" | "container"> = {
+/**
+ * Protocol constants, not fleet values: every literal here is already public in this repo
+ * (the label prefix appears verbatim in the committed HANDOFF's launchctl runbook — it leaks
+ * nothing new, and defaulting to it lets ensureTunnel ADOPT the live hand-built LaunchAgent
+ * instead of double-binding the port under a fresh label).
+ */
+const DEFAULTS: Pick<ObscuraConfig, "gatewayHost" | "tunnelAlias" | "container" | "labelPrefix"> = {
   gatewayHost: "127.0.0.1:8080",
   tunnelAlias: "browse-gateway-tunnel",
   container: "browse-gateway-http",
+  labelPrefix: "com.dvillavicencio",
 };
 
 export function defaultConfigPath(): string {
@@ -99,7 +116,9 @@ export function loadObscuraConfig(
 
   const config: ObscuraConfig = { ...DEFAULTS };
   for (const key of Object.keys(ENV_OVERRIDES) as ConfigKey[]) {
-    const value = env[ENV_OVERRIDES[key]] ?? fromFile[key];
+    // A set-but-blank env var falls through to the file value rather than masking it.
+    const fromEnv = env[ENV_OVERRIDES[key]];
+    const value = (fromEnv !== undefined && fromEnv.trim() ? fromEnv : undefined) ?? fromFile[key];
     if (value !== undefined && value.trim()) config[key] = value;
   }
   return config;

@@ -16,10 +16,12 @@ import { escapeRegExp } from "../security/secrets.js";
 import type { Exec } from "./exec.js";
 import { execCapture } from "./exec.js";
 
-export type { Exec } from "./exec.js";
-
-/** Matches the live hand-built LaunchAgent label scheme (already public in this repo's HANDOFF). */
-const LAUNCH_AGENT_LABEL_PREFIX = "com.dvillavicencio";
+/**
+ * Default LaunchAgent label scheme — matches the live hand-built label (already public in this
+ * repo's HANDOFF runbook) so ensureTunnel ADOPTS the existing agent instead of double-binding
+ * the port under a fresh label. Override via config `labelPrefix` / OBSCURA_LABEL_PREFIX.
+ */
+const DEFAULT_LABEL_PREFIX = "com.dvillavicencio";
 /** The loud line the keeper logs when it boots itself out — the classifier keys on it. */
 export const SELF_DISABLE_MARKER = "SELF-DISABLING";
 /** Tunnel establishment grace: alive longer than this = healthy drop, resets the fail counter. */
@@ -36,6 +38,8 @@ export interface TunnelSpecOptions {
   localPort?: number;
   /** Forward target as prod loopback sees it. */
   gatewayHost?: string;
+  /** LaunchAgent label prefix (reverse-DNS style). Default matches the live setup. */
+  labelPrefix?: string;
   /** Injectable home directory for tests. */
   home?: string;
 }
@@ -58,18 +62,19 @@ export interface TunnelSpec {
 export function tunnelSpec(opts: TunnelSpecOptions): TunnelSpec {
   const home = opts.home ?? homedir();
   const alias = opts.alias;
+  const labelPrefix = opts.labelPrefix ?? DEFAULT_LABEL_PREFIX;
   const keeperDir = join(home, "Library", "Application Support", alias);
   return {
     alias,
     hostName: opts.hostName,
     localPort: opts.localPort ?? 8080,
     gatewayHost: opts.gatewayHost ?? "127.0.0.1:8080",
-    label: `${LAUNCH_AGENT_LABEL_PREFIX}.${alias}`,
+    label: `${labelPrefix}.${alias}`,
     home,
     keyPath: join(home, ".ssh", alias),
     keeperDir,
     keeperPath: join(keeperDir, "tunnel-keeper.sh"),
-    plistPath: join(home, "Library", "LaunchAgents", `${LAUNCH_AGENT_LABEL_PREFIX}.${alias}.plist`),
+    plistPath: join(home, "Library", "LaunchAgents", `${labelPrefix}.${alias}.plist`),
     logPath: join(home, "Library", "Logs", `${alias}.log`),
     sshConfigPath: join(home, ".ssh", "config"),
   };
@@ -269,7 +274,41 @@ export interface EnsureResult {
   newKeypair: boolean;
   /** When newKeypair: the authorized_keys line to pin on prod's bgwtunnel user. */
   installLine?: string;
+  /**
+   * Adopted artifacts whose load-bearing values disagree with the current config (ssh-alias
+   * HostName, keeper forward spec). Existing files are never rewritten, so a config change
+   * does NOT propagate — these warnings are the only way the operator learns that.
+   */
+  drift?: string[];
   action: "none" | "bootstrapped" | "re-enabled";
+}
+
+/** Compare adopted artifacts against the current spec; returns human-readable drift lines. */
+function detectDrift(spec: TunnelSpec, sshConfig: string | null): string[] {
+  const drift: string[] = [];
+  if (sshConfig !== null) {
+    // HostName inside our alias block only: scan from the alias line to the next Host line.
+    const aliasRe = new RegExp(`^Host[ \\t]+${escapeRegExp(spec.alias)}[ \\t]*$`, "m");
+    const start = sshConfig.search(aliasRe);
+    if (start !== -1) {
+      const rest = sshConfig.slice(start).split("\n").slice(1);
+      const end = rest.findIndex((l) => /^Host[ \t]/.test(l));
+      const block = (end === -1 ? rest : rest.slice(0, end)).join("\n");
+      const hostName = block.match(/^[ \t]*HostName[ \t]+(\S+)/m)?.[1];
+      if (hostName !== undefined && hostName !== spec.hostName) {
+        drift.push(`ssh alias "${spec.alias}" points at HostName ${hostName}, but config says ${spec.hostName} — the tunnel dials the OLD host until you update ${spec.sshConfigPath}`);
+      }
+    }
+  }
+  if (existsSync(spec.keeperPath)) {
+    const keeper = readFileSync(spec.keeperPath, "utf8");
+    const forward = keeper.match(/-L[ \t]+(\S+)/)?.[1];
+    const expected = `${spec.localPort}:${spec.gatewayHost}`;
+    if (forward !== undefined && forward !== expected) {
+      drift.push(`keeper forwards ${forward}, but config says ${expected} — regenerate ${spec.keeperPath} to apply the change`);
+    }
+  }
+  return drift;
 }
 
 /**
@@ -316,10 +355,14 @@ export async function ensureTunnel(spec: TunnelSpec, exec: Exec = execCapture): 
   }
   mkdirSync(dirname(spec.logPath), { recursive: true });
 
+  // Adopted artifacts are never rewritten — but silently keeping stale values (old HostName,
+  // old forward) sends the operator chasing ghost failures. Surface the disagreement.
+  const drift = detectDrift(spec, existsSync(spec.sshConfigPath) ? readFileSync(spec.sshConfigPath, "utf8") : null);
+
   const state = await tunnelState(spec, exec);
   if (state.agent === "running" || state.agent === "stopped") {
     // stopped = loaded, between KeepAlive restarts — launchd owns it; nothing to do.
-    return { created, newKeypair, ...(installLine ? { installLine } : {}), action: "none" };
+    return { created, newKeypair, ...(installLine ? { installLine } : {}), ...(drift.length ? { drift } : {}), action: "none" };
   }
   const uid = process.getuid?.() ?? 0;
   const bootstrap = await exec("launchctl", ["bootstrap", `gui/${uid}`, spec.plistPath]);
@@ -330,6 +373,7 @@ export async function ensureTunnel(spec: TunnelSpec, exec: Exec = execCapture): 
     created,
     newKeypair,
     ...(installLine ? { installLine } : {}),
+    ...(drift.length ? { drift } : {}),
     action: state.agent === "self-disabled" ? "re-enabled" : "bootstrapped",
   };
 }

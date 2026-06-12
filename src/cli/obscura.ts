@@ -27,6 +27,7 @@ function keysDeps(): KeysDeps {
     envFilePath: requireConfig(config, "remoteEnvFile"),
     container: config.container,
     gatewayHost: config.gatewayHost,
+    ...(config.applyCmd ? { applyCmd: config.applyCmd } : {}),
     out: (line) => console.log(line),
   };
 }
@@ -45,6 +46,7 @@ async function runConnect(invocation: Invocation): Promise<void> {
     alias: config.tunnelAlias,
     hostName: requireConfig(config, "tunnelHostName"),
     gatewayHost: config.gatewayHost,
+    labelPrefix: config.labelPrefix,
   });
   const deps: ConnectDeps = {
     consumer: requireConfig(config, "consumer"),
@@ -67,6 +69,7 @@ async function runStatus(invocation: Invocation): Promise<void> {
     // status only READS state; the host name is needed solely when generating artifacts.
     hostName: config.tunnelHostName ?? "(unconfigured)",
     gatewayHost: config.gatewayHost,
+    labelPrefix: config.labelPrefix,
   });
   const adminShell = config.adminSsh ? sshShell(config.adminSsh) : undefined;
   const { remoteManifest, remoteEnvFile } = config;

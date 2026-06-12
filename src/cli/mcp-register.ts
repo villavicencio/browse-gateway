@@ -44,27 +44,51 @@ export async function registerMcp(opts: RegisterOptions): Promise<RegisterOutcom
     throw claudeMissing(err);
   }
 
-  if (existing.code === 0) {
-    // `claude mcp get` prints the URL and headers; when both match exactly there is nothing to do.
-    if (existing.stdout.includes(opts.url) && existing.stdout.includes(opts.token)) return "unchanged";
-    const removed = await exec("claude", ["mcp", "remove", name]);
-    if (removed.code !== 0) {
-      throw new Error(`claude mcp remove ${name} failed (exit ${removed.code}): ${removed.stderr.trim() || removed.stdout.trim()}`);
-    }
-  }
-
-  const added = await exec("claude", [
+  const addArgs = (url: string, token: string) => [
     "mcp",
     "add",
     "--transport",
     "http",
     name,
-    opts.url,
+    url,
     "--header",
-    `Authorization: Bearer ${opts.token}`,
-  ]);
+    `Authorization: Bearer ${token}`,
+  ];
+
+  if (existing.code === 0) {
+    // `claude mcp get` prints the URL and headers; when both match exactly there is nothing to do.
+    // (If a future claude version redacts the header value, this never matches and every connect
+    // takes the remove+add path below — churn, but the restore guard keeps it non-destructive.)
+    if (existing.stdout.includes(opts.url) && existing.stdout.includes(opts.token)) return "unchanged";
+    // Capture what we're about to destroy so a failed add can put it back.
+    const oldUrl = existing.stdout.match(/URL:\s*(\S+)/)?.[1];
+    const oldToken = existing.stdout.match(/Bearer\s+([A-Za-z0-9._~+/=-]+)/)?.[1];
+    const removed = await exec("claude", ["mcp", "remove", name]);
+    if (removed.code !== 0) {
+      throw new Error(`claude mcp remove ${name} failed (exit ${removed.code}): ${removed.stderr.trim() || removed.stdout.trim()}`);
+    }
+    const added = await exec("claude", addArgs(opts.url, opts.token));
+    if (added.code !== 0) {
+      // The old registration is gone and the new one failed — try to restore the old one so a
+      // previously-working setup isn't destroyed by a failed update.
+      let restoreNote = "the previous registration could not be parsed for restore — re-run obscura connect once the cause is fixed";
+      if (oldUrl && oldToken) {
+        const restored = await exec("claude", addArgs(oldUrl, oldToken));
+        restoreNote =
+          restored.code === 0
+            ? "the previous registration was RESTORED — the gateway connection is unchanged"
+            : "restoring the previous registration ALSO failed — no registration exists; re-run obscura connect";
+      }
+      throw new Error(
+        `claude mcp add ${name} failed (exit ${added.code}): ${added.stderr.trim() || added.stdout.trim()}; ${restoreNote}`,
+      );
+    }
+    return "updated";
+  }
+
+  const added = await exec("claude", addArgs(opts.url, opts.token));
   if (added.code !== 0) {
     throw new Error(`claude mcp add ${name} failed (exit ${added.code}): ${added.stderr.trim() || added.stdout.trim()}`);
   }
-  return existing.code === 0 ? "updated" : "added";
+  return "added";
 }

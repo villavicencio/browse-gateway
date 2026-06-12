@@ -176,6 +176,38 @@ test("ensureTunnel creates all artifacts from nothing and bootstraps", async () 
   rmSync(spec.home, { recursive: true, force: true });
 });
 
+test("labelPrefix is configurable and derives the label + plist path", () => {
+  const home = mkdtempSync(join(tmpdir(), "obscura-tunnel-"));
+  const spec = tunnelSpec({ alias: "t", hostName: HOSTNAME, home, labelPrefix: "com.example" });
+  assert.equal(spec.label, "com.example.t");
+  assert.ok(spec.plistPath.endsWith("com.example.t.plist"));
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("ensureTunnel surfaces drift when adopted artifacts disagree with the current config", async () => {
+  const spec = makeSpec();
+  // Adopted artifacts generated from a DIFFERENT config: old HostName, old forward target.
+  const oldSpec = tunnelSpec({ alias: spec.alias, hostName: "old-host.example", gatewayHost: "127.0.0.1:9999", home: spec.home });
+  mkdirSync(dirname(spec.keyPath), { recursive: true });
+  writeFileSync(spec.keyPath, "PRIVATE");
+  writeFileSync(`${spec.keyPath}.pub`, "ssh-ed25519 AAAA live\n");
+  writeFileSync(spec.sshConfigPath, sshConfigBlock(oldSpec));
+  mkdirSync(spec.keeperDir, { recursive: true });
+  writeFileSync(spec.keeperPath, keeperScript(oldSpec));
+  mkdirSync(dirname(spec.plistPath), { recursive: true });
+  writeFileSync(spec.plistPath, launchAgentPlist(oldSpec));
+
+  const exec = fakeExec({
+    launchctl: { code: 0, stdout: "state = running\npid = 99\n", stderr: "" },
+    lsof: { code: 1, stdout: "", stderr: "" },
+  });
+  const result = await ensureTunnel(spec, exec);
+  assert.equal(result.drift.length, 2, `got: ${JSON.stringify(result.drift)}`);
+  assert.ok(result.drift.some((d) => d.includes("old-host.example") && d.includes(HOSTNAME)), "HostName drift named");
+  assert.ok(result.drift.some((d) => d.includes("8080:127.0.0.1:9999") && d.includes("8080:127.0.0.1:8080")), "forward drift named");
+  rmSync(spec.home, { recursive: true, force: true });
+});
+
 test("ensureTunnel is a no-op when everything exists and runs; re-enables when self-disabled", async () => {
   const spec = makeSpec();
   // Pre-build every artifact (the adopted live setup).
@@ -196,6 +228,7 @@ test("ensureTunnel is a no-op when everything exists and runs; re-enables when s
   assert.equal(noop.action, "none");
   assert.deepEqual(noop.created, [], "nothing rewritten");
   assert.equal(noop.newKeypair, false);
+  assert.equal(noop.drift, undefined, "matching artifacts report no drift");
   assert.ok(!runningExec.calls.some((c) => c[1] === "bootstrap"), "no bootstrap when running");
   const sshConfig = readFileSync(spec.sshConfigPath, "utf8");
   assert.equal(sshConfig.match(/Host browse-gateway-tunnel/g).length, 1, "alias not duplicated");

@@ -33,6 +33,17 @@ test("--allow accepts repeats, comma lists, and --allow=value", () => {
   const missing = parseCliArgs(["keys", "new", "c", "--allow"]);
   assert.equal(missing.ok, false);
   assert.match(missing.error, /--allow requires a value/);
+
+  // A following flag is never eaten as the value: `--allow --apply` is a mistake, and silently
+  // minting an allow rule called "--apply" (while skipping the apply) would be a policy bug.
+  const ateFlag = parseCliArgs(["keys", "new", "c", "--allow", "--apply"]);
+  assert.equal(ateFlag.ok, false);
+  assert.match(ateFlag.error, /--allow requires a value/);
+
+  // Explicit-but-empty must not silently fall back to the allow-all default.
+  const empty = parseCliArgs(["keys", "new", "c", "--allow", ","]);
+  assert.equal(empty.ok, false);
+  assert.match(empty.error, /at least one non-empty rule/);
 });
 
 test("connect --full and status --stealth parse as booleans", () => {

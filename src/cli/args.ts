@@ -26,12 +26,15 @@ export interface Invocation {
 
 export type ParseResult = { ok: true; invocation: Invocation } | { ok: false; error?: string };
 
+/** Boolean flag names derived from the Invocation interface — adding one there widens this. */
+type BooleanFlagName = { [K in keyof Invocation["flags"]]-?: NonNullable<Invocation["flags"][K]> extends boolean ? K : never }[keyof Invocation["flags"]];
+
 interface FlagSpec {
   takesValue: boolean;
 }
 
 interface CommandSpec {
-  subcommands?: Record<string, Record<string, FlagSpec>>;
+  subcommands?: Partial<Record<KeysSubcommand, Record<string, FlagSpec>>>;
   flags?: Record<string, FlagSpec>;
 }
 
@@ -77,12 +80,13 @@ export function parseCliArgs(argv: string[]): ParseResult {
 
   if (spec.subcommands) {
     const [sub, ...subRest] = rest;
-    if (sub === undefined || !(sub in spec.subcommands)) {
+    const subSpecs = sub === undefined ? undefined : spec.subcommands[sub as KeysSubcommand];
+    if (sub === undefined || subSpecs === undefined) {
       const known = Object.keys(spec.subcommands).join("|");
       return { ok: false, error: `usage: obscura ${head} <${known}>` };
     }
     subcommand = sub as KeysSubcommand;
-    flagSpecs = spec.subcommands[sub] ?? {};
+    flagSpecs = subSpecs;
     args = subRest;
   } else {
     flagSpecs = spec.flags ?? {};
@@ -103,17 +107,22 @@ export function parseCliArgs(argv: string[]): ParseResult {
     if (!flagSpec) return { ok: false, error: `unknown flag for ${head}${subcommand ? ` ${subcommand}` : ""}: --${name}` };
     if (!flagSpec.takesValue) {
       if (eq !== -1) return { ok: false, error: `--${name} takes no value` };
-      flags[name as "apply" | "full" | "stealth"] = true;
+      flags[name as BooleanFlagName] = true;
       continue;
     }
     let value: string | undefined;
     if (eq !== -1) {
       value = arg.slice(eq + 1);
     } else {
-      value = args[++i];
+      value = args[i + 1];
+      // Never eat a following flag as the value (`--allow --apply` is a mistake, not a rule).
+      if (value !== undefined && value.startsWith("--")) value = undefined;
+      else i++;
     }
     if (value === undefined || value === "") return { ok: false, error: `--${name} requires a value` };
     const list = value.split(",").map((s) => s.trim()).filter(Boolean);
+    // Explicit-but-empty (`--allow ,`) must not silently fall back to the allow-all default.
+    if (list.length === 0) return { ok: false, error: `--${name} requires at least one non-empty rule` };
     flags.allow = [...(flags.allow ?? []), ...list];
   }
 

@@ -46,9 +46,12 @@ export async function discoverToken(keychain: Keychain, consumer: string, config
 export function sshStealthGate(shell: RemoteShell, container: string): () => Promise<boolean> {
   return async () => {
     // BGW_ATTEMPTS=1 alone false-FAILs the gate — BGW_REQUIRED=1 must ride along (documented).
+    // The gate drives a real browser through a live target: give it a long leash.
     const r = await shell.run(
       `set -e; export DOCKER_HOST="\${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"; ` +
         `docker exec -e BGW_ATTEMPTS=1 -e BGW_REQUIRED=1 ${shQuote(container)} node scripts/validate-stealth.mjs`,
+      undefined,
+      { timeoutMs: 180_000 },
     );
     return r.code === 0;
   };
@@ -67,6 +70,8 @@ export interface ConnectDeps {
   state?: (spec: TunnelSpec) => Promise<TunnelState>;
   register?: (opts: { url: string; token: string }) => Promise<RegisterOutcome>;
   probe?: VerifyProbe;
+  /** Token-bearing probe for the key-acceptance check; defaults to httpProbe with the bearer. */
+  authedProbe?: VerifyProbe;
   wait?: (ms: number) => Promise<void>;
   verifyTimeoutMs?: number;
   verifyPollMs?: number;
@@ -89,6 +94,7 @@ export async function connect(deps: ConnectDeps, opts: ConnectOptions = {}): Pro
   const ensure = deps.ensure ?? ensureTunnel;
   const ensured = await ensure(spec);
   for (const path of ensured.created) out(note(`created ${path}`));
+  for (const drift of ensured.drift ?? []) out(fail(`tunnel artifact drift: ${drift}`));
   if (ensured.action === "re-enabled") out(note("tunnel LaunchAgent was self-disabled — re-enabled"));
   if (ensured.action === "bootstrapped") out(note("tunnel LaunchAgent bootstrapped"));
   if (ensured.newKeypair && ensured.installLine) {
@@ -142,6 +148,19 @@ export async function connect(deps: ConnectDeps, opts: ConnectOptions = {}): Pro
       );
     case "unexpected":
       throw new Error(`gateway answered /mcp with HTTP ${result.code} — unexpected; check the gateway logs`);
+  }
+
+  // 5b — key acceptance: liveness 401 says the gateway is up, not that OUR token works. An
+  // authenticated probe answering 401 means the bearer was rejected (stale/revoked key) — the
+  // exact case that must not print a false ✓. Any non-401 (typically 400, missing session id)
+  // means the token was accepted.
+  const authedProbe = deps.authedProbe ?? httpProbe(spec.localPort, deps.gatewayHost, discovery.token);
+  const authedCode = await authedProbe();
+  if (authedCode === "401") {
+    throw new Error(
+      `the gateway rejected the ${discovery.source} key for "${deps.consumer}" — it is stale or revoked; ` +
+        `re-mint with: obscura keys new ${deps.consumer} (after revoking the old entry)`,
+    );
   }
 
   const connected = `connected as ${deps.consumer} · gateway healthy`;

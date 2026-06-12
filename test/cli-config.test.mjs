@@ -42,6 +42,16 @@ test("OBSCURA_* env overrides the file", () => {
   }
 });
 
+test("a set-but-blank env var falls through to the file value instead of masking it", () => {
+  const { path, cleanup } = withConfigFile(JSON.stringify({ adminSsh: "from-file" }));
+  try {
+    const cfg = loadObscuraConfig({ OBSCURA_ADMIN_SSH: "" }, path);
+    assert.equal(cfg.adminSsh, "from-file");
+  } finally {
+    cleanup();
+  }
+});
+
 test("missing required key errors by name with how to set it", () => {
   const { path, cleanup } = withConfigFile(undefined); // no file at all
   try {

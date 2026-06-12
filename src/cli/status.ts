@@ -97,11 +97,14 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
       out(fail(`gateway REJECTED the probe (403 with Host: ${deps.gatewayHost}) — Host/allowed-hosts mismatch, not an outage`));
       break;
     case "tunnel-down":
-      out(
-        tunnel.port === "ours"
-          ? fail("gateway down — the tunnel forward is up but nothing answered /mcp on the far side")
-          : fail("gateway unreachable — no tunnel to carry the probe"),
-      );
+      if (tunnel.port === "ours") {
+        out(fail("gateway down — the tunnel forward is up but nothing answered /mcp on the far side"));
+        // A deploy/apply re-create takes ~10–20s, longer than this probe window — don't read a
+        // mid-restart blip as an outage without a second look.
+        out(note("if a deploy or keys --apply just ran, the container may be mid-recreate — recheck in ~20s"));
+      } else {
+        out(fail("gateway unreachable — no tunnel to carry the probe"));
+      }
       break;
     case "unexpected":
       out(fail(`gateway answered /mcp with HTTP ${verify.code} — unexpected; check the gateway logs`));

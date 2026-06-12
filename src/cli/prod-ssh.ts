@@ -7,22 +7,36 @@
 import type { ExecResult } from "./exec.js";
 import { execCapture } from "./exec.js";
 
+export interface RemoteShellRunOptions {
+  /** Per-call watchdog override for long remote operations (e.g. the stealth gate). */
+  timeoutMs?: number;
+}
+
 export interface RemoteShell {
   /** Run a POSIX-sh script on the host, feeding `input` on stdin. Resolves with the exit code. */
-  run(script: string, input?: string): Promise<ExecResult>;
+  run(script: string, input?: string, opts?: RemoteShellRunOptions): Promise<ExecResult>;
 }
 
 /** The real thing: scripts run on the prod host over the operator's admin SSH destination. */
 export function sshShell(destination: string): RemoteShell {
   return {
-    run: (script, input) => execCapture("ssh", ["-o", "BatchMode=yes", destination, script], { input }),
+    run: (script, input, opts) =>
+      // ConnectTimeout bounds the TCP/auth handshake; the execCapture watchdog bounds the rest.
+      execCapture("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination, script], {
+        ...(input !== undefined ? { input } : {}),
+        ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      }),
   };
 }
 
 /** Test/integration fake: the same scripts against the local `sh` (loopback semantics). */
 export function localShell(): RemoteShell {
   return {
-    run: (script, input) => execCapture("sh", ["-c", script], { input }),
+    run: (script, input, opts) =>
+      execCapture("sh", ["-c", script], {
+        ...(input !== undefined ? { input } : {}),
+        ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      }),
   };
 }
 

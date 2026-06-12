@@ -78,6 +78,22 @@ test("self-disabled surfaces the keeper-log reason + the re-enable hint", async 
   assert.ok(lines.some((l) => l.includes("launchctl bootstrap") && l.includes(".plist")), "re-enable hint");
 });
 
+test("clean install (not-bootstrapped, no forward) points at obscura connect", async () => {
+  const { deps, lines } = makeDeps({
+    state: async () => ({ agent: "not-bootstrapped", port: "none" }),
+    probe: async () => "000",
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, false);
+  assert.ok(lines.some((l) => l.includes("tunnel not set up") && l.includes("run: obscura connect")));
+});
+
+test("tunnel up + gateway down hints at a possible mid-deploy recreate", async () => {
+  const { deps, lines } = makeDeps({ probe: async () => "000" });
+  await status(deps);
+  assert.ok(lines.some((l) => l.includes("mid-recreate") && l.includes("recheck")));
+});
+
 test("403 surfaces as Host/token mismatch, not as down", async () => {
   const { deps, lines } = makeDeps({ probe: async () => "403" });
   const report = await status(deps);

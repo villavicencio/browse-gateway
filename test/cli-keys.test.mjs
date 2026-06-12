@@ -19,6 +19,7 @@ import {
   readRemoteFile,
   shQuote,
   tokenEnvKey,
+  execCapture,
 } from "../dist/cli/index.js";
 
 function fixture({ manifest, env } = {}) {
@@ -149,7 +150,7 @@ test("keys revoke removes both lines and surfaces the restart-window caveat", as
   assert.ok(!env.includes(tokenEnvKey("consumer-2")), "env token line removed");
   assert.ok(env.includes(tokenEnvKey("consumer-1")), "other consumers untouched");
   assert.equal(keychain.items.has("consumer-2"), false, "keychain copy removed");
-  assert.ok(lines.some((l) => l.includes("valid until the gateway restarts")), "R-Risk5 surfaced");
+  assert.ok(lines.some((l) => l.includes("valid until the gateway is re-created")), "R-Risk5 surfaced");
 });
 
 test("keys revoke: unknown id errors; one-sided desync is reported then fully cleaned", async () => {
@@ -164,12 +165,101 @@ test("keys revoke: unknown id errors; one-sided desync is reported then fully cl
   assert.deepEqual(JSON.parse(readFileSync(desync.manifestPath, "utf8")).map((e) => e.id), ["consumer-1"], "manifest untouched");
 });
 
+test("keys revoke refuses an id that merely normalizes onto another consumer's env key", async () => {
+  // revoke 'consumer.1' when 'consumer-1' exists: same env key — deleting it would brick the
+  // next gateway boot (manifest entry left with no token).
+  const { deps, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  await assert.rejects(() => keysRevoke(deps, "consumer.1"), /belongs to "consumer-1".*did you mean/s);
+  assert.ok(readFileSync(envFilePath, "utf8").includes(tokenEnvKey("consumer-1")), "token untouched");
+  assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).length, 1, "manifest untouched");
+});
+
+/** Shell fake for the --apply path: applyCmd, curl poll, and docker-exec printenv are scripted. */
+function applyShell({ curlCodes = ["401"], envKeyPresent = true, applyCmdFails = false } = {}) {
+  const calls = [];
+  let curlAt = 0;
+  return {
+    calls,
+    run: async (script, _input, opts) => {
+      calls.push({ script, opts });
+      if (script.includes("printenv")) return { code: envKeyPresent ? 0 : 1, stdout: "", stderr: "" };
+      if (script.includes("curl")) {
+        const code = curlCodes[Math.min(curlAt, curlCodes.length - 1)];
+        curlAt++;
+        return { code: 0, stdout: code, stderr: "" };
+      }
+      // anything else with DOCKER_HOST is the applyCmd invocation
+      return applyCmdFails ? { code: 1, stdout: "", stderr: "boom" } : { code: 0, stdout: "", stderr: "" };
+    },
+  };
+}
+
+test("keys new --apply runs applyCmd, waits for 401, and confirms the token is ACTIVE in the container", async () => {
+  const { deps, lines } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  const fileShell = deps.shell; // keep real file ops for the staged writes
+  const remote = applyShell({ curlCodes: ["000", "000", "401"], envKeyPresent: true });
+  deps.applyCmd = "~/deploy/relaunch.sh";
+  deps.shell = {
+    run: (script, input, opts) =>
+      script.includes("curl") || script.includes("printenv") || script.includes("relaunch.sh")
+        ? remote.run(script, input, opts)
+        : fileShell.run(script, input, opts),
+  };
+  await keysNew(deps, "consumer-2", { apply: true });
+
+  const applyCall = remote.calls.find((c) => c.script.includes("relaunch.sh"));
+  assert.ok(applyCall, "applyCmd invoked over the shell");
+  assert.ok(applyCall.script.includes("DOCKER_HOST"), "rootless socket defaulted for the re-create");
+  assert.ok(remote.calls.some((c) => c.script.includes("printenv BGW_CONSUMER_TOKEN_CONSUMER_2")), "activation checked in-container");
+  assert.ok(lines.some((l) => l.includes("healthy after re-create") && l.includes("active")));
+});
+
+test("keys --apply refuses without applyCmd (docker restart cannot activate env changes)", async () => {
+  const { deps, manifestPath } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /applyCmd.*OBSCURA_APPLY_CMD.*docker restart/s);
+  // The mutation itself still landed (staged) — only the apply step refused.
+  assert.ok(JSON.parse(readFileSync(manifestPath, "utf8")).some((e) => e.id === "consumer-2"), "change staged");
+});
+
+test("keys new --apply fails loudly when the re-created container lacks the new token", async () => {
+  const { deps } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  const fileShell = deps.shell;
+  const remote = applyShell({ curlCodes: ["401"], envKeyPresent: false });
+  deps.applyCmd = "~/deploy/relaunch.sh";
+  deps.shell = {
+    run: (script, input, opts) =>
+      script.includes("curl") || script.includes("printenv") || script.includes("relaunch.sh")
+        ? remote.run(script, input, opts)
+        : fileShell.run(script, input, opts),
+  };
+  await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /NOT in the container env.*did not re-read/s);
+});
+
+test("keys --apply times out when the gateway never answers 401 after the re-create", async () => {
+  const { deps } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  const fileShell = deps.shell;
+  const remote = applyShell({ curlCodes: ["000"] });
+  deps.applyCmd = "~/deploy/relaunch.sh";
+  deps.applyTimeoutMs = 20;
+  deps.shell = {
+    run: (script, input, opts) =>
+      script.includes("curl") || script.includes("relaunch.sh") ? remote.run(script, input, opts) : fileShell.run(script, input, opts),
+  };
+  await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /did not come back healthy/);
+});
+
 test("shQuote survives hostile values through a real shell", async () => {
   const shell = localShell();
   const hostile = `a'b"$(boom) \`tick\``;
   const r = await shell.run(`printf '%s' ${shQuote(hostile)}`);
   assert.equal(r.code, 0);
   assert.equal(r.stdout, hostile);
+});
+
+test("execCapture watchdog: a hung child resolves code -1 instead of hanging the CLI", async () => {
+  const r = await execCapture("sleep", ["5"], { timeoutMs: 100 });
+  assert.equal(r.code, -1);
+  assert.match(r.stderr, /timed out after 100ms/);
 });
 
 test("readRemoteFile distinguishes missing from empty", async () => {

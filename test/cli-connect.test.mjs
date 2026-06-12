@@ -23,6 +23,8 @@ function makeDeps(over = {}) {
     state: async () => ({ agent: "running", port: "ours" }),
     register: async () => "unchanged",
     probe: async () => "401",
+    // The gateway answers 400 (missing session id) to an ACCEPTED bearer; 401 means rejected.
+    authedProbe: async () => "400",
     wait: async () => {},
     verifyTimeoutMs: 200,
     verifyPollMs: 1,
@@ -70,6 +72,33 @@ test("000-then-401 within the window still lands the ✓ (redeploy race)", async
   const { deps, lines } = makeDeps({ probe: async () => (++calls < 3 ? "000" : "401") });
   await connect(deps);
   assert.ok(lines.some((l) => l.includes("✓ connected as consumer-1")));
+});
+
+test("a stale/revoked key is caught by the authenticated probe — no false ✓ on liveness alone", async () => {
+  // Liveness 401 says the gateway is up; the authed probe answering 401 means OUR bearer was
+  // rejected. connect must fail with the re-mint instruction, not print connected.
+  const { deps, lines } = makeDeps({ authedProbe: async () => "401" });
+  await assert.rejects(() => connect(deps), /rejected the keychain key.*stale or revoked.*obscura keys new/s);
+  assert.ok(!lines.some((l) => l.includes("connected as")), "no false connected");
+});
+
+test("--full without the stealth dep wired is a hard error, not a silent skip", async () => {
+  const { deps } = makeDeps({ stealth: undefined });
+  await assert.rejects(() => connect(deps, { full: true }), /--full requires the admin SSH config/);
+});
+
+test("tunnel artifact drift from ensure is surfaced as warnings", async () => {
+  const { deps, lines } = makeDeps({
+    ensure: async () => ({
+      created: [],
+      newKeypair: false,
+      drift: ["ssh alias \"browse-gateway-tunnel\" points at HostName old-host.example, but config says prod-host.example"],
+      action: "none",
+    }),
+  });
+  await connect(deps);
+  assert.ok(lines.some((l) => l.includes("tunnel artifact drift") && l.includes("old-host.example")));
+  assert.ok(lines.some((l) => l.includes("✓ connected as consumer-1")), "drift warns, doesn't abort");
 });
 
 test("register failure: tunnel left up, partial reported, exit non-zero", async () => {
@@ -175,4 +204,51 @@ test("registerMcp idempotency: unchanged / updated / added / claude missing", as
       }),
     /`claude` CLI is not available .* install Claude Code/,
   );
+});
+
+test("registerMcp is non-destructive: a failed add after remove RESTORES the old registration", async () => {
+  const oldGet = `URL: http://127.0.0.1:8080/mcp\nAuthorization: Bearer ${"e".repeat(64)}\n`;
+  const calls = [];
+  let addCount = 0;
+  const exec = async (cmd, args) => {
+    calls.push([cmd, ...args]);
+    if (args[1] === "get") return { code: 0, stdout: oldGet, stderr: "" };
+    if (args[1] === "remove") return { code: 0, stdout: "", stderr: "" };
+    if (args[1] === "add") {
+      addCount++;
+      // First add (the new registration) fails; the restore add succeeds.
+      return addCount === 1 ? { code: 1, stdout: "", stderr: "config locked" } : { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  await assert.rejects(
+    () => registerMcp({ url: "http://127.0.0.1:8080/mcp", token: TOKEN, exec }),
+    /add browse-gateway failed.*was RESTORED/s,
+  );
+  const restore = calls.filter((c) => c.includes("add")).at(-1);
+  assert.ok(restore.includes(`Authorization: Bearer ${"e".repeat(64)}`), "restore re-adds the OLD token");
+});
+
+test("registerMcp: remove failure aborts before any destructive add", async () => {
+  const exec = async (cmd, args) => {
+    if (args[1] === "get") return { code: 0, stdout: "URL: http://127.0.0.1:8080/mcp\nAuthorization: Bearer old\n", stderr: "" };
+    if (args[1] === "remove") return { code: 1, stdout: "", stderr: "permission denied" };
+    throw new Error("add must not run after a failed remove");
+  };
+  await assert.rejects(
+    () => registerMcp({ url: "http://127.0.0.1:8080/mcp", token: TOKEN, exec }),
+    /remove browse-gateway failed \(exit 1\): permission denied/,
+  );
+});
+
+test("registerMcp: redacted `claude mcp get` output takes the update path, never a false unchanged", async () => {
+  const calls = [];
+  const exec = async (cmd, args) => {
+    calls.push(args[1]);
+    if (args[1] === "get") return { code: 0, stdout: "URL: http://127.0.0.1:8080/mcp\nAuthorization: Bearer ****\n", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const outcome = await registerMcp({ url: "http://127.0.0.1:8080/mcp", token: TOKEN, exec });
+  assert.equal(outcome, "updated", "redaction means we cannot prove unchanged — rewrite");
+  assert.ok(calls.includes("remove") && calls.includes("add"));
 });

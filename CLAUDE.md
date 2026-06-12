@@ -33,6 +33,7 @@ browse-gateway/
 │   ├── security/           # CDP-localhost binding, egress filter, secret loading
 │   ├── verbs/              # retrieve(), proxy escalation, CAPTCHA hook
 │   ├── mcp/                # MCP server exposing retrieve as a tool
+│   ├── cli/                # obscura CLI: keys/connect/status (operator front door)
 │   └── observability/      # viewer wiring, session retention/access
 ├── docs/
 │   └── solutions/          # documented solutions to past problems, organized by category with YAML frontmatter (module, tags, problem_type)

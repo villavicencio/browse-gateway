@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { owl, owlArt, banner, bootBannerLine, ok, fail, note, redactTokenLike, loadObscuraConfig, defaultConfigPath } from "../dist/cli/index.js";
+import { owl, owlArt, banner, ok, fail, note, redactTokenLike, loadObscuraConfig, defaultConfigPath } from "../dist/cli/index.js";
 
 test("owl is reactive: rest, wink on connected, eyes shut on down", () => {
   assert.equal(owl("rest"), "(o,o)");
@@ -20,7 +20,12 @@ test("owlArt and banner embed the state-driven face", () => {
   const b = banner();
   assert.ok(b.includes("O B S C U R A"));
   assert.ok(b.includes("(o,o)"));
-  assert.ok(bootBannerLine().includes("OBSCURA"));
+});
+
+test("the gateway boot banner is inlined in http-main (no gateway→cli dependency)", () => {
+  const httpMain = readFileSync(new URL("../src/mcp/http-main.ts", import.meta.url), "utf8");
+  assert.ok(httpMain.includes("OBSCURA"), "boot banner present");
+  assert.ok(!/from "\.\.\/cli\//.test(httpMain), "gateway must not import from the CLI subtree");
 });
 
 test("ok/fail/note formatting is stable", () => {
