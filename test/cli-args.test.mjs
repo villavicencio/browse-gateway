@@ -1,0 +1,90 @@
+/**
+ * Obscura CLI dispatcher tests (U1) — the hand-rolled argv parser: command/subcommand routing,
+ * flag shapes, and usage errors. Pure parser, no process side effects.
+ */
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { parseCliArgs, usage } from "../dist/cli/index.js";
+
+test("keys new dispatches with positional consumer and flag shapes", () => {
+  const r = parseCliArgs(["keys", "new", "consumer-1"]);
+  assert.equal(r.ok, true);
+  assert.equal(r.invocation.command, "keys");
+  assert.equal(r.invocation.subcommand, "new");
+  assert.deepEqual(r.invocation.positionals, ["consumer-1"]);
+  assert.deepEqual(r.invocation.flags, {});
+
+  const withFlags = parseCliArgs(["keys", "new", "consumer-1", "--allow", "x.com", "--apply"]);
+  assert.equal(withFlags.ok, true);
+  assert.deepEqual(withFlags.invocation.flags.allow, ["x.com"]);
+  assert.equal(withFlags.invocation.flags.apply, true);
+});
+
+test("--allow accepts repeats, comma lists, and --allow=value", () => {
+  const repeated = parseCliArgs(["keys", "new", "c", "--allow", "x.com", "--allow", "*.y.com"]);
+  assert.deepEqual(repeated.invocation.flags.allow, ["x.com", "*.y.com"]);
+
+  const comma = parseCliArgs(["keys", "new", "c", "--allow", "x.com,*.y.com"]);
+  assert.deepEqual(comma.invocation.flags.allow, ["x.com", "*.y.com"]);
+
+  const eq = parseCliArgs(["keys", "new", "c", "--allow=x.com"]);
+  assert.deepEqual(eq.invocation.flags.allow, ["x.com"]);
+
+  const missing = parseCliArgs(["keys", "new", "c", "--allow"]);
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /--allow requires a value/);
+});
+
+test("connect --full and status --stealth parse as booleans", () => {
+  const c = parseCliArgs(["connect", "--full"]);
+  assert.equal(c.ok, true);
+  assert.equal(c.invocation.command, "connect");
+  assert.equal(c.invocation.flags.full, true);
+  assert.equal(c.invocation.subcommand, undefined);
+
+  const s = parseCliArgs(["status", "--stealth"]);
+  assert.equal(s.ok, true);
+  assert.equal(s.invocation.flags.stealth, true);
+
+  const bare = parseCliArgs(["status"]);
+  assert.equal(bare.ok, true);
+  assert.deepEqual(bare.invocation.flags, {});
+});
+
+test("unknown command, bare invocation, and unknown subcommand are usage errors", () => {
+  const unknown = parseCliArgs(["frobnicate"]);
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.error, /unknown command: frobnicate/);
+
+  const bare = parseCliArgs([]);
+  assert.equal(bare.ok, false);
+  assert.equal(bare.error, undefined); // bare invocation is not an error worth shouting — just usage
+
+  const badSub = parseCliArgs(["keys", "destroy", "c"]);
+  assert.equal(badSub.ok, false);
+  assert.match(badSub.error, /usage: obscura keys <new\|list\|revoke>/);
+
+  const noSub = parseCliArgs(["keys"]);
+  assert.equal(noSub.ok, false);
+});
+
+test("flags are validated per command — no silent cross-command leakage", () => {
+  const wrong = parseCliArgs(["connect", "--apply"]);
+  assert.equal(wrong.ok, false);
+  assert.match(wrong.error, /unknown flag for connect: --apply/);
+
+  const wrongSub = parseCliArgs(["keys", "list", "--allow", "x.com"]);
+  assert.equal(wrongSub.ok, false);
+  assert.match(wrongSub.error, /unknown flag for keys list: --allow/);
+
+  const boolWithValue = parseCliArgs(["connect", "--full=yes"]);
+  assert.equal(boolWithValue.ok, false);
+  assert.match(boolWithValue.error, /--full takes no value/);
+});
+
+test("usage names every command", () => {
+  const text = usage();
+  for (const word of ["keys new", "keys list", "keys revoke", "connect", "status"]) {
+    assert.ok(text.includes(word), `usage mentions ${word}`);
+  }
+});

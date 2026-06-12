@@ -4,6 +4,9 @@
   "private": true,
   "description": "Owned browser-automation gateway fronting a headful-under-Xvfb Patchright/real-Chrome stealth core.",
   "type": "module",
+  "bin": {
+    "obscura": "./dist/cli/obscura.js"
+  },
   "engines": {
     "node": ">=20"
   },
