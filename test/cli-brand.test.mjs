@@ -4,7 +4,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { owl, owlArt, banner, bootBannerLine, ok, fail, note, redactTokenLike } from "../dist/cli/index.js";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { owl, owlArt, banner, bootBannerLine, ok, fail, note, redactTokenLike, loadObscuraConfig, defaultConfigPath } from "../dist/cli/index.js";
 
 test("owl is reactive: rest, wink on connected, eyes shut on down", () => {
   assert.equal(owl("rest"), "(o,o)");
@@ -43,4 +45,34 @@ test("redactTokenLike masks hex runs and bearer phrases, leaves prose alone", ()
   assert.ok(!redactTokenLike(`token=${"f".repeat(48)}`).includes("ffff"));
   // short hex (a commit sha) is NOT masked — redaction targets credential-length runs
   assert.equal(redactTokenLike("deploy 7855d4b ok"), "deploy 7855d4b ok");
+});
+
+test("fleet hygiene: no real fleet literal from the local config appears in committed source", () => {
+  // The forbidden literals live ONLY in the operator's gitignored local config — this guard reads
+  // them from there at test time, so the values themselves never enter the committed test. On a
+  // machine with no local config (CI, fresh clone) the guard passes vacuously.
+  let config;
+  try {
+    config = loadObscuraConfig(process.env, defaultConfigPath());
+  } catch {
+    return; // unreadable local config — nothing to guard against here
+  }
+  const fleetValues = [config.adminSsh, config.tunnelHostName, config.consumer, config.remoteManifest, config.remoteEnvFile]
+    .filter((v) => typeof v === "string" && v.length >= 4);
+  if (fleetValues.length === 0) return;
+
+  const tracked = execFileSync("git", ["ls-files"], { cwd: new URL("..", import.meta.url).pathname, encoding: "utf8" })
+    .split("\n")
+    .filter(Boolean);
+  for (const file of tracked) {
+    let contents;
+    try {
+      contents = readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+    } catch {
+      continue; // binary/unreadable — git-tracked text sources are the concern
+    }
+    for (const value of fleetValues) {
+      assert.ok(!contents.includes(value), `fleet literal from local config found in committed file: ${file}`);
+    }
+  }
 });

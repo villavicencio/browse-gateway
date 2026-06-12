@@ -26,6 +26,7 @@ import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
+import { bootBannerLine } from "../cli/brand.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
 
@@ -51,6 +52,7 @@ function splitCsv(value: string | undefined): string[] {
 }
 
 async function main(): Promise<void> {
+  log(bootBannerLine()); // the brand on the experiential surface only — env/ports/tool names unchanged
   const config = loadConfig();
   const secrets = new SecretStore();
   // Interactive-CAPTCHA solver for the drive path, wired when BYO config is present (key in the
