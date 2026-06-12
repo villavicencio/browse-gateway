@@ -12,6 +12,9 @@ import { keysNew, keysList, keysRevoke } from "./keys.js";
 import type { KeysDeps } from "./keys.js";
 import { macKeychain } from "./keychain.js";
 import { sshShell } from "./prod-ssh.js";
+import { connect, sshStealthGate } from "./connect.js";
+import type { ConnectDeps } from "./connect.js";
+import { tunnelSpec } from "./tunnel.js";
 
 function keysDeps(): KeysDeps {
   const config = loadObscuraConfig();
@@ -32,6 +35,27 @@ function onePositional(invocation: Invocation, what: string): string {
     throw new Error(`obscura keys ${invocation.subcommand} takes exactly one ${what}`);
   }
   return id;
+}
+
+async function runConnect(invocation: Invocation): Promise<void> {
+  const config = loadObscuraConfig();
+  const spec = tunnelSpec({
+    alias: config.tunnelAlias,
+    hostName: requireConfig(config, "tunnelHostName"),
+    gatewayHost: config.gatewayHost,
+  });
+  const deps: ConnectDeps = {
+    consumer: requireConfig(config, "consumer"),
+    spec,
+    gatewayHost: config.gatewayHost,
+    keychain: macKeychain(),
+    ...(config.token ? { configToken: config.token } : {}),
+    out: (line) => console.log(line),
+    ...(invocation.flags.full
+      ? { stealth: sshStealthGate(sshShell(requireConfig(config, "adminSsh")), config.container) }
+      : {}),
+  };
+  await connect(deps, invocation.flags.full ? { full: true } : {});
 }
 
 async function runKeys(invocation: Invocation): Promise<void> {
@@ -65,9 +89,7 @@ async function main(): Promise<void> {
     case "keys":
       return runKeys(invocation);
     case "connect":
-      console.error(fail("connect: not implemented yet"));
-      process.exitCode = 1;
-      return;
+      return runConnect(invocation);
     case "status":
       console.error(fail("status: not implemented yet"));
       process.exitCode = 1;

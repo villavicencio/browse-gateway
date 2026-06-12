@@ -26,6 +26,12 @@ export interface ObscuraConfig {
   tunnelAlias: string;
   /** Gateway container name on prod (for `--apply` restarts and the stealth gate). */
   container: string;
+  /**
+   * Optional literal consumer token — a fallback discovery source for `connect` when the
+   * Keychain has no copy (KTD4). The Keychain is the preferred home; this exists so a token can
+   * also live in the gitignored config file or `OBSCURA_TOKEN`.
+   */
+  token?: string;
 }
 
 /** Keys that may appear in the config file, with their env override. */
@@ -38,6 +44,7 @@ const ENV_OVERRIDES = {
   gatewayHost: "OBSCURA_GATEWAY_HOST",
   tunnelAlias: "OBSCURA_TUNNEL_ALIAS",
   container: "OBSCURA_CONTAINER",
+  token: "OBSCURA_TOKEN",
 } as const satisfies Record<keyof ObscuraConfig, string>;
 
 type ConfigKey = keyof typeof ENV_OVERRIDES;
