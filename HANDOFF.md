@@ -1,92 +1,77 @@
-# HANDOFF — 2026-06-12 (afternoon PT)
+# HANDOFF — 2026-06-16
 
-Picked up from the 2026-06-11 handoff with one mandate: build the Obscura first cut from the local plan.
-This session executed all six plan units, ran a Tier-2 multi-agent review (9 reviewers + 10 independent
-validators) that caught a validated **P0 before merge**, applied every validated finding, and **merged
-PR #20** (`e8fbd29`). Two new solution docs went straight to main. The CLI is on main but **not yet
-exercised against the real fleet** — manual E2E on the operator Mac is the next step.
+Continued straight from the 2026-06-12 Obscura merge to run the deferred manual E2E of the CLI
+against the real fleet. Used the CLI's `keys` lifecycle to rename the remote consumer to its
+public codename **Vault** — which exposed a real outage path, recovered it, documented the
+learning, and scrubbed a fleet-hygiene leak introduced mid-session.
 
-> Fleet detail (host/IP/consumer identities/prod paths) stays in `*.local.md` + agent memory, never
-> here — this file is committed to a PUBLIC repo. "Vault" is the public-safe consumer codename;
-> "Obscura" is the brand (now shipped on the experiential surfaces).
+> Fleet detail (real consumer id, prod host, the Vault agent's project volume path, the resume
+> command) stays in agent memory + gitignored `*.local.md` — never this file (PUBLIC repo).
+> "Vault" is the public-safe consumer codename; "Obscura" is the CLI brand.
 
-## What We Built
-- **PR #20 (MERGED, squash → `e8fbd29`) — Obscura brand + one-command connect CLI.** New `src/cli/`
-  (15 modules) + 10 `test/cli-*.test.mjs` files (270 tests green, repo total):
-  - `obscura keys new|list|revoke <consumer>` — CSPRNG token + manifest/env mutation over admin SSH
-    (atomic temp+rename, **manifest-before-env** ordering, env forced 0600), macOS Keychain storage
-    (service `obscura`, account = consumer id), token printed once, desync detection both ways.
-  - `obscura connect [--full]` — discover key (Keychain → config → env) → generate/ADOPT the hardened
-    tunnel (keypair, ssh alias, LaunchAgent plist, self-disabling keeper — generated keeper is
-    functionally identical to the live hand-built one, verified by diff) → `claude mcp add` with
-    literal bearer via execFile args → **two-stage verify** (unauthenticated 401 = liveness, then
-    authenticated probe: 401 = key rejected, non-401 = accepted) → `✓ connected as <consumer>`.
-  - `obscura status [--stealth]` — tunnel/gateway/consumer doctor distinguishing "gateway down,
-    tunnel up" vs "tunnel down" vs "403 = Host mismatch, not an outage"; owl header; exit 1 on unhealthy.
-  - Brand kernel (`brand.ts`: reactive owl, redacting output helpers), Obscura README front door,
-    one inlined boot-banner line in `http-main.ts`, `bin: obscura` in package.json.
-  - Fleet config via gitignored `~/.config/obscura/config.json` + `OBSCURA_*` env; a guard test greps
-    every git-tracked file for the operator's real fleet values read from that local config at test time.
-- **docs/solutions (committed to main, `2b8505e`):**
-  `runtime-errors/docker-restart-cannot-activate-env-file-changes.md` (the P0 learning) and
-  `runtime-errors/stealth-gate-attempts-one-needs-required-one.md` (promoted from agent memory).
-- **CLAUDE.md** layout updated with `src/cli/`.
+## What We Built / Did
+- **Created `~/.config/obscura/config.json`** (local, gitignored) — the CLI's required fleet
+  config. Key choice: `adminSsh` uses the **non-root `node@` destination**, not root (a root-owned
+  `0600` env file would be unreadable by the rootless `node` Docker stack, and `node` makes the
+  `DOCKER_HOST` rootless-socket default resolve). `applyCmd` sources the on-host deploy env and
+  re-runs `launch-http.sh` pinned to the **currently-running image** via `docker inspect {{.Image}}`.
+- **Verified the `keys` staged round-trip** (no prod mutation): `keys new vault` → `keys list`
+  (showed all consumers incl. the staged Vault) → `keys revoke vault`.
+- **Renamed the remote consumer → Vault, fleet-side (DONE, healthy):** minted the Vault key, and
+  after the outage below, `keys revoke <old-id> --apply` landed the gateway clean. Live state:
+  manifest + env carry **Vault + the on-box consumer only**; the Vault token is consistent across
+  the prod env file and the macOS Keychain (service `obscura`). Gateway `running`, restarts=0,
+  `/mcp`=401.
+- **Re-synced both deploy scripts** (`deploy-on-host.sh`, `launch-http.sh`) to the prod host's
+  `~/deploy/` — closes the prior handoff's item #2 (PR #19's pre-swap smoke was a no-op on prod
+  until this).
+- **New solution doc** `docs/solutions/runtime-errors/keys-apply-sizing-guard-crash-loop.md`
+  (committed `3fdad4e`) — the crash-loop learning, scrubbed of real names.
+- **Updated agent memory** (`obscura-cli-first-cut`, index) with the E2E results + deferred step.
 
 ## Decisions Made
-- **`--apply` requires an operator-configured `applyCmd` (container RE-CREATE command); `docker restart`
-  is structurally refused.** The review's P0: container env is frozen at `docker run` while the
-  bind-mounted manifest IS re-read on restart — so restart-after-`keys new` boots new-manifest +
-  old-env → fail-closed missing-token → crash loop downing every consumer. With `applyCmd` set, the
-  CLI re-creates, polls /mcp→401, then confirms the token changed **inside** the container
-  (`docker exec printenv`, exit-code only). This supersedes the plan's "lean minimal restart" answer
-  to its own Open Question.
-- **Verify must authenticate.** Liveness 401 alone printed a false ✓ on a stale Keychain key. A valid
-  bearer on GET /mcp returns 400 (missing session id); invalid returns 401 — that distinction is now
-  the key-acceptance check in `connect`.
-- **Tunnel module adopts, never overwrites** — default `labelPrefix`/alias resolve to the live
-  hand-built artifacts; existing files are never rewritten, but `ensure()` now WARNS on drift
-  (adopted ssh-block HostName or keeper forward spec vs current config).
-- **Policy imported, not mirrored**: CLI uses `tokenEnvKey`/`parseConsumerManifest` from `src/policy`
-  directly — the env-key contract cannot drift.
-- **`registerMcp` is non-destructive**: remove→add captures the old registration and restores it if
-  the add fails; redacted `claude mcp get` output takes the update path, never a false "unchanged".
-- **Subprocess watchdogs everywhere**: execCapture 30s default (SIGTERM→SIGKILL), applyCmd 120s,
-  stealth gate 180s; admin ssh gets `-o ConnectTimeout=10`.
-- **Ruled out:** a gateway enroll/admin API (again — SSH trust reuse stands); shipping `--apply` on
-  `docker restart` (P0); mirroring tokenEnvKey; a `com.example` label-prefix default (would abandon
-  the live LaunchAgent and double-bind 8080 — prefix is configurable, defaults to the live value
-  already public in this file's history).
+- **`adminSsh` = non-root `node@`**, for the file-ownership + rootless-socket reasons above. Root
+  would have left the env file unreadable by the gateway stack.
+- **Recovery strategy = revoke back under the floor, not bump MAX_SESSIONS.** The rename only needed
+  2 consumers; dropping the old id put the count back under the configured `BGW_MAX_SESSIONS=5`
+  floor, so no env edit + a single re-create both recovered service *and* completed the rename —
+  never passing back through the broken 3-consumer state.
+- **The leaked-name fix = genericize + amend + force-push**, matching the 2026-06-10 nickname-scrub
+  precedent. The committed doc and its commit message now use placeholders only.
 
 ## What Didn't Work
-- **`docker restart` as the `--apply` reload mechanism** — see P0 above. The "restart-to-reload"
-  shorthand in earlier notes really means *re-create*; the solution doc pins this down.
-- **Liveness-only verify** — passed every test yet proved nothing about the just-registered key.
-- (Process note) The original U2 boot banner imported `cli/brand` from the gateway entry — a layer
-  inversion the review flagged; banner is now inlined in `http-main.ts`.
+- **`keys new vault --apply` crash-looped the entire gateway.** Adding a 3rd consumer pushed the
+  pool-sizing floor (`consumers·perConsumerMax + 1`) to 7, above the configured `BGW_MAX_SESSIONS=5`
+  → boot guard fails closed → `--restart unless-stopped` crash loop → **all** consumers down (not
+  just the new one). Root cause is documented; the key gap is that **`keys --apply` re-creates with
+  NO pre-swap smoke**, unlike the `deploy-on-host.sh` CD path that would have caught it.
+- **First solution-doc commit leaked the real consumer id** into the public repo (body, token-env
+  example, commit message). Caught and rewritten; see blocker below.
 
 ## What's Next
-1. **Manual E2E of the CLI on this Mac** — create `~/.config/obscura/config.json` (`adminSsh`,
-   `tunnelHostName`, `consumer`, `remoteManifest`, `remoteEnvFile`; optional `applyCmd`,
-   `labelPrefix`), then: `obscura status` (expect all green against the live tunnel) → staged
-   `keys new <test-consumer>` + `keys revoke` → only then trust `--apply`. Real ssh/launchctl/
-   Keychain/`claude` effects were test-faked by design; this is the remaining verification.
-2. **Before the next deploy**: re-`scp` BOTH `scripts/deploy/deploy-on-host.sh` and
-   `scripts/deploy/launch-http.sh` to the prod `~/deploy/` (static copies — PR #19's smoke is a
-   no-op on prod until then). Next deploy also picks up the boot banner (cosmetic, log-only).
-3. **Tunnel-key hardening follow-up**: the generated AND live authorized_keys use
-   `restrict,port-forwarding,permitopen=…` — `port-forwarding` re-enables remote (-R) forwarding;
-   verify `permitlisten` pinning against prod sshd and apply to both keys.
-4. **Optional Obscura follow-ups** (deferred at plan time): `obscura disconnect` (bootoutTunnel has
-   no CLI surface), automated new-keypair install over admin SSH, on-box `--local` mode.
+1. **⚠️ Scrub the remote: `git push --force-with-lease origin main`.** Local main is clean
+   (`3fdad4e`); the remote still carries the leaked commit `d80964b` until this force-push replaces
+   it. Classifier-blocked for the agent — operator must run it.
+2. **Re-register the Vault MCP — DEFERRED, needs the Vault agent's project volume mounted.** The
+   live `browse-gateway` registration is `local`-scoped to that project only, and `registerMcp`
+   passes no `--scope` (defaults to cwd's project) — so `obscura connect` MUST run from that project
+   dir or it makes a duplicate and leaves Vault broken. The exact resume command (with the volume
+   path) is in agent memory `obscura-cli-first-cut`. Until then, that agent's MCP still holds the
+   retired token and will 401.
+3. **Close the `keys --apply` product gap.** Either pre-flight the sizing floor in `keysNew`
+   (refuse/warn before staging a config the boot guard will reject) or give the apply path the same
+   real-config pre-swap smoke `deploy-on-host.sh` has.
+4. **Tunnel-key `permitlisten` follow-up** (carried over): the authorized_keys options still allow
+   `-R` remote forwarding on both generated and live keys; pin `permitlisten` against prod sshd.
 
 ## Gotchas & Watch-outs
-- **`obscura` is unconfigured until the local config exists** — every command errors naming the
-  missing key + its `OBSCURA_*` env override. That's by design (zero fleet defaults in source).
-- **`--apply` refuses without `applyCmd`** and the change stays STAGED — the gateway keeps serving
-  the old consumer set until a container re-create. `keys list` shows token=MISSING/desync states.
-- **Known residuals are listed in PR #20's body**: -R forwarding on the tunnel key (above); the
-  fleet-hygiene guard is vacuous in CI (operator-side by design); the port-owner check trusts any
-  `ssh`-named listener; `registerMcp` parses unstructured `claude mcp get` text.
-- **The plan doc was NOT updated** with the `applyCmd` decision (plans are decision artifacts;
-  the solution doc + this handoff + memory `obscura-cli-first-cut` carry it).
-- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
+- **`obscura connect` is scope-sensitive:** run it from the Vault agent's project dir, by absolute
+  path (`obscura` is not on PATH). Expect a Keychain access prompt — run it interactively.
+- **`keys --apply` is a deploy, not a config tweak.** It re-creates the live container with no
+  smoke. When adding the consumer that crosses a `perConsumerMax` boundary, bump `BGW_MAX_SESSIONS`
+  in the same change, or it crash-loops every consumer.
+- **Remote main carries a name leak until item #1 runs.** Don't branch off / open PRs against the
+  current remote tip before the force-push, or the leak propagates.
+- **Coded language is now in force for the real consumer id** — use "Vault" in anything committed or
+  outward-facing; the real id + volume path live only in memory and `*.local.md`.
+- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing, not part of this work).
