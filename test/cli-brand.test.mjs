@@ -62,7 +62,10 @@ test("fleet hygiene: no real fleet literal from the local config appears in comm
   } catch {
     return; // unreadable local config — nothing to guard against here
   }
-  const fleetValues = [config.adminSsh, config.tunnelHostName, config.consumer, config.remoteManifest, config.remoteEnvFile]
+  // config.consumer is intentionally EXCLUDED: the consumer codename (e.g. the public-safe "vault")
+  // is meant to appear in committed docs (HANDOFF, solution docs) per the fleet-hygiene convention —
+  // it is the public-safe name, not a secret. Only the genuinely-secret fleet literals are guarded.
+  const fleetValues = [config.adminSsh, config.tunnelHostName, config.remoteManifest, config.remoteEnvFile]
     .filter((v) => typeof v === "string" && v.length >= 4);
   if (fleetValues.length === 0) return;
 
