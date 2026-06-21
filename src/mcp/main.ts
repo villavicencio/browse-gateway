@@ -50,13 +50,14 @@ async function main(): Promise<void> {
   // Sticky-session suffix template for proxied escalation (parity with http-main; see there).
   const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
   const forceProxyHosts = parseForceProxyHosts(process.env.BGW_FORCE_PROXY_HOSTS);
+  const verifyEgress = process.env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
   // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
   // The interactive `drive` surface: a persistent, consumer-bound session driven via browser_* tools.
   // Proxied (with healthy-exit retry) when a residential proxy is configured and we're on a DC IP.
-  const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix, forceProxyHosts });
+  const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress });
 
   const server = createGatewayMcpServer({
     version: "0.1.0",

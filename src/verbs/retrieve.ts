@@ -150,7 +150,7 @@ export interface EscalationDiagnostics {
   /** Vendor/hard-block classification of the last failed page; null when it was not blocked. */
   reason: BlockReason | null;
   /** Residential-vs-datacenter exit verification (opt-in egress probe, U4); absent unless requested. */
-  exitCheck?: { kind: "datacenter" | "residential" | "unknown"; org?: string };
+  exitCheck?: EgressCheck;
 }
 
 /** Build {@link EscalationDiagnostics} from the escalation tally and the last failed signal. */
@@ -185,6 +185,58 @@ export class EscalationError extends Error {
     this.name = "EscalationError";
     this.diagnostics = diagnostics;
   }
+}
+
+/** Result of the opt-in egress-verification probe (U4): did the proxy give a residential exit? */
+export interface EgressCheck {
+  kind: "datacenter" | "residential" | "unknown";
+  /** The exit's ASN/org string, when the probe could read it (sanitized — a public org name). */
+  org?: string;
+}
+
+/**
+ * ASN/org name fragments that mark a DATACENTER/hosting exit (not residential). Curated, not
+ * exhaustive — an org that matches none but is present is treated as residential; an absent org is
+ * unknown. Used only for the opt-in diagnostic verdict, never to gate behavior.
+ */
+const DATACENTER_ORG_PATTERNS: readonly RegExp[] = [
+  /hetzner/i,
+  /amazon|aws/i,
+  /google|gcp/i,
+  /microsoft|azure/i,
+  /digitalocean/i,
+  /linode/i,
+  /vultr|choopa/i,
+  /\bovh\b/i,
+  /contabo/i,
+  /oracle/i,
+  /leaseweb/i,
+  /scaleway/i,
+  /m247/i,
+  /cloudflare/i,
+  /akamai/i,
+  /fastly/i,
+  /\bdata\s*cent(?:er|re)\b/i,
+  /hosting/i,
+  /\bcolo\b/i,
+  /\bvps\b/i,
+];
+
+/**
+ * Classify an exit by its ASN/org string: a known datacenter/hosting org → "datacenter"; a present
+ * org with no datacenter match → "residential"; absent/empty → "unknown". Pure.
+ */
+export function classifyExitOrg(org: string | undefined): EgressCheck["kind"] {
+  if (!org || !org.trim()) return "unknown";
+  return DATACENTER_ORG_PATTERNS.some((re) => re.test(org)) ? "datacenter" : "residential";
+}
+
+/**
+ * Extract the `org` field from an ip-info JSON body (e.g. ipinfo.io/json) — regex, not JSON.parse, so
+ * it survives the body being wrapped in a browser JSON-viewer's HTML. Returns undefined when absent.
+ */
+export function parseExitOrg(body: string): string | undefined {
+  return body.match(/"org"\s*:\s*"([^"]*)"/)?.[1] || undefined;
 }
 
 /** Assemble a ProxyConfig from BYO secrets, or undefined when no proxy is configured. */

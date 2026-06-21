@@ -23,11 +23,16 @@ import {
   escalationDiagnostics,
   EscalationError,
   hostForcesProxy,
+  classifyExitOrg,
+  parseExitOrg,
   PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
-import type { EscalationDiagnostics } from "../verbs/index.js";
+import type { EscalationDiagnostics, EgressCheck } from "../verbs/index.js";
 import type { DriveController } from "./server.js";
+
+/** Opt-in egress-verification probe target — a plain ip-info JSON endpoint (U4). */
+const EXIT_INFO_URL = "https://ipinfo.io/json";
 
 export class GatewayDriveController implements DriveController {
   #handle?: string;
@@ -44,12 +49,19 @@ export class GatewayDriveController implements DriveController {
   readonly #stickySuffix?: string;
   /** Host suffixes that force residential from the first request (BGW_FORCE_PROXY_HOSTS). */
   readonly #forceProxyHosts: readonly string[];
+  /** Opt-in: on an escalation failure, probe the proxy's exit and classify residential vs datacenter. */
+  readonly #verifyEgressEnabled: boolean;
 
   constructor(
     gateway: Gateway,
     secrets: SecretStore,
     token: string,
-    opts: { onDatacenterIp?: boolean; stickySuffix?: string; forceProxyHosts?: readonly string[] } = {},
+    opts: {
+      onDatacenterIp?: boolean;
+      stickySuffix?: string;
+      forceProxyHosts?: readonly string[];
+      verifyEgress?: boolean;
+    } = {},
   ) {
     this.#gateway = gateway;
     this.#secrets = secrets;
@@ -57,6 +69,7 @@ export class GatewayDriveController implements DriveController {
     this.#onDatacenterIp = opts.onDatacenterIp ?? false;
     this.#stickySuffix = opts.stickySuffix;
     this.#forceProxyHosts = opts.forceProxyHosts ?? [];
+    this.#verifyEgressEnabled = opts.verifyEgress ?? false;
   }
 
   /**
@@ -76,7 +89,13 @@ export class GatewayDriveController implements DriveController {
    * the reduced text surface classification reads; cfHint/pxHint are carried booleans. Secrets-free
    * by construction (no creds, no proxy host).
    */
-  #escalationDiag(opts: { proxyApplied: boolean; forced: boolean; attempts: number; last?: PageSnapshot }): EscalationDiagnostics {
+  #escalationDiag(opts: {
+    proxyApplied: boolean;
+    forced: boolean;
+    attempts: number;
+    last?: PageSnapshot;
+    exitCheck?: EgressCheck;
+  }): EscalationDiagnostics {
     return escalationDiagnostics({
       proxyConfigured: proxyFromSecrets(this.#secrets) !== undefined,
       proxyApplied: opts.proxyApplied,
@@ -85,7 +104,29 @@ export class GatewayDriveController implements DriveController {
       last: opts.last
         ? { title: opts.last.title, text: opts.last.tree, status: opts.last.status ?? null, cfHint: opts.last.cfHint, pxHint: opts.last.pxHint }
         : null,
+      ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
     });
+  }
+
+  /**
+   * Opt-in egress check (U4): open a fresh proxied session, fetch an ip-info endpoint, and classify
+   * the exit as residential vs datacenter from its ASN/org. Best-effort and bounded — any failure
+   * (blocked endpoint, dead exit, unparseable body) yields { kind: "unknown" } and never masks the
+   * escalation error. Costs one extra proxied request, so it is off unless BGW_DIAG_VERIFY_EGRESS=1.
+   */
+  async #verifyEgress(): Promise<EgressCheck> {
+    const override = this.#resolveProxyOverride();
+    if (!override) return { kind: "unknown" };
+    try {
+      await this.#openSession(override);
+      const render = await this.#run((s) => s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }));
+      const org = parseExitOrg(render.html);
+      return { kind: classifyExitOrg(org), ...(org ? { org } : {}) };
+    } catch {
+      return { kind: "unknown" };
+    } finally {
+      await this.#discardSession();
+    }
   }
 
   /**
@@ -294,10 +335,13 @@ export class GatewayDriveController implements DriveController {
       last = snap;
       await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
     }
-    const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last });
+    const exitCheck = this.#verifyEgressEnabled ? await this.#verifyEgress() : undefined;
+    const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, exitCheck });
     throw new EscalationError(
       `could not land a working proxied exit for ${url} after ${PROXY_OPEN_ATTEMPTS} attempts ` +
-        `(last status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"})`,
+        `(last status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}` +
+        (exitCheck ? `, exit=${exitCheck.kind}` : "") +
+        `)`,
       dx,
     );
   }

@@ -83,6 +83,7 @@ async function main(): Promise<void> {
   // cannot clear a CF interstitial (the challenge is IP-bound; rotation moves the IP mid-handshake).
   const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
   const forceProxyHosts = parseForceProxyHosts(process.env.BGW_FORCE_PROXY_HOSTS);
+  const verifyEgress = process.env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
@@ -101,7 +102,7 @@ async function main(): Promise<void> {
       // One consumer-bound graph per connection: a fresh stateful drive controller + a retrieve
       // closure pinned to this consumer's token. The session pool / per-consumer cap / reaper stay
       // GLOBAL on the gateway (do not reintroduce the e431101 per-consumer-cap race).
-      const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix, forceProxyHosts });
+      const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress });
       const server = createGatewayMcpServer({
         version: "0.1.0",
         drive,
