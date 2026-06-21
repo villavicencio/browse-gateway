@@ -19,9 +19,13 @@ import {
   proxyOverrideFor,
   navFailed,
   shouldEscalateDrive,
+  proxyFromSecrets,
+  escalationDiagnostics,
+  EscalationError,
   PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
+import type { EscalationDiagnostics } from "../verbs/index.js";
 import type { DriveController } from "./server.js";
 
 export class GatewayDriveController implements DriveController {
@@ -60,6 +64,24 @@ export class GatewayDriveController implements DriveController {
    */
   #resolveProxyOverride(): BrowserCoreOptions | undefined {
     return proxyOverrideFor(this.#secrets, this.#onDatacenterIp, this.#stickySuffix);
+  }
+
+  /**
+   * Build structured escalation diagnostics from the last failed snapshot, reading proxy-configured
+   * straight from the (possibly rotated) secret store. The drive snapshot's accessibility `tree` is
+   * the reduced text surface classification reads; cfHint/pxHint are carried booleans. Secrets-free
+   * by construction (no creds, no proxy host).
+   */
+  #escalationDiag(opts: { proxyApplied: boolean; forced: boolean; attempts: number; last?: PageSnapshot }): EscalationDiagnostics {
+    return escalationDiagnostics({
+      proxyConfigured: proxyFromSecrets(this.#secrets) !== undefined,
+      proxyApplied: opts.proxyApplied,
+      forced: opts.forced,
+      attempts: opts.attempts,
+      last: opts.last
+        ? { title: opts.last.title, text: opts.last.tree, status: opts.last.status ?? null, cfHint: opts.last.cfHint, pxHint: opts.last.pxHint }
+        : null,
+    });
   }
 
   /**
@@ -149,8 +171,12 @@ export class GatewayDriveController implements DriveController {
     if (this.#resolveProxyOverride() !== undefined && shouldEscalateDrive(direct)) {
       return this.#openHealthyAndNavigate(url);
     }
-    throw new Error(
-      `navigation failed (status=${direct.status ?? "n/a"}): the page was blocked or could not be reached`,
+    const dx = this.#escalationDiag({ proxyApplied: false, forced: false, attempts: 0, last: direct });
+    throw new EscalationError(
+      `navigation failed (status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}): ` +
+        `the page was blocked or could not be reached` +
+        (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
+      dx,
     );
   }
 
@@ -223,6 +249,7 @@ export class GatewayDriveController implements DriveController {
    */
   async #openHealthyAndNavigate(url: string): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
+    let attempts = 0;
     for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
       const override = this.#resolveProxyOverride();
       if (!override) {
@@ -232,6 +259,7 @@ export class GatewayDriveController implements DriveController {
           `proxy escalation unavailable for ${url}: residential proxy configuration was removed mid-retry`,
         );
       }
+      attempts = attempt;
       await this.#openSession(override);
       const snap = await this.#run((s) =>
         s.core.navigate(url, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
@@ -243,9 +271,11 @@ export class GatewayDriveController implements DriveController {
       last = snap;
       await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
     }
-    throw new Error(
+    const dx = this.#escalationDiag({ proxyApplied: true, forced: false, attempts, last });
+    throw new EscalationError(
       `could not land a working proxied exit for ${url} after ${PROXY_OPEN_ATTEMPTS} attempts ` +
-        `(last status=${last?.status ?? "n/a"})`,
+        `(last status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"})`,
+      dx,
     );
   }
 

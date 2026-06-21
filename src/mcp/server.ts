@@ -8,7 +8,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
-import type { BlockReason } from "../verbs/index.js";
+import type { BlockReason, EscalationDiagnostics } from "../verbs/index.js";
+import { EscalationError } from "../verbs/index.js";
 
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
@@ -22,6 +23,8 @@ export interface RetrieveOutcome {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the (v1: no-op) solver. */
   captchaSolved: boolean;
+  /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
+  proxyDiagnostic?: EscalationDiagnostics;
 }
 
 export type RetrieveFn = (input: { url: string }) => Promise<RetrieveOutcome>;
@@ -91,12 +94,13 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           // with no solver wired (v1), which no proxy can clear.
           const why = result.reason ?? "empty-content";
           const hint = result.reason === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
+          const diag = result.proxyDiagnostic ? `\ndiagnostics: ${JSON.stringify(result.proxyDiagnostic)}` : "";
           return {
             isError: true,
             content: [
               {
                 type: "text",
-                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}`,
+                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}${diag}`,
               },
             ],
           };
@@ -118,12 +122,13 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
   // MCP errors. Action verbs return the post-action snapshot so the agent sees the result.
   const drive = deps.drive;
   if (drive) {
-    const fail = (err: unknown) => ({
-      isError: true as const,
-      content: [
-        { type: "text" as const, text: `browse-gateway error: ${err instanceof Error ? err.message : String(err)}` },
-      ],
-    });
+    const fail = (err: unknown) => {
+      const base = `browse-gateway error: ${err instanceof Error ? err.message : String(err)}`;
+      // Attach structured escalation diagnostics when present so the caller sees WHY a proxied
+      // navigation failed (proxy applied? which exit? what blocked it?). Secrets-free by construction.
+      const text = err instanceof EscalationError ? `${base}\ndiagnostics: ${JSON.stringify(err.diagnostics)}` : base;
+      return { isError: true as const, content: [{ type: "text" as const, text }] };
+    };
     const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
     const snap = async (run: () => Promise<PageSnapshot>) => {
       try {

@@ -92,6 +92,8 @@ export interface RetrieveResult {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the solver. */
   captchaSolved: boolean;
+  /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
+  proxyDiagnostic?: EscalationDiagnostics;
 }
 
 /**
@@ -123,6 +125,63 @@ export function classifyBlock(sig: BlockSignal): BlockReason | null {
   if (isPerimeterXVisible(sig) || sig.pxHint === true) return "perimeterx-challenge";
   if (isHardBlock(sig, sig.status)) return "hard-block";
   return "blocked";
+}
+
+/**
+ * Structured diagnostics for a proxy-escalation outcome — caller-visible (issue #21) so a failure
+ * says WHY (was the proxy applied? which exit? what blocked it?) instead of an opaque "last
+ * status=403". Secrets-free BY CONSTRUCTION: no credentials, no proxy host — only booleans, a count,
+ * a status, a {@link BlockReason}, and (opt-in, U4) an ASN/org verdict.
+ */
+export interface EscalationDiagnostics {
+  /** A residential proxy is configured in the secret store. */
+  proxyConfigured: boolean;
+  /** A proxied exit was actually opened/used for this navigation (vs direct-only). */
+  proxyApplied: boolean;
+  /** The proxied path was forced from the first request (force-proxy host/option), not reached via escalation. */
+  forced: boolean;
+  /** Proxied attempts made (0 when the proxy was never engaged). */
+  attempts: number;
+  /** HTTP status of the last (failed) navigation, or null when none was captured. */
+  lastStatus: number | null;
+  /** Vendor/hard-block classification of the last failed page; null when it was not blocked. */
+  reason: BlockReason | null;
+  /** Residential-vs-datacenter exit verification (opt-in egress probe, U4); absent unless requested. */
+  exitCheck?: { kind: "datacenter" | "residential" | "unknown"; org?: string };
+}
+
+/** Build {@link EscalationDiagnostics} from the escalation tally and the last failed signal. */
+export function escalationDiagnostics(opts: {
+  proxyConfigured: boolean;
+  proxyApplied: boolean;
+  forced: boolean;
+  attempts: number;
+  last: BlockSignal | null;
+  exitCheck?: EscalationDiagnostics["exitCheck"];
+}): EscalationDiagnostics {
+  return {
+    proxyConfigured: opts.proxyConfigured,
+    proxyApplied: opts.proxyApplied,
+    forced: opts.forced,
+    attempts: opts.attempts,
+    lastStatus: opts.last?.status ?? null,
+    reason: opts.last ? classifyBlock(opts.last) : null,
+    ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
+  };
+}
+
+/**
+ * A proxy-escalation failure carrying structured {@link EscalationDiagnostics} for the MCP caller.
+ * Thrown on the drive path; the diagnostics survive to the MCP `fail()` surface because the throw is
+ * outside the controller's `#run` redaction re-wrap, and the message itself carries no secret material.
+ */
+export class EscalationError extends Error {
+  readonly diagnostics: EscalationDiagnostics;
+  constructor(message: string, diagnostics: EscalationDiagnostics) {
+    super(message);
+    this.name = "EscalationError";
+    this.diagnostics = diagnostics;
+  }
 }
 
 /** Assemble a ProxyConfig from BYO secrets, or undefined when no proxy is configured. */
@@ -196,6 +255,7 @@ export async function retrieve(
 
   let captchaSolved = false;
   let proxyUsed = false;
+  let proxyAttempts = 0;
 
   // 1) Direct render through an authenticated, allowlist-guarded session.
   let render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
@@ -228,6 +288,7 @@ export async function retrieve(
       clearanceTimeoutMs: opts.clearanceTimeoutMs ?? PROXY_CLEARANCE_TIMEOUT_MS,
     };
     for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
+      proxyAttempts = attempt;
       render = await gateway.withConsumerSession(
         token,
         (s) => s.core.render(url, proxiedRenderOpts),
@@ -265,6 +326,23 @@ export async function retrieve(
             cfHint: hasCloudflareHint(render.html),
             pxHint: hasPerimeterXHint(render.html),
           });
+  // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
+  // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
+  const proxyDiagnostic = proxyUsed
+    ? escalationDiagnostics({
+        proxyConfigured: Boolean(proxy),
+        proxyApplied: true,
+        forced: false,
+        attempts: proxyAttempts,
+        last: {
+          title: render.title,
+          text: render.text,
+          status: render.status,
+          cfHint: hasCloudflareHint(render.html),
+          pxHint: hasPerimeterXHint(render.html),
+        },
+      })
+    : undefined;
   return {
     url,
     status: render.status,
@@ -275,5 +353,6 @@ export async function retrieve(
     reason,
     proxyUsed,
     captchaSolved,
+    ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
   };
 }

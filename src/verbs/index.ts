@@ -2,8 +2,8 @@
  * Outcome verbs (U5). v1 ships `retrieve(url) -> clean markdown`; `synthesize()` and the
  * low-level `drive()` escape hatch are v1.1.
  */
-export { retrieve, classifyBlock, proxyFromSecrets, mintStickyProxy, stickySuffixBootError, PROXY_CLEARANCE_TIMEOUT_MS } from "./retrieve.js";
-export type { RetrieveOptions, RetrieveResult, BlockReason, BlockSignal } from "./retrieve.js";
+export { retrieve, classifyBlock, escalationDiagnostics, EscalationError, proxyFromSecrets, mintStickyProxy, stickySuffixBootError, PROXY_CLEARANCE_TIMEOUT_MS } from "./retrieve.js";
+export type { RetrieveOptions, RetrieveResult, BlockReason, BlockSignal, EscalationDiagnostics } from "./retrieve.js";
 export { extractMarkdown } from "./extract.js";
 export type { Extraction } from "./extract.js";
 export { isCloudflareBlock, shouldEscalateToProxy } from "./escalation.js";
