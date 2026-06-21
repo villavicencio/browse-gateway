@@ -8,13 +8,21 @@
  * creds come from the U4 SecretStore; the CAPTCHA solver is injected (R8).
  */
 import { randomBytes } from "node:crypto";
-import { isVisiblyBlocked, isHardBlock, MIN_CONTENT_LENGTH } from "../browser/index.js";
+import {
+  isVisiblyBlocked,
+  isHardBlock,
+  isCloudflareVisible,
+  isPerimeterXVisible,
+  hasCloudflareHint,
+  hasPerimeterXHint,
+  MIN_CONTENT_LENGTH,
+} from "../browser/index.js";
 import type { ProxyConfig, RenderOptions } from "../browser/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
-import { shouldEscalateToProxy, isCloudflareBlock } from "./escalation.js";
+import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
 import { detectCaptcha } from "./captcha.js";
 import type { CaptchaSolver } from "./captcha.js";
@@ -62,10 +70,12 @@ export interface RetrieveOptions {
  * Why the final render counts as blocked — a diagnostic surfaced to the caller so a failure says
  * WHY instead of a silent "blocked": `nav-failed` (no response — off-allowlist/unreachable),
  * `captcha` (an interactive CAPTCHA widget — needs a solver, not wired in v1), `cf-challenge`
- * (a Cloudflare managed challenge), `hard-block` (4xx/5xx + thin body — IP/WAF reputation),
- * `blocked` (some other visible block phrase). `null` when not blocked.
+ * (a Cloudflare managed challenge), `perimeterx-challenge` (a PerimeterX/HUMAN "Press & Hold"
+ * behavioral interstitial — classified for diagnostics, NOT solved by the token CAPTCHA tier),
+ * `hard-block` (4xx/5xx + thin body — IP/WAF reputation), `blocked` (some other visible block
+ * phrase). `null` when not blocked.
  */
-export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "hard-block" | "blocked";
+export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "perimeterx-challenge" | "hard-block" | "blocked";
 
 export interface RetrieveResult {
   url: string;
@@ -82,6 +92,37 @@ export interface RetrieveResult {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the solver. */
   captchaSolved: boolean;
+}
+
+/**
+ * The reduced signal surface block classification reads: title + visible text + final status + the
+ * HTML-derived vendor hints carried as booleans. retrieve passes hints computed from the full render
+ * HTML; drive passes the booleans its {@link PageSnapshot} already carries (cfHint/pxHint) — so both
+ * paths classify a block identically on one shared surface (the drive↔retrieve detection-parity
+ * invariant).
+ */
+export interface BlockSignal {
+  title: string;
+  text: string;
+  status: number | null;
+  cfHint?: boolean;
+  pxHint?: boolean;
+}
+
+/**
+ * Classify WHY a page is blocked, most-actionable-first, or `null` when it is not blocked. The
+ * single source of truth for vendor/hard-block attribution shared by retrieve and drive.
+ * Interactive-CAPTCHA-widget detection is NOT covered here (it needs raw HTML + sitekey — that stays
+ * in retrieve's {@link detectCaptcha}).
+ */
+export function classifyBlock(sig: BlockSignal): BlockReason | null {
+  const blocked = sig.status === null || isVisiblyBlocked(sig) || isHardBlock(sig, sig.status);
+  if (!blocked) return null;
+  if (sig.status === null) return "nav-failed";
+  if (isCloudflareVisible(sig) || sig.cfHint === true) return "cf-challenge";
+  if (isPerimeterXVisible(sig) || sig.pxHint === true) return "perimeterx-challenge";
+  if (isHardBlock(sig, sig.status)) return "hard-block";
+  return "blocked";
 }
 
 /** Assemble a ProxyConfig from BYO secrets, or undefined when no proxy is configured. */
@@ -217,11 +258,13 @@ export async function retrieve(
       ? "nav-failed"
       : detectCaptcha(render, url)
         ? "captcha"
-        : isCloudflareBlock(render)
-          ? "cf-challenge"
-          : isHardBlock(render, render.status)
-            ? "hard-block"
-            : "blocked";
+        : classifyBlock({
+            title: render.title,
+            text: render.text,
+            status: render.status,
+            cfHint: hasCloudflareHint(render.html),
+            pxHint: hasPerimeterXHint(render.html),
+          });
   return {
     url,
     status: render.status,
