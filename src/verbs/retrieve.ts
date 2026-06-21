@@ -17,7 +17,7 @@ import {
   hasPerimeterXHint,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
-import type { ProxyConfig, RenderOptions } from "../browser/index.js";
+import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -64,6 +64,9 @@ export interface RetrieveOptions {
    * interstitial: the challenge binds to one IP and per-request rotation moves it mid-handshake.
    */
   stickySuffix?: string;
+  /** Force residential from the FIRST render (skip the direct attempt) for a known-hostile host
+   *  (issue #21). The MCP layer resolves this from the {forceProxy} option + BGW_FORCE_PROXY_HOSTS. */
+  forceProxy?: boolean;
 }
 
 /**
@@ -257,8 +260,20 @@ export async function retrieve(
   let proxyUsed = false;
   let proxyAttempts = 0;
 
-  // 1) Direct render through an authenticated, allowlist-guarded session.
-  let render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+  // force-proxy (issue #21): skip the direct attempt and go residential from the FIRST render for a
+  // known-hostile host. Only honored when a proxy is available (configured + datacenter IP); else it
+  // degrades to direct — retrieve is best-effort (the interactive drive path fails loud instead).
+  const forced = (opts.forceProxy ?? false) && Boolean(proxy) && escalation.onDatacenterIp;
+  const proxiedRenderOpts: RenderOptions = {
+    ...renderOpts,
+    clearanceTimeoutMs: opts.clearanceTimeoutMs ?? PROXY_CLEARANCE_TIMEOUT_MS,
+  };
+
+  // 1) Direct render through an authenticated, allowlist-guarded session — skipped when forcing proxy.
+  let render: RenderResult | undefined;
+  if (!forced) {
+    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+  }
 
   // 2) CAPTCHA hook (retrieve path) — detect a widget for the block-reason diagnostic. Full
   //    solve→inject→resume now lives in the browser core's DRIVE path (`#trySolveCaptcha`), which
@@ -267,10 +282,12 @@ export async function retrieve(
   //    stay that way: wiring one here would spend (and bill) a solve with no effect on the page.
   //    `captchaSolved` therefore stays false in production. (Removing `opts.solver` + `captchaSolved`
   //    outright is a follow-up — it changes retrieve's result contract + the mcp surface.)
-  const captcha = detectCaptcha(render, url);
-  if (captcha && opts.solver) {
-    await opts.solver.solve(captcha);
-    captchaSolved = true;
+  if (render && opts.solver) {
+    const captcha = detectCaptcha(render, url);
+    if (captcha) {
+      await opts.solver.solve(captcha);
+      captchaSolved = true;
+    }
   }
 
   // 3) Scoped proxy escalation — a CF managed challenge OR a hard IP/WAF-reputation block
@@ -281,12 +298,8 @@ export async function retrieve(
   //    still rotates past dead/slow/dirty exits (see PROXY_MAX_ATTEMPTS note above). The clearance
   //    budget is raised on proxied attempts: an interstitial clears in ~22s on a held exit, over
   //    the 20s default (probe, 2026-06-09).
-  if (proxy && shouldEscalateToProxy(render, render.status, escalation)) {
+  if (proxy && (forced || (render !== undefined && shouldEscalateToProxy(render, render.status, escalation)))) {
     proxyUsed = true;
-    const proxiedRenderOpts: RenderOptions = {
-      ...renderOpts,
-      clearanceTimeoutMs: opts.clearanceTimeoutMs ?? PROXY_CLEARANCE_TIMEOUT_MS,
-    };
     for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
       proxyAttempts = attempt;
       render = await gateway.withConsumerSession(
@@ -302,6 +315,11 @@ export async function retrieve(
     }
   }
 
+  // render is assigned by here: non-forced did a direct render; forced implies a proxy so it ran >=1
+  // proxied attempt. This guard satisfies the type-checker and the impossible forced-without-proxy case.
+  if (render === undefined) {
+    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+  }
   const extraction = extractMarkdown(render.html, url);
   // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, or a hard
   // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy
@@ -332,7 +350,7 @@ export async function retrieve(
     ? escalationDiagnostics({
         proxyConfigured: Boolean(proxy),
         proxyApplied: true,
-        forced: false,
+        forced,
         attempts: proxyAttempts,
         last: {
           title: render.title,

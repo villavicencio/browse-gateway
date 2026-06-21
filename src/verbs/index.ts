@@ -6,7 +6,7 @@ export { retrieve, classifyBlock, escalationDiagnostics, EscalationError, proxyF
 export type { RetrieveOptions, RetrieveResult, BlockReason, BlockSignal, EscalationDiagnostics } from "./retrieve.js";
 export { extractMarkdown } from "./extract.js";
 export type { Extraction } from "./extract.js";
-export { isCloudflareBlock, shouldEscalateToProxy } from "./escalation.js";
+export { isCloudflareBlock, shouldEscalateToProxy, parseForceProxyHosts, hostForcesProxy } from "./escalation.js";
 export type { EscalationContext } from "./escalation.js";
 export { proxyOverrideFor, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "./drive.js";
 export { detectCaptcha, NullCaptchaSolver } from "./captcha.js";

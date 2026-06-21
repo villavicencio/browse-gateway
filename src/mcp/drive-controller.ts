@@ -22,6 +22,7 @@ import {
   proxyFromSecrets,
   escalationDiagnostics,
   EscalationError,
+  hostForcesProxy,
   PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
@@ -41,18 +42,21 @@ export class GatewayDriveController implements DriveController {
   readonly #onDatacenterIp: boolean;
   /** Sticky-session suffix template (deployment config) — each resolve mints a fresh held exit. */
   readonly #stickySuffix?: string;
+  /** Host suffixes that force residential from the first request (BGW_FORCE_PROXY_HOSTS). */
+  readonly #forceProxyHosts: readonly string[];
 
   constructor(
     gateway: Gateway,
     secrets: SecretStore,
     token: string,
-    opts: { onDatacenterIp?: boolean; stickySuffix?: string } = {},
+    opts: { onDatacenterIp?: boolean; stickySuffix?: string; forceProxyHosts?: readonly string[] } = {},
   ) {
     this.#gateway = gateway;
     this.#secrets = secrets;
     this.#token = token;
     this.#onDatacenterIp = opts.onDatacenterIp ?? false;
     this.#stickySuffix = opts.stickySuffix;
+    this.#forceProxyHosts = opts.forceProxyHosts ?? [];
   }
 
   /**
@@ -113,19 +117,23 @@ export class GatewayDriveController implements DriveController {
     });
   }
 
-  async navigate(url: string): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#navigate(url));
+  async navigate(url: string, opts: { forceProxy?: boolean } = {}): Promise<PageSnapshot> {
+    return this.#serialize(() => this.#navigate(url, opts));
   }
 
-  async #navigate(url: string): Promise<PageSnapshot> {
+  async #navigate(url: string, opts: { forceProxy?: boolean }): Promise<PageSnapshot> {
     // Scheme allowlist (R14-adjacent): only http(s), rejected before any session/navigation —
     // mirrors retrieve(), so a non-http target can't slip past the host-based guard.
     if (!isHttpUrl(url)) {
       throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
     }
+    // Force residential from the first request when the caller asks (forceProxy) or the host is on
+    // the configured force-proxy list — for a known-hostile WAF the direct attempt only wastes a
+    // round-trip and trips reputation (issue #21).
+    const forced = (opts.forceProxy ?? false) || hostForcesProxy(new URL(url).hostname, this.#forceProxyHosts);
     // First navigate of a session: try direct, escalate to a proxied exit only on a block.
     if (!this.#pinned) {
-      return this.#firstNavigate(url);
+      return this.#firstNavigate(url, forced);
     }
     // Pinned session (direct or proxied): one shot. Reopen first if an idle reap closed it (same
     // mode). A failed nav means the committed exit/IP went bad, so discard it — the next navigate
@@ -156,7 +164,22 @@ export class GatewayDriveController implements DriveController {
    * to a proxied residential exit, and only here — BEFORE any interaction — because a stateful
    * session can't swap its exit mid-flow without losing page state (KTD-5).
    */
-  async #firstNavigate(url: string): Promise<PageSnapshot> {
+  async #firstNavigate(url: string, forced: boolean): Promise<PageSnapshot> {
+    // Force-proxy: skip the direct attempt entirely and go residential from the first request.
+    if (forced) {
+      if (this.#resolveProxyOverride() === undefined) {
+        // Fail loud rather than silently fall back to the direct attempt the caller opted out of.
+        const dx = this.#escalationDiag({ proxyApplied: false, forced: true, attempts: 0, last: undefined });
+        throw new EscalationError(
+          `force-proxy requested for ${url} but no residential proxy is available ` +
+            `(proxy configured=${dx.proxyConfigured}, on datacenter IP=${this.#onDatacenterIp}) — ` +
+            `set BGW_PROXY_* + BGW_ON_DATACENTER_IP, or drop the host from BGW_FORCE_PROXY_HOSTS`,
+          dx,
+        );
+      }
+      await this.#discardSession(); // drop any pre-opened direct session before going proxied
+      return this.#openHealthyAndNavigate(url, true);
+    }
     if (!this.#handle) await this.#openSession(undefined); // reuse a pre-opened (direct) session if any
     const direct = await this.#run((s) => s.core.navigate(url));
     if (!navFailed(direct)) {
@@ -169,7 +192,7 @@ export class GatewayDriveController implements DriveController {
     // so it must not spend the proxy budget (matches retrieve's escalation gate).
     await this.#discardSession(); // drop the blocked direct session before escalating
     if (this.#resolveProxyOverride() !== undefined && shouldEscalateDrive(direct)) {
-      return this.#openHealthyAndNavigate(url);
+      return this.#openHealthyAndNavigate(url, false);
     }
     const dx = this.#escalationDiag({ proxyApplied: false, forced: false, attempts: 0, last: direct });
     throw new EscalationError(
@@ -247,7 +270,7 @@ export class GatewayDriveController implements DriveController {
    * session is discarded before the next opens. Worst case PROXY_OPEN_ATTEMPTS × (nav timeout +
    * clearance budget) — still under the idle-reaper TTL so an in-progress retry isn't reclaimed.
    */
-  async #openHealthyAndNavigate(url: string): Promise<PageSnapshot> {
+  async #openHealthyAndNavigate(url: string, forced: boolean): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
     let attempts = 0;
     for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
@@ -271,7 +294,7 @@ export class GatewayDriveController implements DriveController {
       last = snap;
       await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
     }
-    const dx = this.#escalationDiag({ proxyApplied: true, forced: false, attempts, last });
+    const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last });
     throw new EscalationError(
       `could not land a working proxied exit for ${url} after ${PROXY_OPEN_ATTEMPTS} attempts ` +
         `(last status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"})`,

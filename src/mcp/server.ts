@@ -27,7 +27,7 @@ export interface RetrieveOutcome {
   proxyDiagnostic?: EscalationDiagnostics;
 }
 
-export type RetrieveFn = (input: { url: string }) => Promise<RetrieveOutcome>;
+export type RetrieveFn = (input: { url: string; forceProxy?: boolean }) => Promise<RetrieveOutcome>;
 
 /**
  * The stateful `drive` surface: one persistent, consumer-bound session the agent opens, drives
@@ -38,7 +38,7 @@ export type RetrieveFn = (input: { url: string }) => Promise<RetrieveOutcome>;
  */
 export interface DriveController {
   open(): Promise<void>;
-  navigate(url: string): Promise<PageSnapshot>;
+  navigate(url: string, opts?: { forceProxy?: boolean }): Promise<PageSnapshot>;
   snapshot(): Promise<PageSnapshot>;
   click(target: DriveTarget): Promise<PageSnapshot>;
   type(target: DriveTarget, text: string, submit?: boolean): Promise<PageSnapshot>;
@@ -78,11 +78,17 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
         "residential IP on hard blocks, so it succeeds where an ordinary browser is blocked or " +
         'returns "Forbidden". Prefer this over a generic browser for reading a URL; use the ' +
         "browser_* drive tools only when you must interact (click, fill forms, multi-step flows).",
-      inputSchema: { url: z.string().url().describe("Absolute URL to retrieve") },
+      inputSchema: {
+        url: z.string().url().describe("Absolute URL to retrieve"),
+        forceProxy: z
+          .boolean()
+          .optional()
+          .describe("Route through the residential proxy from the first request (for known-hostile hosts)"),
+      },
     },
-    async ({ url }) => {
+    async ({ url, forceProxy }) => {
       try {
-        const result = await deps.retrieve({ url });
+        const result = await deps.retrieve({ url, forceProxy });
         // A null status means the navigation never completed — an off-allowlist policy block
         // or an unreachable host — so the browser's own error page (thin content) must not be
         // handed back as a successful result. A short-but-valid page has a real status, so it
@@ -163,9 +169,15 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
         title: "Navigate the drive session",
         description:
           "Open a URL in the drive session and return a ref-annotated accessibility snapshot of the page. Starts a session if none is open.",
-        inputSchema: { url: z.string().url().describe("Absolute URL to open") },
+        inputSchema: {
+          url: z.string().url().describe("Absolute URL to open"),
+          forceProxy: z
+            .boolean()
+            .optional()
+            .describe("Skip the direct attempt and route through the residential proxy from the first request (for known-hostile hosts)"),
+        },
       },
-      async ({ url }) => snap(() => drive.navigate(url)),
+      async ({ url, forceProxy }) => snap(() => drive.navigate(url, { forceProxy })),
     );
 
     server.registerTool(
