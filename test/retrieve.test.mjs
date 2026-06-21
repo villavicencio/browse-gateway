@@ -161,6 +161,16 @@ test("mintStickyProxy: a fresh random id per call (distinct exits across attempt
   assert.notEqual(a.password, b.password, "two mints must land two different sticky sessions");
 });
 
+test("mintStickyProxy: auto-generated {id} is EXACTLY 8 hex chars (IPRoyal _session- spec)", () => {
+  // IPRoyal requires the _session- value be precisely 8 alphanumeric chars. The auto-generated id
+  // (no explicit id arg) must satisfy that — a 16-char id is out of spec and may be truncated/ignored.
+  const base = { server: "s", password: "pw" };
+  const minted = mintStickyProxy(base, "_country-us_session-{id}_lifetime-30m");
+  const session = minted.password.match(/_session-([0-9a-z]+)_/)?.[1];
+  assert.ok(session, "a session token was appended");
+  assert.match(session, /^[0-9a-f]{8}$/, "session id must be exactly 8 hex chars");
+});
+
 test("mintStickyProxy: a suffix with no {id} is a static no-op append → all attempts pin one exit", () => {
   // The silent rotation-collapse footgun: replaceAll('{id}') matches nothing, so two mints are
   // IDENTICAL. stickySuffixBootError() rejects this config at startup (asserted below).

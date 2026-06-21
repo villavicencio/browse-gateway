@@ -106,7 +106,9 @@ export function proxyFromSecrets(secrets: SecretStore): ProxyConfig | undefined 
 export function mintStickyProxy(
   proxy: ProxyConfig,
   suffixTemplate: string | undefined,
-  id: string = randomBytes(8).toString("hex"),
+  // 4 bytes → 8 hex chars: IPRoyal requires the `_session-` value be PRECISELY 8 alphanumeric
+  // (verified against IPRoyal's rotation docs); a 16-char id is out of spec and may be truncated/ignored.
+  id: string = randomBytes(4).toString("hex"),
 ): ProxyConfig {
   if (!suffixTemplate || !proxy.password) return proxy;
   return { ...proxy, password: proxy.password + suffixTemplate.replaceAll("{id}", id) };
