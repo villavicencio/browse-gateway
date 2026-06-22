@@ -28,6 +28,7 @@ function keysDeps(): KeysDeps {
     container: config.container,
     gatewayHost: config.gatewayHost,
     ...(config.applyCmd ? { applyCmd: config.applyCmd } : {}),
+    ...(config.smokeCmd ? { smokeCmd: config.smokeCmd } : {}),
     out: (line) => console.log(line),
   };
 }

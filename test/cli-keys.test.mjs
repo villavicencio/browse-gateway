@@ -174,14 +174,15 @@ test("keys revoke refuses an id that merely normalizes onto another consumer's e
   assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).length, 1, "manifest untouched");
 });
 
-/** Shell fake for the --apply path: applyCmd, curl poll, and docker-exec printenv are scripted. */
-function applyShell({ curlCodes = ["401"], envKeyPresent = true, applyCmdFails = false } = {}) {
+/** Shell fake for the --apply path: smoke, applyCmd, curl poll, and docker-exec printenv are scripted. */
+function applyShell({ curlCodes = ["401"], envKeyPresent = true, applyCmdFails = false, smokeFails = false } = {}) {
   const calls = [];
   let curlAt = 0;
   return {
     calls,
     run: async (script, _input, opts) => {
       calls.push({ script, opts });
+      if (script.includes("preswap-smoke")) return smokeFails ? { code: 1, stdout: "", stderr: "BGW_MAX_SESSIONS too low" } : { code: 0, stdout: "smoke: OK", stderr: "" };
       if (script.includes("printenv")) return { code: envKeyPresent ? 0 : 1, stdout: "", stderr: "" };
       if (script.includes("curl")) {
         const code = curlCodes[Math.min(curlAt, curlCodes.length - 1)];
@@ -193,6 +194,58 @@ function applyShell({ curlCodes = ["401"], envKeyPresent = true, applyCmdFails =
     },
   };
 }
+
+/** Route the --apply remote calls (smoke/applyCmd/curl/printenv) to the fake, file ops to the real shell. */
+function routeApply(fileShell, remote) {
+  return {
+    run: (script, input, opts) =>
+      /preswap-smoke|relaunch\.sh|curl|printenv/.test(script) ? remote.run(script, input, opts) : fileShell.run(script, input, opts),
+  };
+}
+
+test("keys --apply runs the pre-swap smoke FIRST and aborts (live container untouched) when it fails", async () => {
+  const { deps, manifestPath } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  const fileShell = deps.shell;
+  const remote = applyShell({ smokeFails: true });
+  deps.applyCmd = "~/deploy/relaunch.sh";
+  deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+  deps.shell = routeApply(fileShell, remote);
+
+  await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /pre-swap smoke FAILED.*left untouched/s);
+  assert.ok(remote.calls.some((c) => c.script.includes("preswap-smoke")), "smoke ran");
+  assert.ok(!remote.calls.some((c) => c.script.includes("relaunch.sh")), "re-create NEVER ran after a failed smoke");
+  // The mutation itself still landed (staged) — only the activation aborted.
+  assert.ok(JSON.parse(readFileSync(manifestPath, "utf8")).some((e) => e.id === "consumer-2"), "change staged");
+});
+
+test("keys --apply runs the smoke BEFORE the re-create when it passes", async () => {
+  const { deps } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  const fileShell = deps.shell;
+  const remote = applyShell({ curlCodes: ["401"], envKeyPresent: true });
+  deps.applyCmd = "~/deploy/relaunch.sh";
+  deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+  deps.shell = routeApply(fileShell, remote);
+
+  await keysNew(deps, "consumer-2", { apply: true });
+  const smokeIdx = remote.calls.findIndex((c) => c.script.includes("preswap-smoke"));
+  const recreateIdx = remote.calls.findIndex((c) => c.script.includes("relaunch.sh"));
+  assert.ok(smokeIdx >= 0, "smoke ran");
+  assert.ok(recreateIdx >= 0, "re-create ran");
+  assert.ok(smokeIdx < recreateIdx, "smoke precedes the re-create");
+});
+
+test("keys --apply without smokeCmd warns about the missing gate but still applies", async () => {
+  const { deps, lines } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  const fileShell = deps.shell;
+  const remote = applyShell({ curlCodes: ["401"], envKeyPresent: true });
+  deps.applyCmd = "~/deploy/relaunch.sh"; // no smokeCmd
+  deps.shell = routeApply(fileShell, remote);
+
+  await keysNew(deps, "consumer-2", { apply: true });
+  assert.ok(lines.some((l) => l.includes("WITHOUT a pre-swap smoke")), "warns about the missing smoke gate");
+  assert.ok(!remote.calls.some((c) => c.script.includes("preswap-smoke")), "no smoke attempted when unconfigured");
+  assert.ok(remote.calls.some((c) => c.script.includes("relaunch.sh")), "still re-creates");
+});
 
 test("keys new --apply runs applyCmd, waits for 401, and confirms the token is ACTIVE in the container", async () => {
   const { deps, lines } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
