@@ -58,7 +58,7 @@ test("openConsumerSession: diagnosticsHost installs a diagnostics-only guard, in
   const { factory, cores } = makeFactory();
   const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "c", token: "tok", allow: ["totalwine.com"] }]) });
   const gw = Gateway.create(config(3), factory, policy);
-  await gw.openConsumerSession("tok", undefined, { diagnosticsHost: "ipinfo.io" });
+  await gw.openConsumerSession("tok", undefined, { diagnostics: true });
   const guard = cores[0].guard;
   const nav = (host) => ({ url: `https://${host}/json`, host, resourceType: "document", isNavigationRequest: true });
   // Restrictive consumer allowlist (totalwine.com only) — yet the diagnostics probe still reaches

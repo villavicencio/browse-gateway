@@ -14,6 +14,7 @@
 import { isHttpUrl, redactSecrets } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
+import { DIAGNOSTICS_EGRESS_HOSTS } from "../policy/index.js";
 import type { BrowserCoreOptions, DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
 import {
   proxyOverrideFor,
@@ -31,10 +32,10 @@ import {
 import type { EscalationDiagnostics, EgressCheck } from "../verbs/index.js";
 import type { DriveController } from "./server.js";
 
-/** Opt-in egress-verification probe target — a plain ip-info JSON endpoint (U4). */
-const EXIT_INFO_URL = "https://ipinfo.io/json";
-/** Host of {@link EXIT_INFO_URL} — the ONLY host the egress probe's constrained guard permits. */
-const DIAGNOSTICS_EGRESS_HOST = "ipinfo.io";
+/** The egress probe renders an ip-info JSON endpoint on the policy-owned approved diagnostics host
+ *  ({@link DIAGNOSTICS_EGRESS_HOSTS}) — single source of truth, so the probe URL can't drift from the
+ *  host the diagnostics guard actually permits. */
+const EXIT_INFO_URL = `https://${DIAGNOSTICS_EGRESS_HOSTS[0]}/json`;
 
 export class GatewayDriveController implements DriveController {
   #handle?: string;
@@ -125,7 +126,7 @@ export class GatewayDriveController implements DriveController {
     // discarded by the exhausted escalation loop), always closed. Any failure → unknown, never masks.
     let handle: string | undefined;
     try {
-      handle = await this.#gateway.openConsumerSession(this.#token, override, { diagnosticsHost: DIAGNOSTICS_EGRESS_HOST });
+      handle = await this.#gateway.openConsumerSession(this.#token, override, { diagnostics: true });
       const render = await this.#gateway.useConsumerSession(this.#token, handle, (s) =>
         s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
       );

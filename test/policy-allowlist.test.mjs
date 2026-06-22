@@ -161,23 +161,25 @@ test("guardFor: allows allowlisted host, blocks others, audits both", () => {
   assert.ok(a.some((r) => r.action === "navigate" && r.decision === "block" && r.host === "evil.com"));
 });
 
-test("guardForDiagnostics: allows ONLY the diagnostics host; egress + scheme still enforced; allowlist-independent", () => {
+test("guardForDiagnostics: allows ONLY the policy-owned host (exact, no wildcard); audits under the consumer", () => {
   const audit = new InMemoryAuditSink();
-  // No consumer needed — the diagnostics guard is independent of any consumer allowlist by design.
-  const policy = new PolicyEngine({ registry: new ConsumerRegistry([]), audit });
-  const guard = policy.guardForDiagnostics("ipinfo.io");
+  // An allow-ALL consumer must NOT widen the diagnostics probe, and there is no caller-supplied host
+  // to abuse — the approved set is owned by the policy.
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "agent-1", token: "tok", allow: ["*"] }]), audit });
+  const guard = policy.guardForDiagnostics(policy.authenticate("tok"));
   assert.equal(guard(nav("ipinfo.io")), "allow");
-  assert.equal(guard(nav("totalwine.com")), "block", "the probe reaches nothing but the approved host");
-  assert.equal(guard(nav("evil.example")), "block");
+  assert.equal(guard(nav("evil.example")), "block", "allow-all consumer does not widen the probe");
+  assert.equal(guard(nav("sub.ipinfo.io")), "block", "exact match only — no subdomain widening");
   assert.equal(guard(nav("169.254.169.254")), "block", "egress deny still wins");
   assert.equal(
     guard({ url: "file:///etc/passwd", host: "", resourceType: "document", isNavigationRequest: true }),
     "block",
     "non-http scheme still blocked",
   );
-  const d = audit.records.filter((r) => r.consumerId === "diagnostics");
-  assert.ok(d.some((r) => r.decision === "allow" && r.host === "ipinfo.io"));
-  assert.ok(d.some((r) => r.decision === "block" && r.host === "totalwine.com"));
+  // Attribution: under the INITIATING consumer, never a flat "diagnostics" id.
+  const a = audit.forConsumer("agent-1");
+  assert.ok(a.some((r) => r.decision === "allow" && r.host === "ipinfo.io" && /diagnostics/.test(r.reason ?? "")));
+  assert.equal(audit.records.filter((r) => r.consumerId === "diagnostics").length, 0, "nothing mis-attributed to 'diagnostics'");
 });
 
 test("guardFor: allowed subresources are not audited (signal-dense trail)", () => {

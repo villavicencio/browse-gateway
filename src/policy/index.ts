@@ -11,7 +11,7 @@ import { InMemoryAuditSink } from "./audit.js";
 import type { AuditSink } from "./audit.js";
 import { ConsumerRegistry } from "./consumer.js";
 import type { Consumer } from "./consumer.js";
-import { Allowlist } from "./allowlist.js";
+import { normalizeHost } from "./allowlist.js";
 
 /** Returns true when a host must be blocked for egress reasons (private/metadata ranges). */
 export type EgressFilter = (host: string) => boolean;
@@ -33,6 +33,15 @@ export interface PolicyEngineOptions {
   /** Egress deny-filter, applied before the allowlist. Defaults to private/metadata ranges. */
   egress?: EgressFilter;
 }
+
+/**
+ * Exact hosts an INTERNAL diagnostics probe (the opt-in egress check, issue #21) may reach.
+ * Exact-match ONLY — no wildcard/subdomain rules — and POLICY-OWNED (never caller-supplied), so
+ * "diagnostics only" is enforced here, not by a caller remembering to pass a constant. The egress
+ * probe renders the first entry; extend this set deliberately.
+ */
+export const DIAGNOSTICS_EGRESS_HOSTS: readonly string[] = ["ipinfo.io"];
+const DIAGNOSTICS_HOST_SET = new Set(DIAGNOSTICS_EGRESS_HOSTS.map((h) => normalizeHost(h)));
 
 export class PolicyEngine {
   readonly #registry: ConsumerRegistry;
@@ -127,48 +136,50 @@ export class PolicyEngine {
   }
 
   /**
-   * Build a navigation guard for an INTERNAL diagnostics probe (e.g. the opt-in egress check): allow
-   * ONLY the approved diagnostics host, with the same scheme + egress-deny enforcement as a consumer
-   * guard. Deliberately independent of any consumer allowlist — a restrictive consumer allowlist must
-   * not be able to BLOCK a service-internal probe (the bug this fixes), nor a permissive one widen it.
-   * The probe session is constrained to exactly this host and nothing else. Audited as "diagnostics".
+   * Build a navigation guard for an INTERNAL diagnostics probe (the opt-in egress check). It allows
+   * ONLY the policy-owned {@link DIAGNOSTICS_EGRESS_HOSTS} — EXACT host match, NO wildcard/subdomain
+   * rules — with the same scheme + egress-deny enforcement as a consumer guard. The host set is owned
+   * by the policy (the caller passes no host), so a caller cannot widen "diagnostics" to anything
+   * else. Independent of the consumer's allowlist: a restrictive one can't block the probe and a
+   * permissive one can't widen it. Audited under the INITIATING consumer's id with a diagnostics marker.
    */
-  guardForDiagnostics(host: string): NavigationGuard {
-    const allow = new Allowlist([host]);
+  guardForDiagnostics(consumer: Consumer): NavigationGuard {
     return (req) => {
       if (!isHttpUrl(req.url)) {
         this.#audit.record({
           ts: Date.now(),
-          consumerId: "diagnostics",
+          consumerId: consumer.id,
           action: "navigate",
           decision: "block",
           host: req.host,
           url: req.url,
-          reason: "scheme not allowed (only http/https)",
+          reason: "diagnostics probe: scheme not allowed (only http/https)",
         });
         return "block";
       }
       if (this.#egress(req.host)) {
         this.#audit.record({
           ts: Date.now(),
-          consumerId: "diagnostics",
+          consumerId: consumer.id,
           action: "navigate",
           decision: "block",
           host: req.host,
           url: req.url,
-          reason: EGRESS_DENY_REASON,
+          reason: `diagnostics probe: ${EGRESS_DENY_REASON}`,
         });
         return "block";
       }
-      const allowed = allow.allows(req.host);
+      // Exact membership in the policy-owned approved set — NOT an Allowlist, so a `*` or `*.sub`
+      // rule can never apply and only an exact approved host is reachable.
+      const allowed = DIAGNOSTICS_HOST_SET.has(normalizeHost(req.host));
       this.#audit.record({
         ts: Date.now(),
-        consumerId: "diagnostics",
+        consumerId: consumer.id,
         action: "navigate",
         decision: allowed ? "allow" : "block",
         host: req.host,
         url: req.url,
-        ...(allowed ? {} : { reason: "diagnostics probe: host not the approved diagnostics host" }),
+        reason: allowed ? "diagnostics egress probe" : "diagnostics probe: host not in approved set",
       });
       return allowed ? "allow" : "block";
     };

@@ -106,7 +106,7 @@ test("drive: with verifyEgress on, an exhausted escalation attaches a classified
   });
   // The probe opened a CONSTRAINED diagnostics session (guarded to the ip-info host only), not a
   // normal consumer-allowlist session — so a restrictive allowlist can't block egress verification.
-  assert.ok(opened.some((o) => o.opts?.diagnosticsHost === "ipinfo.io"), "probe used the diagnostics-host path");
+  assert.ok(opened.some((o) => o.opts?.diagnostics === true), "probe used the constrained diagnostics path");
 });
 
 test("drive: with verifyEgress OFF (default), no exitCheck is attached (no extra proxied probe)", async () => {

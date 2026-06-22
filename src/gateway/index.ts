@@ -108,18 +108,17 @@ export class Gateway {
   async openConsumerSession(
     token: string,
     coreOverrides?: BrowserCoreOptions,
-    opts?: { diagnosticsHost?: string },
+    opts?: { diagnostics?: boolean },
   ): Promise<string> {
     const policy = this.#requirePolicy();
     const consumer = policy.authenticate(token);
     const session = await this.#sessions.acquire(coreOverrides, { consumerId: consumer.id });
     try {
-      // A diagnostics probe (e.g. the opt-in egress check) is guarded to the approved diagnostics
-      // host ONLY — never the consumer's allowlist — so a restrictive consumer allowlist can't block
-      // a service-internal probe, and the probe session can reach nothing else.
-      const guard = opts?.diagnosticsHost
-        ? policy.guardForDiagnostics(opts.diagnosticsHost)
-        : policy.guardFor(consumer);
+      // A diagnostics probe (the opt-in egress check) is guarded to the policy-owned approved host
+      // set ONLY — never the consumer's allowlist — so a restrictive allowlist can't block a
+      // service-internal probe and the probe can reach nothing else. The host set lives in the policy
+      // (the caller only flips this flag), so a caller can't widen what "diagnostics" may reach.
+      const guard = opts?.diagnostics ? policy.guardForDiagnostics(consumer) : policy.guardFor(consumer);
       await session.core.setNavigationGuard(guard);
     } catch (err) {
       await this.#sessions.release(session.id); // never leave a half-open, unguarded session
