@@ -375,6 +375,48 @@ test("retrieve: an interactive CAPTCHA block is reported with reason=captcha (mo
   assert.equal(r.reason, "captcha");
 });
 
+test("retrieve: a 200 PerimeterX press-&-hold served as a TOP-document interstitial (copy in html, not innerText) is blocked", async () => {
+  // The live gateway repro (#24 follow-up), top-document form: PX serves the press-&-hold full-page
+  // with a 200. The challenge copy reaches render.html (so extractMarkdown scrapes it) but NOT
+  // render.text (top-doc innerText, here ordinary chrome over the 200-char bar). isHardBlock (needs
+  // 4xx) and isPerimeterXChallenge (needs thin text) both miss it — pxHint + copy-in-source catches it.
+  const challengeHtml =
+    "<html><body><div id='px-captcha-modal'></div>" +
+    "<div>Before we continue... Press &amp; Hold to confirm you are a human (and not a bot). Reference ID 5df6f538</div>" +
+    "</body></html>";
+  const { gateway } = makeFakeGateway([renderOf({ status: 200, text: "x".repeat(220), html: challengeHtml })]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://www.totalwine.com/p/1" });
+  assert.equal(r.blocked, true, "a 200 PX press-&-hold must not be returned as content");
+  assert.equal(r.reason, "perimeterx-challenge");
+});
+
+test("retrieve: a 200 PerimeterX press-&-hold rendered INSIDE the px-captcha-modal iframe (copy only in frameHtml) is blocked", async () => {
+  // The iframe form (P1 review, PR #25): the top document is a fat page whose only PX evidence is the
+  // px-captcha-modal element (pxHint) — the challenge copy lives in the CHILD FRAME's document, which
+  // page.content() (top frame only) never serializes. The core captures it as render.frameHtml; the
+  // top-doc html carries NO copy. Detection must read frameHtml, not just html.
+  const topHtml = "<html><body><div id='px-captcha-modal'></div><main>Total Wine — Folsom, CA</main></body></html>";
+  const frameHtml = "<html><body><div>Press &amp; Hold to confirm you are a human (and not a bot).</div></body></html>";
+  const { gateway } = makeFakeGateway([renderOf({ status: 200, text: "x".repeat(400), html: topHtml, frameHtml })]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://www.totalwine.com/p/1" });
+  assert.equal(r.blocked, true, "an iframe-served PX challenge (copy only in frameHtml) must be blocked");
+  assert.equal(r.reason, "perimeterx-challenge");
+});
+
+test("retrieve: a CLEARED PerimeterX page (px-captcha marker persists, real content, no challenge copy) is NOT blocked", async () => {
+  // px-captcha / _px markers stay embedded after the challenge clears, so pxHint is true on success.
+  // The discriminator is the challenge COPY, which is absent on the real product page — must return content.
+  const clearedHtml =
+    "<html><body><div id='px-captcha-modal'></div>" +
+    `<article><h1>Woodford Reserve</h1><p>${"Real product detail sentence with plenty of words. ".repeat(20)}</p></article>` +
+    "</body></html>";
+  const { gateway } = makeFakeGateway([renderOf({ status: 200, text: "x".repeat(1000), html: clearedHtml })]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://www.totalwine.com/p/1" });
+  assert.equal(r.blocked, false, "a cleared PX page (pxHint persists, no challenge copy) must return content");
+  assert.equal(r.reason, null);
+  assert.match(r.markdown, /Woodford Reserve/);
+});
+
 test("retrieve: a generic visible block (200, non-CF, non-captcha) reports reason=blocked (fallback arm)", async () => {
   // status 200 (so not hard-block), a non-CF block phrase, no captcha widget, no CF HTML hint:
   // exercises the final 'blocked' arm of the reason cascade — every other arm has its own test.

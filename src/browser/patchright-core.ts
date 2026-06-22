@@ -85,11 +85,28 @@ async function pollSignal(page: PatchrightPage): Promise<Pick<PageSignal, "title
   return { title, text };
 }
 
+/**
+ * Concatenated HTML of every child frame. `page.content()` serializes only the TOP document, so a
+ * challenge rendered inside a child frame (PerimeterX's `px-captcha-modal`) is invisible to it.
+ * Playwright reads a child frame's document even cross-origin (verified), so the press-&-hold copy is
+ * recoverable here. Each frame is fetched best-effort — a detached/navigating frame yields "".
+ */
+async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
+  const children = page.frames().filter((f) => f !== page.mainFrame());
+  if (children.length === 0) return "";
+  const parts = await Promise.all(children.map((f) => f.content().catch(() => "")));
+  return parts.join("\n");
+}
+
 /** Capture the title/text/html a page currently renders, tolerant of mid-navigation races. */
 async function snapshot(page: PatchrightPage): Promise<PageSignal> {
   const { title, text } = await pollSignal(page);
   const html = String(await page.content().catch(() => ""));
-  return { title, text, html };
+  // Only walk child frames when the top doc carries a PX marker (the px-captcha-modal element is in
+  // the top document even while its challenge body is in the frame) — so an ordinary page with ad
+  // iframes never pays the cost, and an iframe-served press-&-hold is still detectable.
+  const frameHtml = hasPerimeterXHint(html) ? await captureChildFrameHtml(page) : "";
+  return { title, text, html, frameHtml };
 }
 
 export class PatchrightBrowserCore implements BrowserCore {

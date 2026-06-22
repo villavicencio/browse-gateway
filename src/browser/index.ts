@@ -29,6 +29,7 @@ export {
   isPerimeterXVisible,
   hasPerimeterXHint,
   isPerimeterXChallenge,
+  hasPerimeterXChallengeCopy,
   isHardBlock,
   matchedBlockPhrases,
   vendorHints,
