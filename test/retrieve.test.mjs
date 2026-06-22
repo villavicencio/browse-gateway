@@ -375,6 +375,36 @@ test("retrieve: an interactive CAPTCHA block is reported with reason=captcha (mo
   assert.equal(r.reason, "captcha");
 });
 
+test("retrieve: a 200 PerimeterX press-&-hold (copy in HTML, not innerText) is blocked, not returned as content", async () => {
+  // The live gateway repro (#24 follow-up): PX serves the press-&-hold with a 200 and renders the
+  // widget in a cross-origin px-captcha-modal iframe. The challenge copy reaches render.html (so
+  // extractMarkdown scrapes it) but NOT render.text (top-doc innerText, here ordinary page chrome
+  // over the 200-char bar). isHardBlock (needs 4xx) and isPerimeterXChallenge (needs thin text) both
+  // miss it — only pxHint + the copy-in-source signal catches it.
+  const challengeHtml =
+    "<html><body><div id='px-captcha-modal'></div>" +
+    "<div>Before we continue... Press &amp; Hold to confirm you are a human (and not a bot). Reference ID 5df6f538</div>" +
+    "</body></html>";
+  const { gateway } = makeFakeGateway([renderOf({ status: 200, text: "x".repeat(220), html: challengeHtml })]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://www.totalwine.com/p/1" });
+  assert.equal(r.blocked, true, "a 200 PX press-&-hold must not be returned as content");
+  assert.equal(r.reason, "perimeterx-challenge");
+});
+
+test("retrieve: a CLEARED PerimeterX page (px-captcha marker persists, real content, no challenge copy) is NOT blocked", async () => {
+  // px-captcha / _px markers stay embedded after the challenge clears, so pxHint is true on success.
+  // The discriminator is the challenge COPY, which is absent on the real product page — must return content.
+  const clearedHtml =
+    "<html><body><div id='px-captcha-modal'></div>" +
+    `<article><h1>Woodford Reserve</h1><p>${"Real product detail sentence with plenty of words. ".repeat(20)}</p></article>` +
+    "</body></html>";
+  const { gateway } = makeFakeGateway([renderOf({ status: 200, text: "x".repeat(1000), html: clearedHtml })]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://www.totalwine.com/p/1" });
+  assert.equal(r.blocked, false, "a cleared PX page (pxHint persists, no challenge copy) must return content");
+  assert.equal(r.reason, null);
+  assert.match(r.markdown, /Woodford Reserve/);
+});
+
 test("retrieve: a generic visible block (200, non-CF, non-captcha) reports reason=blocked (fallback arm)", async () => {
   // status 200 (so not hard-block), a non-CF block phrase, no captcha widget, no CF HTML hint:
   // exercises the final 'blocked' arm of the reason cascade — every other arm has its own test.

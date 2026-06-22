@@ -97,3 +97,28 @@ Once `blocked` is true, the existing `isPerimeterXVisible || pxHint` arm attribu
 - **PerimeterX press-&-hold is still CLASSIFIED, not CLEARED.** This fix makes the failure *legible*
   (correct `perimeterx-challenge` + diagnostics); defeating it remains the deferred gesture-automation
   spike. Fires even on a residential exit — it is behavioral, not IP-reputation, gated.
+
+## Follow-up: the thin-content test was incomplete (a 200-chase caught a residual miss)
+
+After deploying the first fix, a loop chasing a live 200 caught a challenge that *still* came back as
+content. The thin-content discriminator (`pxHint && render.text.trim().length < 200`) is necessary but
+not sufficient: PX serves a **boundary-length 200** whose top-doc `innerText` (`render.text`) sits over
+the 200-char bar (ordinary page chrome around the iframe), so `isPerimeterXChallenge` reads it as "not
+thin" and `isVisiblyBlocked` misses it because the challenge phrase is in the iframe/source, not the
+innerText. (`render.text` is `document.body.innerText` of the **top document only** — `patchright-core.ts`
+— so iframe text never reaches it.)
+
+The complete signal is the challenge **copy in the page source**: `hasPerimeterXChallengeCopy(html)`
+matches `PX_BLOCK_PHRASES` against `render.html` (decoding `&amp;` first — "Press & Hold" serializes as
+"Press &amp; Hold" in outerHTML, which defeats a literal `/press\s*&\s*hold/` match). A PX challenge is
+now `pxHint && (thin render.text **OR** challenge copy in source)`. The copy is **absent on a cleared
+page** (its HTML keeps only the persistent `px-captcha` modal id), so it can't false-positive a success;
+`pxHint` gates it so an incidental "press and hold" on a non-PX page can't either. `pxCopy` is added to
+`BlockSignal`; retrieve computes it from the render HTML and feeds it to `classifyBlock`. (Drive's
+snapshot carries no HTML, so it leaves `pxCopy` unset and still relies on `pxHint`+thin + escalation — a
+known narrower gap for a fat-iframe 200 on the drive path.)
+
+**Lesson reinforced:** the detector reads `render.text` (top-doc innerText) while the extractor reads
+`render.html` — any challenge that renders in an iframe lands in the second surface but not the first, so
+detection that keys only on innerText (length or phrase) will miss iframe-served challenges. Key on the
+source/returned-content for iframe vendors.

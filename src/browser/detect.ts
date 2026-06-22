@@ -177,6 +177,27 @@ export function isPerimeterXChallenge(signal: Pick<PageSignal, "text">, pxHint: 
 }
 
 /**
+ * True when the page HTML carries a PerimeterX *challenge copy* phrase ({@link PX_BLOCK_PHRASES}:
+ * "Press & Hold" / "HUMAN Security") — the block-page body text, the HTML sibling of
+ * {@link isPerimeterXVisible}. Needed because the press-&-hold widget renders in a cross-origin
+ * `px-captcha-modal` iframe, so the phrase reaches the page source (and the markdown `retrieve`
+ * extracts) but never the top-document innerText that the visible-text detectors read — which lets a
+ * boundary-length 200 challenge slip past both {@link isVisiblyBlocked} and {@link isPerimeterXChallenge}'s
+ * thin-content test (gateway probe 2026-06-22). UNLIKE {@link hasPerimeterXHint} (vendor markers that
+ * PERSIST after a clear), this copy is ABSENT on a cleared page — verified: a cleared Total Wine
+ * product page's HTML keeps the px-captcha modal id but carries no press-&-hold copy — so it is safe
+ * to read as a block signal. Pair with `pxHint` so an incidental "press and hold" on a non-PX page
+ * can't false-positive.
+ */
+export function hasPerimeterXChallengeCopy(html: string): boolean {
+  // Decode the one entity that defeats a literal match: a "&" in text serializes as "&amp;" in
+  // outerHTML, so "Press & Hold" becomes "Press &amp; Hold" — and /press\s*&\s*hold/ won't span the
+  // "amp;". Cheap targeted decode so the match works on raw render HTML (not just decoded markdown).
+  const decoded = html.replace(/&amp;/gi, "&");
+  return PX_BLOCK_PHRASES.some((re) => re.test(decoded));
+}
+
+/**
  * A "hard block" — a server error status with no real content rendered. This is the
  * IP/WAF-reputation block (F1, 2026-06-01): hammering one CF target from the prod datacenter
  * IP returns a bare `403 Forbidden` (body ~9 chars) that the stealth core CANNOT clear, because

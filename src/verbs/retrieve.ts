@@ -16,6 +16,7 @@ import {
   isPerimeterXChallenge,
   hasCloudflareHint,
   hasPerimeterXHint,
+  hasPerimeterXChallengeCopy,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
@@ -113,6 +114,11 @@ export interface BlockSignal {
   status: number | null;
   cfHint?: boolean;
   pxHint?: boolean;
+  /** PerimeterX challenge COPY ("Press & Hold") is present in the page source — the iframe-served
+   * challenge whose phrase reaches the HTML but not the innerText `text`. retrieve computes it from
+   * the render HTML (drive's snapshot carries no HTML, so it leaves this unset and relies on
+   * pxHint+thin). Absent on a cleared page, so it never false-positives a success. */
+  pxCopy?: boolean;
 }
 
 /**
@@ -122,11 +128,13 @@ export interface BlockSignal {
  * in retrieve's {@link detectCaptcha}).
  */
 export function classifyBlock(sig: BlockSignal): BlockReason | null {
+  // PerimeterX press-&-hold, served either as a thin iframe (no content) or — the case that slipped
+  // #24 — a boundary-length 200 whose challenge copy is in the source but not the innerText. Both
+  // gated by pxHint so a non-PX page can't false-positive.
+  const pxChallenge =
+    isPerimeterXChallenge(sig, sig.pxHint === true) || (sig.pxHint === true && sig.pxCopy === true);
   const blocked =
-    sig.status === null ||
-    isVisiblyBlocked(sig) ||
-    isPerimeterXChallenge(sig, sig.pxHint === true) ||
-    isHardBlock(sig, sig.status);
+    sig.status === null || isVisiblyBlocked(sig) || pxChallenge || isHardBlock(sig, sig.status);
   if (!blocked) return null;
   if (sig.status === null) return "nav-failed";
   if (isCloudflareVisible(sig) || sig.cfHint === true) return "cf-challenge";
@@ -366,11 +374,14 @@ export async function retrieve(
       );
       // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a still-blocked
       // result (dead exit / proxy error page), or a PerimeterX press-&-hold (a 200 challenge whose
-      // phrase never reaches innerText — issue #21 follow-up); a thin-but-OK 200 is not retried.
+      // phrase reaches the HTML/iframe but not innerText — thin OR copy-in-source; #21/#24 follow-up);
+      // a thin-but-OK 200 is not retried.
+      const pxHintR = hasPerimeterXHint(render.html);
       if (
         render.status !== null &&
         !isVisiblyBlocked(render) &&
-        !isPerimeterXChallenge(render, hasPerimeterXHint(render.html)) &&
+        !isPerimeterXChallenge(render, pxHintR) &&
+        !(pxHintR && hasPerimeterXChallengeCopy(render.html)) &&
         !isHardBlock(render, render.status)
       ) {
         break;
@@ -385,16 +396,22 @@ export async function retrieve(
   }
   const extraction = extractMarkdown(render.html, url);
   const pxHint = hasPerimeterXHint(render.html);
+  // pxCopy: the press-&-hold challenge copy is in the page SOURCE (extracted markdown) but not the
+  // top-doc innerText `render.text` — the widget is in a cross-origin px-captcha-modal iframe. This
+  // is the boundary-length 200 case #24's thin-content test missed. Absent on a cleared page.
+  const pxCopy = hasPerimeterXChallengeCopy(render.html);
   // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, a PerimeterX
-  // press-&-hold (pxHint + thin content — a 200 challenge whose phrase renders in a cross-origin
-  // iframe, never reaching render.text; issue #21 follow-up), or a hard block (4xx/5xx + thin body)
-  // on the FINAL render — so a reputation 403, or an exhausted proxy retry where every exit was dead,
-  // is reported as blocked instead of returning the error/empty/challenge body as content (F1 finding
-  // #2). A thin *200* with no PX marker is still NOT blocked, so a legitimately short page isn't flagged.
+  // press-&-hold (pxHint + EITHER thin content OR the challenge copy in source — a 200 challenge whose
+  // phrase renders in a cross-origin iframe, never reaching render.text; #21/#24 follow-up), or a hard
+  // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy retry
+  // where every exit was dead, is reported as blocked instead of returning the error/empty/challenge
+  // body as content (F1 finding #2). A thin *200* with no PX marker is still NOT blocked, so a
+  // legitimately short page isn't flagged.
   const blocked =
     render.status === null ||
     isVisiblyBlocked(render) ||
     isPerimeterXChallenge(render, pxHint) ||
+    (pxHint && pxCopy) ||
     isHardBlock(render, render.status);
   // Diagnostic reason for the block, most-actionable-first: nav-failed (off-allowlist/unreachable),
   // then captcha (an interactive widget — needs a solver, the v1 gap), then cf-challenge, then a
@@ -412,6 +429,7 @@ export async function retrieve(
             status: render.status,
             cfHint: hasCloudflareHint(render.html),
             pxHint,
+            pxCopy,
           });
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
@@ -427,6 +445,7 @@ export async function retrieve(
           status: render.status,
           cfHint: hasCloudflareHint(render.html),
           pxHint,
+          pxCopy,
         },
       })
     : undefined;

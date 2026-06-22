@@ -6,7 +6,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classifyBlock } from "../dist/verbs/index.js";
-import { isPerimeterXVisible, hasPerimeterXHint, isPerimeterXChallenge } from "../dist/browser/index.js";
+import {
+  isPerimeterXVisible,
+  hasPerimeterXHint,
+  isPerimeterXChallenge,
+  hasPerimeterXChallengeCopy,
+} from "../dist/browser/index.js";
 
 // The real PerimeterX "Press & Hold" interstitial text (from the issue #21 repro).
 const PX_TEXT = "Before we continue... Press & Hold to confirm you are a human (and not a bot).";
@@ -57,6 +62,27 @@ test("isPerimeterXChallenge: pxHint + thin → true; pxHint + fat → false; thi
   assert.equal(isPerimeterXChallenge({ text: "Before we continue..." }, true), true);
   assert.equal(isPerimeterXChallenge({ text: "x".repeat(1000) }, true), false);
   assert.equal(isPerimeterXChallenge({ text: "short" }, false), false);
+});
+
+test("classifyBlock: a boundary-length 200 PX challenge (fat innerText, copy in source) → perimeterx-challenge", () => {
+  // The case #24 missed: top-doc innerText is over the thin bar (the press-&-hold is in an iframe), so
+  // isPerimeterXChallenge(thin) is false — but pxHint + the challenge copy in source (pxCopy) catches it.
+  assert.equal(
+    classifyBlock({ title: "", text: "x".repeat(220), status: 200, pxHint: true, pxCopy: true }),
+    "perimeterx-challenge",
+  );
+});
+
+test("classifyBlock: a cleared PX page with fat content + persistent marker but NO challenge copy → null", () => {
+  // pxHint persists on a cleared page; pxCopy is what's absent. Fat content + pxCopy=false → not blocked.
+  assert.equal(classifyBlock({ title: "Woodford", text: "x".repeat(1000), status: 200, pxHint: true, pxCopy: false }), null);
+});
+
+test("hasPerimeterXChallengeCopy: matches the press-&-hold / HUMAN copy in HTML; a cleared product page does not", () => {
+  assert.equal(hasPerimeterXChallengeCopy("<div>Press &amp; Hold to confirm you are a human</div>"), true);
+  assert.equal(hasPerimeterXChallengeCopy("<footer>Powered by HUMAN Security</footer>"), true);
+  // Cleared Total Wine page: px-captcha modal id present (vendor marker), but no challenge copy.
+  assert.equal(hasPerimeterXChallengeCopy("<div id='px-captcha-modal'></div><h1>Woodford Reserve 1.75L</h1><p>$59.99</p>"), false);
 });
 
 test("hasPerimeterXHint: matches distinctive PX markers; a normal page does not", () => {
