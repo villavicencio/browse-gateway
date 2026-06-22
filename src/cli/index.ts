@@ -25,6 +25,7 @@ export {
   classifyAgentState,
   classifyPortOwner,
   parsePortListeners,
+  sshDestination,
   tunnelState,
   ensureTunnel,
   bootoutTunnel,

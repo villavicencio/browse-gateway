@@ -241,31 +241,70 @@ export function parsePortListeners(lsofOutput: string | null): { command: string
 }
 
 /**
+ * ssh(1) single-letter options that take a SEPARATE argument. A bare `-x` from this set consumes the
+ * following token as its value, so that value is NOT the destination operand. Used to locate the
+ * destination correctly — e.g. in `ssh -l <name> -L … <dest>`, `<name>` is the `-l` value, not the host.
+ */
+const SSH_VALUE_FLAGS = new Set("BbcDEeFIiJLlmOopQRSWw".split(""));
+
+/**
+ * Find the ssh DESTINATION operand (the first non-option positional) from an argv token list, honoring
+ * value-taking options so an option value can't be mistaken for the host. Returns null when the parse
+ * is ambiguous (an unrecognized option bundle) or there is no operand — callers treat null as "not
+ * confirmable" and fail closed. tokens[0] is the ssh binary.
+ */
+export function sshDestination(tokens: string[]): string | null {
+  let i = 1;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === undefined) return null;
+    if (t === "--") return tokens[i + 1] ?? null;
+    if (t.startsWith("-") && t.length >= 2) {
+      const flag = t[1] ?? "";
+      if (t.length === 2) {
+        // bare single flag; if it takes a value, the NEXT token is that value
+        i += SSH_VALUE_FLAGS.has(flag) ? 2 : 1;
+        continue;
+      }
+      // length > 2: "-Xvalue" (value-flag with attached value) or a bundle of no-arg flags
+      if (SSH_VALUE_FLAGS.has(flag)) {
+        i += 1; // attached value, self-contained
+        continue;
+      }
+      if ([...t.slice(1)].every((c) => !SSH_VALUE_FLAGS.has(c))) {
+        i += 1; // bundle of no-arg flags (e.g. -NT)
+        continue;
+      }
+      return null; // a value-flag buried in a bundle — can't parse confidently, fail closed
+    }
+    return t; // first non-option token = the destination operand
+  }
+  return null;
+}
+
+/**
  * Classify who owns the local forwarded port. "ours" requires EVERY listener to be OUR specific ssh
- * forward — verified by the forward signature (`-L <localPort>:<gatewayHost>`) AND the alias in the
- * process argv, NOT merely COMMAND=ssh: any `ssh -L <port>` opened by another process also shows
- * COMMAND=ssh, so the old bare-name check would mis-claim a foreign forward as ours. A listener we
- * can't positively confirm (non-ssh, a different forward, or an unresolvable argv) makes the whole
- * port "foreign" — fail closed, so `connect` stops rather than registering against a service it
- * can't prove is ours. (This is the Mac-side local-forward check; the prod-side rootlesskit forward
- * is namespace-invisible to a login shell — never inferred from `ss`/`lsof` there.)
+ * tunnel — verified by the LOCAL forward port (`-L <localPort>:…`) AND the alias being the ssh
+ * DESTINATION operand. NOT merely COMMAND=ssh (any `ssh -L <port>` shows COMMAND=ssh), and NOT the
+ * alias appearing anywhere in argv (a foreign `ssh -l <alias> -L <port>:evil attacker@host` would put
+ * the alias in the `-l` value while really dialing the attacker — so we must validate the destination
+ * POSITION, not token membership). <gatewayHost> is deliberately NOT pinned: the forward target
+ * legitimately drifts when config changes (the live keeper is never rewritten — detectDrift surfaces
+ * that), so pinning it would mis-flag our own healthy tunnel as foreign. A listener we can't
+ * positively confirm (non-ssh, wrong forward, alias not the destination, or an unresolvable/ambiguous
+ * argv) makes the whole port "foreign" — fail closed, so `connect` stops rather than registering a
+ * bearer token against a service it can't prove is ours. (Mac-side local-forward check only; the
+ * prod-side rootlesskit forward is namespace-invisible to a login shell — never inferred from ss/lsof.)
  */
 export function classifyPortOwner(listeners: PortListener[] | null, spec: TunnelSpec): PortOwner {
   if (listeners === null || listeners.length === 0) return "none";
-  // Our keeper runs `ssh … -L <localPort>:<gatewayHost> <alias>`. Identify our tunnel by the LOCAL
-  // forward port + our alias as a STANDALONE argv token — matched at token boundaries, NOT as a
-  // substring (else a foreign `ssh -L <localPort>:evil … -o …/<alias>.hosts …` that merely mentions
-  // the alias in a path would slip through), and WITHOUT pinning <gatewayHost>: the forward target
-  // legitimately drifts when config changes (the live keeper is never rewritten — detectDrift
-  // surfaces that separately), so pinning it here would mis-flag our OWN healthy tunnel as foreign
-  // and make `connect` refuse it. The local port + the alias as a bare arg is the stable identity.
   const isOurs = (l: PortListener): boolean => {
     if (l.command !== "ssh" || l.argv === null) return false;
     const tokens = l.argv.split(/\s+/).filter((t) => t !== "");
     const forwardsOurPort = tokens.some(
       (t, i) => (t === "-L" && (tokens[i + 1]?.startsWith(`${spec.localPort}:`) ?? false)) || t.startsWith(`-L${spec.localPort}:`),
     );
-    return forwardsOurPort && tokens.includes(spec.alias);
+    return forwardsOurPort && sshDestination(tokens) === spec.alias;
   };
   return listeners.every(isOurs) ? "ours" : "foreign";
 }
