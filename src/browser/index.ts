@@ -28,6 +28,7 @@ export {
   hasCloudflareHint,
   isPerimeterXVisible,
   hasPerimeterXHint,
+  isPerimeterXChallenge,
   isHardBlock,
   matchedBlockPhrases,
   vendorHints,

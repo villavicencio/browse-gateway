@@ -13,6 +13,7 @@ import {
   isHardBlock,
   isCloudflareVisible,
   isPerimeterXVisible,
+  isPerimeterXChallenge,
   hasCloudflareHint,
   hasPerimeterXHint,
   MIN_CONTENT_LENGTH,
@@ -121,7 +122,11 @@ export interface BlockSignal {
  * in retrieve's {@link detectCaptcha}).
  */
 export function classifyBlock(sig: BlockSignal): BlockReason | null {
-  const blocked = sig.status === null || isVisiblyBlocked(sig) || isHardBlock(sig, sig.status);
+  const blocked =
+    sig.status === null ||
+    isVisiblyBlocked(sig) ||
+    isPerimeterXChallenge(sig, sig.pxHint === true) ||
+    isHardBlock(sig, sig.status);
   if (!blocked) return null;
   if (sig.status === null) return "nav-failed";
   if (isCloudflareVisible(sig) || sig.cfHint === true) return "cf-challenge";
@@ -359,9 +364,15 @@ export async function retrieve(
         (s) => s.core.render(url, proxiedRenderOpts),
         { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS },
       );
-      // A fresh exit landed a real page -> done. Retry on a failed nav (null status) or a
-      // still-blocked result (dead exit / proxy error page); a thin-but-OK 200 is not retried.
-      if (render.status !== null && !isVisiblyBlocked(render) && !isHardBlock(render, render.status)) {
+      // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a still-blocked
+      // result (dead exit / proxy error page), or a PerimeterX press-&-hold (a 200 challenge whose
+      // phrase never reaches innerText — issue #21 follow-up); a thin-but-OK 200 is not retried.
+      if (
+        render.status !== null &&
+        !isVisiblyBlocked(render) &&
+        !isPerimeterXChallenge(render, hasPerimeterXHint(render.html)) &&
+        !isHardBlock(render, render.status)
+      ) {
         break;
       }
     }
@@ -373,12 +384,18 @@ export async function retrieve(
     render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
   }
   const extraction = extractMarkdown(render.html, url);
-  // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, or a hard
-  // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy
-  // retry where every exit was dead, is reported as blocked instead of returning the error/empty
-  // body as content (F1 finding #2). A thin *200* is still NOT blocked, so a legitimately short
-  // page isn't flagged.
-  const blocked = render.status === null || isVisiblyBlocked(render) || isHardBlock(render, render.status);
+  const pxHint = hasPerimeterXHint(render.html);
+  // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, a PerimeterX
+  // press-&-hold (pxHint + thin content — a 200 challenge whose phrase renders in a cross-origin
+  // iframe, never reaching render.text; issue #21 follow-up), or a hard block (4xx/5xx + thin body)
+  // on the FINAL render — so a reputation 403, or an exhausted proxy retry where every exit was dead,
+  // is reported as blocked instead of returning the error/empty/challenge body as content (F1 finding
+  // #2). A thin *200* with no PX marker is still NOT blocked, so a legitimately short page isn't flagged.
+  const blocked =
+    render.status === null ||
+    isVisiblyBlocked(render) ||
+    isPerimeterXChallenge(render, pxHint) ||
+    isHardBlock(render, render.status);
   // Diagnostic reason for the block, most-actionable-first: nav-failed (off-allowlist/unreachable),
   // then captcha (an interactive widget — needs a solver, the v1 gap), then cf-challenge, then a
   // bare hard-block, else a generic visible block. Surfaced so a caller (and the agent) sees WHY a
@@ -394,7 +411,7 @@ export async function retrieve(
             text: render.text,
             status: render.status,
             cfHint: hasCloudflareHint(render.html),
-            pxHint: hasPerimeterXHint(render.html),
+            pxHint,
           });
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
@@ -409,7 +426,7 @@ export async function retrieve(
           text: render.text,
           status: render.status,
           cfHint: hasCloudflareHint(render.html),
-          pxHint: hasPerimeterXHint(render.html),
+          pxHint,
         },
       })
     : undefined;

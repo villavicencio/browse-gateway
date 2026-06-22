@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classifyBlock } from "../dist/verbs/index.js";
-import { isPerimeterXVisible, hasPerimeterXHint } from "../dist/browser/index.js";
+import { isPerimeterXVisible, hasPerimeterXHint, isPerimeterXChallenge } from "../dist/browser/index.js";
 
 // The real PerimeterX "Press & Hold" interstitial text (from the issue #21 repro).
 const PX_TEXT = "Before we continue... Press & Hold to confirm you are a human (and not a bot).";
@@ -33,6 +33,30 @@ test("classifyBlock: 403 + thin body, no vendor markers → hard-block", () => {
 test("classifyBlock: null status → nav-failed; a real cleared 200 page → null", () => {
   assert.equal(classifyBlock({ title: "x", text: "x".repeat(1000), status: null }), "nav-failed");
   assert.equal(classifyBlock({ title: "Real", text: "x".repeat(1000), status: 200 }), null);
+});
+
+test("classifyBlock: PerimeterX press-&-hold served as a 200 (iframe widget) → perimeterx-challenge", () => {
+  // The gateway repro (2026-06-22): PX serves the challenge with a 200 and renders its widget in a
+  // cross-origin iframe, so the visible phrase never reaches render.text. Only the HTML marker
+  // (pxHint) + thin content betray it. Pre-fix this fell through to `null` and the challenge shell
+  // was returned as content.
+  assert.equal(classifyBlock({ title: "", text: "Before we continue...", status: 200, pxHint: true }), "perimeterx-challenge");
+});
+
+test("classifyBlock: a CLEARED PX page (pxHint persists, but real content) is NOT blocked", () => {
+  // px-captcha / _px3 markers stay embedded in the HTML after the challenge clears, so pxHint is true
+  // on a successful fetch too. Fat content is the discriminator — must not false-positive.
+  assert.equal(classifyBlock({ title: "Woodford Reserve", text: "x".repeat(1000), status: 200, pxHint: true }), null);
+});
+
+test("classifyBlock: a thin 200 with NO PX marker is still a legit short page, not blocked", () => {
+  assert.equal(classifyBlock({ title: "", text: "short", status: 200 }), null);
+});
+
+test("isPerimeterXChallenge: pxHint + thin → true; pxHint + fat → false; thin without pxHint → false", () => {
+  assert.equal(isPerimeterXChallenge({ text: "Before we continue..." }, true), true);
+  assert.equal(isPerimeterXChallenge({ text: "x".repeat(1000) }, true), false);
+  assert.equal(isPerimeterXChallenge({ text: "short" }, false), false);
 });
 
 test("hasPerimeterXHint: matches distinctive PX markers; a normal page does not", () => {
