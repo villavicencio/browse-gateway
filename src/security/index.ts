@@ -24,3 +24,14 @@ export {
   type GcmBox,
   type VaultContext,
 } from "./vault-crypto.js";
+export {
+  VaultStore,
+  openVault,
+  loadVaultKey,
+  countVaultEntries,
+  vaultKeyBootError,
+  rotateVaultKey,
+  type VaultStoreOptions,
+  type VaultEntryMeta,
+  type OpenVaultDeps,
+} from "./vault-store.js";

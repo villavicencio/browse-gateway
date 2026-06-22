@@ -20,7 +20,7 @@ import {
   buildConsumerSpecs,
 } from "../policy/index.js";
 import type { Consumer } from "../policy/index.js";
-import { SecretStore, redactSecrets } from "../security/index.js";
+import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
 import { retrieve, stickySuffixBootError, parseForceProxyHosts, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
@@ -58,6 +58,12 @@ async function main(): Promise<void> {
   log(OBSCURA_BOOT_BANNER); // the brand on the experiential surface only — env/ports/tool names unchanged
   const config = loadConfig();
   const secrets = new SecretStore();
+  // Credential/session-state vault (B1). Off unless BGW_VAULT_DIR is set; constructing it here runs
+  // the fail-closed boot guard (entries on disk but no master key → refuse to boot) and folds the KEK
+  // into the redaction set. Consumed by the assisted-login + restore paths (later units); loaded now
+  // so the guard is live and a misconfigured key never goes unnoticed.
+  const vault = openVault({ canonicalizeHost, redact: (vals) => secrets.addRedactable(vals) });
+  if (vault) log("vault: ready (encrypted credential store enabled)");
   // Interactive-CAPTCHA solver for the drive path, wired when BYO config is present (key in the
   // SecretStore, endpoint in BGW_CAPTCHA_API_URL); absent = a detected CAPTCHA is left to fail.
   config.core.solver = httpCaptchaSolverFromSecrets(secrets, process.env.BGW_CAPTCHA_API_URL, {
