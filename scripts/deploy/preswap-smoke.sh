@@ -16,8 +16,11 @@
 # launch-http.sh (the single `docker run` source) with a throwaway name/port, --restart no, and tiny
 # caps, so the smoke can't self-resurrect or collide with the live container.
 #
-# Required env:
-#   BGW_DEPLOY_IMAGE   image ref to smoke (a digest in CD; the running image's ID for --apply).
+# Image to smoke (BGW_DEPLOY_IMAGE): the CD path (deploy-on-host.sh) sets it explicitly to the NEW
+# digest. The `--apply` provisioning path changes only env/manifest, not the image — so leave it UNSET
+# and the script defaults to the CURRENTLY-RUNNING container's image, validating the staged config
+# against the live image. This lets a literal `smokeCmd=~/deploy/preswap-smoke.sh` work with no image
+# plumbing in the keys/vault path.
 # Config: sourced from $BGW_DEPLOY_CONFIG (default ~/browse-gateway-deploy.env) — the SAME host-local,
 # uncommitted file launch-http.sh needs (sets BGW_ENV_FILE, BGW_CONSUMERS_HOST_PATH, BGW_BIND_ADDR,
 # BGW_HOST_PORT, BGW_DOCKER_HOST). This file is fleet-clean — safe to commit to the public repo.
@@ -29,11 +32,19 @@ CONFIG="${BGW_DEPLOY_CONFIG:-$HOME/browse-gateway-deploy.env}"
 # shellcheck disable=SC1090
 . "$CONFIG"
 
-: "${BGW_DEPLOY_IMAGE:?set BGW_DEPLOY_IMAGE (image ref to smoke)}"
 export DOCKER_HOST="${BGW_DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
 CONTAINER="${BGW_CONTAINER:-browse-gateway-http}"
 BIND_ADDR="${BGW_BIND_ADDR:-127.0.0.1}"
 HOST_PORT="${BGW_HOST_PORT:-8080}"
+
+# Default the image to smoke to the currently-running container's (the --apply case); the CD path
+# passes BGW_DEPLOY_IMAGE explicitly so this default never fires there. Only a box with neither an
+# explicit image nor a running container to derive one from is an error.
+if [ -z "${BGW_DEPLOY_IMAGE:-}" ]; then
+  BGW_DEPLOY_IMAGE="$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null || true)"
+  [ -n "$BGW_DEPLOY_IMAGE" ] \
+    || { echo "smoke: BGW_DEPLOY_IMAGE unset and no running '$CONTAINER' to derive it from" >&2; exit 2; }
+fi
 SMOKE_CONTAINER="${BGW_SMOKE_CONTAINER:-${CONTAINER}-presmoke}"
 SMOKE_PORT="${BGW_SMOKE_PORT:-18080}"               # off 8080 (live); override if 18080 is already bound on the host
 SMOKE_BOOT_TIMEOUT="${BGW_SMOKE_BOOT_TIMEOUT:-30}"  # poll seconds; a bad-config crash surfaces in 2-3s, so a generous budget only spares a slow cold boot from a false abort

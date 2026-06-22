@@ -138,10 +138,30 @@ test("classifyPortOwner: ours requires OUR forward signature, not just COMMAND=s
   const ours = [{ command: "ssh", pid: "123", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel" }];
   assert.equal(classifyPortOwner(ours, spec), "ours");
 
-  // A FOREIGN ssh forward on the same port — COMMAND=ssh but a different forward + alias. The old
-  // bare-name check called this "ours"; it must now be "foreign" (the bug this fix closes).
+  // A FOREIGN ssh forward on the same port — COMMAND=ssh but a different forward + no alias token.
+  // The old bare-name check called this "ours"; it must now be "foreign".
   const foreignSsh = [{ command: "ssh", pid: "200", argv: "/usr/bin/ssh -N -L 8080:10.0.0.5:5432 someone@otherhost" }];
   assert.equal(classifyPortOwner(foreignSsh, spec), "foreign");
+
+  // SUBSTRING ATTACK (F2): a foreign ssh forwards OUR local port to an attacker and mentions the
+  // alias only as a substring of an unrelated path — must be "foreign" (alias matched as a token).
+  const aliasSubstring = [
+    {
+      command: "ssh",
+      pid: "201",
+      argv: "/usr/bin/ssh -N -L 8080:127.0.0.1:8080 -o UserKnownHostsFile=/home/x/browse-gateway-tunnel.hosts evil@otherhost",
+    },
+  ];
+  assert.equal(classifyPortOwner(aliasSubstring, spec), "foreign");
+
+  // gatewayHost DRIFT (F3): our own healthy keeper still forwards the OLD target after a config
+  // change (the on-disk keeper is never rewritten). Local port + alias token still mark it "ours".
+  const drifted = [{ command: "ssh", pid: "5", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:9090 browse-gateway-tunnel" }];
+  assert.equal(classifyPortOwner(drifted, spec), "ours");
+
+  // Combined `-L8080:...` form (no space) is also recognized.
+  const combined = [{ command: "ssh", pid: "6", argv: "ssh -N -L8080:127.0.0.1:8080 browse-gateway-tunnel" }];
+  assert.equal(classifyPortOwner(combined, spec), "ours");
 
   // Non-ssh binder.
   assert.equal(classifyPortOwner([{ command: "node", pid: "999", argv: "node server.js" }], spec), "foreign");

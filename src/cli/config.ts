@@ -36,9 +36,10 @@ export interface ObscuraConfig {
   /**
    * The on-host command `keys --apply` runs (over admin SSH) to PRE-SWAP SMOKE a mutation BEFORE the
    * re-create — boots the current image against the just-staged env + manifest on a throwaway port
-   * and exits non-zero if it can't come up clean (e.g. a wrapper around scripts/deploy/preswap-smoke.sh).
-   * Absent → `--apply` proceeds with a loud warning; a malformed mutation can then crash-loop the
-   * gateway. Configure this to make `--apply` refuse a bad config instead of taking the live box down.
+   * and exits non-zero if it can't come up clean — typically `~/deploy/preswap-smoke.sh` directly (it
+   * defaults the smoked image to the running container's). Absent → `--apply` proceeds with a loud
+   * warning; a malformed mutation can then crash-loop the gateway. Configure this to make `--apply`
+   * refuse a bad config instead of taking the live box down.
    */
   smokeCmd?: string;
   /** LaunchAgent label prefix for generated tunnel artifacts (reverse-DNS style). */

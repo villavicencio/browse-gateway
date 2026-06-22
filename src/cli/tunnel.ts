@@ -252,9 +252,21 @@ export function parsePortListeners(lsofOutput: string | null): { command: string
  */
 export function classifyPortOwner(listeners: PortListener[] | null, spec: TunnelSpec): PortOwner {
   if (listeners === null || listeners.length === 0) return "none";
-  const ourForward = `-L ${spec.localPort}:${spec.gatewayHost}`;
-  const isOurs = (l: PortListener): boolean =>
-    l.command === "ssh" && l.argv !== null && l.argv.includes(ourForward) && l.argv.includes(spec.alias);
+  // Our keeper runs `ssh … -L <localPort>:<gatewayHost> <alias>`. Identify our tunnel by the LOCAL
+  // forward port + our alias as a STANDALONE argv token — matched at token boundaries, NOT as a
+  // substring (else a foreign `ssh -L <localPort>:evil … -o …/<alias>.hosts …` that merely mentions
+  // the alias in a path would slip through), and WITHOUT pinning <gatewayHost>: the forward target
+  // legitimately drifts when config changes (the live keeper is never rewritten — detectDrift
+  // surfaces that separately), so pinning it here would mis-flag our OWN healthy tunnel as foreign
+  // and make `connect` refuse it. The local port + the alias as a bare arg is the stable identity.
+  const isOurs = (l: PortListener): boolean => {
+    if (l.command !== "ssh" || l.argv === null) return false;
+    const tokens = l.argv.split(/\s+/).filter((t) => t !== "");
+    const forwardsOurPort = tokens.some(
+      (t, i) => (t === "-L" && (tokens[i + 1]?.startsWith(`${spec.localPort}:`) ?? false)) || t.startsWith(`-L${spec.localPort}:`),
+    );
+    return forwardsOurPort && tokens.includes(spec.alias);
+  };
   return listeners.every(isOurs) ? "ours" : "foreign";
 }
 

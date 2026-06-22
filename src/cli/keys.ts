@@ -38,8 +38,9 @@ export interface KeysDeps {
   /**
    * On-host command that PRE-SWAP SMOKES the staged mutation BEFORE the re-create: boot the current
    * image against the just-written env + manifest on a throwaway port, exit non-zero if it can't come
-   * up clean (e.g. a wrapper around scripts/deploy/preswap-smoke.sh). Run first so a malformed env or
-   * an undersized `BGW_MAX_SESSIONS` floor aborts the apply with the LIVE container untouched, instead
+   * up clean — typically `~/deploy/preswap-smoke.sh` directly (it defaults the smoked image to the
+   * running container's, so no image plumbing is needed here). Run first so a malformed env or an
+   * undersized `BGW_MAX_SESSIONS` floor aborts the apply with the LIVE container untouched, instead
    * of crash-looping it (the documented `keys --apply` crash-loop). Absent → apply proceeds, warned.
    */
   smokeCmd?: string;
