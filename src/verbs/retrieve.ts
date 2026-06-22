@@ -297,6 +297,16 @@ export function stickySuffixBootError(suffix: string | undefined): string | null
   return null;
 }
 
+/**
+ * PerimeterX press-&-hold copy present in the rendered page — the top-document HTML OR a child
+ * frame's HTML. The challenge renders in a cross-origin `px-captcha-modal` iframe, which
+ * `page.content()` (top frame only) never serializes; the core captures the child frames as
+ * `render.frameHtml` (only when a PX marker is present), so the copy is recoverable either way.
+ */
+function hasPxChallengeCopy(render: Pick<RenderResult, "html" | "frameHtml">): boolean {
+  return hasPerimeterXChallengeCopy(render.html) || hasPerimeterXChallengeCopy(render.frameHtml ?? "");
+}
+
 export async function retrieve(
   gateway: Gateway,
   secrets: SecretStore,
@@ -381,7 +391,7 @@ export async function retrieve(
         render.status !== null &&
         !isVisiblyBlocked(render) &&
         !isPerimeterXChallenge(render, pxHintR) &&
-        !(pxHintR && hasPerimeterXChallengeCopy(render.html)) &&
+        !(pxHintR && hasPxChallengeCopy(render)) &&
         !isHardBlock(render, render.status)
       ) {
         break;
@@ -396,10 +406,12 @@ export async function retrieve(
   }
   const extraction = extractMarkdown(render.html, url);
   const pxHint = hasPerimeterXHint(render.html);
-  // pxCopy: the press-&-hold challenge copy is in the page SOURCE (extracted markdown) but not the
-  // top-doc innerText `render.text` — the widget is in a cross-origin px-captcha-modal iframe. This
-  // is the boundary-length 200 case #24's thin-content test missed. Absent on a cleared page.
-  const pxCopy = hasPerimeterXChallengeCopy(render.html);
+  // pxCopy: the press-&-hold challenge copy is in the page SOURCE but not the top-doc innerText
+  // `render.text` — the widget is in a cross-origin px-captcha-modal iframe. We look at BOTH the
+  // top-document HTML and the child-frame HTML the core captured (`render.frameHtml`), because
+  // page.content() serializes only the top frame. This is the boundary-length 200 case #24's
+  // thin-content test missed. Absent on a cleared page.
+  const pxCopy = hasPxChallengeCopy(render);
   // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, a PerimeterX
   // press-&-hold (pxHint + EITHER thin content OR the challenge copy in source — a 200 challenge whose
   // phrase renders in a cross-origin iframe, never reaching render.text; #21/#24 follow-up), or a hard

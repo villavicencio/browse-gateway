@@ -84,6 +84,11 @@ export interface PageSignal {
   title: string;
   text: string;
   html: string;
+  /** Concatenated HTML of child frames (e.g. the PerimeterX `px-captcha-modal`). The top-document
+   * `html` comes from `page.content()`, which serializes ONLY the top frame — a challenge rendered
+   * inside a child frame's document is otherwise invisible to detection. The core populates this only
+   * when a PX marker is present in the top doc; absent (`undefined`) on an ordinary render. */
+  frameHtml?: string;
 }
 
 /** Minimum body-text length to treat a page as "real content" (vs a near-empty block). */
@@ -162,32 +167,32 @@ export function hasPerimeterXHint(html: string): boolean {
 }
 
 /**
- * True when a page is a PerimeterX press-&-hold challenge served WITHOUT a hard-block status. PX
- * renders its "Press & Hold" widget in a cross-origin iframe, so the visible phrase never reaches the
- * top document's innerText ({@link isPerimeterXVisible}/{@link isVisiblyBlocked} miss it), and the
- * challenge is commonly served with a 200 ({@link isHardBlock}, which needs a 4xx/5xx + thin body,
- * misses it too). The HTML-side marker (`pxHint`, from {@link hasPerimeterXHint}) catches it — but
- * that marker PERSISTS on a CLEARED page, so `pxHint` alone would false-positive every successful
- * fetch from a PX-protected site. The discriminator is content: a challenge renders no real content
- * (thin text), while a cleared page renders the product (fat text). So a PX challenge is `pxHint` AND
- * thin content. (Total Wine, gateway probe 2026-06-22 — issue #21 follow-up.)
+ * The THIN-content arm of PerimeterX detection: a challenge that leaves the top document empty. PX
+ * renders its "Press & Hold" widget in a `px-captcha-modal` (cross-origin) iframe, so when the top
+ * frame is just the modal shell, its innerText (`text`) stays thin and the visible-phrase detectors
+ * ({@link isPerimeterXVisible}/{@link isVisiblyBlocked}) see nothing — and the challenge is commonly a
+ * 200, so {@link isHardBlock} (needs 4xx/5xx + thin) misses it too. `pxHint` ({@link hasPerimeterXHint})
+ * confirms PX is present, but PERSISTS on a cleared page, so `pxHint` alone false-positives every
+ * success; the discriminator is content. A PX challenge whose top frame instead stays FAT (page chrome
+ * around the modal) is caught by {@link hasPerimeterXChallengeCopy} on the captured frame HTML, not
+ * here. (Total Wine, gateway probe 2026-06-22 — issue #21/#24 follow-up.)
  */
 export function isPerimeterXChallenge(signal: Pick<PageSignal, "text">, pxHint: boolean): boolean {
   return pxHint && signal.text.trim().length < MIN_CONTENT_LENGTH;
 }
 
 /**
- * True when the page HTML carries a PerimeterX *challenge copy* phrase ({@link PX_BLOCK_PHRASES}:
- * "Press & Hold" / "HUMAN Security") — the block-page body text, the HTML sibling of
- * {@link isPerimeterXVisible}. Needed because the press-&-hold widget renders in a cross-origin
- * `px-captcha-modal` iframe, so the phrase reaches the page source (and the markdown `retrieve`
- * extracts) but never the top-document innerText that the visible-text detectors read — which lets a
- * boundary-length 200 challenge slip past both {@link isVisiblyBlocked} and {@link isPerimeterXChallenge}'s
- * thin-content test (gateway probe 2026-06-22). UNLIKE {@link hasPerimeterXHint} (vendor markers that
- * PERSIST after a clear), this copy is ABSENT on a cleared page — verified: a cleared Total Wine
- * product page's HTML keeps the px-captcha modal id but carries no press-&-hold copy — so it is safe
- * to read as a block signal. Pair with `pxHint` so an incidental "press and hold" on a non-PX page
- * can't false-positive.
+ * True when a page-source string carries a PerimeterX *challenge copy* phrase ({@link PX_BLOCK_PHRASES}:
+ * "Press & Hold" / "HUMAN Security") — the block-page body text, the source sibling of
+ * {@link isPerimeterXVisible}. Callers pass the top-document HTML AND the child-frame HTML the core
+ * captured (`frameHtml`): the press-&-hold widget renders in a `px-captcha-modal` iframe, whose
+ * document `page.content()` (top frame only) never serializes, so a fat-top-frame challenge would be
+ * invisible without the frame HTML — that is the boundary-length 200 that slipped {@link isVisiblyBlocked}
+ * and {@link isPerimeterXChallenge}'s thin-content test (gateway probe 2026-06-22). UNLIKE
+ * {@link hasPerimeterXHint} (vendor markers that PERSIST after a clear), this copy is ABSENT on a
+ * cleared page — verified: a cleared Total Wine product page keeps the px-captcha modal id but no
+ * press-&-hold copy — so it is safe to read as a block signal. Pair with `pxHint` so an incidental
+ * "press and hold" on a non-PX page can't false-positive.
  */
 export function hasPerimeterXChallengeCopy(html: string): boolean {
   // Decode the one entity that defeats a literal match: a "&" in text serializes as "&amp;" in

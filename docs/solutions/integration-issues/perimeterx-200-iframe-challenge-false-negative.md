@@ -122,3 +122,22 @@ known narrower gap for a fat-iframe 200 on the drive path.)
 `render.html` — any challenge that renders in an iframe lands in the second surface but not the first, so
 detection that keys only on innerText (length or phrase) will miss iframe-served challenges. Key on the
 source/returned-content for iframe vendors.
+
+### Second follow-up: `render.html` is *also* top-frame only — capture child frames (PR #25 P1 review)
+
+A reviewer caught that `render.html` comes from `page.content()`, which serializes only the **top
+document** — a child frame's document (the actual `px-captcha-modal`) is never included. So
+`hasPerimeterXChallengeCopy(render.html)` only catches PX served as a **top-document interstitial**
+(the form the live probe happened to hit — `extractMarkdown` got the copy *because* it was in the top
+doc). A challenge whose copy stays **inside the iframe** over a fat top page would still be a false
+negative.
+
+Fix: the core now captures child-frame HTML. `snapshot()` walks `page.frames()` and concatenates each
+child's `content()` into a new `frameHtml` field — but **only when the top doc carries a PX marker**
+(`hasPerimeterXHint`), so an ordinary page with ad iframes never pays the walk. Detection
+(`hasPxChallengeCopy`) reads `render.html` **and** `render.frameHtml`. Verified empirically that
+Playwright reads a **cross-origin** frame's `content()` (it operates per-frame over CDP, not via
+same-origin-restricted in-page JS) — proven by `scripts/validate-frame-capture.mjs` (real browser, a
+cross-origin data: child frame). **Lesson:** `page.content()` is top-frame only; for any vendor that
+renders in an iframe, you must walk `page.frames()` explicitly — both `render.text` (innerText) and
+`render.html` (page.content) stop at the top document.

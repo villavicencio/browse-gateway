@@ -61,6 +61,10 @@ export interface RenderResult {
   title: string;
   text: string;
   html: string;
+  /** Concatenated HTML of child frames (the px-captcha-modal et al.), captured by the core only when
+   * a PX marker is present — so an iframe-served press-&-hold is detectable, since `html`
+   * (page.content()) is top-document only. Absent on an ordinary render. */
+  frameHtml?: string;
   /** Wall-clock ms spent waiting for the page to clear (challenge auto-solve). */
   clearanceWaitedMs: number;
 }
