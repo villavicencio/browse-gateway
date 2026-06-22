@@ -161,6 +161,30 @@ test("guardFor: allows allowlisted host, blocks others, audits both", () => {
   assert.ok(a.some((r) => r.action === "navigate" && r.decision === "block" && r.host === "evil.com"));
 });
 
+test("guardForDiagnostics: allows ONLY the policy-owned host (exact, no wildcard); audits under the consumer", () => {
+  const audit = new InMemoryAuditSink();
+  // An allow-ALL consumer must NOT widen the diagnostics probe, and there is no caller-supplied host
+  // to abuse — the approved set is owned by the policy.
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "agent-1", token: "tok", allow: ["*"] }]), audit });
+  const guard = policy.guardForDiagnostics(policy.authenticate("tok"));
+  assert.equal(guard(nav("ipinfo.io")), "allow");
+  assert.equal(guard(nav("evil.example")), "block", "allow-all consumer does not widen the probe");
+  assert.equal(guard(nav("sub.ipinfo.io")), "block", "exact match only — no subdomain widening");
+  assert.equal(guard(nav("www.ipinfo.io")), "block", "www. is a DIFFERENT host — literal enforcement (P3)");
+  assert.equal(guard(nav("IPINFO.IO")), "allow", "case-insensitive");
+  assert.equal(guard(nav("ipinfo.io.")), "allow", "trailing FQDN-root dot tolerated");
+  assert.equal(guard(nav("169.254.169.254")), "block", "egress deny still wins");
+  assert.equal(
+    guard({ url: "file:///etc/passwd", host: "", resourceType: "document", isNavigationRequest: true }),
+    "block",
+    "non-http scheme still blocked",
+  );
+  // Attribution: under the INITIATING consumer, never a flat "diagnostics" id.
+  const a = audit.forConsumer("agent-1");
+  assert.ok(a.some((r) => r.decision === "allow" && r.host === "ipinfo.io" && /diagnostics/.test(r.reason ?? "")));
+  assert.equal(audit.records.filter((r) => r.consumerId === "diagnostics").length, 0, "nothing mis-attributed to 'diagnostics'");
+});
+
 test("guardFor: allowed subresources are not audited (signal-dense trail)", () => {
   const audit = new InMemoryAuditSink();
   const policy = new PolicyEngine({

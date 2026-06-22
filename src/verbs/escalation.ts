@@ -42,3 +42,24 @@ export function shouldEscalateToProxy(
   if (!ctx.onDatacenterIp || !ctx.proxyAvailable) return false;
   return isCloudflareBlock(signal) || isHardBlock(signal, status);
 }
+
+/**
+ * Parse `BGW_FORCE_PROXY_HOSTS` — a comma-separated list of host suffixes (e.g.
+ * "totalwine.com,www.example.com") — into a normalized lowercase list. A target whose host matches
+ * one skips the direct-first attempt and goes residential from the FIRST request (issue #21): for a
+ * known-hostile WAF (PerimeterX et al.) the direct attempt only burns time and trips reputation.
+ */
+export function parseForceProxyHosts(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/** True when `host` matches a force-proxy suffix — an exact match or a dotted subdomain of it
+ *  (`totalwine.com` covers `www.totalwine.com` but NOT `nottotalwine.com`). */
+export function hostForcesProxy(host: string, suffixes: readonly string[]): boolean {
+  const h = host.toLowerCase();
+  return suffixes.some((s) => h === s || h.endsWith(`.${s}`));
+}

@@ -5,7 +5,7 @@
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
 import { hostFromUrl } from "../security/url.js";
-import { isCleared, isVisiblyBlocked, hasCloudflareHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
+import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
@@ -238,7 +238,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // Carry the CF vendor-hint signal (the HTML half of retrieve's CF detection) as a scrubbed
     // boolean, so drive's escalation recognizes a CF interstitial that shows no visible CF phrase.
     const html = String(await page.content().catch(() => ""));
-    return { ...(await this.#snapshotOf(page)), cfHint: hasCloudflareHint(html) };
+    return { ...(await this.#snapshotOf(page)), cfHint: hasCloudflareHint(html), pxHint: hasPerimeterXHint(html) };
   }
 
   async snapshot(): Promise<PageSnapshot> {

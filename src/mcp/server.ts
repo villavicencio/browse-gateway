@@ -8,7 +8,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
-import type { BlockReason } from "../verbs/index.js";
+import type { BlockReason, EscalationDiagnostics } from "../verbs/index.js";
+import { EscalationError } from "../verbs/index.js";
 
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
@@ -22,9 +23,11 @@ export interface RetrieveOutcome {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the (v1: no-op) solver. */
   captchaSolved: boolean;
+  /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
+  proxyDiagnostic?: EscalationDiagnostics;
 }
 
-export type RetrieveFn = (input: { url: string }) => Promise<RetrieveOutcome>;
+export type RetrieveFn = (input: { url: string; forceProxy?: boolean }) => Promise<RetrieveOutcome>;
 
 /**
  * The stateful `drive` surface: one persistent, consumer-bound session the agent opens, drives
@@ -35,7 +38,7 @@ export type RetrieveFn = (input: { url: string }) => Promise<RetrieveOutcome>;
  */
 export interface DriveController {
   open(): Promise<void>;
-  navigate(url: string): Promise<PageSnapshot>;
+  navigate(url: string, opts?: { forceProxy?: boolean }): Promise<PageSnapshot>;
   snapshot(): Promise<PageSnapshot>;
   click(target: DriveTarget): Promise<PageSnapshot>;
   type(target: DriveTarget, text: string, submit?: boolean): Promise<PageSnapshot>;
@@ -75,11 +78,17 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
         "residential IP on hard blocks, so it succeeds where an ordinary browser is blocked or " +
         'returns "Forbidden". Prefer this over a generic browser for reading a URL; use the ' +
         "browser_* drive tools only when you must interact (click, fill forms, multi-step flows).",
-      inputSchema: { url: z.string().url().describe("Absolute URL to retrieve") },
+      inputSchema: {
+        url: z.string().url().describe("Absolute URL to retrieve"),
+        forceProxy: z
+          .boolean()
+          .optional()
+          .describe("Route through the residential proxy from the first request (for known-hostile hosts)"),
+      },
     },
-    async ({ url }) => {
+    async ({ url, forceProxy }) => {
       try {
-        const result = await deps.retrieve({ url });
+        const result = await deps.retrieve({ url, forceProxy });
         // A null status means the navigation never completed — an off-allowlist policy block
         // or an unreachable host — so the browser's own error page (thin content) must not be
         // handed back as a successful result. A short-but-valid page has a real status, so it
@@ -91,12 +100,13 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           // with no solver wired (v1), which no proxy can clear.
           const why = result.reason ?? "empty-content";
           const hint = result.reason === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
+          const diag = result.proxyDiagnostic ? `\ndiagnostics: ${JSON.stringify(result.proxyDiagnostic)}` : "";
           return {
             isError: true,
             content: [
               {
                 type: "text",
-                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}`,
+                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}${diag}`,
               },
             ],
           };
@@ -118,12 +128,13 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
   // MCP errors. Action verbs return the post-action snapshot so the agent sees the result.
   const drive = deps.drive;
   if (drive) {
-    const fail = (err: unknown) => ({
-      isError: true as const,
-      content: [
-        { type: "text" as const, text: `browse-gateway error: ${err instanceof Error ? err.message : String(err)}` },
-      ],
-    });
+    const fail = (err: unknown) => {
+      const base = `browse-gateway error: ${err instanceof Error ? err.message : String(err)}`;
+      // Attach structured escalation diagnostics when present so the caller sees WHY a proxied
+      // navigation failed (proxy applied? which exit? what blocked it?). Secrets-free by construction.
+      const text = err instanceof EscalationError ? `${base}\ndiagnostics: ${JSON.stringify(err.diagnostics)}` : base;
+      return { isError: true as const, content: [{ type: "text" as const, text }] };
+    };
     const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
     const snap = async (run: () => Promise<PageSnapshot>) => {
       try {
@@ -158,9 +169,15 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
         title: "Navigate the drive session",
         description:
           "Open a URL in the drive session and return a ref-annotated accessibility snapshot of the page. Starts a session if none is open.",
-        inputSchema: { url: z.string().url().describe("Absolute URL to open") },
+        inputSchema: {
+          url: z.string().url().describe("Absolute URL to open"),
+          forceProxy: z
+            .boolean()
+            .optional()
+            .describe("Skip the direct attempt and route through the residential proxy from the first request (for known-hostile hosts)"),
+        },
       },
-      async ({ url }) => snap(() => drive.navigate(url)),
+      async ({ url, forceProxy }) => snap(() => drive.navigate(url, { forceProxy })),
     );
 
     server.registerTool(

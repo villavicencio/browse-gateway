@@ -54,6 +54,21 @@ test("withSession: runs fn, releases the session, and closes the core", async ()
   assert.equal(cores[0].closed, true, "core closed on release");
 });
 
+test("openConsumerSession: diagnosticsHost installs a diagnostics-only guard, independent of the consumer allowlist (issue #21 egress probe)", async () => {
+  const { factory, cores } = makeFactory();
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "c", token: "tok", allow: ["totalwine.com"] }]) });
+  const gw = Gateway.create(config(3), factory, policy);
+  await gw.openConsumerSession("tok", undefined, { diagnostics: true });
+  const guard = cores[0].guard;
+  const nav = (host) => ({ url: `https://${host}/json`, host, resourceType: "document", isNavigationRequest: true });
+  // Restrictive consumer allowlist (totalwine.com only) — yet the diagnostics probe still reaches
+  // ipinfo.io (the bug was that the consumer guard blocked it)...
+  assert.equal(guard(nav("ipinfo.io")), "allow");
+  // ...and the probe session is constrained to ONLY that host — not even the consumer's own host.
+  assert.equal(guard(nav("totalwine.com")), "block");
+  assert.equal(guard(nav("evil.example")), "block");
+});
+
 test("withSession: releases the session even when fn throws", async () => {
   const { factory, cores } = makeFactory();
   const gateway = Gateway.create(config(2), factory);

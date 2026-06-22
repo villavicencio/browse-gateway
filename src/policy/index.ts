@@ -6,7 +6,7 @@
  */
 import type { NavigationGuard } from "../browser/index.js";
 import { isBlockedEgressHost, EGRESS_DENY_REASON } from "../security/egress.js";
-import { isHttpUrl } from "../security/url.js";
+import { isHttpUrl, canonicalizeHost } from "../security/url.js";
 import { InMemoryAuditSink } from "./audit.js";
 import type { AuditSink } from "./audit.js";
 import { ConsumerRegistry } from "./consumer.js";
@@ -32,6 +32,17 @@ export interface PolicyEngineOptions {
   /** Egress deny-filter, applied before the allowlist. Defaults to private/metadata ranges. */
   egress?: EgressFilter;
 }
+
+/**
+ * Exact hosts an INTERNAL diagnostics probe (the opt-in egress check, issue #21) may reach.
+ * Exact-match ONLY — no wildcard/subdomain rules — and POLICY-OWNED (never caller-supplied), so
+ * "diagnostics only" is enforced here, not by a caller remembering to pass a constant. The egress
+ * probe renders the first entry; extend this set deliberately. Canonicalized with `canonicalizeHost`
+ * (case + trailing-dot tolerant) NOT `normalizeHost` — the latter strips a leading `www.`, which
+ * would let `www.ipinfo.io` satisfy a literal `ipinfo.io` entry; a diagnostics host must be literal.
+ */
+export const DIAGNOSTICS_EGRESS_HOSTS: readonly string[] = ["ipinfo.io"];
+const DIAGNOSTICS_HOST_SET = new Set(DIAGNOSTICS_EGRESS_HOSTS.map((h) => canonicalizeHost(h)));
 
 export class PolicyEngine {
   readonly #registry: ConsumerRegistry;
@@ -121,6 +132,57 @@ export class PolicyEngine {
           ...(allowed ? {} : { reason: "host not in consumer allowlist" }),
         });
       }
+      return allowed ? "allow" : "block";
+    };
+  }
+
+  /**
+   * Build a navigation guard for an INTERNAL diagnostics probe (the opt-in egress check). It allows
+   * ONLY the policy-owned {@link DIAGNOSTICS_EGRESS_HOSTS} — EXACT host match, NO wildcard/subdomain
+   * rules — with the same scheme + egress-deny enforcement as a consumer guard. The host set is owned
+   * by the policy (the caller passes no host), so a caller cannot widen "diagnostics" to anything
+   * else. Independent of the consumer's allowlist: a restrictive one can't block the probe and a
+   * permissive one can't widen it. Audited under the INITIATING consumer's id with a diagnostics marker.
+   */
+  guardForDiagnostics(consumer: Consumer): NavigationGuard {
+    return (req) => {
+      if (!isHttpUrl(req.url)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: "diagnostics probe: scheme not allowed (only http/https)",
+        });
+        return "block";
+      }
+      if (this.#egress(req.host)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: `diagnostics probe: ${EGRESS_DENY_REASON}`,
+        });
+        return "block";
+      }
+      // Exact membership in the policy-owned approved set — NOT an Allowlist, so a `*` or `*.sub`
+      // rule can never apply; and via canonicalizeHost (not normalizeHost) `www.ipinfo.io` does NOT
+      // satisfy a literal `ipinfo.io` entry. Only an exact approved host is reachable.
+      const allowed = DIAGNOSTICS_HOST_SET.has(canonicalizeHost(req.host));
+      this.#audit.record({
+        ts: Date.now(),
+        consumerId: consumer.id,
+        action: "navigate",
+        decision: allowed ? "allow" : "block",
+        host: req.host,
+        url: req.url,
+        reason: allowed ? "diagnostics egress probe" : "diagnostics probe: host not in approved set",
+      });
       return allowed ? "allow" : "block";
     };
   }

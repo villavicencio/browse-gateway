@@ -8,13 +8,21 @@
  * creds come from the U4 SecretStore; the CAPTCHA solver is injected (R8).
  */
 import { randomBytes } from "node:crypto";
-import { isVisiblyBlocked, isHardBlock, MIN_CONTENT_LENGTH } from "../browser/index.js";
-import type { ProxyConfig, RenderOptions } from "../browser/index.js";
+import {
+  isVisiblyBlocked,
+  isHardBlock,
+  isCloudflareVisible,
+  isPerimeterXVisible,
+  hasCloudflareHint,
+  hasPerimeterXHint,
+  MIN_CONTENT_LENGTH,
+} from "../browser/index.js";
+import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
-import { shouldEscalateToProxy, isCloudflareBlock } from "./escalation.js";
+import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
 import { detectCaptcha } from "./captcha.js";
 import type { CaptchaSolver } from "./captcha.js";
@@ -56,16 +64,21 @@ export interface RetrieveOptions {
    * interstitial: the challenge binds to one IP and per-request rotation moves it mid-handshake.
    */
   stickySuffix?: string;
+  /** Force residential from the FIRST render (skip the direct attempt) for a known-hostile host
+   *  (issue #21). The MCP layer resolves this from the {forceProxy} option + BGW_FORCE_PROXY_HOSTS. */
+  forceProxy?: boolean;
 }
 
 /**
  * Why the final render counts as blocked — a diagnostic surfaced to the caller so a failure says
  * WHY instead of a silent "blocked": `nav-failed` (no response — off-allowlist/unreachable),
  * `captcha` (an interactive CAPTCHA widget — needs a solver, not wired in v1), `cf-challenge`
- * (a Cloudflare managed challenge), `hard-block` (4xx/5xx + thin body — IP/WAF reputation),
- * `blocked` (some other visible block phrase). `null` when not blocked.
+ * (a Cloudflare managed challenge), `perimeterx-challenge` (a PerimeterX/HUMAN "Press & Hold"
+ * behavioral interstitial — classified for diagnostics, NOT solved by the token CAPTCHA tier),
+ * `hard-block` (4xx/5xx + thin body — IP/WAF reputation), `blocked` (some other visible block
+ * phrase). `null` when not blocked.
  */
-export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "hard-block" | "blocked";
+export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "perimeterx-challenge" | "hard-block" | "blocked";
 
 export interface RetrieveResult {
   url: string;
@@ -82,6 +95,148 @@ export interface RetrieveResult {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the solver. */
   captchaSolved: boolean;
+  /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
+  proxyDiagnostic?: EscalationDiagnostics;
+}
+
+/**
+ * The reduced signal surface block classification reads: title + visible text + final status + the
+ * HTML-derived vendor hints carried as booleans. retrieve passes hints computed from the full render
+ * HTML; drive passes the booleans its {@link PageSnapshot} already carries (cfHint/pxHint) — so both
+ * paths classify a block identically on one shared surface (the drive↔retrieve detection-parity
+ * invariant).
+ */
+export interface BlockSignal {
+  title: string;
+  text: string;
+  status: number | null;
+  cfHint?: boolean;
+  pxHint?: boolean;
+}
+
+/**
+ * Classify WHY a page is blocked, most-actionable-first, or `null` when it is not blocked. The
+ * single source of truth for vendor/hard-block attribution shared by retrieve and drive.
+ * Interactive-CAPTCHA-widget detection is NOT covered here (it needs raw HTML + sitekey — that stays
+ * in retrieve's {@link detectCaptcha}).
+ */
+export function classifyBlock(sig: BlockSignal): BlockReason | null {
+  const blocked = sig.status === null || isVisiblyBlocked(sig) || isHardBlock(sig, sig.status);
+  if (!blocked) return null;
+  if (sig.status === null) return "nav-failed";
+  if (isCloudflareVisible(sig) || sig.cfHint === true) return "cf-challenge";
+  if (isPerimeterXVisible(sig) || sig.pxHint === true) return "perimeterx-challenge";
+  if (isHardBlock(sig, sig.status)) return "hard-block";
+  return "blocked";
+}
+
+/**
+ * Structured diagnostics for a proxy-escalation outcome — caller-visible (issue #21) so a failure
+ * says WHY (was the proxy applied? which exit? what blocked it?) instead of an opaque "last
+ * status=403". Secrets-free BY CONSTRUCTION: no credentials, no proxy host — only booleans, a count,
+ * a status, a {@link BlockReason}, and (opt-in, U4) an ASN/org verdict.
+ */
+export interface EscalationDiagnostics {
+  /** A residential proxy is configured in the secret store. */
+  proxyConfigured: boolean;
+  /** A proxied exit was actually opened/used for this navigation (vs direct-only). */
+  proxyApplied: boolean;
+  /** The proxied path was forced from the first request (force-proxy host/option), not reached via escalation. */
+  forced: boolean;
+  /** Proxied attempts made (0 when the proxy was never engaged). */
+  attempts: number;
+  /** HTTP status of the last (failed) navigation, or null when none was captured. */
+  lastStatus: number | null;
+  /** Vendor/hard-block classification of the last failed page; null when it was not blocked. */
+  reason: BlockReason | null;
+  /** Residential-vs-datacenter exit verification (opt-in egress probe, U4); absent unless requested. */
+  exitCheck?: EgressCheck;
+}
+
+/** Build {@link EscalationDiagnostics} from the escalation tally and the last failed signal. */
+export function escalationDiagnostics(opts: {
+  proxyConfigured: boolean;
+  proxyApplied: boolean;
+  forced: boolean;
+  attempts: number;
+  last: BlockSignal | null;
+  exitCheck?: EscalationDiagnostics["exitCheck"];
+}): EscalationDiagnostics {
+  return {
+    proxyConfigured: opts.proxyConfigured,
+    proxyApplied: opts.proxyApplied,
+    forced: opts.forced,
+    attempts: opts.attempts,
+    lastStatus: opts.last?.status ?? null,
+    reason: opts.last ? classifyBlock(opts.last) : null,
+    ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
+  };
+}
+
+/**
+ * A proxy-escalation failure carrying structured {@link EscalationDiagnostics} for the MCP caller.
+ * Thrown on the drive path; the diagnostics survive to the MCP `fail()` surface because the throw is
+ * outside the controller's `#run` redaction re-wrap, and the message itself carries no secret material.
+ */
+export class EscalationError extends Error {
+  readonly diagnostics: EscalationDiagnostics;
+  constructor(message: string, diagnostics: EscalationDiagnostics) {
+    super(message);
+    this.name = "EscalationError";
+    this.diagnostics = diagnostics;
+  }
+}
+
+/** Result of the opt-in egress-verification probe (U4): did the proxy give a residential exit? */
+export interface EgressCheck {
+  kind: "datacenter" | "residential" | "unknown";
+  /** The exit's ASN/org string, when the probe could read it (sanitized — a public org name). */
+  org?: string;
+}
+
+/**
+ * ASN/org name fragments that mark a DATACENTER/hosting exit (not residential). Curated, not
+ * exhaustive — an org that matches none but is present is treated as residential; an absent org is
+ * unknown. Used only for the opt-in diagnostic verdict, never to gate behavior.
+ */
+const DATACENTER_ORG_PATTERNS: readonly RegExp[] = [
+  /hetzner/i,
+  /amazon|aws/i,
+  /google|gcp/i,
+  /microsoft|azure/i,
+  /digitalocean/i,
+  /linode/i,
+  /vultr|choopa/i,
+  /\bovh\b/i,
+  /contabo/i,
+  /oracle/i,
+  /leaseweb/i,
+  /scaleway/i,
+  /m247/i,
+  /cloudflare/i,
+  /akamai/i,
+  /fastly/i,
+  /\bdata\s*cent(?:er|re)\b/i,
+  /hosting/i,
+  /\bcolo\b/i,
+  /\bvps\b/i,
+];
+
+/**
+ * Classify an exit by its ASN/org string: a known datacenter/hosting org → "datacenter"; a present
+ * org with no datacenter match → "residential"; absent/empty → "unknown". Pure.
+ */
+export function classifyExitOrg(org: string | undefined): EgressCheck["kind"] {
+  if (!org || !org.trim()) return "unknown";
+  return DATACENTER_ORG_PATTERNS.some((re) => re.test(org)) ? "datacenter" : "residential";
+}
+
+/**
+ * Extract the `org` field from an ip-info JSON body (e.g. ipinfo.io/json) — regex, not JSON.parse, so
+ * it survives the body being wrapped in a browser JSON-viewer's HTML. Returns undefined when absent.
+ */
+export function parseExitOrg(body: string): string | undefined {
+  return body.match(/"org"\s*:\s*"([^"]*)"/)?.[1] || undefined;
 }
 
 /** Assemble a ProxyConfig from BYO secrets, or undefined when no proxy is configured. */
@@ -106,7 +261,9 @@ export function proxyFromSecrets(secrets: SecretStore): ProxyConfig | undefined 
 export function mintStickyProxy(
   proxy: ProxyConfig,
   suffixTemplate: string | undefined,
-  id: string = randomBytes(8).toString("hex"),
+  // 4 bytes → 8 hex chars: IPRoyal requires the `_session-` value be PRECISELY 8 alphanumeric
+  // (verified against IPRoyal's rotation docs); a 16-char id is out of spec and may be truncated/ignored.
+  id: string = randomBytes(4).toString("hex"),
 ): ProxyConfig {
   if (!suffixTemplate || !proxy.password) return proxy;
   return { ...proxy, password: proxy.password + suffixTemplate.replaceAll("{id}", id) };
@@ -153,9 +310,22 @@ export async function retrieve(
 
   let captchaSolved = false;
   let proxyUsed = false;
+  let proxyAttempts = 0;
 
-  // 1) Direct render through an authenticated, allowlist-guarded session.
-  let render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+  // force-proxy (issue #21): skip the direct attempt and go residential from the FIRST render for a
+  // known-hostile host. Only honored when a proxy is available (configured + datacenter IP); else it
+  // degrades to direct — retrieve is best-effort (the interactive drive path fails loud instead).
+  const forced = (opts.forceProxy ?? false) && Boolean(proxy) && escalation.onDatacenterIp;
+  const proxiedRenderOpts: RenderOptions = {
+    ...renderOpts,
+    clearanceTimeoutMs: opts.clearanceTimeoutMs ?? PROXY_CLEARANCE_TIMEOUT_MS,
+  };
+
+  // 1) Direct render through an authenticated, allowlist-guarded session — skipped when forcing proxy.
+  let render: RenderResult | undefined;
+  if (!forced) {
+    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+  }
 
   // 2) CAPTCHA hook (retrieve path) — detect a widget for the block-reason diagnostic. Full
   //    solve→inject→resume now lives in the browser core's DRIVE path (`#trySolveCaptcha`), which
@@ -164,10 +334,12 @@ export async function retrieve(
   //    stay that way: wiring one here would spend (and bill) a solve with no effect on the page.
   //    `captchaSolved` therefore stays false in production. (Removing `opts.solver` + `captchaSolved`
   //    outright is a follow-up — it changes retrieve's result contract + the mcp surface.)
-  const captcha = detectCaptcha(render, url);
-  if (captcha && opts.solver) {
-    await opts.solver.solve(captcha);
-    captchaSolved = true;
+  if (render && opts.solver) {
+    const captcha = detectCaptcha(render, url);
+    if (captcha) {
+      await opts.solver.solve(captcha);
+      captchaSolved = true;
+    }
   }
 
   // 3) Scoped proxy escalation — a CF managed challenge OR a hard IP/WAF-reputation block
@@ -178,13 +350,10 @@ export async function retrieve(
   //    still rotates past dead/slow/dirty exits (see PROXY_MAX_ATTEMPTS note above). The clearance
   //    budget is raised on proxied attempts: an interstitial clears in ~22s on a held exit, over
   //    the 20s default (probe, 2026-06-09).
-  if (proxy && shouldEscalateToProxy(render, render.status, escalation)) {
+  if (proxy && (forced || (render !== undefined && shouldEscalateToProxy(render, render.status, escalation)))) {
     proxyUsed = true;
-    const proxiedRenderOpts: RenderOptions = {
-      ...renderOpts,
-      clearanceTimeoutMs: opts.clearanceTimeoutMs ?? PROXY_CLEARANCE_TIMEOUT_MS,
-    };
     for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
+      proxyAttempts = attempt;
       render = await gateway.withConsumerSession(
         token,
         (s) => s.core.render(url, proxiedRenderOpts),
@@ -198,6 +367,11 @@ export async function retrieve(
     }
   }
 
+  // render is assigned by here: non-forced did a direct render; forced implies a proxy so it ran >=1
+  // proxied attempt. This guard satisfies the type-checker and the impossible forced-without-proxy case.
+  if (render === undefined) {
+    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+  }
   const extraction = extractMarkdown(render.html, url);
   // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, or a hard
   // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy
@@ -215,11 +389,30 @@ export async function retrieve(
       ? "nav-failed"
       : detectCaptcha(render, url)
         ? "captcha"
-        : isCloudflareBlock(render)
-          ? "cf-challenge"
-          : isHardBlock(render, render.status)
-            ? "hard-block"
-            : "blocked";
+        : classifyBlock({
+            title: render.title,
+            text: render.text,
+            status: render.status,
+            cfHint: hasCloudflareHint(render.html),
+            pxHint: hasPerimeterXHint(render.html),
+          });
+  // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
+  // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
+  const proxyDiagnostic = proxyUsed
+    ? escalationDiagnostics({
+        proxyConfigured: Boolean(proxy),
+        proxyApplied: true,
+        forced,
+        attempts: proxyAttempts,
+        last: {
+          title: render.title,
+          text: render.text,
+          status: render.status,
+          cfHint: hasCloudflareHint(render.html),
+          pxHint: hasPerimeterXHint(render.html),
+        },
+      })
+    : undefined;
   return {
     url,
     status: render.status,
@@ -230,5 +423,6 @@ export async function retrieve(
     reason,
     proxyUsed,
     captchaSolved,
+    ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
   };
 }

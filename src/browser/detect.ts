@@ -23,6 +23,17 @@ export const CF_BLOCK_PHRASES: readonly RegExp[] = [
 ];
 
 /**
+ * PerimeterX (HUMAN Security) visible challenge phrases — the "Press & Hold" behavioral
+ * interstitial that Total Wine and similar retail WAFs serve. Single source of truth for PX
+ * visible signatures, mirroring {@link CF_BLOCK_PHRASES}. Classification/diagnostics only: the
+ * press-and-hold challenge is behavioral and NOT cleared by the token-CAPTCHA solver (issue #21).
+ * Deliberately NOT folded into {@link BLOCK_PHRASES} — these drive vendor ATTRIBUTION
+ * ({@link isPerimeterXVisible}) for an already-blocked page (PX serves a 403+thin hard block), not
+ * the blocked decision, so legit "press and hold" copy can't false-positive a real page as blocked.
+ */
+export const PX_BLOCK_PHRASES: readonly RegExp[] = [/press\s*(?:and|&)\s*hold/i, /human security/i];
+
+/**
  * Visible challenge/block phrases — matched against page TITLE + visible TEXT only.
  * These appear on an actual interstitial/block page and disappear once it clears.
  */
@@ -40,6 +51,16 @@ export const BLOCK_PHRASES: readonly RegExp[] = [
 /** Cloudflare challenge scripts/cookies in HTML. Source of truth shared with escalation. */
 export const CF_VENDOR_HINTS: readonly RegExp[] = [/cf-chl/i, /challenge-platform/i, /cf_chl_opt/i];
 
+/** PerimeterX (HUMAN) scripts/cookies in HTML — distinctive PX markers (cookie family + CDN hosts). */
+export const PX_VENDOR_HINTS: readonly RegExp[] = [
+  /perimeterx/i,
+  /px-captcha/i,
+  /captcha\.px-cdn/i,
+  /px-cloud\.net/i,
+  /_pxhd/i,
+  /\b_px3\b/i,
+];
+
 /**
  * Vendor protection scripts/cookies/hosts that persist in page HTML even AFTER a challenge
  * clears. DIAGNOSTIC ONLY — never used to decide "blocked" (that's what caused false
@@ -47,6 +68,7 @@ export const CF_VENDOR_HINTS: readonly RegExp[] = [/cf-chl/i, /challenge-platfor
  */
 export const VENDOR_SCRIPT_HINTS: readonly RegExp[] = [
   ...CF_VENDOR_HINTS,
+  ...PX_VENDOR_HINTS,
   /geo\.captcha-delivery\.com/i,
   /captcha-delivery/i,
   /datadome/i,
@@ -114,6 +136,25 @@ export function isCloudflareVisible(signal: Pick<PageSignal, "title" | "text">):
  */
 export function hasCloudflareHint(html: string): boolean {
   return CF_VENDOR_HINTS.some((re) => re.test(html));
+}
+
+/**
+ * True when a *PerimeterX-specific* visible challenge phrase ("Press & Hold", HUMAN Security) is
+ * present (title + visible text) — the PX sibling of {@link isCloudflareVisible}. Classification
+ * only: PX press-and-hold is behavioral and not cleared by the token-CAPTCHA solver.
+ */
+export function isPerimeterXVisible(signal: Pick<PageSignal, "title" | "text">): boolean {
+  const haystack = `${signal.title}\n${signal.text}`;
+  return PX_BLOCK_PHRASES.some((re) => re.test(haystack));
+}
+
+/**
+ * True when the page HTML carries a PerimeterX script/cookie marker — the HTML sibling of
+ * {@link hasCloudflareHint}, surfaced as a scrubbed boolean (`pxHint`) so a drive
+ * {@link PageSnapshot} can carry the PX signal without raw HTML.
+ */
+export function hasPerimeterXHint(html: string): boolean {
+  return PX_VENDOR_HINTS.some((re) => re.test(html));
 }
 
 /**

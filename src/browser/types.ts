@@ -107,6 +107,12 @@ export interface PageSnapshot {
    * escalation recognize a CF interstitial that shows no visible CF phrase, matching retrieve.
    */
   cfHint?: boolean;
+  /**
+   * Scrubbed PerimeterX-hint flag: `true` when the page's HTML carried a PerimeterX/HUMAN marker
+   * (`_pxhd`, `perimeterx`, `px-captcha` etc.). The PX sibling of {@link cfHint}, surfaced as a
+   * boolean so the drive layer can classify a PerimeterX block without carrying page content.
+   */
+  pxHint?: boolean;
 }
 
 export type NavigationDecision = "allow" | "block";
