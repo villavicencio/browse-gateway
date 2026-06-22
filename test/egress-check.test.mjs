@@ -56,7 +56,7 @@ function makeProxyGateway(sessionNavLists, exitOrgJson) {
   const opened = [];
   const gateway = {
     sessions: { get: (h) => open.get(h) },
-    async openConsumerSession(_token, overrides) {
+    async openConsumerSession(_token, overrides, opts) {
       si += 1;
       const navs = sessionNavLists[Math.min(si, sessionNavLists.length - 1)] ?? [{}];
       let ni = 0;
@@ -77,7 +77,7 @@ function makeProxyGateway(sessionNavLists, exitOrgJson) {
           },
         },
       });
-      opened.push({ id, overrides });
+      opened.push({ id, overrides, opts });
       return id;
     },
     async useConsumerSession(_token, handle, fn) {
@@ -93,7 +93,7 @@ function makeProxyGateway(sessionNavLists, exitOrgJson) {
 }
 
 test("drive: with verifyEgress on, an exhausted escalation attaches a classified exitCheck", async () => {
-  const { gateway } = makeProxyGateway([[THIN_403], [THIN_403]], '{"ip":"5.78.127.182","org":"AS24940 Hetzner Online GmbH"}');
+  const { gateway, opened } = makeProxyGateway([[THIN_403], [THIN_403]], '{"ip":"5.78.127.182","org":"AS24940 Hetzner Online GmbH"}');
   const drive = new GatewayDriveController(gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pw" })), "tok", {
     onDatacenterIp: true,
     verifyEgress: true,
@@ -104,6 +104,9 @@ test("drive: with verifyEgress on, an exhausted escalation attaches a classified
     assert.match(err.diagnostics.exitCheck?.org ?? "", /Hetzner/);
     return true;
   });
+  // The probe opened a CONSTRAINED diagnostics session (guarded to the ip-info host only), not a
+  // normal consumer-allowlist session — so a restrictive allowlist can't block egress verification.
+  assert.ok(opened.some((o) => o.opts?.diagnosticsHost === "ipinfo.io"), "probe used the diagnostics-host path");
 });
 
 test("drive: with verifyEgress OFF (default), no exitCheck is attached (no extra proxied probe)", async () => {

@@ -33,6 +33,8 @@ import type { DriveController } from "./server.js";
 
 /** Opt-in egress-verification probe target — a plain ip-info JSON endpoint (U4). */
 const EXIT_INFO_URL = "https://ipinfo.io/json";
+/** Host of {@link EXIT_INFO_URL} — the ONLY host the egress probe's constrained guard permits. */
+const DIAGNOSTICS_EGRESS_HOST = "ipinfo.io";
 
 export class GatewayDriveController implements DriveController {
   #handle?: string;
@@ -117,15 +119,22 @@ export class GatewayDriveController implements DriveController {
   async #verifyEgress(): Promise<EgressCheck> {
     const override = this.#resolveProxyOverride();
     if (!override) return { kind: "unknown" };
+    // A dedicated, constrained probe session: guarded to the diagnostics host ONLY (not the
+    // consumer's allowlist), so a restrictive allowlist can't block egress verification and the probe
+    // can reach nothing but the ip-info endpoint. Its own handle (the controller's session was already
+    // discarded by the exhausted escalation loop), always closed. Any failure → unknown, never masks.
+    let handle: string | undefined;
     try {
-      await this.#openSession(override);
-      const render = await this.#run((s) => s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }));
+      handle = await this.#gateway.openConsumerSession(this.#token, override, { diagnosticsHost: DIAGNOSTICS_EGRESS_HOST });
+      const render = await this.#gateway.useConsumerSession(this.#token, handle, (s) =>
+        s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
+      );
       const org = parseExitOrg(render.html);
       return { kind: classifyExitOrg(org), ...(org ? { org } : {}) };
     } catch {
       return { kind: "unknown" };
     } finally {
-      await this.#discardSession();
+      if (handle) await this.#gateway.closeConsumerSession(this.#token, handle).catch(() => {});
     }
   }
 

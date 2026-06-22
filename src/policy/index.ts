@@ -11,6 +11,7 @@ import { InMemoryAuditSink } from "./audit.js";
 import type { AuditSink } from "./audit.js";
 import { ConsumerRegistry } from "./consumer.js";
 import type { Consumer } from "./consumer.js";
+import { Allowlist } from "./allowlist.js";
 
 /** Returns true when a host must be blocked for egress reasons (private/metadata ranges). */
 export type EgressFilter = (host: string) => boolean;
@@ -121,6 +122,54 @@ export class PolicyEngine {
           ...(allowed ? {} : { reason: "host not in consumer allowlist" }),
         });
       }
+      return allowed ? "allow" : "block";
+    };
+  }
+
+  /**
+   * Build a navigation guard for an INTERNAL diagnostics probe (e.g. the opt-in egress check): allow
+   * ONLY the approved diagnostics host, with the same scheme + egress-deny enforcement as a consumer
+   * guard. Deliberately independent of any consumer allowlist — a restrictive consumer allowlist must
+   * not be able to BLOCK a service-internal probe (the bug this fixes), nor a permissive one widen it.
+   * The probe session is constrained to exactly this host and nothing else. Audited as "diagnostics".
+   */
+  guardForDiagnostics(host: string): NavigationGuard {
+    const allow = new Allowlist([host]);
+    return (req) => {
+      if (!isHttpUrl(req.url)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: "diagnostics",
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: "scheme not allowed (only http/https)",
+        });
+        return "block";
+      }
+      if (this.#egress(req.host)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: "diagnostics",
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: EGRESS_DENY_REASON,
+        });
+        return "block";
+      }
+      const allowed = allow.allows(req.host);
+      this.#audit.record({
+        ts: Date.now(),
+        consumerId: "diagnostics",
+        action: "navigate",
+        decision: allowed ? "allow" : "block",
+        host: req.host,
+        url: req.url,
+        ...(allowed ? {} : { reason: "diagnostics probe: host not the approved diagnostics host" }),
+      });
       return allowed ? "allow" : "block";
     };
   }

@@ -161,6 +161,25 @@ test("guardFor: allows allowlisted host, blocks others, audits both", () => {
   assert.ok(a.some((r) => r.action === "navigate" && r.decision === "block" && r.host === "evil.com"));
 });
 
+test("guardForDiagnostics: allows ONLY the diagnostics host; egress + scheme still enforced; allowlist-independent", () => {
+  const audit = new InMemoryAuditSink();
+  // No consumer needed — the diagnostics guard is independent of any consumer allowlist by design.
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([]), audit });
+  const guard = policy.guardForDiagnostics("ipinfo.io");
+  assert.equal(guard(nav("ipinfo.io")), "allow");
+  assert.equal(guard(nav("totalwine.com")), "block", "the probe reaches nothing but the approved host");
+  assert.equal(guard(nav("evil.example")), "block");
+  assert.equal(guard(nav("169.254.169.254")), "block", "egress deny still wins");
+  assert.equal(
+    guard({ url: "file:///etc/passwd", host: "", resourceType: "document", isNavigationRequest: true }),
+    "block",
+    "non-http scheme still blocked",
+  );
+  const d = audit.records.filter((r) => r.consumerId === "diagnostics");
+  assert.ok(d.some((r) => r.decision === "allow" && r.host === "ipinfo.io"));
+  assert.ok(d.some((r) => r.decision === "block" && r.host === "totalwine.com"));
+});
+
 test("guardFor: allowed subresources are not audited (signal-dense trail)", () => {
   const audit = new InMemoryAuditSink();
   const policy = new PolicyEngine({

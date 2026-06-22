@@ -105,12 +105,22 @@ export class Gateway {
    * drives it via {@link useConsumerSession} and ends it with {@link closeConsumerSession}. The guard
    * is installed before the handle is returned, so the session is never drivable while unguarded.
    */
-  async openConsumerSession(token: string, coreOverrides?: BrowserCoreOptions): Promise<string> {
+  async openConsumerSession(
+    token: string,
+    coreOverrides?: BrowserCoreOptions,
+    opts?: { diagnosticsHost?: string },
+  ): Promise<string> {
     const policy = this.#requirePolicy();
     const consumer = policy.authenticate(token);
     const session = await this.#sessions.acquire(coreOverrides, { consumerId: consumer.id });
     try {
-      await session.core.setNavigationGuard(policy.guardFor(consumer));
+      // A diagnostics probe (e.g. the opt-in egress check) is guarded to the approved diagnostics
+      // host ONLY — never the consumer's allowlist — so a restrictive consumer allowlist can't block
+      // a service-internal probe, and the probe session can reach nothing else.
+      const guard = opts?.diagnosticsHost
+        ? policy.guardForDiagnostics(opts.diagnosticsHost)
+        : policy.guardFor(consumer);
+      await session.core.setNavigationGuard(guard);
     } catch (err) {
       await this.#sessions.release(session.id); // never leave a half-open, unguarded session
       throw err;
