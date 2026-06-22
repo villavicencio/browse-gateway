@@ -1,84 +1,111 @@
-# HANDOFF — 2026-06-21, late evening
+# HANDOFF — 2026-06-22
 
-Long session spanning fleet ops → product strategy → a full feature build → merge. Started from a
-`/pickup`, cleared the carried-over name-leak scrub, re-registered the **Vault** consumer's MCP,
-onboarded a third consumer (**Argus**, the agents project), reframed the product strategy, then
-designed, built, reviewed (3 rounds), and **merged issue #21** (proxy-escalation diagnostics +
-force-proxy). Everything is merged and pushed — `main` is in sync with origin, no open PRs.
-
-> Fleet detail (real consumer ids, prod host, paths, exact resume commands) stays in agent memory +
-> gitignored `*.local.md` — never this file (PUBLIC repo). "Vault" / "Argus" are public-safe consumer
-> codenames; "Obscura" is the CLI brand.
+Session began with a `/pickup` (post-#21) and the question "can we hit Total Wine now?" Probing the
+PerimeterX-gated Total Wine product page through the gateway exposed a detection false-negative,
+which we fixed across **two PRs (#24, #25)**, deployed to prod, and then hardened through a P1 code
+review. Along the way we discovered prod had **never been deployed since 2026-06-10** (so #21 only
+went live this session), and we wrote a spike plan for actually *defeating* the press-&-hold. The
+gateway now correctly **classifies** PerimeterX with diagnostics; it still does not **clear** it.
 
 ## What We Built
 
-- **Issue #21 — proxy-escalation diagnostics + force-proxy: MERGED** (#22 `2b546fe` then #23 `4b7ce50`,
-  squash-merged; 5 units, 302 tests).
-  - **U2** — IPRoyal sticky `_session-` id 16→8 hex (`randomBytes(4)`), correcting a spec violation.
-  - **U1** — shared `classifyBlock` vendor classifier (`src/browser/detect.ts`) + **PerimeterX**
-    recognition (`pxHint` mirrors `cfHint`; new `perimeterx-challenge` `BlockReason`).
-  - **U3** — structured `EscalationDiagnostics` surfaced to the MCP caller (drive throws
-    `EscalationError`, retrieve returns `proxyDiagnostic`); secrets-free by construction + redaction test.
-  - **U5** — force-proxy: env **`BGW_FORCE_PROXY_HOSTS`** + per-call `{forceProxy}` MCP option; drive
-    fails loud when forced without a proxy.
-  - **U4** — opt-in egress probe: env **`BGW_DIAG_VERIFY_EGRESS=1`**, classifies the exit
-    residential-vs-datacenter via an ip-info ASN/org lookup.
-  - **#22 companion** — fleet-hygiene guard fix (excluded the public "vault" codename from the guard).
-  - Plan: `docs/plans/2026-06-21-001-fix-drive-proxy-diagnostics-force-proxy-plan.local.md`.
-- **Onboarded Argus (3rd consumer = the agents project).** Bumped prod `BGW_MAX_SESSIONS` 5→7,
-  `obscura keys new argus --apply` (✓ healthy), `obscura connect` from the agents project. Roster:
-  **atlas, vault, argus**.
-- **Re-registered Vault's MCP** — `obscura connect` updated it to the post-rename token (✓ healthy).
-- **Scrubbed the remote name leak** — force-pushed clean `main` over the leaked tip.
-- **Strategy reframed** (agent memory): the gateway is **internal back-office infra for the operator's
-  own future ventures**, not a product sold to outsiders.
+- **PR #24 (`4aacb66`) — PX 200-challenge detection, first pass. MERGED + DEPLOYED.**
+  `isPerimeterXChallenge(signal, pxHint)` = `pxHint && thin render.text`. Closed the case where a 200
+  PX challenge left the top document empty. Files: `src/browser/detect.ts`, `src/browser/index.ts`,
+  `src/verbs/retrieve.ts` (classifyBlock gate + blocked decision + proxy retry-break).
+- **PR #25 (`b1316ae`) — completed the detection. MERGED + DEPLOYED; reviewer signed off.**
+  - `hasPerimeterXChallengeCopy(html)` — matches the press-&-hold copy in page source, **decoding
+    `&amp;` first** ("Press & Hold" serializes as "Press &amp; Hold" in outerHTML).
+  - **Child-frame capture (the P1 fix):** `patchright-core.ts` `snapshot()` now walks `page.frames()`
+    and concatenates each child's `content()` into a new **`frameHtml`** field on `PageSignal` +
+    `RenderResult` — **gated on `hasPerimeterXHint(top html)`** so ordinary pages with ad iframes
+    don't pay the walk. Needed because `render.html` = `page.content()` = **top frame only**.
+  - `retrieve.ts` `hasPxChallengeCopy(render)` reads `render.html` **and** `render.frameHtml`;
+    used in the blocked decision + retry-break. `pxCopy` added to `BlockSignal`.
+  - **`scripts/validate-frame-capture.mjs`** (+ `npm run validate:frame-capture`) — real-browser proof
+    with a cross-origin `data:` child frame. 5/5 PASS.
+  - Tests: `test/retrieve.test.mjs` (top-document interstitial + iframe-only-in-`frameHtml` cases),
+    `test/block-classifier.test.mjs`. **312 unit tests green.**
+- **Solution doc:** `docs/solutions/integration-issues/perimeterx-200-iframe-challenge-false-negative.md`
+  (root cause + both follow-ups + the `page.content()`-is-top-frame-only lesson).
+- **Spike plan (gitignored):** `docs/plans/2026-06-22-001-spike-defeat-perimeterx-press-hold.local.md`
+  — Track A avoidance / Track B gesture / Track C solver, strategy gate, architecture decisions.
+- **Deployed to prod 3×** this session via `deploy-http.yml` (`-f image_tag=latest`): #24, then #25
+  (twice — the P1 fix re-deployed). Re-probe confirms `retrieve` + `drive` both return
+  `reason=perimeterx-challenge` + structured `proxyDiagnostic`.
+- **Throwaway probes (gitignored):** `scripts/probe-totalwine-gateway.local.mjs`,
+  `scripts/probe-totalwine-200-chase.local.mjs` — keep for post-deploy re-verification.
 
 ## Decisions Made
 
-- **PerimeterX is CLASSIFIED, not CLEARED.** Total Wine's root cause is PerimeterX press-and-hold
-  (behavioral) — the token CAPTCHA tier can't solve it. #21 makes the failure legible + steerable;
-  defeating PX is a **separate spike**.
-- **Egress probe = a policy-approved diagnostics guard** (evolved across 3 review rounds): the
-  approved host set is **policy-owned** (`DIAGNOSTICS_EGRESS_HOSTS`, `src/policy/index.ts`), the
-  Gateway API exposes only a `{ diagnostics: true }` boolean (no caller-supplied host), matching is
-  **exact via `canonicalizeHost`** (no wildcard, no subdomain, no `www`-collapse), and probe
-  navigations are audited under the **initiating consumer**.
-- **Guard fix shipped as its own PR (#22)**, kept out of the feature PR per the operator's earlier call.
-- **IPRoyal sticky id = 8 hex chars** — the documented "precisely 8 alphanumeric" spec; placement on
-  the password was already correct.
+- **Detection keys on the challenge COPY in the page source** (top-doc HTML **+** child-frame HTML),
+  gated by `pxHint`. NOT `pxHint` alone (the `px-captcha` marker persists on a *cleared* page — a
+  cleared Total Wine page has a dormant `px-captcha-modal` iframe). NOT `render.text` alone (it is
+  top-document `innerText` only — iframe-served copy never reaches it).
+- **Child-frame walk is gated on a top-doc PX marker** for performance — verified Playwright reads a
+  **cross-origin** frame's `content()` (per-frame over CDP, not same-origin in-page JS).
+- **PX-defeat = avoidance-first.** Track A (warm-up nav homepage→category→target + session/cookie
+  persistence + IP hygiene + fingerprint coherence). Track B (gesture automation) is gated on an
+  **`isTrusted=false` kill-test** (browser-enforced; Patchright can't forge synthetic-input trust) +
+  a venture need. Track C (commercial solvers) **ruled out** — CapSolver PX "Coming Soon", 2Captcha
+  unavailable, no portable token API, `_px3` expires ~60s.
+- **Strategy gate:** defeating PX is **substrate-polish unless venture-pulled** — stop after Track A
+  if exploratory.
+- **Architecture:** gesture automation would need a **new policy-gated internal primitive below the
+  verb layer**, NOT raw input/CDP exposed to consumers (preserves the single-policy invariant).
+- **Standing workflow pref (saved to memory):** every external code-review round, after addressing
+  findings, `pbcopy` a paste-ready reviewer reply (finding → fix+sha → verification → carry-overs →
+  "please re-review") until the reviewer is satisfied.
 
 ## What Didn't Work
 
-- **`keys new argus --apply` would have crash-looped the gateway** (3rd consumer trips the
-  `consumers·perConsumerMax+1` boot floor above `BGW_MAX_SESSIONS=5`). Avoided by bumping
-  `BGW_MAX_SESSIONS` 5→7 *first*, then minting.
-- **Caller-supplied diagnostics host (P2)** — `guardForDiagnostics("*")` would have blanket-bypassed
-  the allowlist. Replaced with a policy-owned exact set + boolean flag.
-- **`normalizeHost` for the diagnostics match (P3)** — it strips a leading `www.`, so `www.ipinfo.io`
-  satisfied a literal `ipinfo.io`. Switched to `canonicalizeHost`.
+- **#24's thin-content-only test was incomplete** — missed the *boundary-length* 200 (top-doc
+  innerText just over the 200-char bar). A live 200-chase caught it still returning as content. → #25.
+- **#25's first pass (`hasPerimeterXChallengeCopy(render.html)`) was ALSO incomplete (P1 review):**
+  `render.html` = `page.content()` = top frame only, so a challenge whose copy stays inside the
+  `px-captcha-modal` child frame was still a false negative; the test put the phrase in a top-level
+  `<div>`. → child-frame capture (`frameHtml`).
+- **HTML entity gotcha:** "Press & Hold" → "Press &amp; Hold" in `outerHTML` defeats a literal
+  `/press\s*&\s*hold/` — `hasPerimeterXChallengeCopy` decodes `&amp;` first.
+- **Browserbase remote unusable** on the current API key — proxies + verified/advanced-stealth are
+  gated to paid plans (402/403). Used **local Chrome** (residential IP) for recon instead.
 
 ## What's Next
 
-1. **Deferred #21 follow-ups:** the PerimeterX-defeat spike (gesture automation / fingerprint
-   coherence); the audit-log `diagnostics` field; a per-call `{verifyEgress}` MCP option + a
+1. **PX-defeat spike, Track A** (the plan's recommended first step): build warm-up navigation +
+   session/cookie persistence, then **measure the challenge-rate delta** on Total Wine through the
+   gateway. That number decides whether Track B (gesture automation) is ever needed. Gated on the
+   strategy decision (is this venture-pulled?).
+2. **Drive-path frame-capture follow-up:** drive builds its own `PageSnapshot` (ariaSnapshot), not
+   `render`/`snapshot`, so it does NOT get `frameHtml` — a fat-iframe-200 on the *drive* path still
+   slips. Explicitly out of #25's retrieve-focused scope; the tracked gap.
+3. **Cookie/session-state vault** (operator question this session): persistent per-consumer browser
+   context (cookies + store-selection + logins), encrypted at rest, R9-redacted, per-consumer
+   isolated. Scoped in the spike plan §7; overlaps Track A2. Not built.
+4. **Deferred #21 follow-ups:** audit-log `diagnostics` field; per-call `{verifyEgress}` option +
    retrieve-path egress probe.
-2. **Operator-only — IPRoyal monthly → PAYG** (dashboard). Non-breaking for the gateway: fund the PAYG
-   balance before cancelling to avoid a traffic gap, then re-verify the 3 `BGW_PROXY_*` creds.
-3. **Pool-sizing for many-consumer onboarding:** if wiring up several more CC projects, switch
-   `perConsumerMax` 2→1 + `maxSessions` 8 once (supports ~7 consumers under the ~4 GB OOM-safe ceiling)
-   rather than bumping `maxSessions` per consumer. At `perConsumerMax=2`, a 4th consumer needs floor 9.
-4. **Strategy threads:** sketch **venture #1** (the general-contractor idea) to pull real gateway
-   requirements; the Obscura **TUI** design session (operator-gated — do not start unprompted).
+5. **Operator-only:** IPRoyal monthly → PAYG (fund before cancelling; re-verify the 3 `BGW_PROXY_*`).
 
 ## Gotchas & Watch-outs
 
-- **`BGW_MAX_SESSIONS=7`** (floor exactly met at 3 consumers). A 4th consumer crosses the floor — bump
-  it (or drop `perConsumerMax`) in the same change, or the boot guard crash-loops every consumer.
-- **New env vars** (safe defaults / off): `BGW_FORCE_PROXY_HOSTS` (comma host-suffix list),
-  `BGW_DIAG_VERIFY_EGRESS=1` (opt-in egress probe — one extra proxied request per failure).
-- **Agent can't push `main`** (auto-mode classifier) — the operator pushes / merges.
-- **Drive live-gate validator is flaky** on its idle-reaper check (baseline, pre-existing — noted by
-  the reviewer; not caused by the #21 work).
-- **Coded language in force:** "vault" / "argus" are public codenames; real ids + paths live only in
-  agent memory + `*.local.md`.
+- **⚠️ ROTATE the Browserbase API key** — its value was echoed to the session transcript twice while
+  grepping env / `~/.claude.json`. It wasn't exfiltrated, but it's in transcript history. (browserbase.com/settings)
+- **Prod was pre-#21 until this session.** The `deploy-http` workflow had no successful run between
+  2026-06-10 and today, so this session shipped #21 + #24 + #25 to prod for the *first* time.
+  `keys new --apply` restarts with the *existing* image (no GHCR pull), so consumer onboarding never
+  deployed code. Mental-model correction vs. prior handoffs that treated #21 as live.
+- **The `:8080` tunnel is currently UP** (brought up this session via
+  `launchctl bootstrap … com.dvillavicencio.browse-gateway-tunnel.plist`). Take down with
+  `launchctl bootout gui/$(id -u)/com.dvillavicencio.browse-gateway-tunnel` if desired. Ops in `TUNNEL.local.md`.
+- **Deploy flow:** merge → CI `build-image` pushes `latest` to GHCR → `gh workflow run deploy-http.yml
+  -f image_tag=latest` → watch gate→swap→verify. The `build-image` job is **flaky on a Docker Hub
+  oauth-token fetch** (transient `connection reset` pulling the base image) — `gh run rerun <id> --failed`.
+- **Agent merges PRs (green+reviewed) but does NOT push `main`** — the main-push classifier is the
+  gated path; PR merges via `gh` are fine.
+- **PerimeterX is still CLASSIFIED, not CLEARED** — press-&-hold fires even on residential local
+  Chrome (behavioral, not IP-reputation). Defeating it is the spike, not done.
+- **`BGW_MAX_SESSIONS=7`** sits exactly at the boot floor for 3 consumers (atlas, vault, argus) — a
+  4th crosses it; bump it (or drop `perConsumerMax`) in the same change or the boot guard crash-loops.
+- **Coded language in force:** "atlas / vault / argus" are public codenames; real ids, prod host,
+  paths, tokens live only in agent memory + `*.local.md` (repo is PUBLIC).
 - **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
