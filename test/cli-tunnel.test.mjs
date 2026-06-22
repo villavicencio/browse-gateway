@@ -18,6 +18,7 @@ import {
   authorizedKeysLine,
   classifyAgentState,
   classifyPortOwner,
+  parsePortListeners,
   tunnelState,
   ensureTunnel,
   SELF_DISABLE_MARKER,
@@ -121,15 +122,54 @@ test("classifyAgentState: running / stopped / self-disabled / not-bootstrapped",
   assert.equal(classifyAgentState(null, oldMarker), "not-bootstrapped");
 });
 
-test("classifyPortOwner: ours (ssh), foreign binder, none", () => {
-  const sshOut = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nssh 123 user 5u IPv4 0x0 0t0 TCP 127.0.0.1:8080 (LISTEN)\nssh 123 user 6u IPv6 0x0 0t0 TCP [::1]:8080 (LISTEN)\n";
-  assert.equal(classifyPortOwner(sshOut), "ours");
+test("parsePortListeners extracts (command, pid), dropping header/blank lines", () => {
+  const out =
+    "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nssh 123 user 5u IPv4 0x0 0t0 TCP 127.0.0.1:8080 (LISTEN)\nssh 123 user 6u IPv6 0x0 0t0 TCP [::1]:8080 (LISTEN)\n";
+  assert.deepEqual(parsePortListeners(out), [
+    { command: "ssh", pid: "123" },
+    { command: "ssh", pid: "123" },
+  ]);
+  assert.deepEqual(parsePortListeners(null), []);
+  assert.deepEqual(parsePortListeners("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"), []);
+});
 
-  const foreign = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 999 user 20u IPv4 0x0 0t0 TCP *:8080 (LISTEN)\n";
-  assert.equal(classifyPortOwner(foreign), "foreign");
+test("classifyPortOwner: ours requires OUR forward signature, not just COMMAND=ssh", () => {
+  const spec = makeSpec();
+  const ours = [{ command: "ssh", pid: "123", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel" }];
+  assert.equal(classifyPortOwner(ours, spec), "ours");
 
-  assert.equal(classifyPortOwner(null), "none");
-  assert.equal(classifyPortOwner("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"), "none");
+  // A FOREIGN ssh forward on the same port — COMMAND=ssh but a different forward + alias. The old
+  // bare-name check called this "ours"; it must now be "foreign" (the bug this fix closes).
+  const foreignSsh = [{ command: "ssh", pid: "200", argv: "/usr/bin/ssh -N -L 8080:10.0.0.5:5432 someone@otherhost" }];
+  assert.equal(classifyPortOwner(foreignSsh, spec), "foreign");
+
+  // Non-ssh binder.
+  assert.equal(classifyPortOwner([{ command: "node", pid: "999", argv: "node server.js" }], spec), "foreign");
+
+  // Unresolvable argv (ps failed) → fail closed.
+  assert.equal(classifyPortOwner([{ command: "ssh", pid: "123", argv: null }], spec), "foreign");
+
+  // Mixed: one ours + one foreign → foreign (EVERY listener must be ours).
+  assert.equal(classifyPortOwner([...ours, { command: "node", pid: "9", argv: "node x" }], spec), "foreign");
+
+  // Nothing listening.
+  assert.equal(classifyPortOwner([], spec), "none");
+  assert.equal(classifyPortOwner(null, spec), "none");
+  rmSync(spec.home, { recursive: true, force: true });
+});
+
+test("tunnelState resolves listener argv via ps to distinguish our forward from a foreign ssh", async () => {
+  const spec = makeSpec();
+  // A foreign ssh forward squatting on 8080 — lsof shows COMMAND=ssh, but ps reveals a different forward.
+  const exec = fakeExec({
+    launchctl: { code: 0, stdout: "state = running\npid = 5\n", stderr: "" },
+    lsof: { code: 0, stdout: "COMMAND PID USER\nssh 4242 user 5u IPv4 TCP 127.0.0.1:8080 (LISTEN)\n", stderr: "" },
+    ps: { code: 0, stdout: "ssh -N -L 8080:10.0.0.9:5432 attacker@elsewhere\n", stderr: "" },
+  });
+  const state = await tunnelState(spec, exec);
+  assert.equal(state.port, "foreign", "a foreign ssh forward is no longer mis-claimed as ours");
+  assert.ok(exec.calls.some((c) => c[0] === "ps" && c.includes("4242")), "argv resolved for the listening pid");
+  rmSync(spec.home, { recursive: true, force: true });
 });
 
 test("tunnelState surfaces the keeper-log reason when self-disabled", async () => {
@@ -223,6 +263,7 @@ test("ensureTunnel is a no-op when everything exists and runs; re-enables when s
   const runningExec = fakeExec({
     launchctl: { code: 0, stdout: "state = running\npid = 99\n", stderr: "" },
     lsof: { code: 0, stdout: "COMMAND PID\nssh 99 user 5u IPv4 TCP 127.0.0.1:8080 (LISTEN)\n", stderr: "" },
+    ps: { code: 0, stdout: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel\n", stderr: "" },
   });
   const noop = await ensureTunnel(spec, runningExec);
   assert.equal(noop.action, "none");

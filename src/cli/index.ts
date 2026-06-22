@@ -24,12 +24,13 @@ export {
   authorizedKeysLine,
   classifyAgentState,
   classifyPortOwner,
+  parsePortListeners,
   tunnelState,
   ensureTunnel,
   bootoutTunnel,
   SELF_DISABLE_MARKER,
 } from "./tunnel.js";
-export type { TunnelSpec, TunnelSpecOptions, TunnelState, AgentState, PortOwner, EnsureResult } from "./tunnel.js";
+export type { TunnelSpec, TunnelSpecOptions, TunnelState, AgentState, PortOwner, PortListener, EnsureResult } from "./tunnel.js";
 export { classifyProbeCode, httpProbe, verifyGateway } from "./verify.js";
 export type { VerifyState, VerifyResult, VerifyProbe, VerifyOptions } from "./verify.js";
 export { registerMcp, MCP_SERVER_NAME } from "./mcp-register.js";

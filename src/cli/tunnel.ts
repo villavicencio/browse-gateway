@@ -218,16 +218,44 @@ export function classifyAgentState(printOutput: string | null, logTail: string):
   return "not-bootstrapped";
 }
 
+/** A listener on the forwarded port: lsof's COMMAND + PID, plus the full argv resolved from the PID. */
+export interface PortListener {
+  /** lsof COMMAND column — truncated (e.g. "ssh") and NOT trusted alone (see classifyPortOwner). */
+  command: string;
+  pid: string;
+  /** Full argv from `ps -o command= -p <pid>` — null when it can't be resolved. */
+  argv: string | null;
+}
+
+/** Parse `lsof -nP -iTCP:<port> -sTCP:LISTEN` rows into (command, pid) pairs (header/blank dropped). */
+export function parsePortListeners(lsofOutput: string | null): { command: string; pid: string }[] {
+  if (lsofOutput === null) return [];
+  return lsofOutput
+    .split("\n")
+    .filter((l) => l.trim() && !l.startsWith("COMMAND"))
+    .map((l) => {
+      const cols = l.split(/\s+/);
+      return { command: cols[0] ?? "", pid: cols[1] ?? "" };
+    })
+    .filter((r) => r.command !== "" && r.pid !== "");
+}
+
 /**
- * Classify who owns the local forwarded port from `lsof -iTCP:<port> -sTCP:LISTEN` output
- * (null = nothing listening). Our tunnel listens via ssh; anything else bound there means
- * `connect` must stop, not silently register against an unknown service.
+ * Classify who owns the local forwarded port. "ours" requires EVERY listener to be OUR specific ssh
+ * forward — verified by the forward signature (`-L <localPort>:<gatewayHost>`) AND the alias in the
+ * process argv, NOT merely COMMAND=ssh: any `ssh -L <port>` opened by another process also shows
+ * COMMAND=ssh, so the old bare-name check would mis-claim a foreign forward as ours. A listener we
+ * can't positively confirm (non-ssh, a different forward, or an unresolvable argv) makes the whole
+ * port "foreign" — fail closed, so `connect` stops rather than registering against a service it
+ * can't prove is ours. (This is the Mac-side local-forward check; the prod-side rootlesskit forward
+ * is namespace-invisible to a login shell — never inferred from `ss`/`lsof` there.)
  */
-export function classifyPortOwner(lsofOutput: string | null): PortOwner {
-  if (lsofOutput === null) return "none";
-  const dataLines = lsofOutput.split("\n").filter((l) => l.trim() && !l.startsWith("COMMAND"));
-  if (dataLines.length === 0) return "none";
-  return dataLines.every((l) => l.split(/\s+/)[0] === "ssh") ? "ours" : "foreign";
+export function classifyPortOwner(listeners: PortListener[] | null, spec: TunnelSpec): PortOwner {
+  if (listeners === null || listeners.length === 0) return "none";
+  const ourForward = `-L ${spec.localPort}:${spec.gatewayHost}`;
+  const isOurs = (l: PortListener): boolean =>
+    l.command === "ssh" && l.argv !== null && l.argv.includes(ourForward) && l.argv.includes(spec.alias);
+  return listeners.every(isOurs) ? "ours" : "foreign";
 }
 
 export interface TunnelState {
@@ -254,7 +282,16 @@ export async function tunnelState(spec: TunnelSpec, exec: Exec = execCapture): P
   ]);
   const logTail = readLogTail(spec);
   const agent = classifyAgentState(print && print.code === 0 ? print.stdout : null, logTail);
-  const port = classifyPortOwner(lsof && lsof.code === 0 ? lsof.stdout : null);
+  // Resolve each listener's full argv (lsof's COMMAND is truncated to "ssh") so the classifier can
+  // confirm it's OUR forward, not just some ssh. Fail closed: an unresolvable argv stays "foreign".
+  const rows = parsePortListeners(lsof && lsof.code === 0 ? lsof.stdout : null);
+  const listeners: PortListener[] = await Promise.all(
+    rows.map(async ({ command, pid }) => {
+      const ps = await exec("ps", ["-o", "command=", "-p", pid]).catch(() => null);
+      return { command, pid, argv: ps && ps.code === 0 ? ps.stdout.trim() : null };
+    }),
+  );
+  const port = classifyPortOwner(listeners, spec);
   if (agent !== "self-disabled") return { agent, port };
   const lines = logTail.split("\n");
   let at = 0;
