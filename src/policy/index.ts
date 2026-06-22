@@ -6,12 +6,11 @@
  */
 import type { NavigationGuard } from "../browser/index.js";
 import { isBlockedEgressHost, EGRESS_DENY_REASON } from "../security/egress.js";
-import { isHttpUrl } from "../security/url.js";
+import { isHttpUrl, canonicalizeHost } from "../security/url.js";
 import { InMemoryAuditSink } from "./audit.js";
 import type { AuditSink } from "./audit.js";
 import { ConsumerRegistry } from "./consumer.js";
 import type { Consumer } from "./consumer.js";
-import { normalizeHost } from "./allowlist.js";
 
 /** Returns true when a host must be blocked for egress reasons (private/metadata ranges). */
 export type EgressFilter = (host: string) => boolean;
@@ -38,10 +37,12 @@ export interface PolicyEngineOptions {
  * Exact hosts an INTERNAL diagnostics probe (the opt-in egress check, issue #21) may reach.
  * Exact-match ONLY — no wildcard/subdomain rules — and POLICY-OWNED (never caller-supplied), so
  * "diagnostics only" is enforced here, not by a caller remembering to pass a constant. The egress
- * probe renders the first entry; extend this set deliberately.
+ * probe renders the first entry; extend this set deliberately. Canonicalized with `canonicalizeHost`
+ * (case + trailing-dot tolerant) NOT `normalizeHost` — the latter strips a leading `www.`, which
+ * would let `www.ipinfo.io` satisfy a literal `ipinfo.io` entry; a diagnostics host must be literal.
  */
 export const DIAGNOSTICS_EGRESS_HOSTS: readonly string[] = ["ipinfo.io"];
-const DIAGNOSTICS_HOST_SET = new Set(DIAGNOSTICS_EGRESS_HOSTS.map((h) => normalizeHost(h)));
+const DIAGNOSTICS_HOST_SET = new Set(DIAGNOSTICS_EGRESS_HOSTS.map((h) => canonicalizeHost(h)));
 
 export class PolicyEngine {
   readonly #registry: ConsumerRegistry;
@@ -170,8 +171,9 @@ export class PolicyEngine {
         return "block";
       }
       // Exact membership in the policy-owned approved set — NOT an Allowlist, so a `*` or `*.sub`
-      // rule can never apply and only an exact approved host is reachable.
-      const allowed = DIAGNOSTICS_HOST_SET.has(normalizeHost(req.host));
+      // rule can never apply; and via canonicalizeHost (not normalizeHost) `www.ipinfo.io` does NOT
+      // satisfy a literal `ipinfo.io` entry. Only an exact approved host is reachable.
+      const allowed = DIAGNOSTICS_HOST_SET.has(canonicalizeHost(req.host));
       this.#audit.record({
         ts: Date.now(),
         consumerId: consumer.id,

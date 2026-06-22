@@ -170,6 +170,9 @@ test("guardForDiagnostics: allows ONLY the policy-owned host (exact, no wildcard
   assert.equal(guard(nav("ipinfo.io")), "allow");
   assert.equal(guard(nav("evil.example")), "block", "allow-all consumer does not widen the probe");
   assert.equal(guard(nav("sub.ipinfo.io")), "block", "exact match only — no subdomain widening");
+  assert.equal(guard(nav("www.ipinfo.io")), "block", "www. is a DIFFERENT host — literal enforcement (P3)");
+  assert.equal(guard(nav("IPINFO.IO")), "allow", "case-insensitive");
+  assert.equal(guard(nav("ipinfo.io.")), "allow", "trailing FQDN-root dot tolerated");
   assert.equal(guard(nav("169.254.169.254")), "block", "egress deny still wins");
   assert.equal(
     guard({ url: "file:///etc/passwd", host: "", resourceType: "document", isNavigationRequest: true }),
