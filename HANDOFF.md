@@ -1,77 +1,75 @@
-# HANDOFF — 2026-06-16
+# HANDOFF — 2026-06-21
 
-Continued straight from the 2026-06-12 Obscura merge to run the deferred manual E2E of the CLI
-against the real fleet. Used the CLI's `keys` lifecycle to rename the remote consumer to its
-public codename **Vault** — which exposed a real outage path, recovered it, documented the
-learning, and scrubbed a fleet-hygiene leak introduced mid-session.
+Long working session spanning fleet ops → strategy → a full feature build. Cleared the carried-over
+name-leak scrub, re-registered the **Vault** consumer's MCP, onboarded a new third consumer
+(**Argus**, the agents project), reframed the product strategy, and implemented **issue #21**
+(proxy-escalation diagnostics + force-proxy) end-to-end — now MERGED to `main` (PRs #22 + #23).
 
-> Fleet detail (real consumer id, prod host, the Vault agent's project volume path, the resume
-> command) stays in agent memory + gitignored `*.local.md` — never this file (PUBLIC repo).
-> "Vault" is the public-safe consumer codename; "Obscura" is the CLI brand.
+> Fleet detail (real consumer ids, prod host, paths, exact resume commands) stays in agent memory +
+> gitignored `*.local.md` — never this file (PUBLIC repo). "Vault" and "Argus" are public-safe
+> consumer codenames; "Obscura" is the CLI brand.
 
-## What We Built / Did
-- **Created `~/.config/obscura/config.json`** (local, gitignored) — the CLI's required fleet
-  config. Key choice: `adminSsh` uses the **non-root `node@` destination**, not root (a root-owned
-  `0600` env file would be unreadable by the rootless `node` Docker stack, and `node` makes the
-  `DOCKER_HOST` rootless-socket default resolve). `applyCmd` sources the on-host deploy env and
-  re-runs `launch-http.sh` pinned to the **currently-running image** via `docker inspect {{.Image}}`.
-- **Verified the `keys` staged round-trip** (no prod mutation): `keys new vault` → `keys list`
-  (showed all consumers incl. the staged Vault) → `keys revoke vault`.
-- **Renamed the remote consumer → Vault, fleet-side (DONE, healthy):** minted the Vault key, and
-  after the outage below, `keys revoke <old-id> --apply` landed the gateway clean. Live state:
-  manifest + env carry **Vault + the on-box consumer only**; the Vault token is consistent across
-  the prod env file and the macOS Keychain (service `obscura`). Gateway `running`, restarts=0,
-  `/mcp`=401.
-- **Re-synced both deploy scripts** (`deploy-on-host.sh`, `launch-http.sh`) to the prod host's
-  `~/deploy/` — closes the prior handoff's item #2 (PR #19's pre-swap smoke was a no-op on prod
-  until this).
-- **New solution doc** `docs/solutions/runtime-errors/keys-apply-sizing-guard-crash-loop.md`
-  (committed `3fdad4e`) — the crash-loop learning, scrubbed of real names.
-- **Updated agent memory** (`obscura-cli-first-cut`, index) with the E2E results + deferred step.
+## What We Did
 
-## Decisions Made
-- **`adminSsh` = non-root `node@`**, for the file-ownership + rootless-socket reasons above. Root
-  would have left the env file unreadable by the gateway stack.
-- **Recovery strategy = revoke back under the floor, not bump MAX_SESSIONS.** The rename only needed
-  2 consumers; dropping the old id put the count back under the configured `BGW_MAX_SESSIONS=5`
-  floor, so no env edit + a single re-create both recovered service *and* completed the rename —
-  never passing back through the broken 3-consumer state.
-- **The leaked-name fix = genericize + amend + force-push**, matching the 2026-06-10 nickname-scrub
-  precedent. The committed doc and its commit message now use placeholders only.
+- **Scrubbed the remote (carried-over item #1): DONE.** Force-pushed the clean local `main` over the
+  leaked tip — `origin/main` no longer carries the leaked commit (verified: not reachable from any
+  remote branch). GitHub may retain the dangling object by SHA for a while (low risk — it was a
+  consumer codename, not a credential).
+- **Re-registered Vault's MCP: DONE.** `obscura connect` from Vault's project dir → registration
+  `updated` to the post-rename token, `✓ connected as vault · gateway healthy`.
+- **Onboarded Argus (3rd consumer = the agents project): DONE.** Bumped prod `BGW_MAX_SESSIONS` 5→7
+  (3 consumers × perConsumerMax 2 + 1 = floor 7), `obscura keys new argus --apply` (✓ healthy), then
+  `obscura connect` from the agents project (`added`, ✓ healthy). Roster now **atlas, vault, argus**.
+- **Implemented + MERGED issue #21 — proxy-escalation diagnostics + force-proxy.** Both PRs squash-
+  merged to `main` (#22 = `2b546fe`, #23 = `4b7ce50`); 5 units, 302 tests.
+  - **#23** (feature): U2 IPRoyal sticky-id 16→8 chars · U1 shared `classifyBlock` + PerimeterX
+    recognition · U3 structured `EscalationDiagnostics` to the MCP caller (secrets-free + redaction
+    test) · U5 force-proxy (`BGW_FORCE_PROXY_HOSTS` + `{forceProxy}`) · U4 opt-in egress probe
+    (`BGW_DIAG_VERIFY_EGRESS`).
+  - **#22** (companion): fleet-hygiene guard fix (excluded the public "vault" codename from the guard).
+  - **3 review rounds, all resolved (final re-review: no findings):** P1 (egress probe rode the
+    consumer allowlist → policy-approved diagnostics guard), P2 (caller-supplied host / flat audit →
+    policy-owned exact host set + `{ diagnostics: true }` boolean + consumer-attributed audits),
+    P3 (`www.ipinfo.io` satisfied a literal `ipinfo.io` → `canonicalizeHost`, no www-strip).
+  - Plan: `docs/plans/2026-06-21-001-fix-drive-proxy-diagnostics-force-proxy-plan.local.md`.
+- **Strategy reframed** (captured in agent memory): the gateway is **internal back-office infra for
+  the operator's own future ventures**, not a product sold to outsiders.
 
-## What Didn't Work
-- **`keys new vault --apply` crash-looped the entire gateway.** Adding a 3rd consumer pushed the
-  pool-sizing floor (`consumers·perConsumerMax + 1`) to 7, above the configured `BGW_MAX_SESSIONS=5`
-  → boot guard fails closed → `--restart unless-stopped` crash loop → **all** consumers down (not
-  just the new one). Root cause is documented; the key gap is that **`keys --apply` re-creates with
-  NO pre-swap smoke**, unlike the `deploy-on-host.sh` CD path that would have caught it.
-- **First solution-doc commit leaked the real consumer id** into the public repo (body, token-env
-  example, commit message). Caught and rewritten; see blocker below.
+## Decisions
+
+- **PerimeterX is CLASSIFIED, not CLEARED.** The Total Wine failure root cause is PerimeterX
+  press-and-hold (behavioral) — the token CAPTCHA tier can't solve it. #21 makes the failure legible
+  (structured `perimeterx-challenge` diagnostic) and steerable (force-proxy, egress check) but does
+  not defeat PX. Defeating it is a **separate spike** (gesture automation / fingerprint coherence).
+- **Two PRs, not a default-branch push.** The guard fix is kept out of the #21 PR (operator's earlier
+  call) and the agent is classifier-blocked from pushing `main`, so it became its own PR (#22) rather
+  than a direct commit to main.
+- **IPRoyal sticky id = 8 hex chars** (`randomBytes(4)`), correcting a 16-char code bug that violated
+  IPRoyal's "precisely 8 alphanumeric" spec. Password placement was already correct.
 
 ## What's Next
-1. **⚠️ Scrub the remote: `git push --force-with-lease origin main`.** Local main is clean
-   (`3fdad4e`); the remote still carries the leaked commit `d80964b` until this force-push replaces
-   it. Classifier-blocked for the agent — operator must run it.
-2. **Re-register the Vault MCP — DEFERRED, needs the Vault agent's project volume mounted.** The
-   live `browse-gateway` registration is `local`-scoped to that project only, and `registerMcp`
-   passes no `--scope` (defaults to cwd's project) — so `obscura connect` MUST run from that project
-   dir or it makes a duplicate and leaves Vault broken. The exact resume command (with the volume
-   path) is in agent memory `obscura-cli-first-cut`. Until then, that agent's MCP still holds the
-   retired token and will 401.
-3. **Close the `keys --apply` product gap.** Either pre-flight the sizing floor in `keysNew`
-   (refuse/warn before staging a config the boot guard will reject) or give the apply path the same
-   real-config pre-swap smoke `deploy-on-host.sh` has.
-4. **Tunnel-key `permitlisten` follow-up** (carried over): the authorized_keys options still allow
-   `-R` remote forwarding on both generated and live keys; pin `permitlisten` against prod sshd.
+
+1. **Push this handoff commit to `main`** — the only remaining git action (agent main-push is gated):
+   `git push origin main`. #21 + #22 are already merged; `main` is otherwise in sync with origin.
+2. **Operator-only:** switch IPRoyal monthly → PAYG (dashboard action). Non-breaking for the gateway —
+   fund the PAYG balance before cancelling to avoid a traffic gap, then re-verify the proxy creds.
+3. **Open: pool-sizing for many-consumer onboarding.** If wiring up several more CC projects, switch
+   `perConsumerMax` 2→1 + `maxSessions` 8 once (supports ~7 consumers under the ~4 GB OOM-safe ceiling)
+   instead of bumping `maxSessions` per consumer. At perConsumerMax=2, a 4th consumer needs floor 9.
+4. **Deferred #21 follow-ups:** the PerimeterX-defeat spike; audit-log `diagnostics` field; per-call
+   `{verifyEgress}` MCP option + a retrieve-path egress probe.
+5. **Strategy threads:** sketch venture #1 (the general-contractor idea) to pull real requirements;
+   the Obscura **TUI** design session (operator-gated — do not start unprompted).
 
 ## Gotchas & Watch-outs
-- **`obscura connect` is scope-sensitive:** run it from the Vault agent's project dir, by absolute
-  path (`obscura` is not on PATH). Expect a Keychain access prompt — run it interactively.
-- **`keys --apply` is a deploy, not a config tweak.** It re-creates the live container with no
-  smoke. When adding the consumer that crosses a `perConsumerMax` boundary, bump `BGW_MAX_SESSIONS`
-  in the same change, or it crash-loops every consumer.
-- **Remote main carries a name leak until item #1 runs.** Don't branch off / open PRs against the
-  current remote tip before the force-push, or the leak propagates.
-- **Coded language is now in force for the real consumer id** — use "Vault" in anything committed or
-  outward-facing; the real id + volume path live only in memory and `*.local.md`.
-- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing, not part of this work).
+
+- **Agent can't push `main`** (auto-mode classifier) — operator pushes main / merges PRs.
+- **`BGW_MAX_SESSIONS=7` now** (floor exactly met at 3 consumers). Adding a 4th crosses the floor —
+  bump it (or drop `perConsumerMax`) in the same change, or the boot guard crash-loops every consumer.
+- **New env vars** (both safe defaults / off): `BGW_FORCE_PROXY_HOSTS` (comma host-suffix list),
+  `BGW_DIAG_VERIFY_EGRESS=1` (opt-in egress probe — costs one extra proxied request per failure).
+- **Coded language in force:** "vault" / "argus" are public codenames; real ids + paths live only in
+  agent memory + `*.local.md`.
+- **This handoff is committed locally on `main` but not pushed** (agent main-push is gated) — push it
+  yourself, ideally after merging #22/#23 to avoid a divergence.
+- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
