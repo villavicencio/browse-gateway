@@ -27,9 +27,13 @@ export const CF_BLOCK_PHRASES: readonly RegExp[] = [
  * interstitial that Total Wine and similar retail WAFs serve. Single source of truth for PX
  * visible signatures, mirroring {@link CF_BLOCK_PHRASES}. Classification/diagnostics only: the
  * press-and-hold challenge is behavioral and NOT cleared by the token-CAPTCHA solver (issue #21).
- * Deliberately NOT folded into {@link BLOCK_PHRASES} — these drive vendor ATTRIBUTION
- * ({@link isPerimeterXVisible}) for an already-blocked page (PX serves a 403+thin hard block), not
- * the blocked decision, so legit "press and hold" copy can't false-positive a real page as blocked.
+ * Deliberately NOT folded into {@link BLOCK_PHRASES}: legit "press and hold" copy on a real page must
+ * not false-positive it as blocked. These phrases drive vendor ATTRIBUTION ({@link isPerimeterXVisible})
+ * once a page is already known blocked. NOTE the press-&-hold widget often renders in a cross-origin
+ * iframe — so the visible phrase never reaches the top-doc innerText, AND the challenge can be served
+ * with a 200 (not the 403+thin hard block this once assumed). That case is caught by
+ * {@link isPerimeterXChallenge} (pxHint + thin content), not the visible phrase (issue #21 follow-up,
+ * gateway probe 2026-06-22).
  */
 export const PX_BLOCK_PHRASES: readonly RegExp[] = [/press\s*(?:and|&)\s*hold/i, /human security/i];
 
@@ -155,6 +159,21 @@ export function isPerimeterXVisible(signal: Pick<PageSignal, "title" | "text">):
  */
 export function hasPerimeterXHint(html: string): boolean {
   return PX_VENDOR_HINTS.some((re) => re.test(html));
+}
+
+/**
+ * True when a page is a PerimeterX press-&-hold challenge served WITHOUT a hard-block status. PX
+ * renders its "Press & Hold" widget in a cross-origin iframe, so the visible phrase never reaches the
+ * top document's innerText ({@link isPerimeterXVisible}/{@link isVisiblyBlocked} miss it), and the
+ * challenge is commonly served with a 200 ({@link isHardBlock}, which needs a 4xx/5xx + thin body,
+ * misses it too). The HTML-side marker (`pxHint`, from {@link hasPerimeterXHint}) catches it — but
+ * that marker PERSISTS on a CLEARED page, so `pxHint` alone would false-positive every successful
+ * fetch from a PX-protected site. The discriminator is content: a challenge renders no real content
+ * (thin text), while a cleared page renders the product (fat text). So a PX challenge is `pxHint` AND
+ * thin content. (Total Wine, gateway probe 2026-06-22 — issue #21 follow-up.)
+ */
+export function isPerimeterXChallenge(signal: Pick<PageSignal, "text">, pxHint: boolean): boolean {
+  return pxHint && signal.text.trim().length < MIN_CONTENT_LENGTH;
 }
 
 /**
