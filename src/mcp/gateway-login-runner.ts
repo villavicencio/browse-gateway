@@ -55,6 +55,14 @@ export function makeGatewayLoginRunner(
       throw new Error(`vault login: recipe loginUrl host (${loginHost}) does not match the entry host (${host})`);
     }
     const forced = hostForcesProxy(loginHost, opts.forceProxyHosts ?? []);
+    // A proxied capture is only meaningful if it can be RE-PINNED on warm replay (R3). Pinning needs a
+    // sticky-exit suffix: with BGW_PROXY_STICKY_SUFFIX unset, mintStickyProxy ignores the id and the
+    // exit ROTATES, so a stored stickyExitId would be a lie (warm replay can't return to the capture
+    // IP — and a rotating exit can't clear a CF interstitial in the first place). So a proxied capture
+    // requires a PINNABLE proxy: proxy creds + onDatacenterIp + a sticky suffix. We refuse rather than
+    // store a session falsely presented as R3-bound.
+    const proxyConfigured = proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix) !== undefined;
+    const canPin = proxyConfigured && opts.stickySuffix !== undefined;
 
     let handle: string | undefined;
     let stickyExitId: string | undefined; // set whenever a proxied exit lands the page (forced or escalated)
@@ -62,10 +70,17 @@ export function makeGatewayLoginRunner(
       if (forced) {
         // Force-proxy: do NOT open a direct session at all — a forced host must never receive the
         // login attempt from the datacenter IP (mirrors drive's #firstNavigate forced path).
-        if (proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix) === undefined) {
+        if (!proxyConfigured) {
           throw new Error(
             `vault login: force-proxy is configured for ${loginHost} but no residential proxy is available ` +
               `(set BGW_PROXY_* + BGW_ON_DATACENTER_IP, or drop the host from BGW_FORCE_PROXY_HOSTS)`,
+          );
+        }
+        if (!canPin) {
+          throw new Error(
+            `vault login: force-proxy is configured for ${loginHost} but BGW_PROXY_STICKY_SUFFIX is unset — ` +
+              `a forced capture must bind a re-pinnable sticky exit so warm replay returns to the same ` +
+              `residential IP (R3). Set BGW_PROXY_STICKY_SUFFIX, or drop the host from BGW_FORCE_PROXY_HOSTS.`,
           );
         }
         // handle stays undefined → the pinned-exit loop below opens proxied from the first request.
@@ -74,11 +89,13 @@ export function makeGatewayLoginRunner(
         handle = await gateway.openConsumerSession(token, undefined);
         const directSnap = await gateway.useConsumerSession(token, handle, (s) => s.core.navigate(recipe.loginUrl));
         if (navFailed(directSnap)) {
-          // Escalate ONLY on a block a clean residential exit can clear, and only if a proxy is available.
-          if (!shouldEscalateDrive(directSnap) || proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix) === undefined) {
+          // Escalate ONLY on a block a clean residential exit can clear, and only to a RE-PINNABLE exit
+          // (proxy + sticky suffix). Without a suffix the escalated exit rotates → it couldn't be bound
+          // for warm replay (and a rotating exit can't clear a CF interstitial), so fail loud instead.
+          if (!shouldEscalateDrive(directSnap) || !canPin) {
             throw new Error(
               `vault login: ${recipe.loginUrl} was blocked and could not be cleared on a direct exit ` +
-                `(no residential proxy available to escalate to)`,
+                `(no re-pinnable residential exit to escalate to — needs a residential proxy + BGW_PROXY_STICKY_SUFFIX)`,
             );
           }
           await gateway.closeConsumerSession(token, handle).catch(() => {});
