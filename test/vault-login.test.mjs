@@ -41,28 +41,40 @@ function tmpVault() {
   const dir = mkdtempSync(join(tmpdir(), "bgw-vault-login-"));
   return { vault: new VaultStore({ kek: randomBytes(32), dir, canonicalizeHost }), dir };
 }
-function fakeRunner(state) {
+/** A fake LoginRunner. Returns `{state}` for a direct capture, or `{state, stickyExitId}` to
+ *  simulate an escalated capture that bound an exit (the runner owns the direct-first decision). */
+function fakeRunner(state, stickyExitId) {
   const calls = [];
-  return { calls, run: async (args) => (calls.push(args), state) };
+  return { calls, run: async (args) => (calls.push(args), { state, ...(stickyExitId ? { stickyExitId } : {}) }) };
 }
 
-test("captureLoginToVault: mints a sticky exit, drives the login, persists {session, creds, stickyExitId}", async () => {
+test("captureLoginToVault: drives the login and persists the bound exit the runner reports (escalated capture)", async () => {
   const { vault, dir } = tmpVault();
   try {
-    const r = fakeRunner(SESSION);
+    const r = fakeRunner(SESSION, "abcd1234"); // runner escalated → reports a bound exit
     const entry = await captureLoginToVault({ vault, runLogin: r.run }, { consumerId: "atlas", host: "ex.com", recipe: RECIPE, creds: CREDS });
-    // the runner got a freshly-minted 8-hex sticky id + the host/recipe/creds
+    // the runner is called with host/recipe/creds — NOT a pre-minted exit id (it owns the decision)
     assert.equal(r.calls.length, 1);
-    assert.match(r.calls[0].stickyExitId, /^[0-9a-f]{8}$/);
-    assert.equal(r.calls[0].host, "ex.com");
-    assert.deepEqual(r.calls[0].recipe, RECIPE);
-    // and the SAME id is persisted with the captured session + creds
+    assert.deepEqual(r.calls[0], { host: "ex.com", recipe: RECIPE, creds: CREDS });
+    // the runner-reported exit is persisted with the captured session + creds
     const stored = getVaultEntry(vault, "atlas", "ex.com");
     assert.deepEqual(stored.session, SESSION);
     assert.deepEqual(stored.creds, CREDS);
-    assert.equal(stored.stickyExitId, r.calls[0].stickyExitId);
+    assert.equal(stored.stickyExitId, "abcd1234");
     assert.equal(stored.stickyExitId, entry.stickyExitId);
     assert.equal(typeof stored.updatedAt, "number");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("captureLoginToVault: a DIRECT capture (runner reports no exit) binds no stickyExitId", async () => {
+  const { vault, dir } = tmpVault();
+  try {
+    const r = fakeRunner(SESSION); // direct — runner cleared without escalating
+    const entry = await captureLoginToVault({ vault, runLogin: r.run }, { consumerId: "atlas", host: "ex.com", recipe: RECIPE, creds: CREDS });
+    assert.equal("stickyExitId" in entry, false, "no bound exit recorded for a direct capture");
+    assert.equal("stickyExitId" in getVaultEntry(vault, "atlas", "ex.com"), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -124,6 +136,12 @@ test("buildWarmOverride: restores the captured state AND re-pins the bound stick
   assert.ok(override.proxy, "proxy applied (configured + on datacenter IP)");
   assert.ok(override.proxy.password.startsWith("pw"), "base proxy password preserved");
   assert.ok(override.proxy.password.includes("abcd1234"), "the BOUND exit id is pinned, not a fresh one");
+});
+
+test("buildWarmOverride: a DIRECT-captured entry (no bound exit) replays direct even with proxy configured (R7)", () => {
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  const entry = { session: SESSION, creds: CREDS, updatedAt: 1 }; // no stickyExitId → direct capture
+  assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: true, stickySuffix: "_session-{id}" }), { restoreState: SESSION });
 });
 
 test("buildWarmOverride: warm session is direct (state only) when no proxy is configured", () => {
