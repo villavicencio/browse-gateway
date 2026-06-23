@@ -12,3 +12,26 @@ export {
   type SecretSource,
   type SecretKey,
 } from "./secrets.js";
+export {
+  seal,
+  open,
+  sealJson,
+  openJson,
+  decodeMasterKey,
+  secretEquals,
+  VAULT_SCHEMA_VERSION,
+  type SealedRecord,
+  type GcmBox,
+  type VaultContext,
+} from "./vault-crypto.js";
+export {
+  VaultStore,
+  openVault,
+  loadVaultKey,
+  countVaultEntries,
+  vaultKeyBootError,
+  rotateVaultKey,
+  type VaultStoreOptions,
+  type VaultEntryMeta,
+  type OpenVaultDeps,
+} from "./vault-store.js";

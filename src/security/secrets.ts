@@ -14,6 +14,9 @@ export const SECRET_KEYS = [
   "BGW_PROXY_USERNAME",
   "BGW_PROXY_PASSWORD",
   "BGW_CAPTCHA_API_KEY",
+  // Raw base64 vault master key (the fallback to BGW_VAULT_KEY_FILE) — folded in so it's never
+  // stringified and is auto-redacted. The FILE-path variant is not secret and stays out of this set.
+  "BGW_VAULT_KEY",
 ] as const;
 
 export type SecretKey = (typeof SECRET_KEYS)[number];
