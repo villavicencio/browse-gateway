@@ -76,15 +76,23 @@ export function makeGatewayLoginRunner(
           const pinned = proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, id);
           if (!pinned) throw new Error("vault login: residential proxy configuration was removed mid-capture");
           const h = await gateway.openConsumerSession(token, pinned);
-          snap = await gateway.useConsumerSession(token, h, (s) =>
-            s.core.navigate(recipe.loginUrl, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
-          );
-          if (!navFailed(snap)) {
-            handle = h;
-            stickyExitId = id;
-            break;
+          let promoted = false;
+          try {
+            snap = await gateway.useConsumerSession(token, h, (s) =>
+              s.core.navigate(recipe.loginUrl, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
+            );
+            if (!navFailed(snap)) {
+              handle = h;
+              stickyExitId = id;
+              promoted = true;
+              break;
+            }
+          } finally {
+            // Close this exit unless it was promoted to the committed handle — so a dead/dirty exit OR
+            // a navigate that THROWS never leaks a held session occupying the per-consumer slot (the
+            // outer finally only owns the committed handle).
+            if (!promoted) await gateway.closeConsumerSession(token, h).catch(() => {});
           }
-          await gateway.closeConsumerSession(token, h).catch(() => {}); // dead/dirty exit — discard, draw a fresh one
         }
         if (!handle) {
           throw new Error(

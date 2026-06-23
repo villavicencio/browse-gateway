@@ -31,7 +31,7 @@ const dead = (url = "https://ex.com/login") => ({ url, title: "", tree: "", stat
 function fakeCore({ navQueue = [], defaultNav = clean, state = STATE, throwOnCapture = false } = {}) {
   const q = [...navQueue];
   return {
-    async navigate(url) { return q.shift() ?? defaultNav(url); },
+    async navigate(url) { const n = q.length ? q.shift() : defaultNav(url); if (n instanceof Error) throw n; return n; },
     async readField() { return { present: true, value: "" }; },
     async type() {},
     async click() {},
@@ -79,6 +79,17 @@ test("escalation retries FRESH exits (new sticky id each) until one lands — a 
   assert.equal(opened.length, 3, "direct + two proxied attempts");
   assert.notEqual(opened[1].proxy.password, opened[2].proxy.password, "each retry draws a FRESH exit (distinct id)");
   assert.ok(opened[2].proxy.password.endsWith(res.stickyExitId), "bound to the exit that actually landed");
+});
+
+test("a retry session whose navigate THROWS is closed, not leaked (PR #32 P1 round 3)", async () => {
+  // direct blocked → escalate → the proxied navigate REJECTS (e.g. session reaped). The opened retry
+  // session must be closed by the per-attempt cleanup; before the fix it leaked (only the direct
+  // session was closed).
+  const { gateway, opened, closed } = fakeGateway(fakeCore({ navQueue: [blockedCF(), new Error("nav boom")] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /nav boom/);
+  assert.equal(opened.length, 2, "direct + one proxied retry opened");
+  assert.deepEqual(closed, ["h1", "h2"], "BOTH the direct and the retry session were closed — no leak");
 });
 
 test("escalation that exhausts all attempts throws after N tries (no false success)", async () => {
