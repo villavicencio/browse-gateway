@@ -60,6 +60,38 @@ function assertSeedIfPresent(creds: LoginCredentials): void {
 }
 
 /**
+ * Cookie names for IP-bound anti-bot CHALLENGE tokens — clearance/bot-management cookies a vendor
+ * binds to the exit IP (and device/short TTL). They MUST NOT be persisted (R3 / KTD-3): a warm
+ * replay from a changed or expired sticky exit would present a stale clearance that no longer matches
+ * the IP — a strong "replayed session" tell — instead of letting the site re-mint a fresh one. A
+ * DENYLIST (not an allowlist) so the durable auth/session cookies we DO want are never dropped.
+ */
+const IP_BOUND_COOKIE_PATTERNS: readonly RegExp[] = [
+  /^cf_clearance$/i, // Cloudflare IP-bound challenge clearance (the canonical case)
+  /^__cf_bm$/i, // Cloudflare bot-management (session/IP-scoped, short-lived)
+  /^cf_chl_/i, // Cloudflare in-flight challenge state
+  /^_px/i, // PerimeterX/HUMAN: _px, _px2, _px3, _pxhd, _pxvid (IP/device-bound, ~60s)
+  /^pxcts$/i, // PerimeterX client token
+  /^datadome$/i, // DataDome device/IP token
+  /^(_abck|bm_sz|ak_bmsc|bm_sv|bm_mi)$/i, // Akamai Bot Manager (session/IP-bound)
+  /^(incap_ses|visid_incap|nlbi)_/i, // Imperva/Incapsula session/visitor ids
+];
+
+/** True when `name` is a known IP-bound anti-bot challenge token (case-insensitive). */
+export function isIpBoundChallengeCookie(name: string): boolean {
+  return IP_BOUND_COOKIE_PATTERNS.some((re) => re.test(name));
+}
+
+/**
+ * Drop IP-bound anti-bot challenge cookies from a captured/imported {@link StorageState} before it is
+ * persisted, enforcing the R3 invariant. localStorage origins are left untouched — these tokens are
+ * cookie-based; a vendor that stashed one in `sessionStorage` would not be captured anyway (KTD-4).
+ */
+export function stripIpBoundTokens(state: StorageState): StorageState {
+  return { ...state, cookies: (state.cookies ?? []).filter((c) => !isIpBoundChallengeCookie(c.name)) };
+}
+
+/**
  * Drive the login once (pinned to a freshly-minted sticky exit), capture the authenticated session,
  * and persist it. OVERWRITES any existing entry — this is also the refresh-on-expiry path: re-running
  * a capture replaces a stale/blocked entry in place. Returns the stored entry.
@@ -70,8 +102,10 @@ export async function captureLoginToVault(
 ): Promise<VaultEntry> {
   assertSeedIfPresent(args.creds);
   const stickyExitId = newStickyExitId();
-  const session = await deps.runLogin({ host: args.host, recipe: args.recipe, creds: args.creds, stickyExitId });
-  const entry: VaultEntry = { session, creds: args.creds, stickyExitId, updatedAt: Date.now() };
+  const captured = await deps.runLogin({ host: args.host, recipe: args.recipe, creds: args.creds, stickyExitId });
+  // Strip IP-bound challenge tokens BEFORE persisting — captureStorageState() returns every cookie
+  // verbatim, including cf_clearance et al., which must not survive into a warm replay (R3).
+  const entry: VaultEntry = { session: stripIpBoundTokens(captured), creds: args.creds, stickyExitId, updatedAt: Date.now() };
   deps.vault.put(args.consumerId, args.host, entry);
   return entry;
 }
@@ -91,8 +125,9 @@ export function importLoginToVault(
   },
 ): VaultEntry {
   assertSeedIfPresent(args.creds);
+  // An operator-provided storageState can also carry a stale IP-bound clearance — strip it too.
   const entry: VaultEntry = {
-    session: args.session,
+    session: stripIpBoundTokens(args.session),
     creds: args.creds,
     ...(args.stickyExitId ? { stickyExitId: args.stickyExitId } : {}),
     updatedAt: Date.now(),
@@ -116,7 +151,9 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
  * captured cookies + localStorage (so the first navigation is already logged-in) AND re-pin the
  * proxy to the exact sticky exit bound at capture, so the replay returns to the same residential IP
  * (R3). When no proxy is configured / not on a datacenter IP, the warm session is direct — just the
- * restored state. The entry's exit id is threaded straight to `proxyOverrideFor`.
+ * restored state. The entry's exit id is threaded straight to `proxyOverrideFor`. The stored
+ * `session` was already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound
+ * clearance is replayed here.
  */
 export function buildWarmOverride(
   entry: VaultEntry,

@@ -17,6 +17,8 @@ import {
   getVaultEntry,
   revokeVaultEntry,
   buildWarmOverride,
+  stripIpBoundTokens,
+  isIpBoundChallengeCookie,
 } from "../dist/mcp/vault-login.js";
 import { VaultStore, canonicalizeHost, SecretStore } from "../dist/security/index.js";
 
@@ -27,6 +29,13 @@ const SESSION = {
 };
 const CREDS = { username: "atlas-user", password: "p".repeat(20), totpSeed: SEED };
 const RECIPE = { loginUrl: "https://ex.com/login", usernameField: "#u", passwordField: "#p", submit: "#s", successText: "Welcome" };
+
+const cookie = (name, value = "v") => ({ name, value, domain: "ex.com", path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "Lax" });
+// A captured session carrying a durable login cookie PLUS IP-bound anti-bot challenge tokens.
+const CHALLENGED = {
+  cookies: [cookie("sid", "x".repeat(40)), cookie("cf_clearance", "cf"), cookie("__cf_bm", "bm"), cookie("_px3", "px"), cookie("datadome", "dd"), cookie("_abck", "ak")],
+  origins: [{ origin: "https://ex.com", localStorage: [{ name: "tok", value: "keepme" }] }],
+};
 
 function tmpVault() {
   const dir = mkdtempSync(join(tmpdir(), "bgw-vault-login-"));
@@ -127,4 +136,41 @@ test("buildWarmOverride: no proxy when not on a datacenter IP, even with proxy c
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
   assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: false, stickySuffix: "_session-{id}" }), { restoreState: SESSION });
+});
+
+test("capture drops IP-bound challenge tokens; the durable cookie + localStorage survive capture→vault→warm (PR #31 P1)", async () => {
+  const { vault, dir } = tmpVault();
+  try {
+    const r = fakeRunner(CHALLENGED);
+    const entry = await captureLoginToVault({ vault, runLogin: r.run }, { consumerId: "atlas", host: "ex.com", recipe: RECIPE, creds: CREDS });
+    assert.deepEqual(entry.session.cookies.map((c) => c.name), ["sid"], "only the durable login cookie is persisted");
+    assert.deepEqual(entry.session.origins, CHALLENGED.origins, "localStorage is preserved");
+    // it round-trips through the encrypted store stripped...
+    assert.deepEqual(getVaultEntry(vault, "atlas", "ex.com").session.cookies.map((c) => c.name), ["sid"]);
+    // ...and the warm-replay override carries no IP-bound clearance either.
+    const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: true });
+    assert.deepEqual(override.restoreState.cookies.map((c) => c.name), ["sid"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("import also drops IP-bound challenge tokens from an operator-provided state (PR #31 P1)", () => {
+  const { vault, dir } = tmpVault();
+  try {
+    const e = importLoginToVault(vault, { consumerId: "atlas", host: "imp.com", session: CHALLENGED, creds: CREDS });
+    assert.deepEqual(e.session.cookies.map((c) => c.name), ["sid"]);
+    assert.deepEqual(getVaultEntry(vault, "atlas", "imp.com").session.cookies.map((c) => c.name), ["sid"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stripIpBoundTokens / isIpBoundChallengeCookie: vendor challenge cookies dropped, durable cookies kept", () => {
+  const drop = ["cf_clearance", "CF_CLEARANCE", "__cf_bm", "cf_chl_2", "_px", "_px3", "_pxhd", "pxcts", "datadome", "_abck", "bm_sz", "ak_bmsc", "incap_ses_1_2", "visid_incap_99", "nlbi_123"];
+  const keep = ["sid", "session", "auth_token", "csrf_token", "__Host-session", "remember_me", "JSESSIONID", "laravel_session"];
+  for (const n of drop) assert.equal(isIpBoundChallengeCookie(n), true, `${n} must be treated as IP-bound`);
+  for (const n of keep) assert.equal(isIpBoundChallengeCookie(n), false, `${n} must be kept`);
+  const state = { cookies: [...drop, ...keep].map((n) => cookie(n)), origins: [] };
+  assert.deepEqual(stripIpBoundTokens(state).cookies.map((c) => c.name), keep, "exactly the durable cookies remain");
 });
