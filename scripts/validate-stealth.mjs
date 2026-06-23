@@ -19,6 +19,8 @@
  *   BGW_SKIP_NEGATIVE_CONTROL=0  "1" to skip the headless negative control
  */
 import { createBrowserCore, assess } from "../dist/browser/index.js";
+import { SecretStore, redactSecrets } from "../dist/security/index.js";
+import { RedactingAuditSink, InMemoryAuditSink } from "../dist/policy/index.js";
 
 const ATTEMPTS = Number(process.env.BGW_ATTEMPTS ?? 3);
 const REQUIRED = Number(process.env.BGW_REQUIRED ?? 3);
@@ -185,6 +187,67 @@ async function runWebglCheck() {
   }
 }
 
+/**
+ * Secret-leak check (U7 R4): prove the redaction mechanism actually scrubs a stored vault value out of
+ * the surfaces redaction is wired into — process logs/errors (`redactSecrets`) and the audit trail
+ * (`RedactingAuditSink`) — so a regression that re-exposed a credential turns this leg RED. Modeled on
+ * the WebRTC leg: plant a sentinel, exercise the real surfaces, FAIL on any leak. It needs no real
+ * credential — the sentinel stands in for a cookie/password/TOTP value, registered exactly as vault
+ * creds are (`addRedactable`) — and runs without a browser, so it is the cheapest leg in the gate.
+ *
+ * A POSITIVE CONTROL guards against a vacuous pass: the same sentinel, through a store that was NEVER
+ * told about it, MUST survive — so an empty/misrouted capture (which would trivially "find no leak")
+ * fails here instead of passing. This is the WebRTC leg's "no vacuous pass" property ported to secrets.
+ *
+ * SCOPE (honest, by design — see docs/solutions/architecture-patterns/vault-observability-redaction-gap.md): this covers the
+ * surfaces redaction exists on today. Session-observability output (rendered HTML/frameHtml,
+ * screenshots) and egress request bodies have NO redactor yet — a stored value rendered into the page
+ * DOM is not scrubbed there. That gap is tracked follow-up; this leg deliberately does not claim it.
+ */
+async function runSecretLeakCheck() {
+  console.log(`\n── secret-leak: stored values never survive the redaction surfaces (U7 R4) ──`);
+  // A distinctive, high-entropy stand-in for a stored cookie/password/TOTP value (well over the
+  // redactor's 3-char floor; characters chosen so verbatim and URL-encoded forms coincide).
+  const SENTINEL = "S3NT1NEL_vault_7f3a9c2e1b8d4056_do_not_log";
+  const store = new SecretStore(() => ({}));
+  store.addRedactable([SENTINEL]); // folded in exactly as a decrypted vault credential is
+
+  const carrier = `boot ok; warm session cookie=${SENTINEL}; proceeding`;
+  const leaks = [];
+
+  // Surface 1 — the log/error scrubber (every verb/MCP/CLI boundary throws redactSecrets(message)).
+  const scrubbedLog = redactSecrets(carrier, store);
+  if (scrubbedLog.includes(SENTINEL)) leaks.push(`log scrub leaked the sentinel: ${scrubbedLog}`);
+
+  // Surface 2 — the audit trail (RedactingAuditSink scrubs host/url/reason before recording).
+  const inner = new InMemoryAuditSink();
+  new RedactingAuditSink(inner, store).record({
+    ts: 0,
+    consumerId: "probe",
+    action: "navigate",
+    decision: "block",
+    host: SENTINEL,
+    url: `https://example.test/${SENTINEL}`,
+    reason: `blocked ${SENTINEL}`,
+  });
+  const serialized = JSON.stringify(inner.records);
+  if (serialized.includes(SENTINEL)) leaks.push(`audit sink leaked the sentinel into a record: ${serialized}`);
+
+  // Positive control — a store that never learned the sentinel must NOT scrub it. If this fails, the
+  // probe is not exercising a live value and a "no leak" result above would be meaningless.
+  const controlOk = redactSecrets(carrier, new SecretStore(() => ({}))).includes(SENTINEL);
+  if (!controlOk) leaks.push("positive control FAILED — an unregistered sentinel did not survive (probe not exercising a live value)");
+
+  const passed = leaks.length === 0;
+  console.log(
+    `  surfaces=2 (log-scrub, audit) control=${controlOk ? "ok" : "BROKEN"} — ` +
+      `${passed ? "PASS" : "FAIL (a stored value escaped a redaction surface)"}`,
+  );
+  for (const l of leaks) console.log(`    ${l}`);
+  console.log("  (scope: log + audit surfaces; observability HTML/screenshots + egress payloads are an unredacted, documented gap)");
+  return passed;
+}
+
 /** Negative control: strict headless on the CF target must be blocked (proves Xvfb works). */
 async function runNegativeControl() {
   console.log(`\n── negative control: strict headless must be blocked ──`);
@@ -210,16 +273,18 @@ async function main() {
   const datadome = await runGroup("datadome", GROUPS.datadome);
   const webrtc = await runWebrtcLeakCheck();
   const webgl = await runWebglCheck();
+  const secretLeak = await runSecretLeakCheck();
   const negative = SKIP_NEGATIVE_CONTROL ? true : await runNegativeControl();
   if (SKIP_NEGATIVE_CONTROL) console.log("\n(negative control skipped)");
 
-  const passed = cloudflare && datadome && webrtc && webgl && negative;
+  const passed = cloudflare && datadome && webrtc && webgl && secretLeak && negative;
   console.log(`\n=== GATE: ${passed ? "PASS ✅" : "FAIL ❌"} ===`);
   console.log(
     `  cloudflare=${cloudflare ? "PASS" : "FAIL"} ` +
       `datadome=${datadome ? "PASS" : "FAIL"} ` +
       `webrtc=${webrtc ? "PASS" : "FAIL"} ` +
       `webgl=${webgl ? "PASS" : "FAIL"} ` +
+      `secret-leak=${secretLeak ? "PASS" : "FAIL"} ` +
       `negative-control=${negative ? "PASS" : "FAIL"}`,
   );
   process.exit(passed ? 0 : 1);

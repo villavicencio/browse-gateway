@@ -11,6 +11,7 @@ import { InMemoryAuditSink } from "./audit.js";
 import type { AuditSink } from "./audit.js";
 import { ConsumerRegistry } from "./consumer.js";
 import type { Consumer } from "./consumer.js";
+import { OriginationBoundary, ORIGINATION_DENY_REASON } from "./origination.js";
 
 /** Returns true when a host must be blocked for egress reasons (private/metadata ranges). */
 export type EgressFilter = (host: string) => boolean;
@@ -31,6 +32,12 @@ export interface PolicyEngineOptions {
   audit?: AuditSink;
   /** Egress deny-filter, applied before the allowlist. Defaults to private/metadata ranges. */
   egress?: EgressFilter;
+  /**
+   * Origination boundary (R4), applied to top-level navigations before the allowlist. Defaults to the
+   * public deny set (no env extensions); production passes {@link OriginationBoundary.fromEnv}. Always
+   * on — there is no "off": the boundary is a feature.
+   */
+  originationBoundary?: OriginationBoundary;
 }
 
 /**
@@ -48,11 +55,13 @@ export class PolicyEngine {
   readonly #registry: ConsumerRegistry;
   readonly #audit: AuditSink;
   readonly #egress: EgressFilter;
+  readonly #origination: OriginationBoundary;
 
   constructor(opts: PolicyEngineOptions) {
     this.#registry = opts.registry;
     this.#audit = opts.audit ?? new InMemoryAuditSink();
     this.#egress = opts.egress ?? isBlockedEgressHost;
+    this.#origination = opts.originationBoundary ?? new OriginationBoundary();
   }
 
   get audit(): AuditSink {
@@ -117,6 +126,22 @@ export class PolicyEngine {
           host: req.host,
           url: req.url,
           reason: EGRESS_DENY_REASON,
+        });
+        return "block";
+      }
+      // Origination boundary (R4): refuse a TOP-LEVEL navigation that would originate account creation
+      // or money movement — even to an allowlisted host. Gated on navigation requests only, so an
+      // embedded payment SDK/pixel (a subresource on a legit page) is not blocked; this targets the
+      // hand-off navigation, not page display. Like egress, it wins over the allowlist and is audited.
+      if (req.isNavigationRequest && this.#origination.denies(req.host, req.url)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: ORIGINATION_DENY_REASON,
         });
         return "block";
       }
@@ -195,3 +220,9 @@ export { tokenEnvKey, parseConsumerManifest, buildConsumerSpecs } from "./consum
 export type { ConsumerManifestEntry, BuiltConsumers } from "./consumer-config.js";
 export { InMemoryAuditSink, consoleAuditSink, RedactingAuditSink } from "./audit.js";
 export type { AuditRecord, AuditSink, AuditDecision } from "./audit.js";
+export {
+  OriginationBoundary,
+  ORIGINATION_DENY_REASON,
+  DEFAULT_ORIGINATION_DENY_HOSTS,
+  DEFAULT_ORIGINATION_DENY_PATHS,
+} from "./origination.js";

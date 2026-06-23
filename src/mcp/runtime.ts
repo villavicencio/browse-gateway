@@ -18,6 +18,7 @@ import {
   ConsumerRegistry,
   InMemoryAuditSink,
   RedactingAuditSink,
+  OriginationBoundary,
   parseConsumerManifest,
   buildConsumerSpecs,
 } from "../policy/index.js";
@@ -108,6 +109,8 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   const policy = new PolicyEngine({
     registry,
     audit: new RedactingAuditSink(new InMemoryAuditSink(AUDIT_MAX_RECORDS), secrets),
+    // Origination boundary (R4): public deny set + any BGW_ORIGINATION_DENY_HOSTS/_PATHS extensions.
+    originationBoundary: OriginationBoundary.fromEnv(env),
     ...(opts.policyEgress ? { egress: opts.policyEgress } : {}),
   });
   const gateway = Gateway.create(config, undefined, policy);

@@ -13,6 +13,7 @@
 import type { BrowserCoreOptions, StorageState } from "../browser/index.js";
 import type { LoginCredentials, LoginRecipe } from "../verbs/index.js";
 import { proxyOverrideFor, isValidTotpSeed } from "../verbs/index.js";
+import { cookieBelongsToHost, hostFromUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 
 /**
@@ -149,6 +150,24 @@ export function getVaultEntry(vault: VaultEntryStore, consumerId: string, host: 
   return vault.get<VaultEntry>(consumerId, host);
 }
 
+/**
+ * Restrict a captured {@link StorageState} to the entry's owning host (R4 host-scoped no-exfil): keep
+ * only the cookies and localStorage origins that {@link cookieBelongsToHost} `ownerHost`, dropping the
+ * rest. `storageState()` captures the WHOLE jar — third-party analytics/CDN cookies, and any host-B
+ * cookie a mis-filed/seeded blob carried — so a warm replay that injected the blob verbatim could send
+ * host-B's cookie wherever host-B is reachable. This is the choke point that makes "a stored host-A
+ * cookie is only ever injected into a host-A session" true: it is a FILTER, not an assertion, because
+ * a real login jar legitimately contains third-party cookies that must simply be left out, not treated
+ * as fatal. The owner-host cookies that remain are exactly the durable identity for this entry.
+ */
+export function hostScopeSession(state: StorageState, ownerHost: string): StorageState {
+  return {
+    ...state,
+    cookies: (state.cookies ?? []).filter((c) => cookieBelongsToHost(c.domain, ownerHost)),
+    origins: (state.origins ?? []).filter((o) => cookieBelongsToHost(hostFromUrl(o.origin), ownerHost)),
+  };
+}
+
 /** Crypto-shred an entry (drop the wrapped DEK). Returns whether one was removed. */
 export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, host: string): boolean {
   return vault.remove(consumerId, host);
@@ -164,14 +183,19 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
  * a bound `stickyExitId` (and a proxy is configured + on a datacenter IP). The stored `session` was
  * already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound clearance is
  * replayed here.
+ *
+ * `ownerHost` is the host the entry is keyed on (the lookup key the caller resolved it by). The restored
+ * state is {@link hostScopeSession}-filtered to it (R4 no-exfil): only owner-host cookies/origins are
+ * ever injected, so a third-party or smuggled off-host cookie in the blob can never ride into the
+ * session. It is REQUIRED, not optional — every warm-open must be host-scoped, enforced by the type.
  */
 export function buildWarmOverride(
   entry: VaultEntry,
   secrets: SecretStore,
-  opts: { onDatacenterIp: boolean; stickySuffix?: string },
+  opts: { onDatacenterIp: boolean; stickySuffix?: string; ownerHost: string },
 ): BrowserCoreOptions {
   const proxyOverride = entry.stickyExitId
     ? proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, entry.stickyExitId)
     : undefined;
-  return { restoreState: entry.session, ...(proxyOverride ?? {}) };
+  return { restoreState: hostScopeSession(entry.session, opts.ownerHost), ...(proxyOverride ?? {}) };
 }

@@ -131,8 +131,8 @@ test("an invalid TOTP seed is rejected at STORE time, before driving the login (
 test("buildWarmOverride: restores the captured state AND re-pins the bound sticky exit (R3)", () => {
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  const override = buildWarmOverride(entry, secrets, { onDatacenterIp: true, stickySuffix: "_session-{id}" });
-  assert.equal(override.restoreState, SESSION, "warm session restores the captured state");
+  const override = buildWarmOverride(entry, secrets, { onDatacenterIp: true, stickySuffix: "_session-{id}", ownerHost: "ex.com" });
+  assert.deepEqual(override.restoreState, SESSION, "warm session restores the captured state (host-scoped to ex.com)");
   assert.ok(override.proxy, "proxy applied (configured + on datacenter IP)");
   assert.ok(override.proxy.password.startsWith("pw"), "base proxy password preserved");
   assert.ok(override.proxy.password.includes("abcd1234"), "the BOUND exit id is pinned, not a fresh one");
@@ -141,19 +141,19 @@ test("buildWarmOverride: restores the captured state AND re-pins the bound stick
 test("buildWarmOverride: a DIRECT-captured entry (no bound exit) replays direct even with proxy configured (R7)", () => {
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, updatedAt: 1 }; // no stickyExitId → direct capture
-  assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: true, stickySuffix: "_session-{id}" }), { restoreState: SESSION });
+  assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: true, stickySuffix: "_session-{id}", ownerHost: "ex.com" }), { restoreState: SESSION });
 });
 
 test("buildWarmOverride: warm session is direct (state only) when no proxy is configured", () => {
   const bare = new SecretStore(() => ({}));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  assert.deepEqual(buildWarmOverride(entry, bare, { onDatacenterIp: true }), { restoreState: SESSION });
+  assert.deepEqual(buildWarmOverride(entry, bare, { onDatacenterIp: true, ownerHost: "ex.com" }), { restoreState: SESSION });
 });
 
 test("buildWarmOverride: no proxy when not on a datacenter IP, even with proxy configured", () => {
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: false, stickySuffix: "_session-{id}" }), { restoreState: SESSION });
+  assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: false, stickySuffix: "_session-{id}", ownerHost: "ex.com" }), { restoreState: SESSION });
 });
 
 test("capture drops IP-bound challenge tokens; the durable cookie + localStorage survive capture→vault→warm (PR #31 P1)", async () => {
@@ -166,7 +166,7 @@ test("capture drops IP-bound challenge tokens; the durable cookie + localStorage
     // it round-trips through the encrypted store stripped...
     assert.deepEqual(getVaultEntry(vault, "atlas", "ex.com").session.cookies.map((c) => c.name), ["sid"]);
     // ...and the warm-replay override carries no IP-bound clearance either.
-    const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: true });
+    const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: true, ownerHost: "ex.com" });
     assert.deepEqual(override.restoreState.cookies.map((c) => c.name), ["sid"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });

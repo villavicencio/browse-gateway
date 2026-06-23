@@ -5,7 +5,7 @@
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Gateway, loadConfig } from "../gateway/index.js";
-import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink } from "../policy/index.js";
+import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary } from "../policy/index.js";
 import { SecretStore, redactSecrets } from "../security/index.js";
 import { retrieve, stickySuffixBootError, parseForceProxyHosts, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
@@ -37,6 +37,8 @@ async function main(): Promise<void> {
     // Durable-trail default for the live path: bounded in-memory store wrapped in the
     // secret-scrubbing sink (R9) so BYO proxy/CAPTCHA material can never reach the audit log.
     audit: new RedactingAuditSink(new InMemoryAuditSink(AUDIT_MAX_RECORDS), secrets),
+    // Origination boundary (R4): public deny set + any BGW_ORIGINATION_DENY_HOSTS/_PATHS extensions.
+    originationBoundary: OriginationBoundary.fromEnv(process.env),
   });
   const config = loadConfig();
   // Wire the interactive-CAPTCHA solver onto the drive path when BYO config is present (key in the

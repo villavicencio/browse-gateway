@@ -108,7 +108,7 @@ export class Gateway {
   async openConsumerSession(
     token: string,
     coreOverrides?: BrowserCoreOptions,
-    opts?: { diagnostics?: boolean },
+    opts?: { diagnostics?: boolean; credentialHost?: string },
   ): Promise<string> {
     const policy = this.#requirePolicy();
     const consumer = policy.authenticate(token);
@@ -120,6 +120,22 @@ export class Gateway {
       // (the caller only flips this flag), so a caller can't widen what "diagnostics" may reach.
       const guard = opts?.diagnostics ? policy.guardForDiagnostics(consumer) : policy.guardFor(consumer);
       await session.core.setNavigationGuard(guard);
+      // R4/R18: a credentialed (warm-replay) session opens with a stored credential RESTORED into the
+      // jar — audit it attributably the moment it is guarded and ready. Only the consumer id + owning
+      // host are recorded (both non-secret; host is scrubbed by the redacting sink anyway); the stored
+      // credential/cookie values are never touched. A cold drive session (and the cold login-capture
+      // session, which mints rather than restores auth) passes no `credentialHost` and emits nothing
+      // here, keeping the trail signal-dense.
+      if (opts?.credentialHost) {
+        policy.audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "session-open",
+          decision: "open",
+          host: opts.credentialHost,
+          reason: "credentialed session",
+        });
+      }
     } catch (err) {
       await this.#sessions.release(session.id); // never leave a half-open, unguarded session
       throw err;
