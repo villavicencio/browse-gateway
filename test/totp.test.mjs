@@ -71,6 +71,36 @@ test("isValidTotpSeed: enforces Base32 charset + the ≥128-bit floor", () => {
   assert.equal(isValidTotpSeed(""), false);
 });
 
+test("isValidTotpSeed: rejects an invalid Base32 quantum the decoder would reject (PR #29 P2 regression)", () => {
+  // 27 chars passes a naive ⌊chars·5/8⌋≥16 byte-count check (16 bytes) AND the charset regex, but is
+  // NOT a valid Base32 length — the real decoder throws "excess padding". A heuristic check would
+  // accept it and the seed would only fail at first login. Authoritative validation rejects it.
+  assert.equal(isValidTotpSeed("A".repeat(27)), false);
+  assert.equal(isValidTotpSeed("A".repeat(32)), true); // a valid 32-char quantum (20 bytes) still passes
+});
+
+test("isValidTotpSeed never diverges from generateTotp (accepts exactly what generates)", () => {
+  // The invariant the P2 was about: a seed is "valid" iff generateTotp can actually use it.
+  const cases = [
+    SEED,
+    "JBSWY3DPEHPK3PXP", // 80-bit
+    "A".repeat(27), // bad quantum
+    "A".repeat(32), // good quantum
+    "not base32 0189!",
+    "",
+    "MFRGGZDFMZTWQ2LKNNWG23TPOA======", // padded, valid
+  ];
+  for (const seed of cases) {
+    let generates = true;
+    try {
+      generateTotp(seed, 0);
+    } catch {
+      generates = false;
+    }
+    assert.equal(isValidTotpSeed(seed), generates, `divergence for ${JSON.stringify(seed)}`);
+  }
+});
+
 test("generateTotp: a too-short seed throws a clean, SECRET-FREE message (no seed in the error)", () => {
   const weak = "JBSWY3DPEHPK3PXP"; // 80-bit, otplib rejects
   assert.throws(

@@ -30,16 +30,22 @@ export function normalizeTotpSeed(seed: string): string {
 }
 
 /**
- * Fast, up-front check that `seed` is a syntactically valid Base32 secret meeting the ≥128-bit floor,
- * so the vault import path can reject a malformed/weak seed with a clear message rather than failing
- * at first login. Base32 packs 5 bits per char (padding excluded); ⌊chars·5/8⌋ bytes must be
- * ≥ {@link MIN_TOTP_SEED_BYTES}. {@link generateTotp} remains authoritative (it runs the real decode).
+ * Up-front check that the vault import path can use to reject a malformed/weak `seed` with a clear
+ * message rather than failing at first login.
+ *
+ * AUTHORITATIVE by construction: it runs the SAME path {@link generateTotp} uses — the real Base32
+ * decode (scure) plus otplib's ≥128-bit guardrail — and reports whether that path succeeds. A char
+ * count + bit-count heuristic is necessary-but-NOT-sufficient: it would accept strings the decoder
+ * rejects (e.g. an invalid Base32 quantum / excess padding like `"A".repeat(27)`), so a caller could
+ * store a seed that then throws at login. Delegating removes any chance of that divergence.
  */
 export function isValidTotpSeed(seed: string): boolean {
-  const s = normalizeTotpSeed(seed);
-  if (!/^[A-Z2-7]+=*$/.test(s)) return false;
-  const chars = s.replace(/=+$/, "").length;
-  return Math.floor((chars * 5) / 8) >= MIN_TOTP_SEED_BYTES;
+  try {
+    generateTotp(seed, 0); // epoch pinned for determinism; the generated code is discarded
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
