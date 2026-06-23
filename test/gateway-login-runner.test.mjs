@@ -107,6 +107,59 @@ test("a block with no residential proxy to escalate to fails clearly (no silent 
   assert.deepEqual(opened, [undefined], "only the direct session was opened");
 });
 
+test("force-proxy host: begins on a PINNED residential exit — no direct session is ever opened (issue #21)", async () => {
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [clean()] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["ex.com"] });
+  const res = await runner({ host: "ex.com", recipe: RECIPE, creds: CREDS });
+  assert.equal(opened.length, 1, "exactly one session — the proxied one (no wasted direct attempt)");
+  assert.ok(opened[0]?.proxy, "first request is PROXIED, not direct");
+  assert.match(opened[0].proxy.password, /_s-[0-9a-f]{8}$/, "pinned to a sticky exit");
+  assert.ok(opened.every((o) => o !== undefined), "NO direct (undefined-override) session is ever opened for a forced host");
+  assert.ok(opened[0].proxy.password.endsWith(res.stickyExitId), "entry bound to the forced exit (warm replay re-pins it)");
+});
+
+test("force-proxy host with no residential proxy fails LOUD — never falls back to a direct login", async () => {
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [clean()] }));
+  const runner = makeGatewayLoginRunner(gateway, new SecretStore(() => ({})), "tok", { onDatacenterIp: true, forceProxyHosts: ["ex.com"] });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /force-proxy is configured.*no residential proxy is available/);
+  assert.equal(opened.length, 0, "no session opened at all — never a direct fallback");
+});
+
+test("force-proxy by subdomain suffix (totalwine.com covers www.totalwine.com)", async () => {
+  const recipe = { ...RECIPE, loginUrl: "https://www.shop.test/login" };
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [clean("https://www.shop.test/login")] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["shop.test"] });
+  const res = await runner({ host: "www.shop.test", recipe, creds: CREDS });
+  assert.ok(opened[0]?.proxy, "subdomain of a forced suffix is proxied from the first request");
+  assert.ok(res.stickyExitId, "bound to the forced exit");
+});
+
+test("a non-forced host is unaffected — still DIRECT-first even with a force list set for OTHER hosts", async () => {
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [clean()] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["other.test"] });
+  const res = await runner({ host: "ex.com", recipe: RECIPE, creds: CREDS });
+  assert.deepEqual(opened, [undefined], "ex.com is not on the list → first request is DIRECT");
+  assert.equal(res.stickyExitId, undefined, "direct capture binds no exit");
+});
+
+test("force-proxy with a proxy but NO sticky suffix fails LOUD — never stores a falsely R3-bound entry (PR #34 P1)", async () => {
+  // Rotating-exit config (BGW_PROXY_STICKY_SUFFIX unset): a stored stickyExitId could not re-pin the
+  // capture IP, so a forced capture must refuse rather than mint a meaningless id.
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [clean()] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, forceProxyHosts: ["ex.com"] });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /BGW_PROXY_STICKY_SUFFIX is unset/);
+  assert.equal(opened.length, 0, "no proxied session opened — never a rotating capture mislabeled as pinned");
+});
+
+test("escalation with a proxy but NO sticky suffix fails LOUD — no false-bound entry (PR #34 P1)", async () => {
+  // Direct gets a CF block, but with no suffix the escalated exit would rotate (and couldn't clear the
+  // interstitial anyway) — so refuse instead of opening a rotating exit and storing a bogus id.
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [blockedCF()] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /no re-pinnable residential exit/);
+  assert.deepEqual(opened, [undefined], "only the direct probe opened; no rotating exit was pinned + stored");
+});
+
 test("a non-escalatable failure (dead/unreachable, not a CF challenge) does NOT proxy", async () => {
   const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [dead()] }));
   const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });

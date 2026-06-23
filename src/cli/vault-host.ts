@@ -25,11 +25,13 @@ import {
   SecretStore,
   redactSecrets,
 } from "../security/index.js";
-import { importLoginToVault, getVaultEntry, revokeVaultEntry } from "../mcp/vault-login.js";
+import { importLoginToVault, captureLoginToVault, getVaultEntry, revokeVaultEntry } from "../mcp/vault-login.js";
 import type { VaultEntry } from "../mcp/vault-login.js";
+import { buildGatewayRuntime } from "../mcp/runtime.js";
+import { makeGatewayLoginRunner } from "../mcp/gateway-login-runner.js";
 import { parseConsumerManifest } from "../policy/index.js";
 import type { StorageState } from "../browser/index.js";
-import type { LoginCredentials } from "../verbs/index.js";
+import type { LoginCredentials, LoginRecipe } from "../verbs/index.js";
 
 const log = (msg: string): void => void process.stderr.write(`[obscura-vault-host] ${msg}\n`);
 
@@ -190,6 +192,88 @@ async function doRevoke(argv: string[], vault: VaultStore): Promise<void> {
   emit({ command: "revoke", ok: true, removed });
 }
 
+/** Minimal shape-validation of an operator-supplied login recipe (fields are selectors, not secrets). */
+function assertRecipe(recipe: unknown): asserts recipe is LoginRecipe {
+  const r = recipe as Partial<LoginRecipe> | undefined;
+  if (!r || typeof r !== "object") throw new Error("vault-host: login payload missing `recipe`");
+  for (const field of ["loginUrl", "usernameField", "passwordField", "submit"] as const) {
+    if (typeof r[field] !== "string" || !r[field]) throw new Error(`vault-host: recipe is missing the "${field}" selector`);
+  }
+  if (!r.successText && !r.successSelector) {
+    throw new Error("vault-host: recipe needs a success condition (successText or successSelector)");
+  }
+}
+
+/**
+ * Drive a live login capture on-host and persist it. This is the ONLY path that launches a browser:
+ * it builds the full gateway runtime (REUSING the process redaction sink so the KEK/tokens/creds all
+ * scrub), opens a consumer-bound, allowlist-guarded session via the production login-runner (R7
+ * direct-first / escalate-on-block; host-scoping + no-raw-CDP come free from `openConsumerSession`),
+ * captures, strips IP-bound tokens, seals, and fresh-decrypt-verifies. The throwaway Gateway is shut
+ * down no matter what — never leave a second Chrome alive in the container.
+ */
+async function doLogin(env: NodeJS.ProcessEnv, argv: string[]): Promise<void> {
+  const consumerId = requireArg(argv, "consumer");
+  const host = requireArg(argv, "host");
+
+  const raw = await readStdin();
+  if (!raw.trim()) throw new Error("vault-host: login expects a JSON payload {recipe, creds} on stdin");
+  let payload: { recipe?: unknown; creds?: unknown };
+  try {
+    payload = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`vault-host: login payload is not valid JSON: ${(e as Error).message}`);
+  }
+  assertRecipe(payload.recipe);
+  const recipe = payload.recipe;
+  const creds = payload.creds as LoginCredentials | undefined;
+  if (!creds || typeof creds.username !== "string" || typeof creds.password !== "string") {
+    throw new Error("vault-host: login payload missing valid `creds` (username + password strings)");
+  }
+  // Fold the secret material in BEFORE building the runtime / capturing — so any later throw scrubs it.
+  secrets.addRedactable([creds.username, creds.password, ...(creds.totpSeed ? [creds.totpSeed] : [])]);
+
+  // The full runtime launches a browser; reuse the process redaction sink so KEK + tokens fold here too.
+  const runtime = buildGatewayRuntime(env, { log, secrets });
+  try {
+    if (!runtime.vault) {
+      throw new Error("vault-host: the vault has no master key configured (set BGW_VAULT_KEY_FILE) — cannot store the captured login");
+    }
+    const spec = runtime.specs.find((s) => s.id === consumerId);
+    if (!spec) {
+      throw new Error(
+        `vault-host: consumer "${consumerId}" is not in the manifest — add it first (obscura keys new ${consumerId}); ` +
+          `a vault entry for an unknown consumer can never be replayed`,
+      );
+    }
+    const runLogin = makeGatewayLoginRunner(runtime.gateway, runtime.secrets, spec.token, {
+      onDatacenterIp: runtime.onDatacenterIp,
+      ...(runtime.stickySuffix ? { stickySuffix: runtime.stickySuffix } : {}),
+      // Honor BGW_FORCE_PROXY_HOSTS just like drive/retrieve: a forced host's login starts proxied,
+      // never from the datacenter IP (issue #21).
+      forceProxyHosts: runtime.forceProxyHosts,
+    });
+    const entry = await captureLoginToVault({ vault: runtime.vault, runLogin }, { consumerId, host, recipe, creds });
+    freshDecryptVerify(env, secrets, consumerId, host, entry);
+
+    const cookieNames = (entry.session.cookies ?? []).map((c) => c.name);
+    emit({
+      command: "login",
+      ok: true,
+      consumerId,
+      host,
+      updatedAt: entry.updatedAt,
+      cookieNames,
+      // The runner reports a bound exit ONLY when it escalated past a block (R7) — a direct capture binds none.
+      escalated: entry.stickyExitId !== undefined,
+      bound: entry.stickyExitId !== undefined,
+      verified: true,
+    });
+  } finally {
+    await runtime.gateway.shutdown().catch(() => {}); // never leave a second headful Chrome alive
+  }
+}
+
 async function main(): Promise<void> {
   const [sub, ...argv] = process.argv.slice(2);
   const env = process.env;
@@ -199,8 +283,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  // import/revoke need an open vault (the master key). openVault folds the KEK into the redaction set
-  // and runs the fail-closed boot guard; null means dir-set-but-dormant or feature-off.
+  // login is the only browser-launching path — it builds the FULL gateway runtime itself (and tears
+  // it down), so it does not use the lightweight openVault below.
+  if (sub === "login") {
+    await doLogin(env, argv);
+    return;
+  }
+
+  // import/revoke need an open vault (the master key) but no browser. openVault folds the KEK into the
+  // redaction set and runs the fail-closed boot guard; null means dir-set-but-dormant or feature-off.
   if (!env.BGW_VAULT_DIR) {
     throw new Error("vault-host: the vault is not enabled on this gateway (BGW_VAULT_DIR is unset)");
   }
@@ -216,10 +307,8 @@ async function main(): Promise<void> {
     case "revoke":
       await doRevoke(argv, vault);
       return;
-    case "login":
-      throw new Error("vault-host: `login` is not available yet (U8b) — use `import` for a hand-captured session");
     default:
-      throw new Error(`vault-host: unknown subcommand "${sub ?? ""}" (status|import|revoke)`);
+      throw new Error(`vault-host: unknown subcommand "${sub ?? ""}" (status|import|login|revoke)`);
   }
 }
 

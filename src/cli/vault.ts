@@ -18,6 +18,8 @@ const VAULT_HOST_WORKDIR = "/app";
 const VAULT_HOST_ENTRY = "dist/cli/vault-host.js";
 /** A vault op is a single docker-exec round-trip; give it a generous leash over the default ssh watchdog. */
 const VAULT_EXEC_TIMEOUT_MS = 60_000;
+/** `login` drives a real browser on-host (navigate + assisted login + 2FA + possible proxy retries) — far longer. */
+const LOGIN_EXEC_TIMEOUT_MS = 180_000;
 
 export interface VaultDeps {
   shell: RemoteShell;
@@ -48,8 +50,9 @@ async function runHost(
   sub: string,
   flags: Record<string, string | undefined>,
   stdin?: string,
+  timeoutMs?: number,
 ): Promise<Record<string, unknown>> {
-  const r = await deps.shell.run(execScript(deps, sub, flags), stdin, { timeoutMs: deps.timeoutMs ?? VAULT_EXEC_TIMEOUT_MS });
+  const r = await deps.shell.run(execScript(deps, sub, flags), stdin, { timeoutMs: timeoutMs ?? deps.timeoutMs ?? VAULT_EXEC_TIMEOUT_MS });
   if (r.code !== 0) {
     throw new Error(`vault ${sub} failed (exit ${r.code}): ${r.stderr.trim() || r.stdout.trim() || "no output from the on-host entrypoint"}`);
   }
@@ -148,4 +151,58 @@ export async function vaultImport(deps: VaultDeps, args: VaultImportArgs): Promi
     ),
   );
   if (res.bound === true) deps.out(note("bound to a sticky exit — warm replay re-pins the same residential IP"));
+}
+
+export interface VaultLoginArgs {
+  consumerId: string;
+  host: string;
+  /** Local path to the login recipe JSON (selectors + success condition). */
+  recipePath: string;
+  /** Local path to the credentials JSON ({username, password, totpSeed?}). */
+  credsPath: string;
+}
+
+/**
+ * Capture a live login on-host into the vault. The recipe + creds are read on the Mac, validated, and
+ * shipped as ONE JSON payload over stdin (never the command line); the on-host runner drives a real
+ * browser (direct-first, escalating to a residential exit only on a block), captures the
+ * authenticated session, strips IP-bound tokens, and seals it. A longer watchdog covers the live
+ * browser flow; the second headful Chrome is transient (operator runs this at low load).
+ */
+export async function vaultLogin(deps: VaultDeps, args: VaultLoginArgs): Promise<void> {
+  const read = deps.readLocalFile ?? ((p: string) => readFileSync(p, "utf8"));
+  let recipe: Record<string, unknown>;
+  let creds: { username?: unknown; password?: unknown };
+  try {
+    recipe = JSON.parse(read(args.recipePath));
+  } catch (e) {
+    throw new Error(`--recipe ${args.recipePath}: not readable as JSON (${e instanceof Error ? e.message : String(e)})`);
+  }
+  try {
+    creds = JSON.parse(read(args.credsPath));
+  } catch (e) {
+    throw new Error(`--creds ${args.credsPath}: not readable as JSON (${e instanceof Error ? e.message : String(e)})`);
+  }
+  // Validate locally for fast feedback before a ~minute-long on-host capture (the runner re-checks too).
+  for (const field of ["loginUrl", "usernameField", "passwordField", "submit"]) {
+    if (typeof recipe[field] !== "string" || !recipe[field]) {
+      throw new Error(`--recipe ${args.recipePath}: missing the "${field}" selector`);
+    }
+  }
+  if (!recipe.successText && !recipe.successSelector) {
+    throw new Error(`--recipe ${args.recipePath}: needs a success condition (successText or successSelector)`);
+  }
+  if (typeof creds.username !== "string" || typeof creds.password !== "string") {
+    throw new Error(`--creds ${args.credsPath}: must contain string "username" and "password" fields`);
+  }
+  const payload = JSON.stringify({ recipe, creds });
+  deps.out(note("capturing the login on-host — launches a second headful Chrome in the gateway container for ~10–40s (run when gateway load is low)"));
+  const res = await runHost(deps, "login", { consumer: args.consumerId, host: args.host }, payload, LOGIN_EXEC_TIMEOUT_MS);
+  const cookieNames = (res.cookieNames as string[]) ?? [];
+  deps.out(ok(`captured login for ${res.consumerId} @ ${res.host} — ${cookieNames.length} durable cookie(s), decrypt-verified`));
+  if (res.escalated === true) {
+    deps.out(note("escalated past a block to a residential exit — entry bound to that sticky exit (warm replay re-pins it)"));
+  } else {
+    deps.out(note("captured on the direct datacenter exit (no proxy needed) — warm replay stays direct"));
+  }
 }

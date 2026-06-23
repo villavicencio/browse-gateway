@@ -19,6 +19,7 @@
     "validate:vault-roundtrip": "npm run build && node scripts/validate-vault-roundtrip.mjs",
     "validate:assisted-login": "npm run build && node scripts/validate-assisted-login.mjs",
     "validate:vault-login": "npm run build && node scripts/validate-vault-login.mjs",
+    "validate:vault-host-login": "npm run build && node scripts/validate-vault-host-login.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {

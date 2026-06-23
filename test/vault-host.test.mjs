@@ -29,7 +29,9 @@ function setup({ withKey = true, manifest = [{ id: "atlas", allow: ["*"] }] } = 
   const manifestPath = join(root, "consumers.json");
   writeFileSync(manifestPath, JSON.stringify(manifest));
   // Restricted env: only what the entrypoint needs (+ PATH so `node` resolves) — no inherited secrets.
-  const env = { PATH: process.env.PATH, BGW_VAULT_DIR: vaultDir, BGW_CONSUMERS_MANIFEST: manifestPath };
+  // A bearer token per manifest consumer + a pool size, so the `login` path can build the full runtime.
+  const env = { PATH: process.env.PATH, BGW_VAULT_DIR: vaultDir, BGW_CONSUMERS_MANIFEST: manifestPath, BGW_MAX_SESSIONS: "3" };
+  for (const m of manifest) env[`BGW_CONSUMER_TOKEN_${m.id.toUpperCase()}`] = `tok-${m.id}-${"z".repeat(40)}`;
   if (withKey) env.BGW_VAULT_KEY_FILE = keyFile;
   return { root, vaultDir, keyB64, keyFile, manifestPath, env, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
@@ -185,12 +187,57 @@ test("status: entries on disk with NO key loads → boot-blocked, but the keyles
   }
 });
 
-test("login: reports not-yet-available (U8b)", () => {
+// --- login guards (these all fail BEFORE a browser launches, so they stay fast + Chrome-free) ---
+const RECIPE = (loginUrl) => ({ loginUrl, usernameField: "#u", passwordField: "#p", submit: "#s", successText: "Welcome" });
+const loginPayload = (recipe, creds = { username: "u", password: PASSWORD, totpSeed: SEED }) => JSON.stringify({ recipe, creds });
+
+test("login: rejects a recipe whose loginUrl host ≠ --host (before launching a browser)", () => {
   const fx = setup();
   try {
-    const r = run(fx.env, ["login", "--consumer", "atlas", "--host", "ex.com"]);
+    const r = run(fx.env, ["login", "--consumer", "atlas", "--host", "ex.com"], loginPayload(RECIPE("https://evil.com/login")));
     assert.equal(r.code, 1);
-    assert.match(r.stderr, /not available yet \(U8b\)/);
+    assert.match(r.stderr, /does not match the entry host/);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("login: refuses a consumer not in the manifest", () => {
+  const fx = setup();
+  try {
+    const r = run(fx.env, ["login", "--consumer", "ghost", "--host", "ex.com"], loginPayload(RECIPE("https://ex.com/login")));
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /"ghost" is not in the manifest/);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("login: rejects a malformed payload / missing success condition", () => {
+  const fx = setup();
+  try {
+    const noStdin = run(fx.env, ["login", "--consumer", "atlas", "--host", "ex.com"], "");
+    assert.equal(noStdin.code, 1);
+    assert.match(noStdin.stderr, /expects a JSON payload .* on stdin/);
+
+    const noSuccess = run(
+      fx.env,
+      ["login", "--consumer", "atlas", "--host", "ex.com"],
+      JSON.stringify({ recipe: { loginUrl: "https://ex.com/login", usernameField: "#u", passwordField: "#p", submit: "#s" }, creds: { username: "u", password: PASSWORD } }),
+    );
+    assert.equal(noSuccess.code, 1);
+    assert.match(noSuccess.stderr, /success condition/);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("login: refuses when the vault has no master key", () => {
+  const fx = setup({ withKey: false });
+  try {
+    const r = run(fx.env, ["login", "--consumer", "atlas", "--host", "ex.com"], loginPayload(RECIPE("https://ex.com/login")));
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /no master key configured/);
   } finally {
     fx.cleanup();
   }

@@ -14,8 +14,8 @@ export { macKeychain, memoryKeychain, KEYCHAIN_SERVICE } from "./keychain.js";
 export type { Keychain } from "./keychain.js";
 export { keysNew, keysList, keysRevoke, inspectConsumers, formatConsumerLine } from "./keys.js";
 export type { KeysDeps, KeysNewOptions, KeysRevokeOptions, KeysListResult, KeysListEntry, ProdFilesDeps } from "./keys.js";
-export { vaultStatus, vaultImport, vaultRevoke } from "./vault.js";
-export type { VaultDeps, VaultImportArgs } from "./vault.js";
+export { vaultStatus, vaultImport, vaultRevoke, vaultLogin } from "./vault.js";
+export type { VaultDeps, VaultImportArgs, VaultLoginArgs } from "./vault.js";
 export { status } from "./status.js";
 export type { StatusDeps, StatusOptions, StatusReport } from "./status.js";
 export {

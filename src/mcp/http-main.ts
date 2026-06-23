@@ -9,19 +9,10 @@
  * over a pipe (R13/R17); this port is the MCP surface, not CDP.
  */
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
-import { Gateway, loadConfig, poolSizingError } from "../gateway/index.js";
-import {
-  PolicyEngine,
-  ConsumerRegistry,
-  InMemoryAuditSink,
-  RedactingAuditSink,
-  parseConsumerManifest,
-  buildConsumerSpecs,
-} from "../policy/index.js";
 import type { Consumer } from "../policy/index.js";
-import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
-import { retrieve, stickySuffixBootError, parseForceProxyHosts, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { redactSecrets } from "../security/index.js";
+import { retrieve, hostForcesProxy } from "../verbs/index.js";
+import { buildGatewayRuntime } from "./runtime.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
@@ -33,7 +24,6 @@ const log = (msg: string): void => void process.stderr.write(`[browse-gateway-ht
 // direction), and one banner string doesn't justify a shared module.
 const OBSCURA_BOOT_BANNER = "(o,o) OBSCURA — see without being seen";
 
-const AUDIT_MAX_RECORDS = 10_000;
 const DRIVE_IDLE_TTL_MS = 5 * 60_000; // browser-session idle reap (frees Chrome)
 const DRIVE_REAPER_INTERVAL_MS = 60_000;
 const MCP_SESSION_REAPER_INTERVAL_MS = 60_000;
@@ -41,57 +31,17 @@ const SHUTDOWN_DRAIN_MS = 5_000; // bounded wait for in-flight tool calls before
 const DEFAULT_PORT = 8080;
 const DEFAULT_BIND = "127.0.0.1"; // fail-closed: deployment sets the Tailnet address explicitly
 
-function loadConsumers(env: NodeJS.ProcessEnv, secrets: SecretStore) {
-  const path = env.BGW_CONSUMERS_MANIFEST;
-  if (!path) throw new Error("BGW_CONSUMERS_MANIFEST is required (path to the consumer manifest JSON)");
-  const manifest = parseConsumerManifest(readFileSync(path, "utf8"));
-  const { specs, tokens } = buildConsumerSpecs(manifest, env);
-  secrets.addRedactable(tokens); // tokens never surface in logs/audit/errors (R9)
-  return specs;
-}
-
 function splitCsv(value: string | undefined): string[] {
   return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
 async function main(): Promise<void> {
   log(OBSCURA_BOOT_BANNER); // the brand on the experiential surface only — env/ports/tool names unchanged
-  const config = loadConfig();
-  const secrets = new SecretStore();
-  // Credential/session-state vault (B1). Off unless BGW_VAULT_DIR is set; constructing it here runs
-  // the fail-closed boot guard (entries on disk but no master key → refuse to boot) and folds the KEK
-  // into the redaction set. Consumed by the assisted-login + restore paths (later units); loaded now
-  // so the guard is live and a misconfigured key never goes unnoticed.
-  const vault = openVault({ canonicalizeHost, redact: (vals) => secrets.addRedactable(vals) });
-  if (vault) log("vault: ready (encrypted credential store enabled)");
-  // Interactive-CAPTCHA solver for the drive path, wired when BYO config is present (key in the
-  // SecretStore, endpoint in BGW_CAPTCHA_API_URL); absent = a detected CAPTCHA is left to fail.
-  config.core.solver = httpCaptchaSolverFromSecrets(secrets, process.env.BGW_CAPTCHA_API_URL, {
-    budget: DEFAULT_CAPTCHA_BUDGET,
-  });
-  const specs = loadConsumers(process.env, secrets);
-  const registry = new ConsumerRegistry(specs);
-
-  // P0: with held drive sessions sharing the global pool, the cap must cover every consumer's
-  // per-consumer share PLUS headroom for a concurrent transient `retrieve`. Refuse to boot
-  // mis-sized rather than fail opaquely at the first retrieve under load (Skeptic C2).
-  const sizingError = poolSizingError(registry.size, config.perConsumerMax, config.maxSessions);
-  if (sizingError) throw new Error(sizingError);
-
-  const policy = new PolicyEngine({
-    registry,
-    audit: new RedactingAuditSink(new InMemoryAuditSink(AUDIT_MAX_RECORDS), secrets),
-  });
-  const gateway = Gateway.create(config, undefined, policy);
-  const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
-  // Sticky-session suffix template for proxied escalation ({id} minted per attempt). Deployment
-  // config, NOT a secret (the proxy password it appends to is). Absent = rotating exits, which
-  // cannot clear a CF interstitial (the challenge is IP-bound; rotation moves the IP mid-handshake).
-  const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
-  const forceProxyHosts = parseForceProxyHosts(process.env.BGW_FORCE_PROXY_HOSTS);
-  const verifyEgress = process.env.BGW_DIAG_VERIFY_EGRESS === "1";
-  const stickyErr = stickySuffixBootError(stickySuffix);
-  if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
+  // Build the shared gateway runtime (config, secrets, vault, consumers, policy, gateway, escalation
+  // posture) with every fail-closed boot guard. Identical construction is used by the on-host
+  // `obscura vault login` capture (cli/vault-host.ts) so the two never drift.
+  const { gateway, secrets, policy, specs, config, onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress } =
+    buildGatewayRuntime(process.env, { log });
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
   // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without Host-based
