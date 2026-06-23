@@ -23,6 +23,7 @@ import type {
   BrowserCore,
   BrowserCoreOptions,
   DriveTarget,
+  FieldState,
   NavigationDecision,
   NavigationGuard,
   PageSnapshot,
@@ -325,6 +326,22 @@ export class PatchrightBrowserCore implements BrowserCore {
 
   async snapshot(): Promise<PageSnapshot> {
     return this.#snapshotOf(this.#requireActivePage());
+  }
+
+  async readField(target: DriveTarget): Promise<FieldState> {
+    const page = this.#requireActivePage();
+    const loc = page.locator(targetToSelector(target.target));
+    // count() is a one-shot existence check (no auto-wait) — the assisted-login poller owns the wait,
+    // so an absent field returns immediately as not-present rather than blocking on a locator timeout.
+    const count = await loc.count().catch(() => 0);
+    if (count === 0) return { present: false, value: "" };
+    // inputValue() reads <input>/<textarea>/<select>; a non-input (or detached) target yields "" via
+    // the catch rather than throwing, so "present but not input-like" reads as present + empty.
+    const value = await loc
+      .first()
+      .inputValue({ timeout: DEFAULT_ACTION_TIMEOUT_MS })
+      .catch(() => "");
+    return { present: true, value };
   }
 
   async click(target: DriveTarget): Promise<void> {
