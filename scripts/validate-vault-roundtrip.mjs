@@ -137,6 +137,20 @@ try {
   } finally {
     await restored.close();
   }
+
+  // --- Failure path: a malformed/legacy persisted cookie (no domain/path) makes addCookies reject
+  // AFTER Chrome has launched. launch() must surface that rejection (restoreOrClose closes the
+  // orphaned context first). Here we prove the rejection end-to-end against real Chrome; the
+  // close-is-called invariant is asserted in the unit test with a fake context. ---
+  let rejected = false;
+  try {
+    const bad = { cookies: [{ name: "sid", value: "x" }], origins: [] }; // no domain/url → addCookies throws
+    const leaky = await createBrowserCore({ ...coreOpts, userDataDir: "", restoreState: bad });
+    await leaky.close(); // should not be reached; clean up if it somehow was
+  } catch {
+    rejected = true;
+  }
+  check("malformed restoreState → launch rejects (context closed, not orphaned)", rejected);
 } finally {
   await a.close();
   await b.close();

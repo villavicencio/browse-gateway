@@ -10,7 +10,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildLocalStorageSeedScript } from "../dist/browser/index.js";
+import { buildLocalStorageSeedScript, restoreOrClose } from "../dist/browser/index.js";
 
 /** A Map-backed stand-in for the DOM `Storage` interface — getItem returns `null` when absent. */
 function fakeLocalStorage(initial = {}) {
@@ -109,6 +109,58 @@ test("does not throw when localStorage is unavailable (opaque/sandboxed origin)"
 test("empty origins → an inert no-op script (no entries, still valid JS)", () => {
   const out = run(buildLocalStorageSeedScript([]), { origin: ORIGIN, initial: { keep: "me" } });
   assert.deepEqual(out, { keep: "me" });
+});
+
+// --- restoreOrClose: the close-on-failure invariant (no real browser; a fake context records calls) ---
+// A just-launched Chrome must not be orphaned when a malformed/legacy persisted cookie makes
+// addCookies reject; restoreOrClose closes the context and rethrows the ORIGINAL error.
+
+/** A minimal BrowserContext stand-in recording cookie/init-script/close calls; addCookies can throw. */
+function fakeContext({ cookiesThrow = null } = {}) {
+  const ctx = {
+    closed: 0,
+    cookies: null,
+    initScript: null,
+    async addCookies(c) {
+      if (cookiesThrow) throw cookiesThrow;
+      ctx.cookies = c;
+    },
+    async addInitScript(s) {
+      ctx.initScript = s;
+    },
+    async close() {
+      ctx.closed++;
+    },
+  };
+  return ctx;
+}
+
+test("restoreOrClose: closes the context and rethrows the original error when restore fails", async () => {
+  const boom = new Error("addCookies: Cookie should have a url or a domain/path pair");
+  const ctx = fakeContext({ cookiesThrow: boom });
+  // A legacy/malformed persisted cookie (no domain/path) — the real addCookies-rejection trigger.
+  const bad = { cookies: [{ name: "sid", value: "x" }], origins: [] };
+  await assert.rejects(() => restoreOrClose(ctx, bad), (e) => e === boom, "rethrows the ORIGINAL error");
+  assert.equal(ctx.closed, 1, "context closed exactly once on failure (no orphan Chrome)");
+});
+
+test("restoreOrClose: success path applies state and never closes the context", async () => {
+  const ctx = fakeContext();
+  await restoreOrClose(ctx, {
+    cookies: [{ name: "sid", value: "x", domain: "ex.com", path: "/" }],
+    origins: [{ origin: "https://ex.com", localStorage: [{ name: "k", value: "v" }] }],
+  });
+  assert.equal(ctx.closed, 0, "a successful restore leaves the context open");
+  assert.ok(ctx.cookies, "cookies applied");
+  assert.match(ctx.initScript?.content ?? "", /localStorage/, "init script applied");
+});
+
+test("restoreOrClose: absent state is a no-op (ordinary cold session, context untouched)", async () => {
+  const ctx = fakeContext();
+  await restoreOrClose(ctx, undefined);
+  assert.equal(ctx.closed, 0);
+  assert.equal(ctx.cookies, null);
+  assert.equal(ctx.initScript, null);
 });
 
 test("emitted script structurally carries both guards (regression backstop for the eval paths)", () => {

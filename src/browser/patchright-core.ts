@@ -121,6 +121,31 @@ async function applyRestoreState(
   }
 }
 
+/**
+ * Restore `state` into a freshly-launched `context`, closing the context if restoration fails.
+ *
+ * The context is already a running Chrome by the time we seed it, and `addCookies` can REJECT on a
+ * malformed or legacy-shaped persisted cookie (one missing `domain`/`url`, say). Letting that reject
+ * propagate out of `launch()` would leave the browser process orphaned — and because every vault
+ * session that hits the same bad blob repeats the failure, the leaked processes accumulate until the
+ * capped browser pool is exhausted. So on any restore failure we close the context (best-effort) and
+ * rethrow the ORIGINAL error, so the caller sees the real cause, not a teardown error. A `null`/absent
+ * `state` is a no-op (the ordinary cold session). Exported for unit coverage of the close-on-failure
+ * path without launching a real browser.
+ */
+export async function restoreOrClose(
+  context: PatchrightContext,
+  state?: StorageState,
+): Promise<void> {
+  if (!state) return;
+  try {
+    await applyRestoreState(context, state);
+  } catch (err) {
+    await context.close().catch(() => {});
+    throw err;
+  }
+}
+
 /** Capture the title/text/html a page currently renders, tolerant of mid-navigation races. */
 async function snapshot(page: PatchrightPage): Promise<PageSignal> {
   const { title, text } = await pollSignal(page);
@@ -174,10 +199,9 @@ export class PatchrightBrowserCore implements BrowserCore {
     // Seed any captured session state BEFORE the first navigation, so a vault session is logged-in
     // from its first goto. This runs against the live context (not a launch arg), like the solver.
     // It registers cookies + an init script only — no network request — so it predates and is
-    // independent of the navigation guard the gateway installs next.
-    if (opts.restoreState) {
-      await applyRestoreState(context, opts.restoreState);
-    }
+    // independent of the navigation guard the gateway installs next. restoreOrClose owns the
+    // close-on-failure invariant so a bad blob can't orphan the just-launched Chrome.
+    await restoreOrClose(context, opts.restoreState);
     // The solver is a runtime dependency (not a launch arg) — pass it through to the instance.
     return new PatchrightBrowserCore(context, resolved, opts.solver);
   }

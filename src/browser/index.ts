@@ -22,7 +22,7 @@ export type {
   StorageStateOrigin,
   WaitCondition,
 } from "./types.js";
-export { createBrowserCore, PatchrightBrowserCore, targetToSelector } from "./patchright-core.js";
+export { createBrowserCore, PatchrightBrowserCore, restoreOrClose, targetToSelector } from "./patchright-core.js";
 export {
   assess,
   isCleared,
