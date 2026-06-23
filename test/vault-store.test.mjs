@@ -146,6 +146,58 @@ test("openVault: dir unset → off; dir+key → ready; dir+entries+no key → th
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("short sensitive values (TOTP code / PIN / short password) fold despite the length floor", () => {
+  const dir = tmp();
+  const folded = new Set();
+  const s = store(dir, KEK, (vals) => { for (const v of vals) folded.add(v); });
+  s.put("atlas", "example.com", { creds: { totp: "123456", pin: "4821", password: "hunter2" }, note: "ok" });
+  assert.ok(folded.has("123456"), "6-digit TOTP under a sensitive key folds");
+  assert.ok(folded.has("4821"), "4-digit PIN folds");
+  assert.ok(folded.has("hunter2"), "7-char password folds");
+  assert.ok(!folded.has("ok"), "a short value under a non-sensitive key is NOT folded (avoids over-redaction)");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("store rejects control characters in consumer/host (slot-field validation)", () => {
+  const dir = tmp();
+  const NUL = String.fromCharCode(0);
+  assert.throws(() => store(dir).put("atlas", "a" + NUL + "b.com", { x: 1 }), /control characters/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("openVault fails closed with a clear message when BGW_VAULT_DIR is a file", () => {
+  const dir = tmp();
+  const f = join(dir, "notadir");
+  writeFileSync(f, "x");
+  assert.throws(() => openVault({ env: { BGW_VAULT_DIR: f }, canonicalizeHost }), /not a directory.*refusing to boot/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey aborts on a corrupt entry BEFORE rewriting any (no split-brain)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  const s = store(dir, oldKek);
+  const slots = [["atlas", "a.com"], ["vault", "b.com"], ["argus", "c.com"]];
+  for (const [c, h] of slots) s.put(c, h, { c, h });
+  // Corrupt one entry's ciphertext on disk.
+  const victim = join(dir, readdirSync(dir).find((n) => n.endsWith(".vault.json")));
+  const ef = JSON.parse(readFileSync(victim, "utf8"));
+  const ct = Buffer.from(ef.record.blob.ct, "base64"); ct[0] ^= 0xff; ef.record.blob.ct = ct.toString("base64");
+  writeFileSync(victim, JSON.stringify(ef));
+
+  assert.throws(() => rotateVaultKey(dir, oldKek, newKek, canonicalizeHost), /authenticate|decrypt/i);
+
+  // No entry was re-sealed: the non-corrupt ones still open under the OLD key, none under the new.
+  const old = store(dir, oldKek);
+  let openUnderOld = 0;
+  for (const [c, h] of slots) { try { old.get(c, h); openUnderOld++; } catch { /* the corrupt one */ } }
+  assert.ok(openUnderOld >= 2, "non-corrupt entries still open under the OLD key (rotation did not touch them)");
+  const neu = store(dir, newKek);
+  for (const [c, h] of slots) assert.throws(() => neu.get(c, h));
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("rotateVaultKey: new key opens everything, old key no longer works", () => {
   const dir = tmp();
   const oldKek = randomBytes(32);

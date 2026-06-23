@@ -1,7 +1,7 @@
 /**
  * Vault crypto (U3) — the AES-256-GCM envelope: round-trip, authentication (tamper/wrong-key),
- * AAD slot-binding (no cross-consumer/host transplant), nonce freshness, version + shape guards.
- * All pure, no I/O. KEKs are random 32-byte buffers; consumer/host use placeholder codenames.
+ * AAD slot-binding (no cross-consumer/host transplant, injective even with odd field bytes), nonce
+ * freshness, version + shape guards. All pure, no I/O. KEKs are random 32-byte buffers.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -22,10 +22,8 @@ test("round-trips empty, small, and large payloads", () => {
   for (const pt of ["", "hello", "x".repeat(100_000)]) {
     assert.equal(open(seal(pt, CTX), CTX).toString("utf8"), pt);
   }
-  // Buffer in, buffer out.
   const bytes = randomBytes(4096);
   assert.ok(open(seal(bytes, CTX), CTX).equals(bytes));
-  // JSON convenience round-trips structured state.
   const state = { cookies: [{ name: "sid", value: "abc" }], origins: [{ origin: "https://example.com" }] };
   assert.deepEqual(openJson(sealJson(state, CTX), CTX), state);
 });
@@ -48,12 +46,24 @@ test("authentication: a tampered wrapped-DEK fails open()", () => {
 
 test("AAD slot-binding: a record cannot be transplanted to another consumer or host", () => {
   const rec = seal("atlas-on-example", CTX);
-  // Same KEK, different consumer → throws (AAD mismatch at the DEK unwrap).
   assert.throws(() => open(rec, { kek: KEK, consumerId: "vault", host: "example.com" }));
-  // Same KEK, different host → throws.
   assert.throws(() => open(rec, { kek: KEK, consumerId: "atlas", host: "other.com" }));
-  // Exact slot still opens.
   assert.equal(open(rec, CTX).toString("utf8"), "atlas-on-example");
+});
+
+test("AAD is INJECTIVE across the consumer/host boundary — a space in a field can't collide slots", () => {
+  // Two DISTINCT slots a naive space-join would map to the SAME AAD ("...atlas x.com y.com").
+  const recA = seal("A", { kek: KEK, consumerId: "atlas", host: "x.com y.com" });
+  assert.throws(() => open(recA, { kek: KEK, consumerId: "atlas x.com", host: "y.com" }), /authenticate|decrypt/i);
+  assert.equal(open(recA, { kek: KEK, consumerId: "atlas", host: "x.com y.com" }).toString("utf8"), "A");
+});
+
+test("slot fields reject NUL / control characters and empties", () => {
+  const NUL = String.fromCharCode(0);
+  const SOH = String.fromCharCode(1);
+  assert.throws(() => seal("x", { kek: KEK, consumerId: "atlas", host: "a" + NUL + "b.com" }), /control characters/);
+  assert.throws(() => seal("x", { kek: KEK, consumerId: "at" + SOH + "las", host: "a.com" }), /control characters/);
+  assert.throws(() => seal("x", { kek: KEK, consumerId: "", host: "a.com" }), /non-empty/);
 });
 
 test("wrong master key fails open()", () => {
@@ -76,7 +86,7 @@ test("nonce + DEK freshness: every seal uses distinct nonces (no fixed-nonce reu
     const rec = seal("same-plaintext-every-time", CTX);
     blobNonces.add(rec.blob.nonce);
     dekNonces.add(rec.dek.nonce);
-    dekCts.add(rec.dek.ct); // a fresh random DEK each time → wrapped ciphertext differs too
+    dekCts.add(rec.dek.ct);
   }
   assert.equal(blobNonces.size, N, "blob nonces all distinct");
   assert.equal(dekNonces.size, N, "DEK-wrap nonces all distinct");
@@ -93,7 +103,6 @@ test("shape guard: an unauthenticated / malformed record is refused before decry
   assert.throws(() => open({ v: VAULT_SCHEMA_VERSION, blob: { nonce: "a", ct: "b", tag: "c" } }, CTX), /missing dek\/blob/);
   assert.throws(() => open({ v: VAULT_SCHEMA_VERSION, dek: {}, blob: {} }, CTX), /missing dek\/blob/);
   assert.throws(() => open({ dek: { nonce: "a", ct: "b", tag: "c" }, blob: { nonce: "a", ct: "b", tag: "c" } }, CTX), /missing numeric version/);
-  // A tag of the wrong length (e.g. a CBC/CTR-shaped record with no real GCM tag) is refused.
   const rec = seal("x", CTX);
   const noTag = { ...rec, blob: { ...rec.blob, tag: Buffer.alloc(4).toString("base64") } };
   assert.throws(() => open(noTag, CTX), /auth-tag length|unauthenticated/);

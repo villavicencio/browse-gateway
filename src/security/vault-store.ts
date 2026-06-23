@@ -2,12 +2,16 @@
  * Vault store (B1) — per-`(consumer, host)` encrypted entries on disk, sealed via the U3 envelope
  * crypto. Entries decrypt only in-process into the owning session; the store never logs a payload.
  *
- * Layout: one JSON file per entry, named by `sha256(canonicalHost \0 consumerId)` so the filename is
- * filesystem-safe and traversal-proof. The file carries the `(consumerId, host)` tuple in PLAINTEXT
- * (neither is secret — both are also in the record's AAD) so `list()`/`vault status` can enumerate
- * without a key, plus the sealed record. Security rides on the AAD binding inside the record, not on
- * the filename or the stored tuple: a swapped/misfiled file fails to open under the requested
- * (consumer, host) because its tag won't verify.
+ * Layout: one JSON file per entry, named by sha256 of an INJECTIVE length-prefixed encoding of
+ * (canonicalHost, consumerId) — filesystem-safe, traversal-proof, and collision-free even if a field
+ * contains odd bytes. The file carries the `(consumerId, host)` tuple in PLAINTEXT (neither is secret
+ * — both are also in the record's AAD) so `list()`/`vault status` can enumerate without a key, plus
+ * the sealed record. Security rides on the AAD binding inside the record, not on the filename or the
+ * stored tuple: a swapped/misfiled file fails to open under the requested (consumer, host).
+ *
+ * Redaction: decrypted secret leaf values fold into the ever-loaded redaction set (sensitive-key
+ * values fold even when short). The set is an idempotent Set, so re-reading an entry never grows it;
+ * growth is bounded by the count of DISTINCT secret values across all entries (small for one operator).
  *
  * Master key: host-held key FILE (`BGW_VAULT_KEY_FILE`, chmod 600), or a raw base64 key in
  * `BGW_VAULT_KEY` as a fallback. On a single box the blast radius is irreducible (the process must
@@ -26,12 +30,16 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
-import { sealJson, openJson, decodeMasterKey, type SealedRecord } from "./vault-crypto.js";
+import { sealJson, openJson, decodeMasterKey, assertSlotField, type SealedRecord } from "./vault-crypto.js";
 
 const ENTRY_SUFFIX = ".vault.json";
-/** Length window for folding a decrypted leaf value into the redaction set (skip noise + huge blobs). */
+/** Generic leaf values fold for redaction only inside this length window (skip noise + huge blobs). */
 const REDACT_MIN = 8;
 const REDACT_MAX = 4096;
+/** Values under a sensitive-looking JSON key fold regardless of length (down to redactSecrets' 3-char floor). */
+const REDACT_SENSITIVE_MIN = 3;
+/** JSON keys whose values are credential-grade — fold them even when short (TOTP code, PIN, CVV, short password). */
+const SENSITIVE_KEY = /pass|secret|token|totp|otp|pin|cvv|cvc|key|credential|cookie|auth|bearer/i;
 
 /** What lands on disk per entry: the plaintext lookup tuple + the sealed payload. */
 interface EntryFile {
@@ -59,14 +67,23 @@ export interface VaultStoreOptions {
   redact?: (values: Iterable<string>) => void;
 }
 
-/** Collect string leaf values from an arbitrary decrypted payload, length-filtered, for redaction. */
-function leafSecrets(value: unknown, out: Set<string>): void {
+/**
+ * Collect string leaf values from a decrypted payload for redaction. Generic values fold within a
+ * length window (skip noise + huge blobs); values under a SENSITIVE_KEY (password/totp/pin/cvv/…) fold
+ * even when short, since a 6-digit code or 4-char PIN is exactly the kind of credential that must not
+ * surface in a log — the plain length floor would silently drop it.
+ */
+function leafSecrets(value: unknown, out: Set<string>, sensitiveKey = false): void {
   if (typeof value === "string") {
-    if (value.length >= REDACT_MIN && value.length <= REDACT_MAX) out.add(value);
+    const min = sensitiveKey ? REDACT_SENSITIVE_MIN : REDACT_MIN;
+    if (value.length >= min && value.length <= REDACT_MAX) out.add(value);
   } else if (Array.isArray(value)) {
-    for (const v of value) leafSecrets(v, out);
+    // An array inherits its key's sensitivity (e.g. `tokens: ["a","b"]`).
+    for (const v of value) leafSecrets(v, out, sensitiveKey);
   } else if (value && typeof value === "object") {
-    for (const v of Object.values(value)) leafSecrets(v, out);
+    // An object RESETS sensitivity per immediate key — it does not propagate down a container key, so
+    // `cookies: [{name:"sid", value:"…"}]` folds the long value (generic floor) but NOT the short name.
+    for (const [k, v] of Object.entries(value)) leafSecrets(v, out, SENSITIVE_KEY.test(k));
   }
 }
 
@@ -84,7 +101,17 @@ export class VaultStore {
   }
 
   #fileFor(consumerId: string, canonicalHost: string): string {
-    const name = createHash("sha256").update(`${canonicalHost}\0${consumerId}`).digest("hex");
+    // Reject control chars (so the same slot validity rule governs the filename and the AAD), then
+    // hash an INJECTIVE length-prefixed encoding — a plain `host \0 consumer` join would collide if a
+    // field itself contained a NUL, silently overwriting another slot's entry.
+    assertSlotField("consumerId", consumerId);
+    assertSlotField("host", canonicalHost);
+    const c = Buffer.from(consumerId, "utf8");
+    const h = Buffer.from(canonicalHost, "utf8");
+    const head = Buffer.alloc(8);
+    head.writeUInt32BE(h.length, 0);
+    head.writeUInt32BE(c.length, 4);
+    const name = createHash("sha256").update(Buffer.concat([head, h, c])).digest("hex");
     return join(this.#dir, `${name}${ENTRY_SUFFIX}`);
   }
 
@@ -156,8 +183,13 @@ export class VaultStore {
 /**
  * Rotate the master key: re-seal every entry under `newKek` (decrypt with `oldKek`, encrypt afresh —
  * a new DEK + nonces per entry). After this returns, point BGW_VAULT_KEY_FILE at the new key; the old
- * key no longer opens anything. Returns the number of entries rotated. Throws (and leaves the dir
- * untouched past the last successful write) if any entry fails to decrypt under `oldKek`.
+ * key no longer opens anything. Returns the number of entries rotated.
+ *
+ * Two phases so a single bad entry can't leave a half-rotated split-brain vault: decrypt EVERY entry
+ * under `oldKek` FIRST — if any fails, throw before a single file is rewritten, so the old key still
+ * opens everything. Only once the whole set is verified do we re-seal in place. (Residual: a process
+ * crash during the write phase can leave a partial rotation; re-run with the old key — verified
+ * entries that already flipped will fail phase 1, surfacing the partial state to the operator.)
  */
 export function rotateVaultKey(
   dir: string,
@@ -165,20 +197,23 @@ export function rotateVaultKey(
   newKek: Buffer,
   canonicalizeHost: (host: string) => string,
 ): number {
-  const store = new VaultStore({ kek: oldKek, dir, canonicalizeHost });
-  const next = new VaultStore({ kek: newKek, dir, canonicalizeHost });
-  let n = 0;
-  for (const meta of store.list()) {
-    const value = store.get(meta.consumerId, meta.host); // throws under a wrong oldKek (fail closed)
-    next.put(meta.consumerId, meta.host, value);
-    n++;
-  }
-  return n;
+  const oldStore = new VaultStore({ kek: oldKek, dir, canonicalizeHost });
+  // Phase 1 — decrypt all under the old key. A corrupt/mismatched entry throws here, before any write.
+  const decrypted = oldStore.list().map((m) => ({ m, value: oldStore.get(m.consumerId, m.host) }));
+  // Phase 2 — re-seal under the new key (pure) and write each in place (atomic temp + rename per file).
+  const newStore = new VaultStore({ kek: newKek, dir, canonicalizeHost });
+  for (const { m, value } of decrypted) newStore.put(m.consumerId, m.host, value);
+  return decrypted.length;
 }
 
-/** Count entries on disk without a key — used by the boot guard. */
+/**
+ * Count entries on disk without a key — used by the boot guard. Throws a clear error when BGW_VAULT_DIR
+ * exists but isn't a readable directory (a file, a permission problem), so the caller fails closed with
+ * a message instead of a raw ENOTDIR stack trace.
+ */
 export function countVaultEntries(dir: string): number {
   if (!existsSync(dir)) return 0;
+  if (!statSync(dir).isDirectory()) throw new Error(`BGW_VAULT_DIR is not a directory: ${dir}`);
   return readdirSync(dir).filter((n) => n.endsWith(ENTRY_SUFFIX)).length;
 }
 
@@ -237,7 +272,12 @@ export function openVault(deps: OpenVaultDeps): VaultStore | null {
   const env = deps.env ?? process.env;
   const dir = env.BGW_VAULT_DIR;
   if (!dir) return null;
-  const entryCount = countVaultEntries(dir);
+  let entryCount: number;
+  try {
+    entryCount = countVaultEntries(dir); // throws on a mis-set dir (a file / unreadable)
+  } catch (e) {
+    throw new Error(`vault: ${(e as Error).message} — refusing to boot (fix BGW_VAULT_DIR)`);
+  }
   let key: Buffer | null = null;
   let keyError: string | undefined;
   try {
