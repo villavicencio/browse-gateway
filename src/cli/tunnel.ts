@@ -218,13 +218,17 @@ export function classifyAgentState(printOutput: string | null, logTail: string):
   return "not-bootstrapped";
 }
 
-/** A listener on the forwarded port: lsof's COMMAND + PID, plus the full argv resolved from the PID. */
+/** A listener on the forwarded port, enriched from `ps` with the provenance the classifier needs. */
 export interface PortListener {
   /** lsof COMMAND column — truncated (e.g. "ssh") and NOT trusted alone (see classifyPortOwner). */
   command: string;
   pid: string;
-  /** Full argv from `ps -o command= -p <pid>` — null when it can't be resolved. */
+  /** Owning UID from `ps` — argv shape is forgeable by a foreign account, the UID is the real boundary. */
+  uid: number | null;
+  /** Full argv from `ps` — null when it can't be resolved. */
   argv: string | null;
+  /** Parent process command from `ps` — must reference OUR keeper for the listener to be ours. */
+  parentCommand: string | null;
 }
 
 /** Parse `lsof -nP -iTCP:<port> -sTCP:LISTEN` rows into (command, pid) pairs (header/blank dropped). */
@@ -238,6 +242,15 @@ export function parsePortListeners(lsofOutput: string | null): { command: string
       return { command: cols[0] ?? "", pid: cols[1] ?? "" };
     })
     .filter((r) => r.command !== "" && r.pid !== "");
+}
+
+/** Parse one `ps -o uid=,ppid=,command=` line into its numeric uid, ppid, and full argv. */
+function parsePsLine(out: string): { uid: number; ppid: string; argv: string } | null {
+  const m = out.trim().match(/^(\d+)\s+(\d+)\s+([\s\S]+)$/);
+  if (m === null) return null;
+  const [, uid, ppid, argv] = m;
+  if (uid === undefined || ppid === undefined || argv === undefined) return null;
+  return { uid: Number(uid), ppid, argv };
 }
 
 /**
@@ -315,24 +328,29 @@ function isOurKeeperInvocation(tokens: string[], spec: TunnelSpec): boolean {
 }
 
 /**
- * Classify who owns the local forwarded port. "ours" requires EVERY listener to be OUR specific ssh
- * tunnel — an ssh process whose argv matches the keeper's tightly allowlisted shape (only -N/-T/-L),
- * forwards OUR local port, and has our alias as the destination operand. All three must hold:
- *  - COMMAND=ssh is necessary but not sufficient (any `ssh -L <port>` shows COMMAND=ssh);
- *  - the alias must be the destination OPERAND, not just present (a foreign `ssh -l <alias> …` puts it
- *    in the -l value while dialing the attacker);
- *  - the argv carries NO redirecting option (`-o HostName=…`, `-F`, `-J`) — those override where the
- *    alias resolves, so operand + forward alone don't prove the connection reaches our host.
+ * Classify who owns the local forwarded port. "ours" requires EVERY listener to clear PROVENANCE and
+ * argv-shape checks — argv shape ALONE is forgeable, because a foreign local account can run the exact
+ * `ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel` using ITS OWN `~/.ssh/config`, where the
+ * alias resolves to an attacker host. So the load-bearing gate is provenance:
+ *  - **UID == the current user** — a different account's listener is never ours (this is the boundary
+ *    that matters; a same-UID attacker already controls our session and our ssh_config anyway);
+ *  - **descends from OUR keeper** — the listener's parent command references `spec.keeperPath`, the only
+ *    thing that legitimately runs this forward (rejects a same-user process with a clean config + the
+ *    right argv but a different parent);
+ *  - **argv matches the keeper's allowlisted shape** (only -N/-T/-L, our forward, alias as the
+ *    destination operand, NO redirecting -o/-F/-J) — defense in depth on top of provenance.
  * <gatewayHost> is deliberately NOT pinned (the forward target legitimately drifts on a config change;
- * the live keeper is never rewritten — detectDrift surfaces that). A listener we can't positively
- * confirm makes the whole port "foreign" — fail closed, so `connect` never registers a bearer token
- * against a service it can't prove is ours. (Mac-side local-forward check only; the prod-side
- * rootlesskit forward is namespace-invisible to a login shell — never inferred from ss/lsof.)
+ * the live keeper is never rewritten — detectDrift surfaces that). Anything we can't positively confirm
+ * makes the whole port "foreign" — fail closed, so `connect` never registers a bearer token against a
+ * service it can't prove is ours. (Mac-side local-forward check only; the prod-side rootlesskit forward
+ * is namespace-invisible to a login shell — never inferred from ss/lsof.)
  */
-export function classifyPortOwner(listeners: PortListener[] | null, spec: TunnelSpec): PortOwner {
+export function classifyPortOwner(listeners: PortListener[] | null, spec: TunnelSpec, expectedUid: number): PortOwner {
   if (listeners === null || listeners.length === 0) return "none";
   const isOurs = (l: PortListener): boolean => {
     if (l.command !== "ssh" || l.argv === null) return false;
+    if (l.uid !== expectedUid) return false; // provenance: a foreign account's listener is NOT ours
+    if (l.parentCommand === null || !l.parentCommand.includes(spec.keeperPath)) return false; // our keeper
     return isOurKeeperInvocation(l.argv.split(/\s+/).filter((t) => t !== ""), spec);
   };
   return listeners.every(isOurs) ? "ours" : "foreign";
@@ -362,16 +380,23 @@ export async function tunnelState(spec: TunnelSpec, exec: Exec = execCapture): P
   ]);
   const logTail = readLogTail(spec);
   const agent = classifyAgentState(print && print.code === 0 ? print.stdout : null, logTail);
-  // Resolve each listener's full argv (lsof's COMMAND is truncated to "ssh") so the classifier can
-  // confirm it's OUR forward, not just some ssh. Fail closed: an unresolvable argv stays "foreign".
+  // Enrich each listener from `ps` with its UID + argv + parent command — lsof's COMMAND is truncated
+  // and argv shape is forgeable by a foreign account, so the classifier needs provenance (owning UID
+  // and the parent process) to confirm it's OUR tunnel. Fail closed: anything unresolvable → "foreign".
   const rows = parsePortListeners(lsof && lsof.code === 0 ? lsof.stdout : null);
   const listeners: PortListener[] = await Promise.all(
     rows.map(async ({ command, pid }) => {
-      const ps = await exec("ps", ["-o", "command=", "-p", pid]).catch(() => null);
-      return { command, pid, argv: ps && ps.code === 0 ? ps.stdout.trim() : null };
+      const ps = await exec("ps", ["-o", "uid=,ppid=,command=", "-p", pid]).catch(() => null);
+      const parsed = ps && ps.code === 0 ? parsePsLine(ps.stdout) : null;
+      let parentCommand: string | null = null;
+      if (parsed) {
+        const pp = await exec("ps", ["-o", "command=", "-p", parsed.ppid]).catch(() => null);
+        parentCommand = pp && pp.code === 0 ? pp.stdout.trim() : null;
+      }
+      return { command, pid, uid: parsed?.uid ?? null, argv: parsed?.argv ?? null, parentCommand };
     }),
   );
-  const port = classifyPortOwner(listeners, spec);
+  const port = classifyPortOwner(listeners, spec, uid);
   if (agent !== "self-disabled") return { agent, port };
   const lines = logTail.split("\n");
   let at = 0;
