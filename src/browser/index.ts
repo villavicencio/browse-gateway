@@ -10,6 +10,7 @@ export type {
   BrowserCoreOptions,
   Category,
   DriveTarget,
+  FieldState,
   NavigationDecision,
   NavigationGuard,
   NavigationRequest,

@@ -10,6 +10,8 @@ export { isCloudflareBlock, shouldEscalateToProxy, parseForceProxyHosts, hostFor
 export type { EscalationContext } from "./escalation.js";
 export { proxyOverrideFor, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "./drive.js";
 export { generateTotp, verifyTotp, isValidTotpSeed, normalizeTotpSeed, MIN_TOTP_SEED_BYTES } from "./totp.js";
+export { assistedLogin, coreLoginDriver, DEFAULT_FIELD_TIMEOUT_MS, DEFAULT_FIELD_POLL_MS } from "./assisted-login.js";
+export type { LoginRecipe, LoginCredentials, LoginDriver, AssistedLoginOptions, AssistedLoginResult } from "./assisted-login.js";
 export { detectCaptcha, NullCaptchaSolver } from "./captcha.js";
 export type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "./captcha.js";
 export { HttpCaptchaSolver, CaptchaSolveError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "./captcha-solver.js";

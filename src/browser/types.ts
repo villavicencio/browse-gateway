@@ -202,6 +202,19 @@ export interface WaitCondition {
   timeMs?: number;
 }
 
+/**
+ * Tri-state result of {@link BrowserCore.readField}: whether the element exists yet, and its current
+ * input value when it does. The assisted-login flow (U6) reads it as absent / present-empty /
+ * present-filled — so it can poll an async-rendered field into existence, fill only an empty one
+ * (a pre-filled "remember me" field is left alone), and never type into a field that isn't there.
+ */
+export interface FieldState {
+  /** True when at least one element matches the target (the field has rendered). */
+  present: boolean;
+  /** The field's current value when present and input-like; `""` for an absent or non-input target. */
+  value: string;
+}
+
 export interface BrowserCore {
   /** Identifies the concrete vehicle, e.g. `"patchright"`. */
   readonly kind: string;
@@ -233,6 +246,13 @@ export interface BrowserCore {
   navigate(url: string, opts?: RenderOptions): Promise<PageSnapshot>;
   /** Capture a ref-annotated accessibility snapshot of the active page. */
   snapshot(): Promise<PageSnapshot>;
+  /**
+   * Read a field's tri-state {@link FieldState} (present? + current value) without acting on it.
+   * The assisted-login flow's source of truth for polling an async-rendered login/2FA field and for
+   * filling only an empty one. Never throws on an absent or non-input target — returns
+   * `{ present: false, value: "" }` / `{ present: true, value: "" }`.
+   */
+  readField(target: DriveTarget): Promise<FieldState>;
   /** Click the element identified by `target` (a snapshot ref or a selector). */
   click(target: DriveTarget): Promise<void>;
   /** Fill `text` into the element; `submit` presses Enter afterward. */

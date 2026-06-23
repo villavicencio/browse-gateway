@@ -17,6 +17,7 @@
     "validate:http": "npm run build && node scripts/validate-http.mjs",
     "validate:frame-capture": "npm run build && node scripts/validate-frame-capture.mjs",
     "validate:vault-roundtrip": "npm run build && node scripts/validate-vault-roundtrip.mjs",
+    "validate:assisted-login": "npm run build && node scripts/validate-assisted-login.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
