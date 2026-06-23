@@ -185,6 +185,35 @@ test("OriginationBoundary.denies: account-creation + money-movement paths and pa
   assert.equal(b.denies("ex.com", "https://ex.com/registered-trademarks"), false, "/register must not match /registered-...");
 });
 
+test("OriginationBoundary.denies: percent-encoded paths are decoded before matching (no /sign%75p evasion)", () => {
+  const b = new OriginationBoundary();
+  // A server decodes these to the denied route; matching the raw escaped pathname alone would miss it.
+  assert.equal(b.denies("ex.com", "https://ex.com/sign%75p"), true, "/sign%75p -> /signup");
+  assert.equal(b.denies("ex.com", "https://ex.com/trans%66er"), true, "/trans%66er -> /transfer");
+  assert.equal(b.denies("ex.com", "https://ex.com/account/cr%65ate"), true, "/account/cr%65ate -> /account/create");
+  // Double-encoded — iterated decode catches it.
+  assert.equal(b.denies("ex.com", "https://ex.com/sign%2575p"), true, "/sign%2575p -> /sign%75p -> /signup");
+  // A malformed escape must not throw and must not wrongly match.
+  assert.equal(b.denies("ex.com", "https://ex.com/products%"), false);
+  // A legitimately encoded NON-origination path stays allowed.
+  assert.equal(b.denies("ex.com", "https://ex.com/sea%72ch"), false, "/search is not origination");
+});
+
+test("OriginationBoundary.denies: matrix params (;) and NUL truncation can't hide a denied route behind the anchor", () => {
+  const b = new OriginationBoundary();
+  // Matrix / path-parameter: servlet containers strip `;...` and route to the bare segment.
+  assert.equal(b.denies("ex.com", "https://ex.com/transfer;id=1"), true, "/transfer;id=1 routes to /transfer");
+  assert.equal(b.denies("ex.com", "https://ex.com/signup;jsessionid=x"), true);
+  assert.equal(b.denies("ex.com", "https://ex.com/account/create;x=1"), true);
+  assert.equal(b.denies("ex.com", "https://ex.com/foo;a=1/transfer;b=2"), true, "matrix params stripped per segment");
+  assert.equal(b.denies("ex.com", "https://ex.com/trans%66er;x"), true, "composes with percent-encoding");
+  // NUL truncation: a backend that cuts the path at \0 sees the denied route.
+  assert.equal(b.denies("ex.com", "https://ex.com/transfer%00"), true, "/transfer%00 truncates to /transfer");
+  assert.equal(b.denies("ex.com", "https://ex.com/account/create%00.html"), true);
+  // A legitimate path with no denied segment after normalization stays allowed.
+  assert.equal(b.denies("ex.com", "https://ex.com/account/settings;tab=2"), false);
+});
+
 test("OriginationBoundary.fromEnv: env extends the public defaults, never replaces them", () => {
   const b = OriginationBoundary.fromEnv({ BGW_ORIGINATION_DENY_HOSTS: "custom-pay.example", BGW_ORIGINATION_DENY_PATHS: "/donate(?:[/?.]|$)" });
   assert.equal(b.denies("custom-pay.example", "https://custom-pay.example/"), true, "env host added");
@@ -224,6 +253,49 @@ test("Rail 3: the origination boundary is ON BY DEFAULT (no explicit boundary pa
   const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["ex.com"] }]), audit });
   const guard = policy.guardFor(policy.authenticate("tok"));
   assert.equal(guard(navReq("ex.com", "/account/create")), "block", "the public deny set applies with no opt-in");
+});
+
+// ───────── Rail 1 (second half): credentialed-session navigation is clamped to the owner host ─────────
+
+test("Rail 1: a credentialed session clamps NAVIGATION to the owner host — a retained parent cookie can't ride to a sibling", () => {
+  const audit = new InMemoryAuditSink();
+  // *.example.com is allowlisted, so the consumer guard alone would let the session reach any subdomain.
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["*.example.com"] }]), audit });
+  const guard = policy.guardForCredentialHost(policy.authenticate("tok"), "accounts.example.com");
+
+  assert.equal(guard(navReq("accounts.example.com", "/dashboard")), "allow", "the owner host is navigable");
+  assert.equal(guard(navReq("evil.example.com", "/")), "block", "a sibling subdomain is blocked — the parent cookie must not ride there");
+  assert.equal(guard(navReq("www.example.com", "/")), "block");
+  assert.equal(guard(navReq("example.com", "/")), "block", "even the apex is blocked");
+  // Subresources still load within the consumer allowlist so the owner-host page renders.
+  assert.equal(guard(navReq("cdn.example.com", "/app.js", false)), "allow", "a subresource is not nav-clamped");
+  // The origination boundary still applies on the owner host.
+  assert.equal(guard(navReq("accounts.example.com", "/signup")), "block", "origination still enforced");
+  // A blocked sibling navigation is audited with the credential-scope reason.
+  assert.ok(audit.records.find((r) => r.host === "evil.example.com" && /credential scope/.test(r.reason ?? "")));
+});
+
+test("Rail 1: guardForCredentialHost is never WIDER than the consumer allowlist (owner host ∩ allowlist)", () => {
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["accounts.example.com"] }]) });
+  const guard = policy.guardForCredentialHost(policy.authenticate("tok"), "other.com");
+  assert.equal(guard(navReq("other.com", "/")), "block", "an owner host outside the consumer allowlist is still blocked");
+});
+
+test("Rail 1+2: openConsumerSession with credentialHost installs the owner-host-clamped guard AND audits the open", async () => {
+  const audit = new InMemoryAuditSink();
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["*.example.com"] }]), audit });
+  const { factory, cores } = makeFactory();
+  const gw = Gateway.create(config(3), factory, policy);
+
+  const handle = await gw.openConsumerSession("tok", { restoreState: SESSION }, { credentialHost: "accounts.example.com" });
+  const guard = cores[0].guard; // the guard installed on the session's core
+  assert.equal(guard(navReq("accounts.example.com", "/")), "allow");
+  assert.equal(guard(navReq("evil.example.com", "/")), "block", "sibling blocked by the credential clamp, not just the consumer allowlist");
+  assert.ok(
+    audit.records.find((r) => r.action === "session-open" && r.host === "accounts.example.com"),
+    "the credentialed open is on the audit trail",
+  );
+  await gw.closeConsumerSession("tok", handle);
 });
 
 // ─────────────────── Rail 4: secret-leak (deterministic unit half) ───────────────────

@@ -72,6 +72,52 @@ export const DEFAULT_ORIGINATION_DENY_PATHS: readonly string[] = [
   "/payment[\\-_]?methods?/(?:new|add)(?:[/?.]|$)",
 ];
 
+/**
+ * The raw pathname plus each distinct percent-DECODED form, iterated up to a small cap to defeat
+ * double-encoding (`%2575` → `%75` → `u`). An origin server commonly decodes `/sign%75p` → `/signup`
+ * and `/trans%66er` → `/transfer` when routing, so matching only the raw escaped pathname would let an
+ * agent slip a denied route past the boundary. We match the deny patterns against ALL forms. A decode
+ * that throws (a malformed escape like a lone `%`) just stops the walk on the forms seen so far —
+ * fail-open on that one variant, but the raw form (and any earlier successful decode) is still matched.
+ */
+function decodedPathVariants(pathname: string): string[] {
+  const seen = [pathname];
+  let cur = pathname;
+  for (let i = 0; i < 3; i++) {
+    let dec: string;
+    try {
+      dec = decodeURIComponent(cur);
+    } catch {
+      break;
+    }
+    if (dec === cur || seen.includes(dec)) break;
+    seen.push(dec);
+    cur = dec;
+  }
+  return seen;
+}
+
+/**
+ * Normalize a path the way a permissive origin server does before it routes — so a denied route can't
+ * hide behind a segment terminator the deny regexes' `(?:[/?.]|$)` anchor doesn't cover:
+ *   - drop per-segment MATRIX parameters (everything after the first `;` in each `/`-segment): servlet
+ *     containers / JAX-RS strip these, routing `/transfer;jsessionid=x` → the `/transfer` handler;
+ *   - truncate at a NUL (`\0`, typically arriving as `%00`): some backends cut the path there, so
+ *     `/transfer%00` routes as `/transfer`.
+ * Applied to every decoded variant, so `/trans%66er;x` and `/transfer%00.html` both reduce to `/transfer`.
+ */
+function serverNormalizedPath(pathname: string): string {
+  const nul = pathname.indexOf("\0");
+  const truncated = nul === -1 ? pathname : pathname.slice(0, nul);
+  return truncated
+    .split("/")
+    .map((seg) => {
+      const semi = seg.indexOf(";");
+      return semi === -1 ? seg : seg.slice(0, semi);
+    })
+    .join("/");
+}
+
 /** Split a comma/whitespace-separated env list into trimmed, non-empty entries. */
 function splitEnvList(raw: string | undefined): string[] {
   return (raw ?? "")
@@ -126,6 +172,16 @@ export class OriginationBoundary {
     } catch {
       return false;
     }
-    return this.#paths.some((re) => re.test(pathname));
+    // Match against the raw AND percent-decoded pathname — `URL.pathname` preserves escapes
+    // (`/sign%75p` stays encoded), so matching it alone would miss a route the origin decodes to a
+    // denied path — AND each form's server-normalized version, so a matrix param (`/transfer;x`) or a
+    // NUL truncation (`/transfer%00`) can't hide a denied route behind the anchor. See
+    // {@link decodedPathVariants} / {@link serverNormalizedPath}.
+    const candidates = new Set<string>();
+    for (const v of decodedPathVariants(pathname)) {
+      candidates.add(v);
+      candidates.add(serverNormalizedPath(v));
+    }
+    return this.#paths.some((re) => [...candidates].some((p) => re.test(p)));
   }
 }

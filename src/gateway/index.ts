@@ -118,7 +118,15 @@ export class Gateway {
       // set ONLY — never the consumer's allowlist — so a restrictive allowlist can't block a
       // service-internal probe and the probe can reach nothing else. The host set lives in the policy
       // (the caller only flips this flag), so a caller can't widen what "diagnostics" may reach.
-      const guard = opts?.diagnostics ? policy.guardForDiagnostics(consumer) : policy.guardFor(consumer);
+      // A credentialed (warm-replay) session clamps NAVIGATION to the credential's owner host (R4
+      // no-exfil) — so a retained parent-domain cookie can't ride a navigation to a sibling host the
+      // consumer's allowlist would otherwise permit. Both extra guards are strictly narrower than the
+      // consumer's; a cold session keeps the plain consumer guard.
+      const guard = opts?.diagnostics
+        ? policy.guardForDiagnostics(consumer)
+        : opts?.credentialHost
+          ? policy.guardForCredentialHost(consumer, opts.credentialHost)
+          : policy.guardFor(consumer);
       await session.core.setNavigationGuard(guard);
       // R4/R18: a credentialed (warm-replay) session opens with a stored credential RESTORED into the
       // jar — audit it attributably the moment it is guarded and ready. Only the consumer id + owning
