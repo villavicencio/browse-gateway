@@ -89,6 +89,24 @@ export interface LoginDriver {
   wait(ms: number): Promise<void>;
 }
 
+/**
+ * Sleep one poll step, CLAMPED to the time left in the window, and return the new elapsed total.
+ * Without the clamp `fieldTimeoutMs` is not a true upper bound — a loop checks the deadline then
+ * sleeps the full `pollIntervalMs`, overshooting by up to one interval (and the real core caps a
+ * single wait at 60s, so a large interval blocks far past the configured timeout). Callers invoke
+ * this only while `waited < fieldTimeoutMs`, so the step is always > 0 and the loop still advances.
+ */
+async function sleepStep(
+  driver: LoginDriver,
+  waited: number,
+  fieldTimeoutMs: number,
+  pollIntervalMs: number,
+): Promise<number> {
+  const step = Math.min(pollIntervalMs, fieldTimeoutMs - waited);
+  await driver.wait(step);
+  return waited + step;
+}
+
 /** Poll a field into existence within the bounded window, returning its final {@link FieldState}
  *  (which may still be `present: false` if it never rendered). */
 async function pollField(
@@ -100,8 +118,7 @@ async function pollField(
   let waited = 0;
   let state = await driver.readField(target);
   while (!state.present && waited < fieldTimeoutMs) {
-    await driver.wait(pollIntervalMs);
-    waited += pollIntervalMs;
+    waited = await sleepStep(driver, waited, fieldTimeoutMs, pollIntervalMs);
     state = await driver.readField(target);
   }
   return state;
@@ -148,8 +165,7 @@ async function pollSuccess(
   for (;;) {
     if (await judgeSuccess(driver, recipe)) return true;
     if (waited >= fieldTimeoutMs) return false;
-    await driver.wait(pollIntervalMs);
-    waited += pollIntervalMs;
+    waited = await sleepStep(driver, waited, fieldTimeoutMs, pollIntervalMs);
   }
 }
 
@@ -171,8 +187,7 @@ async function settleAfterSubmit(
     if (await judgeSuccess(driver, recipe)) return "success";
     if (totpField && (await driver.readField(totpField)).present) return "twofa";
     if (waited >= fieldTimeoutMs) return "neither";
-    await driver.wait(pollIntervalMs);
-    waited += pollIntervalMs;
+    waited = await sleepStep(driver, waited, fieldTimeoutMs, pollIntervalMs);
   }
 }
 

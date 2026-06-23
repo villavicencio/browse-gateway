@@ -51,7 +51,7 @@ function makeFakeDriver(cfg = {}) {
   let dashReadyAt = Infinity; // wait-count at which a "dashboard" phase actually shows the success DOM
   const polls = { [SEL.user]: 0, [SEL.pass]: 0, [SEL.totp]: 0 };
   const values = { [SEL.user]: prefilled.username ?? "", [SEL.pass]: prefilled.password ?? "", [SEL.totp]: "" };
-  const log = { navigations: [], fills: [], submits: [], captures: 0, waits: 0 };
+  const log = { navigations: [], fills: [], submits: [], captures: 0, waits: 0, waitedMs: 0 };
   const dashReady = () => phase === "dashboard" && log.waits >= dashReadyAt;
 
   const present = (target) => {
@@ -94,8 +94,9 @@ function makeFakeDriver(cfg = {}) {
       log.captures++;
       return captured;
     },
-    async wait() {
+    async wait(ms) {
       log.waits++;
+      log.waitedMs += ms; // sum the REQUESTED sleep so a test can assert the timeout upper bound
     },
   };
   return { driver, log };
@@ -134,6 +135,28 @@ test("SPA 2FA: dashboard rendered asynchronously after the code submit is polled
   const { driver } = makeFakeDriver({ requires2fa: true, successDelay: 3 });
   const res = await assistedLogin(driver, recipe, { username: "u", password: "p", totpSeed: SEED }, FAST);
   assert.deepEqual(res.state, CAPTURED);
+});
+
+test("the configured timeout is a true upper bound — final sleep clamped to remaining (PR #30 P2 round 2)", async () => {
+  // timeout 1ms < interval 25ms: the one sleep must be clamped to 1ms, not the full 25ms (the
+  // overshoot the clamp removes; the real core would otherwise block up to its 60s wait cap).
+  const TIGHT = { fieldTimeoutMs: 1, pollIntervalMs: 25 };
+
+  // settleAfterSubmit loop: wrong creds → polls to timeout.
+  const a = makeFakeDriver({ acceptCreds: false });
+  await assert.rejects(() => assistedLogin(a.driver, RECIPE, { username: "u", password: "p" }, TIGHT));
+  assert.ok(a.log.waitedMs <= 1, `settle loop waited ${a.log.waitedMs}ms, must not exceed the 1ms timeout`);
+
+  // pollField loop: username never renders.
+  const b = makeFakeDriver({ usernameDelay: 9999 });
+  await assert.rejects(() => assistedLogin(b.driver, RECIPE, { username: "u", password: "p" }, TIGHT));
+  assert.ok(b.log.waitedMs <= 1, `field poll waited ${b.log.waitedMs}ms, must not exceed the 1ms timeout`);
+
+  // pollSuccess loop (post-2FA): code submitted, dashboard never renders → polls to timeout.
+  const recipe = { ...RECIPE, totpField: SEL.totp };
+  const c = makeFakeDriver({ requires2fa: true, acceptCode: () => false });
+  await assert.rejects(() => assistedLogin(c.driver, recipe, { username: "u", password: "p", totpSeed: SEED }, TIGHT));
+  assert.ok(c.log.waitedMs <= 1, `success poll waited ${c.log.waitedMs}ms, must not exceed the 1ms timeout`);
 });
 
 test("invalid poll options are rejected up front, not spun on (PR #30 P2)", async () => {
