@@ -283,6 +283,16 @@ export function mintStickyProxy(
 }
 
 /**
+ * Mint a fresh, STABLE sticky-exit id — 8 hex chars, the IPRoyal `_session-` quantum (see
+ * {@link mintStickyProxy}). The vault stores this with an entry at capture and re-pins it on warm
+ * replay (via `proxyOverrideFor(..., stickyExitId)`), so a logged-in session returns to the SAME
+ * residential exit IP (R3): an IP-bound login cookie replayed from a different exit is a tell.
+ */
+export function newStickyExitId(): string {
+  return randomBytes(4).toString("hex");
+}
+
+/**
  * Boot-time validation for `BGW_PROXY_STICKY_SUFFIX`: a non-empty template MUST contain the `{id}`
  * placeholder, or {@link mintStickyProxy}'s `replaceAll` is a no-op and every escalation attempt
  * pins the SAME sticky exit — silently collapsing the rotate-across-retries property with no runtime
