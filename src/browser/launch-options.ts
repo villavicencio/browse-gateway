@@ -3,7 +3,7 @@
  * options Patchright's `launchPersistentContext` expects. Kept separate from the core so
  * the stealth-critical launch config can be unit-tested without starting a browser.
  */
-import type { BrowserCoreOptions, ProxyConfig } from "./types.js";
+import type { BrowserCoreOptions, ProxyConfig, StorageStateOrigin } from "./types.js";
 
 /** Resolved options with every default applied — no `undefined` fields (proxy stays optional). */
 export interface ResolvedCoreOptions {
@@ -96,4 +96,47 @@ export function buildLaunchOptions(
   if (resolved.noSandbox) launch.args.push("--no-sandbox");
   if (resolved.proxy) launch.proxy = resolved.proxy;
   return launch;
+}
+
+/**
+ * Build the page init script that restores captured localStorage into a cold session (KTD-4).
+ *
+ * `launchPersistentContext` has no `storageState` option (the persistent profile *is* the storage;
+ * Playwright issue #14949), so localStorage is seeded via an `addInitScript` that runs before every
+ * page's own scripts. That places two hard requirements on this script, both encoded here:
+ *
+ *  - **Origin-guarded.** The script fires on *every* navigation in the context, across all origins.
+ *    It must write origin X's localStorage only while the document IS origin X — never leak a
+ *    captured value onto a different origin. We compare `window.location.origin` per entry.
+ *  - **Idempotent / non-clobbering.** The same script re-runs on every navigation, and the page may
+ *    have updated a key since the first seed. Seeding only when the key is **absent**
+ *    (`getItem(name) === null`) makes re-runs no-ops and never overwrites a live page value.
+ *
+ * Values are embedded as a JSON literal (safe inside a JS expression); U+2028/U+2029 are escaped
+ * defensively (valid in JSON, historically illegal in JS string literals pre-ES2019). The whole
+ * body is wrapped in try/catch because `localStorage` access throws on an opaque/sandboxed origin.
+ */
+export function buildLocalStorageSeedScript(
+  origins: StorageStateOrigin[],
+): string {
+  const json = JSON.stringify(origins).replace(
+    /[\u2028\u2029]/g,
+    (c) => "\\u" + c.charCodeAt(0).toString(16),
+  );
+  return `(() => {
+  try {
+    const seed = ${json};
+    const here = window.location.origin;
+    for (const o of seed) {
+      if (o.origin !== here) continue; // origin-guard: never seed another origin's store
+      for (const e of (o.localStorage || [])) {
+        // seed-if-absent: idempotent across the every-navigation re-fire; never clobbers a
+        // value the page itself has since written.
+        if (window.localStorage.getItem(e.name) === null) {
+          window.localStorage.setItem(e.name, e.value);
+        }
+      }
+    }
+  } catch (_e) { /* localStorage unavailable (opaque/sandboxed origin) — best-effort. */ }
+})();`;
 }

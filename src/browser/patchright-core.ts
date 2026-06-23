@@ -15,6 +15,7 @@ import {
 } from "./captcha.js";
 import {
   buildLaunchOptions,
+  buildLocalStorageSeedScript,
   resolveCoreOptions,
   type ResolvedCoreOptions,
 } from "./launch-options.js";
@@ -27,6 +28,7 @@ import type {
   PageSnapshot,
   RenderOptions,
   RenderResult,
+  StorageState,
   WaitCondition,
 } from "./types.js";
 
@@ -98,6 +100,52 @@ async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
   return parts.join("\n");
 }
 
+/**
+ * Restore captured session state into a freshly-launched context (KTD-3/4). Cookies go straight
+ * into the jar via `addCookies` (the storageState cookie shape is exactly what `addCookies` takes,
+ * so `expires`-in-seconds and the `sameSite` enum round-trip with no translation). localStorage
+ * can't be set on the context directly — `launchPersistentContext` has no `storageState` option —
+ * so it is seeded by an origin-guarded, idempotent init script (see `buildLocalStorageSeedScript`).
+ * Best-effort and additive: an empty blob is a no-op (an ordinary cold session).
+ */
+async function applyRestoreState(
+  context: PatchrightContext,
+  state: StorageState,
+): Promise<void> {
+  if (state.cookies?.length) {
+    await context.addCookies(state.cookies);
+  }
+  const origins = (state.origins ?? []).filter((o) => o.localStorage?.length);
+  if (origins.length) {
+    await context.addInitScript({ content: buildLocalStorageSeedScript(origins) });
+  }
+}
+
+/**
+ * Restore `state` into a freshly-launched `context`, closing the context if restoration fails.
+ *
+ * The context is already a running Chrome by the time we seed it, and `addCookies` can REJECT on a
+ * malformed or legacy-shaped persisted cookie (one missing `domain`/`url`, say). Letting that reject
+ * propagate out of `launch()` would leave the browser process orphaned — and because every vault
+ * session that hits the same bad blob repeats the failure, the leaked processes accumulate until the
+ * capped browser pool is exhausted. So on any restore failure we close the context (best-effort) and
+ * rethrow the ORIGINAL error, so the caller sees the real cause, not a teardown error. A `null`/absent
+ * `state` is a no-op (the ordinary cold session). Exported for unit coverage of the close-on-failure
+ * path without launching a real browser.
+ */
+export async function restoreOrClose(
+  context: PatchrightContext,
+  state?: StorageState,
+): Promise<void> {
+  if (!state) return;
+  try {
+    await applyRestoreState(context, state);
+  } catch (err) {
+    await context.close().catch(() => {});
+    throw err;
+  }
+}
+
 /** Capture the title/text/html a page currently renders, tolerant of mid-navigation races. */
 async function snapshot(page: PatchrightPage): Promise<PageSignal> {
   const { title, text } = await pollSignal(page);
@@ -148,8 +196,25 @@ export class PatchrightBrowserCore implements BrowserCore {
       resolved.userDataDir,
       launchOptions,
     );
+    // Seed any captured session state BEFORE the first navigation, so a vault session is logged-in
+    // from its first goto. This runs against the live context (not a launch arg), like the solver.
+    // It registers cookies + an init script only — no network request — so it predates and is
+    // independent of the navigation guard the gateway installs next. restoreOrClose owns the
+    // close-on-failure invariant so a bad blob can't orphan the just-launched Chrome.
+    await restoreOrClose(context, opts.restoreState);
     // The solver is a runtime dependency (not a launch arg) — pass it through to the instance.
     return new PatchrightBrowserCore(context, resolved, opts.solver);
+  }
+
+  /**
+   * Serialize the context's cookies + per-origin localStorage for the vault to persist (KTD-3).
+   * Playwright's `storageState()` shape is carried verbatim — its cookie/origin fields are exactly
+   * {@link StorageState} — so what comes out here replays through {@link BrowserCoreOptions.restoreState}
+   * with no translation. Context-wide (cookies are not per-page); safe to call with no active page.
+   */
+  async captureStorageState(): Promise<StorageState> {
+    const { cookies, origins } = await this.#context.storageState();
+    return { cookies, origins };
   }
 
   async render(url: string, opts: RenderOptions = {}): Promise<RenderResult> {
