@@ -68,6 +68,16 @@ planned it (full Tier-2 credential vault, plan-first), then shipped the first tw
 
 ## What's Next
 
+> ### ⏭️ REMINDERS FOR NEXT SESSION (operator asked to be reminded — 2026-06-22)
+> 1. **Resume Phase 2 of the credential vault.** Start with **U5** (browser-core `storageState`
+>    capture/restore — design is locked below), then **U6** (assisted-login + TOTP + sticky-exit).
+>    Branch off `main` (the vault store from #27 is there).
+> 2. **Activation is still opt-in — nothing the vault/smoke does is live yet.** When ready:
+>    - **Vault:** set `BGW_VAULT_DIR` + a `0600` `BGW_VAULT_KEY_FILE` (key injected at deploy time,
+>      out of the image + git) → expect `vault: ready` in the boot log.
+>    - **`keys --apply` smoke:** set `OBSCURA_SMOKE_CMD=~/deploy/preswap-smoke.sh` in the operator
+>      config + `scp` `preswap-smoke.sh` to the on-host deploy dir (until then it's advisory).
+
 1. **Phase 2 — U5 (browser-core capture/restore).** Design locked (read the code):
    - Add `captureStorageState(): Promise<StorageState>` to `BrowserCore` + `PatchrightBrowserCore`
      (wraps `context.storageState()`).
