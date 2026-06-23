@@ -12,7 +12,7 @@
  */
 import type { BrowserCoreOptions, StorageState } from "../browser/index.js";
 import type { LoginCredentials, LoginRecipe } from "../verbs/index.js";
-import { proxyOverrideFor, newStickyExitId, isValidTotpSeed } from "../verbs/index.js";
+import { proxyOverrideFor, isValidTotpSeed } from "../verbs/index.js";
 import type { SecretStore } from "../security/index.js";
 
 /**
@@ -40,17 +40,18 @@ export interface VaultEntryStore {
 }
 
 /**
- * Runs a host-scoped assisted login pinned to `stickyExitId` and returns the captured session state.
- * The production impl opens a guarded consumer session (so policy stays below the verb layer) and
- * drives `assistedLogin` over the session's core; tests inject a fake. Kept as a seam so this
+ * Runs a host-scoped assisted login and returns the captured state plus the bound exit, if any. The
+ * runner owns the proxy posture: DIRECT-FIRST, escalating to a pinned residential exit only on a
+ * qualifying block (R7) — so it reports `stickyExitId` ONLY when it escalated (a direct capture binds
+ * no exit). The production impl opens a guarded consumer session (policy stays below the verb layer)
+ * and drives `assistedLogin` over the session's core; tests inject a fake. Kept as a seam so this
  * orchestration carries no browser/gateway dependency.
  */
 export type LoginRunner = (args: {
   host: string;
   recipe: LoginRecipe;
   creds: LoginCredentials;
-  stickyExitId: string;
-}) => Promise<StorageState>;
+}) => Promise<{ state: StorageState; stickyExitId?: string }>;
 
 /** Reject an unusable TOTP seed at store time (authoritative U6a check) rather than at first login. */
 function assertSeedIfPresent(creds: LoginCredentials): void {
@@ -92,20 +93,27 @@ export function stripIpBoundTokens(state: StorageState): StorageState {
 }
 
 /**
- * Drive the login once (pinned to a freshly-minted sticky exit), capture the authenticated session,
- * and persist it. OVERWRITES any existing entry — this is also the refresh-on-expiry path: re-running
- * a capture replaces a stale/blocked entry in place. Returns the stored entry.
+ * Drive the login once (direct-first, the runner escalates only on a block), capture the
+ * authenticated session, and persist it — recording the bound exit only if the runner escalated.
+ * OVERWRITES any existing entry — this is also the refresh-on-expiry path: re-running a capture
+ * replaces a stale/blocked entry in place. Returns the stored entry.
  */
 export async function captureLoginToVault(
   deps: { vault: VaultEntryStore; runLogin: LoginRunner },
   args: { consumerId: string; host: string; recipe: LoginRecipe; creds: LoginCredentials },
 ): Promise<VaultEntry> {
   assertSeedIfPresent(args.creds);
-  const stickyExitId = newStickyExitId();
-  const captured = await deps.runLogin({ host: args.host, recipe: args.recipe, creds: args.creds, stickyExitId });
+  // The runner is direct-first and reports a bound exit ONLY if it escalated (R7) — store stickyExitId
+  // only then, so a direct capture replays direct rather than re-pinning an exit it never used.
+  const { state, stickyExitId } = await deps.runLogin({ host: args.host, recipe: args.recipe, creds: args.creds });
   // Strip IP-bound challenge tokens BEFORE persisting — captureStorageState() returns every cookie
   // verbatim, including cf_clearance et al., which must not survive into a warm replay (R3).
-  const entry: VaultEntry = { session: stripIpBoundTokens(captured), creds: args.creds, stickyExitId, updatedAt: Date.now() };
+  const entry: VaultEntry = {
+    session: stripIpBoundTokens(state),
+    creds: args.creds,
+    ...(stickyExitId ? { stickyExitId } : {}),
+    updatedAt: Date.now(),
+  };
   deps.vault.put(args.consumerId, args.host, entry);
   return entry;
 }
@@ -150,16 +158,20 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
  * Build the {@link BrowserCoreOptions} to open a WARM session from a stored entry: restore the
  * captured cookies + localStorage (so the first navigation is already logged-in) AND re-pin the
  * proxy to the exact sticky exit bound at capture, so the replay returns to the same residential IP
- * (R3). When no proxy is configured / not on a datacenter IP, the warm session is direct — just the
- * restored state. The entry's exit id is threaded straight to `proxyOverrideFor`. The stored
- * `session` was already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound
- * clearance is replayed here.
+ * (R3). A DIRECT capture (no bound exit) replays DIRECT — its durable cookies are not IP-bound, and
+ * proxying a session captured on the direct IP would needlessly burn residential egress (R7) and
+ * change the exit from the one it was minted on. So a proxy is re-pinned ONLY when the entry carries
+ * a bound `stickyExitId` (and a proxy is configured + on a datacenter IP). The stored `session` was
+ * already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound clearance is
+ * replayed here.
  */
 export function buildWarmOverride(
   entry: VaultEntry,
   secrets: SecretStore,
   opts: { onDatacenterIp: boolean; stickySuffix?: string },
 ): BrowserCoreOptions {
-  const proxyOverride = proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, entry.stickyExitId);
+  const proxyOverride = entry.stickyExitId
+    ? proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, entry.stickyExitId)
+    : undefined;
   return { restoreState: entry.session, ...(proxyOverride ?? {}) };
 }

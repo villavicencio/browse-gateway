@@ -113,6 +113,15 @@ test("happy path (no 2FA): fills creds, submits, judges success, captures state"
   assert.equal(log.captures, 1);
 });
 
+test("skipInitialNavigate: the primitive does not navigate (the caller already landed the page)", async () => {
+  const { driver, log } = makeFakeDriver(); // phase starts at "form" → fields present without a navigate
+  const res = await assistedLogin(driver, RECIPE, { username: "u", password: "p" }, { ...FAST, skipInitialNavigate: true });
+  assert.deepEqual(res.state, CAPTURED);
+  assert.equal(log.navigations.length, 0, "no navigate when the caller already landed the login page");
+  assert.deepEqual(log.fills.map((f) => f.target), [SEL.user, SEL.pass], "still fills + submits");
+  assert.deepEqual(log.submits, [SEL.submit]);
+});
+
 test("async-rendered fields are polled into existence, then filled", async () => {
   const { driver, log } = makeFakeDriver({ usernameDelay: 3, passwordDelay: 2 });
   await assistedLogin(driver, RECIPE, { username: "u", password: "p" }, FAST);

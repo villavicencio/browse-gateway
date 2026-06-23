@@ -60,6 +60,13 @@ export interface AssistedLoginOptions {
   pollIntervalMs?: number;
   /** Pin the TOTP time (Unix seconds) — a deterministic-test hook; omitted = now. */
   totpAtSeconds?: number;
+  /**
+   * Skip the initial `navigate(loginUrl)` — the caller has ALREADY landed the login page. The gateway
+   * login-runner uses this: it does the first navigate itself so it can run the direct-first /
+   * escalate-on-block proxy decision (R7) and apply the right clearance budget before handing a
+   * landed, committed-exit session to the login flow. Default false (the primitive navigates).
+   */
+  skipInitialNavigate?: boolean;
 }
 
 export interface AssistedLoginResult {
@@ -223,7 +230,7 @@ export async function assistedLogin(
   // Bind once so TS keeps it narrowed to `string` across the awaits in the 2FA branch below.
   const totpField = recipe.totpField;
 
-  await driver.navigate(recipe.loginUrl);
+  if (!opts.skipInitialNavigate) await driver.navigate(recipe.loginUrl);
   await fillWhenReady(driver, recipe.usernameField, creds.username, "username", fieldTimeoutMs, pollIntervalMs);
   await fillWhenReady(driver, recipe.passwordField, creds.password, "password", fieldTimeoutMs, pollIntervalMs);
   await driver.submit(recipe.submit);

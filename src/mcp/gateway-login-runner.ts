@@ -12,13 +12,27 @@
 import type { Gateway } from "../gateway/index.js";
 import type { SecretStore } from "../security/index.js";
 import { canonicalizeHost } from "../security/index.js";
-import { assistedLogin, coreLoginDriver, proxyOverrideFor } from "../verbs/index.js";
+import {
+  assistedLogin,
+  coreLoginDriver,
+  proxyOverrideFor,
+  newStickyExitId,
+  navFailed,
+  shouldEscalateDrive,
+  PROXY_CLEARANCE_TIMEOUT_MS,
+} from "../verbs/index.js";
 import type { LoginRunner } from "./vault-login.js";
 
 /**
  * Build a {@link LoginRunner} bound to one consumer `token`. `opts` mirror the drive controller's
- * proxy posture (`onDatacenterIp` + the optional sticky suffix); the bound `stickyExitId` is pinned
- * per call so the captured session is tied to ONE residential exit IP (R3).
+ * proxy posture (`onDatacenterIp` + the optional sticky suffix).
+ *
+ * Proxy posture is DIRECT-FIRST / escalate-on-block (R7), exactly like the drive flow — never proxy a
+ * login that the direct datacenter IP can clear. We open direct and probe-navigate the login URL;
+ * only if a QUALIFYING block is observed (a Cloudflare managed challenge or a hard reputation block)
+ * AND a residential proxy is available do we re-open pinned to a fresh held exit. The captured session
+ * is bound to whichever exit landed the page, so `stickyExitId` is reported back ONLY when we
+ * escalated (a direct capture binds no exit and replays direct).
  */
 export function makeGatewayLoginRunner(
   gateway: Gateway,
@@ -26,21 +40,51 @@ export function makeGatewayLoginRunner(
   token: string,
   opts: { onDatacenterIp: boolean; stickySuffix?: string },
 ): LoginRunner {
-  return async ({ host, recipe, creds, stickyExitId }) => {
+  return async ({ host, recipe, creds }) => {
     // Guard against a recipe driving a login on a DIFFERENT host than the vault key it will be stored
     // under — otherwise a session captured on host B would be filed (and later replayed) as host A.
     const loginHost = canonicalizeHost(new URL(recipe.loginUrl).hostname);
     if (loginHost !== canonicalizeHost(host)) {
       throw new Error(`vault login: recipe loginUrl host (${loginHost}) does not match the entry host (${host})`);
     }
-    // Pin the bound exit (proxied path); direct when no proxy is configured / not on a datacenter IP.
-    const override = proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, stickyExitId);
-    const handle = await gateway.openConsumerSession(token, override);
+
+    // Direct-first: the first request goes out on the datacenter IP with no proxy, regardless of
+    // onDatacenterIp/proxy config (R7 — proxy is trigger-only).
+    let handle = await gateway.openConsumerSession(token, undefined);
+    let stickyExitId: string | undefined; // set ONLY if we escalate
     try {
+      let snap = await gateway.useConsumerSession(token, handle, (s) => s.core.navigate(recipe.loginUrl));
+      if (navFailed(snap)) {
+        // Escalate ONLY on a block a clean residential exit can clear (CF managed challenge / hard
+        // block), and only if a proxy is actually available. A fresh held exit is minted and PINNED so
+        // the capture is bound to one stable IP (R3); the proxied navigate gets the raised clearance
+        // budget (a fresh exit re-hits the interstitial).
+        const id = newStickyExitId();
+        const pinned = shouldEscalateDrive(snap)
+          ? proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, id)
+          : undefined;
+        if (!pinned) {
+          throw new Error(
+            `vault login: ${recipe.loginUrl} was blocked and could not be cleared on a direct exit ` +
+              `(no residential proxy available to escalate to)`,
+          );
+        }
+        await gateway.closeConsumerSession(token, handle).catch(() => {});
+        stickyExitId = id;
+        handle = await gateway.openConsumerSession(token, pinned);
+        snap = await gateway.useConsumerSession(token, handle, (s) =>
+          s.core.navigate(recipe.loginUrl, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
+        );
+        if (navFailed(snap)) {
+          throw new Error(`vault login: could not land ${recipe.loginUrl} on a proxied exit — retry the capture`);
+        }
+      }
+      // On a committed exit with the login page landed: drive the flow WITHOUT re-navigating (we own
+      // the navigate above so the escalation decision + clearance budget are applied exactly once).
       const { state } = await gateway.useConsumerSession(token, handle, (s) =>
-        assistedLogin(coreLoginDriver(s.core), recipe, creds),
+        assistedLogin(coreLoginDriver(s.core), recipe, creds, { skipInitialNavigate: true }),
       );
-      return state;
+      return { state, ...(stickyExitId ? { stickyExitId } : {}) };
     } finally {
       // Always release the capture session — never leave a held login session occupying the pool.
       await gateway.closeConsumerSession(token, handle).catch(() => {});

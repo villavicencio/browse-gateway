@@ -104,7 +104,9 @@ try {
   console.log(`  (captured cookie names: ${JSON.stringify(names)})`);
   check("capture persisted an entry with the durable session cookie", names.includes("sid"));
   check("IP-bound challenge cookies were stripped live (no cf_clearance / __cf_bm)", !names.includes("cf_clearance") && !names.includes("__cf_bm"));
-  check("a bound sticky-exit id was recorded", /^[0-9a-f]{8}$/.test(entry?.stickyExitId ?? ""));
+  // The loopback fixture clears DIRECT, so the runner never escalates → no exit is bound (R7). A
+  // bound stickyExitId only appears when escalation actually happens (covered by the runner unit test).
+  check("direct capture bound no sticky exit (R7 — proxy is trigger-only)", entry?.stickyExitId === undefined);
 
   // --- Warm replay through a FRESH gateway session built from the stored entry.
   const override = buildWarmOverride(entry, secrets, { onDatacenterIp: false });
