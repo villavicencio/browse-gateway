@@ -33,6 +33,15 @@ export interface ObscuraConfig {
    * why there is no default: without this key, `--apply` refuses rather than faking a reload.
    */
   applyCmd?: string;
+  /**
+   * The on-host command `keys --apply` runs (over admin SSH) to PRE-SWAP SMOKE a mutation BEFORE the
+   * re-create — boots the current image against the just-staged env + manifest on a throwaway port
+   * and exits non-zero if it can't come up clean — typically `~/deploy/preswap-smoke.sh` directly (it
+   * defaults the smoked image to the running container's). Absent → `--apply` proceeds with a loud
+   * warning; a malformed mutation can then crash-loop the gateway. Configure this to make `--apply`
+   * refuse a bad config instead of taking the live box down.
+   */
+  smokeCmd?: string;
   /** LaunchAgent label prefix for generated tunnel artifacts (reverse-DNS style). */
   labelPrefix: string;
   /**
@@ -54,6 +63,7 @@ const ENV_OVERRIDES = {
   tunnelAlias: "OBSCURA_TUNNEL_ALIAS",
   container: "OBSCURA_CONTAINER",
   applyCmd: "OBSCURA_APPLY_CMD",
+  smokeCmd: "OBSCURA_SMOKE_CMD",
   labelPrefix: "OBSCURA_LABEL_PREFIX",
   token: "OBSCURA_TOKEN",
 } as const satisfies Record<keyof ObscuraConfig, string>;

@@ -35,6 +35,15 @@ export interface KeysDeps {
    * fail-closed missing-token check — downing every consumer. Absent → `--apply` refuses.
    */
   applyCmd?: string;
+  /**
+   * On-host command that PRE-SWAP SMOKES the staged mutation BEFORE the re-create: boot the current
+   * image against the just-written env + manifest on a throwaway port, exit non-zero if it can't come
+   * up clean — typically `~/deploy/preswap-smoke.sh` directly (it defaults the smoked image to the
+   * running container's, so no image plumbing is needed here). Run first so a malformed env or an
+   * undersized `BGW_MAX_SESSIONS` floor aborts the apply with the LIVE container untouched, instead
+   * of crash-looping it (the documented `keys --apply` crash-loop). Absent → apply proceeds, warned.
+   */
+  smokeCmd?: string;
   out: (line: string) => void;
   /** Injectable for tests; defaults to a real sleep. */
   wait?: (ms: number) => Promise<void>;
@@ -47,6 +56,8 @@ const APPLY_TIMEOUT_MS = 60_000;
 const APPLY_POLL_MS = 2_000;
 /** The re-create command itself gets a longer leash than the default ssh watchdog. */
 const APPLY_CMD_TIMEOUT_MS = 120_000;
+/** The smoke boots a throwaway container + polls for startup — give it a generous leash too. */
+const SMOKE_CMD_TIMEOUT_MS = 120_000;
 
 /** Match this consumer's token line in the env file (with or without `export`). */
 function tokenLineRe(envKey: string): RegExp {
@@ -83,9 +94,45 @@ function restartInstruction(deps: KeysDeps): string {
 }
 
 /**
+ * Pre-swap smoke (when `smokeCmd` is configured): boot the current image against the just-staged env
+ * + manifest on a throwaway port and ABORT the apply — live container untouched — if it can't come up
+ * clean. This is the guard for the documented `keys --apply` crash-loop: an undersized
+ * `BGW_MAX_SESSIONS` floor (or any malformed config) is caught here instead of after the live
+ * re-create. Absent `smokeCmd` → warn loudly and proceed (backward-compatible; the change is still
+ * staged on disk regardless).
+ */
+async function preswapSmoke(deps: KeysDeps): Promise<void> {
+  if (!deps.smokeCmd) {
+    deps.out(
+      note(
+        "applying WITHOUT a pre-swap smoke — a malformed env/manifest (e.g. BGW_MAX_SESSIONS below the " +
+          "floor) can crash-loop the gateway and take every consumer down. Configure `smokeCmd` " +
+          "(OBSCURA_SMOKE_CMD) to gate the apply on a throwaway-port boot of the staged config.",
+      ),
+    );
+    return;
+  }
+  deps.out(note("pre-swap smoke — booting the current image against the staged config on a throwaway port"));
+  const smoke = await deps.shell.run(
+    `set -e; export DOCKER_HOST="\${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"; ${deps.smokeCmd}`,
+    undefined,
+    { timeoutMs: SMOKE_CMD_TIMEOUT_MS },
+  );
+  if (smoke.code !== 0) {
+    throw new Error(
+      `pre-swap smoke FAILED (exit ${smoke.code}) — the staged config does not boot clean, so the live ` +
+        `container was left untouched (NOT re-created). Fix the staged env/manifest and re-run. ` +
+        `${smoke.stderr.trim() || smoke.stdout.trim()}`.trim(),
+    );
+  }
+  deps.out(ok("pre-swap smoke passed — staged config boots clean"));
+}
+
+/**
  * Re-create the gateway container via the operator's `applyCmd`, wait for /mcp to answer 401
  * (the liveness signal), then confirm the consumer's token env actually changed inside the new
- * container — liveness alone can't tell a real reload from a stale-env no-op.
+ * container — liveness alone can't tell a real reload from a stale-env no-op. A pre-swap smoke runs
+ * FIRST (when configured) so a bad config aborts before the live container is touched.
  */
 async function applyRecreate(deps: KeysDeps, expectEnvKey: { key: string; present: boolean }): Promise<void> {
   if (!deps.applyCmd) {
@@ -96,6 +143,9 @@ async function applyRecreate(deps: KeysDeps, expectEnvKey: { key: string; presen
         "The change is staged — apply it manually or configure applyCmd and re-run.",
     );
   }
+  // Gate the re-create on a throwaway-port boot of the staged config — abort here leaves the live
+  // container running; only a clean smoke proceeds to the swap below.
+  await preswapSmoke(deps);
   const wait = deps.wait ?? sleep;
   deps.out(note(`re-creating ${deps.container} via applyCmd — every consumer's session drops for ~10–20s`));
   const recreate = await deps.shell.run(

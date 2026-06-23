@@ -218,16 +218,142 @@ export function classifyAgentState(printOutput: string | null, logTail: string):
   return "not-bootstrapped";
 }
 
+/** A listener on the forwarded port, enriched from `ps` with the provenance the classifier needs. */
+export interface PortListener {
+  /** lsof COMMAND column — truncated (e.g. "ssh") and NOT trusted alone (see classifyPortOwner). */
+  command: string;
+  pid: string;
+  /** Owning UID from `ps` — argv shape is forgeable by a foreign account, the UID is the real boundary. */
+  uid: number | null;
+  /** Full argv from `ps` — null when it can't be resolved. */
+  argv: string | null;
+  /** Parent process command from `ps` — must reference OUR keeper for the listener to be ours. */
+  parentCommand: string | null;
+}
+
+/** Parse `lsof -nP -iTCP:<port> -sTCP:LISTEN` rows into (command, pid) pairs (header/blank dropped). */
+export function parsePortListeners(lsofOutput: string | null): { command: string; pid: string }[] {
+  if (lsofOutput === null) return [];
+  return lsofOutput
+    .split("\n")
+    .filter((l) => l.trim() && !l.startsWith("COMMAND"))
+    .map((l) => {
+      const cols = l.split(/\s+/);
+      return { command: cols[0] ?? "", pid: cols[1] ?? "" };
+    })
+    .filter((r) => r.command !== "" && r.pid !== "");
+}
+
+/** Parse one `ps -o uid=,ppid=,command=` line into its numeric uid, ppid, and full argv. */
+function parsePsLine(out: string): { uid: number; ppid: string; argv: string } | null {
+  const m = out.trim().match(/^(\d+)\s+(\d+)\s+([\s\S]+)$/);
+  if (m === null) return null;
+  const [, uid, ppid, argv] = m;
+  if (uid === undefined || ppid === undefined || argv === undefined) return null;
+  return { uid: Number(uid), ppid, argv };
+}
+
 /**
- * Classify who owns the local forwarded port from `lsof -iTCP:<port> -sTCP:LISTEN` output
- * (null = nothing listening). Our tunnel listens via ssh; anything else bound there means
- * `connect` must stop, not silently register against an unknown service.
+ * ssh(1) single-letter options that take a SEPARATE argument. A bare `-x` from this set consumes the
+ * following token as its value, so that value is NOT the destination operand. Used to locate the
+ * destination correctly — e.g. in `ssh -l <name> -L … <dest>`, `<name>` is the `-l` value, not the host.
  */
-export function classifyPortOwner(lsofOutput: string | null): PortOwner {
-  if (lsofOutput === null) return "none";
-  const dataLines = lsofOutput.split("\n").filter((l) => l.trim() && !l.startsWith("COMMAND"));
-  if (dataLines.length === 0) return "none";
-  return dataLines.every((l) => l.split(/\s+/)[0] === "ssh") ? "ours" : "foreign";
+const SSH_VALUE_FLAGS = new Set("BbcDEeFIiJLlmOopQRSWw".split(""));
+
+/**
+ * Find the ssh DESTINATION operand (the first non-option positional) from an argv token list, honoring
+ * value-taking options so an option value can't be mistaken for the host. Returns null when the parse
+ * is ambiguous (an unrecognized option bundle) or there is no operand — callers treat null as "not
+ * confirmable" and fail closed. tokens[0] is the ssh binary.
+ */
+export function sshDestination(tokens: string[]): string | null {
+  let i = 1;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === undefined) return null;
+    if (t === "--") return tokens[i + 1] ?? null;
+    if (t.startsWith("-") && t.length >= 2) {
+      const flag = t[1] ?? "";
+      if (t.length === 2) {
+        // bare single flag; if it takes a value, the NEXT token is that value
+        i += SSH_VALUE_FLAGS.has(flag) ? 2 : 1;
+        continue;
+      }
+      // length > 2: "-Xvalue" (value-flag with attached value) or a bundle of no-arg flags
+      if (SSH_VALUE_FLAGS.has(flag)) {
+        i += 1; // attached value, self-contained
+        continue;
+      }
+      if ([...t.slice(1)].every((c) => !SSH_VALUE_FLAGS.has(c))) {
+        i += 1; // bundle of no-arg flags (e.g. -NT)
+        continue;
+      }
+      return null; // a value-flag buried in a bundle — can't parse confidently, fail closed
+    }
+    return t; // first non-option token = the destination operand
+  }
+  return null;
+}
+
+/**
+ * The keeper's invocation uses ONLY these option flags: `ssh -N -T -L <localPort>:<gatewayHost> <alias>`.
+ * EVERY connection setting (HostName, User, IdentityFile, ProxyJump…) lives in the ssh_config alias,
+ * never on the command line. So validating the argv against this tiny allowlist is load-bearing: it is
+ * NOT enough that the alias is the destination operand, because `-o HostName=attacker`, `-F <alt-config>`,
+ * or `-J <jump>` would override where the alias resolves and send the forwarded port — and the bearer
+ * token `connect` registers against it — to an attacker's ssh server. Allowlist (reject anything outside
+ * -N/-T/-L), don't blocklist (which could miss a redirecting flag).
+ */
+function isOurKeeperInvocation(tokens: string[], spec: TunnelSpec): boolean {
+  let forwardsOurPort = false;
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i] ?? "";
+    if (t === "--") break; // remaining tokens are operands; the destination is checked below
+    if (!t.startsWith("-")) continue; // an operand (the destination) — validated at the end
+    if (t === "-L") {
+      const val = tokens[++i];
+      if (val === undefined) return false;
+      if (val.startsWith(`${spec.localPort}:`)) forwardsOurPort = true;
+      continue;
+    }
+    if (t.startsWith("-L")) {
+      if (t.slice(2).startsWith(`${spec.localPort}:`)) forwardsOurPort = true;
+      continue; // attached -L<forward>
+    }
+    // Any other option must be a bundle of ONLY no-arg keeper flags (-N, -T). A redirecting/value flag
+    // (-o, -F, -J, -l, -i, -p, …) fails here even if the destination operand is our alias.
+    if (![...t.slice(1)].every((c) => c === "N" || c === "T")) return false;
+  }
+  return forwardsOurPort && sshDestination(tokens) === spec.alias;
+}
+
+/**
+ * Classify who owns the local forwarded port. "ours" requires EVERY listener to clear PROVENANCE and
+ * argv-shape checks — argv shape ALONE is forgeable, because a foreign local account can run the exact
+ * `ssh -N -T -L 8080:127.0.0.1:8080 browse-gateway-tunnel` using ITS OWN `~/.ssh/config`, where the
+ * alias resolves to an attacker host. So the load-bearing gate is provenance:
+ *  - **UID == the current user** — a different account's listener is never ours (this is the boundary
+ *    that matters; a same-UID attacker already controls our session and our ssh_config anyway);
+ *  - **descends from OUR keeper** — the listener's parent command references `spec.keeperPath`, the only
+ *    thing that legitimately runs this forward (rejects a same-user process with a clean config + the
+ *    right argv but a different parent);
+ *  - **argv matches the keeper's allowlisted shape** (only -N/-T/-L, our forward, alias as the
+ *    destination operand, NO redirecting -o/-F/-J) — defense in depth on top of provenance.
+ * <gatewayHost> is deliberately NOT pinned (the forward target legitimately drifts on a config change;
+ * the live keeper is never rewritten — detectDrift surfaces that). Anything we can't positively confirm
+ * makes the whole port "foreign" — fail closed, so `connect` never registers a bearer token against a
+ * service it can't prove is ours. (Mac-side local-forward check only; the prod-side rootlesskit forward
+ * is namespace-invisible to a login shell — never inferred from ss/lsof.)
+ */
+export function classifyPortOwner(listeners: PortListener[] | null, spec: TunnelSpec, expectedUid: number): PortOwner {
+  if (listeners === null || listeners.length === 0) return "none";
+  const isOurs = (l: PortListener): boolean => {
+    if (l.command !== "ssh" || l.argv === null) return false;
+    if (l.uid !== expectedUid) return false; // provenance: a foreign account's listener is NOT ours
+    if (l.parentCommand === null || !l.parentCommand.includes(spec.keeperPath)) return false; // our keeper
+    return isOurKeeperInvocation(l.argv.split(/\s+/).filter((t) => t !== ""), spec);
+  };
+  return listeners.every(isOurs) ? "ours" : "foreign";
 }
 
 export interface TunnelState {
@@ -254,7 +380,23 @@ export async function tunnelState(spec: TunnelSpec, exec: Exec = execCapture): P
   ]);
   const logTail = readLogTail(spec);
   const agent = classifyAgentState(print && print.code === 0 ? print.stdout : null, logTail);
-  const port = classifyPortOwner(lsof && lsof.code === 0 ? lsof.stdout : null);
+  // Enrich each listener from `ps` with its UID + argv + parent command — lsof's COMMAND is truncated
+  // and argv shape is forgeable by a foreign account, so the classifier needs provenance (owning UID
+  // and the parent process) to confirm it's OUR tunnel. Fail closed: anything unresolvable → "foreign".
+  const rows = parsePortListeners(lsof && lsof.code === 0 ? lsof.stdout : null);
+  const listeners: PortListener[] = await Promise.all(
+    rows.map(async ({ command, pid }) => {
+      const ps = await exec("ps", ["-o", "uid=,ppid=,command=", "-p", pid]).catch(() => null);
+      const parsed = ps && ps.code === 0 ? parsePsLine(ps.stdout) : null;
+      let parentCommand: string | null = null;
+      if (parsed) {
+        const pp = await exec("ps", ["-o", "command=", "-p", parsed.ppid]).catch(() => null);
+        parentCommand = pp && pp.code === 0 ? pp.stdout.trim() : null;
+      }
+      return { command, pid, uid: parsed?.uid ?? null, argv: parsed?.argv ?? null, parentCommand };
+    }),
+  );
+  const port = classifyPortOwner(listeners, spec, uid);
   if (agent !== "self-disabled") return { agent, port };
   const lines = logTail.split("\n");
   let at = 0;
