@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { proxyOverrideFor, navFailed, shouldEscalateDrive } from "../dist/verbs/index.js";
+import { proxyOverrideFor, navFailed, shouldEscalateDrive, newStickyExitId } from "../dist/verbs/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { SecretStore } from "../dist/security/index.js";
 
@@ -31,6 +31,21 @@ test("proxyOverrideFor: with a sticky suffix, EACH CALL mints a fresh held exit"
   assert.notEqual(a?.proxy?.password, b?.proxy?.password, "fresh sticky session per resolve");
   // No suffix → base password untouched (prior rotating behavior).
   assert.equal(proxyOverrideFor(secrets, true)?.proxy?.password, "pw");
+});
+
+test("proxyOverrideFor: a PINNED stickyExitId re-pins the SAME held exit across calls (vault warm replay, R3)", () => {
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  const a = proxyOverrideFor(secrets, true, "_s-{id}", "abcd1234");
+  const b = proxyOverrideFor(secrets, true, "_s-{id}", "abcd1234");
+  assert.equal(a?.proxy?.password, "pw_s-abcd1234");
+  assert.equal(a?.proxy?.password, b?.proxy?.password, "same id → same exit, every replay");
+  // A pinned id differs from a fresh mint, and 3-arg callers are unchanged (fresh per call).
+  assert.notEqual(proxyOverrideFor(secrets, true, "_s-{id}")?.proxy?.password, "pw_s-abcd1234");
+});
+
+test("newStickyExitId: an 8-hex id (the IPRoyal quantum), distinct across calls", () => {
+  assert.match(newStickyExitId(), /^[0-9a-f]{8}$/);
+  assert.notEqual(newStickyExitId(), newStickyExitId());
 });
 
 test("navFailed: fails on null status, a 4xx+thin page, or a visible interstitial; a real cleared page does not", () => {

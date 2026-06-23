@@ -40,10 +40,15 @@ export function proxyOverrideFor(
   secrets: SecretStore,
   onDatacenterIp: boolean,
   stickySuffix?: string,
+  stickyExitId?: string,
 ): BrowserCoreOptions | undefined {
   const proxy = proxyFromSecrets(secrets);
+  // `stickyExitId` PINS a specific held exit (vault warm-replay re-pins the exit bound at capture, R3);
+  // omitted, mintStickyProxy mints a fresh id per call (the escalation-retry rotate behavior). Passing
+  // `undefined` through triggers mintStickyProxy's own fresh-id default, so existing 3-arg callers are
+  // unchanged.
   return proxy && onDatacenterIp
-    ? { proxy: mintStickyProxy(proxy, stickySuffix), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS }
+    ? { proxy: mintStickyProxy(proxy, stickySuffix, stickyExitId), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS }
     : undefined;
 }
 
