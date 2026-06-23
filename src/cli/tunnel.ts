@@ -283,28 +283,57 @@ export function sshDestination(tokens: string[]): string | null {
 }
 
 /**
+ * The keeper's invocation uses ONLY these option flags: `ssh -N -T -L <localPort>:<gatewayHost> <alias>`.
+ * EVERY connection setting (HostName, User, IdentityFile, ProxyJump…) lives in the ssh_config alias,
+ * never on the command line. So validating the argv against this tiny allowlist is load-bearing: it is
+ * NOT enough that the alias is the destination operand, because `-o HostName=attacker`, `-F <alt-config>`,
+ * or `-J <jump>` would override where the alias resolves and send the forwarded port — and the bearer
+ * token `connect` registers against it — to an attacker's ssh server. Allowlist (reject anything outside
+ * -N/-T/-L), don't blocklist (which could miss a redirecting flag).
+ */
+function isOurKeeperInvocation(tokens: string[], spec: TunnelSpec): boolean {
+  let forwardsOurPort = false;
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i] ?? "";
+    if (t === "--") break; // remaining tokens are operands; the destination is checked below
+    if (!t.startsWith("-")) continue; // an operand (the destination) — validated at the end
+    if (t === "-L") {
+      const val = tokens[++i];
+      if (val === undefined) return false;
+      if (val.startsWith(`${spec.localPort}:`)) forwardsOurPort = true;
+      continue;
+    }
+    if (t.startsWith("-L")) {
+      if (t.slice(2).startsWith(`${spec.localPort}:`)) forwardsOurPort = true;
+      continue; // attached -L<forward>
+    }
+    // Any other option must be a bundle of ONLY no-arg keeper flags (-N, -T). A redirecting/value flag
+    // (-o, -F, -J, -l, -i, -p, …) fails here even if the destination operand is our alias.
+    if (![...t.slice(1)].every((c) => c === "N" || c === "T")) return false;
+  }
+  return forwardsOurPort && sshDestination(tokens) === spec.alias;
+}
+
+/**
  * Classify who owns the local forwarded port. "ours" requires EVERY listener to be OUR specific ssh
- * tunnel — verified by the LOCAL forward port (`-L <localPort>:…`) AND the alias being the ssh
- * DESTINATION operand. NOT merely COMMAND=ssh (any `ssh -L <port>` shows COMMAND=ssh), and NOT the
- * alias appearing anywhere in argv (a foreign `ssh -l <alias> -L <port>:evil attacker@host` would put
- * the alias in the `-l` value while really dialing the attacker — so we must validate the destination
- * POSITION, not token membership). <gatewayHost> is deliberately NOT pinned: the forward target
- * legitimately drifts when config changes (the live keeper is never rewritten — detectDrift surfaces
- * that), so pinning it would mis-flag our own healthy tunnel as foreign. A listener we can't
- * positively confirm (non-ssh, wrong forward, alias not the destination, or an unresolvable/ambiguous
- * argv) makes the whole port "foreign" — fail closed, so `connect` stops rather than registering a
- * bearer token against a service it can't prove is ours. (Mac-side local-forward check only; the
- * prod-side rootlesskit forward is namespace-invisible to a login shell — never inferred from ss/lsof.)
+ * tunnel — an ssh process whose argv matches the keeper's tightly allowlisted shape (only -N/-T/-L),
+ * forwards OUR local port, and has our alias as the destination operand. All three must hold:
+ *  - COMMAND=ssh is necessary but not sufficient (any `ssh -L <port>` shows COMMAND=ssh);
+ *  - the alias must be the destination OPERAND, not just present (a foreign `ssh -l <alias> …` puts it
+ *    in the -l value while dialing the attacker);
+ *  - the argv carries NO redirecting option (`-o HostName=…`, `-F`, `-J`) — those override where the
+ *    alias resolves, so operand + forward alone don't prove the connection reaches our host.
+ * <gatewayHost> is deliberately NOT pinned (the forward target legitimately drifts on a config change;
+ * the live keeper is never rewritten — detectDrift surfaces that). A listener we can't positively
+ * confirm makes the whole port "foreign" — fail closed, so `connect` never registers a bearer token
+ * against a service it can't prove is ours. (Mac-side local-forward check only; the prod-side
+ * rootlesskit forward is namespace-invisible to a login shell — never inferred from ss/lsof.)
  */
 export function classifyPortOwner(listeners: PortListener[] | null, spec: TunnelSpec): PortOwner {
   if (listeners === null || listeners.length === 0) return "none";
   const isOurs = (l: PortListener): boolean => {
     if (l.command !== "ssh" || l.argv === null) return false;
-    const tokens = l.argv.split(/\s+/).filter((t) => t !== "");
-    const forwardsOurPort = tokens.some(
-      (t, i) => (t === "-L" && (tokens[i + 1]?.startsWith(`${spec.localPort}:`) ?? false)) || t.startsWith(`-L${spec.localPort}:`),
-    );
-    return forwardsOurPort && sshDestination(tokens) === spec.alias;
+    return isOurKeeperInvocation(l.argv.split(/\s+/).filter((t) => t !== ""), spec);
   };
   return listeners.every(isOurs) ? "ours" : "foreign";
 }

