@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { makeGatewayLoginRunner } from "../dist/mcp/gateway-login-runner.js";
 import { SecretStore } from "../dist/security/index.js";
+import { PROXY_OPEN_ATTEMPTS } from "../dist/verbs/index.js";
 
 const STATE = {
   cookies: [{ name: "sid", value: "v", domain: "ex.com", path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "Lax" }],
@@ -25,11 +26,12 @@ const clean = (url = "https://ex.com/login") => ({ url, title: "t", tree: "AUTHE
 const blockedCF = (url = "https://ex.com/login") => ({ url, title: "Just a moment...", tree: "", status: 403, cfHint: true });
 const dead = (url = "https://ex.com/login") => ({ url, title: "", tree: "", status: null });
 
-/** A fake core: navigate() pops scripted snapshots; the assisted-login surface always succeeds. */
-function fakeCore({ navQueue = [], state = STATE, throwOnCapture = false } = {}) {
+/** A fake core: navigate() pops scripted snapshots (then falls back to `defaultNav`); the
+ *  assisted-login surface always succeeds. */
+function fakeCore({ navQueue = [], defaultNav = clean, state = STATE, throwOnCapture = false } = {}) {
   const q = [...navQueue];
   return {
-    async navigate(url) { return q.shift() ?? clean(url); },
+    async navigate(url) { return q.shift() ?? defaultNav(url); },
     async readField() { return { present: true, value: "" }; },
     async type() {},
     async click() {},
@@ -62,11 +64,29 @@ test("escalate-on-block: a CF managed challenge escalates to a pinned residentia
   const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [blockedCF(), clean()] }));
   const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
   const res = await runner({ host: "ex.com", recipe: RECIPE, creds: CREDS });
-  assert.equal(opened.length, 2, "direct then escalated");
+  assert.equal(opened.length, 2, "direct then escalated (landed on the first proxied exit)");
   assert.equal(opened[0], undefined, "first DIRECT");
   assert.match(opened[1].proxy.password, /_s-[0-9a-f]{8}$/, "escalated to a pinned sticky exit");
   assert.match(res.stickyExitId, /^[0-9a-f]{8}$/);
   assert.ok(opened[1].proxy.password.endsWith(res.stickyExitId), "the recorded id matches the pinned exit");
+});
+
+test("escalation retries FRESH exits (new sticky id each) until one lands — a dead exit doesn't fail the capture", async () => {
+  // direct blocked → first proxied exit is dead → second proxied exit lands.
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [blockedCF(), dead(), clean()] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  const res = await runner({ host: "ex.com", recipe: RECIPE, creds: CREDS });
+  assert.equal(opened.length, 3, "direct + two proxied attempts");
+  assert.notEqual(opened[1].proxy.password, opened[2].proxy.password, "each retry draws a FRESH exit (distinct id)");
+  assert.ok(opened[2].proxy.password.endsWith(res.stickyExitId), "bound to the exit that actually landed");
+});
+
+test("escalation that exhausts all attempts throws after N tries (no false success)", async () => {
+  // direct blocked, then every proxied exit is dead → exhaust PROXY_OPEN_ATTEMPTS.
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [blockedCF()], defaultNav: dead }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), new RegExp(`after ${PROXY_OPEN_ATTEMPTS} attempts`));
+  assert.equal(opened.length, 1 + PROXY_OPEN_ATTEMPTS, "direct + one open per retry attempt");
 });
 
 test("a block with no residential proxy to escalate to fails clearly (no silent direct success)", async () => {
@@ -81,13 +101,6 @@ test("a non-escalatable failure (dead/unreachable, not a CF challenge) does NOT 
   const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
   await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /blocked and could not be cleared/);
   assert.deepEqual(opened, [undefined], "never escalated for a non-qualifying block");
-});
-
-test("escalation that still cannot land throws a retry hint, not a false success", async () => {
-  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [blockedCF(), blockedCF()] }));
-  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
-  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /could not land .* on a proxied exit/);
-  assert.equal(opened.length, 2);
 });
 
 test("runner: closes the session even when the login throws after landing (no held capture session leaks)", async () => {

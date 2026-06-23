@@ -19,6 +19,7 @@ import {
   newStickyExitId,
   navFailed,
   shouldEscalateDrive,
+  PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { LoginRunner } from "./vault-login.js";
@@ -50,33 +51,46 @@ export function makeGatewayLoginRunner(
 
     // Direct-first: the first request goes out on the datacenter IP with no proxy, regardless of
     // onDatacenterIp/proxy config (R7 — proxy is trigger-only).
-    let handle = await gateway.openConsumerSession(token, undefined);
+    let handle: string | undefined = await gateway.openConsumerSession(token, undefined);
     let stickyExitId: string | undefined; // set ONLY if we escalate
     try {
       let snap = await gateway.useConsumerSession(token, handle, (s) => s.core.navigate(recipe.loginUrl));
       if (navFailed(snap)) {
         // Escalate ONLY on a block a clean residential exit can clear (CF managed challenge / hard
-        // block), and only if a proxy is actually available. A fresh held exit is minted and PINNED so
-        // the capture is bound to one stable IP (R3); the proxied navigate gets the raised clearance
-        // budget (a fresh exit re-hits the interstitial).
-        const id = newStickyExitId();
-        const pinned = shouldEscalateDrive(snap)
-          ? proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, id)
-          : undefined;
-        if (!pinned) {
+        // block), and only if a proxy is actually available.
+        if (!shouldEscalateDrive(snap) || proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix) === undefined) {
           throw new Error(
             `vault login: ${recipe.loginUrl} was blocked and could not be cleared on a direct exit ` +
               `(no residential proxy available to escalate to)`,
           );
         }
         await gateway.closeConsumerSession(token, handle).catch(() => {});
-        stickyExitId = id;
-        handle = await gateway.openConsumerSession(token, pinned);
-        snap = await gateway.useConsumerSession(token, handle, (s) =>
-          s.core.navigate(recipe.loginUrl, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
-        );
-        if (navFailed(snap)) {
-          throw new Error(`vault login: could not land ${recipe.loginUrl} on a proxied exit — retry the capture`);
+        handle = undefined;
+        // Retry FRESH held exits — a new sticky id + fresh session each attempt — until one lands the
+        // page, mirroring the drive flow: residential exits are intermittently dead/dirty, so one bad
+        // exit must not fail the capture. This is the pre-login GET only, so retrying is safe (no page
+        // state to lose). Each proxied navigate gets the raised clearance budget (a fresh exit re-hits
+        // the interstitial). Bind the entry to whichever exit landed (R3).
+        for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
+          const id = newStickyExitId();
+          const pinned = proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, id);
+          if (!pinned) throw new Error("vault login: residential proxy configuration was removed mid-capture");
+          const h = await gateway.openConsumerSession(token, pinned);
+          snap = await gateway.useConsumerSession(token, h, (s) =>
+            s.core.navigate(recipe.loginUrl, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
+          );
+          if (!navFailed(snap)) {
+            handle = h;
+            stickyExitId = id;
+            break;
+          }
+          await gateway.closeConsumerSession(token, h).catch(() => {}); // dead/dirty exit — discard, draw a fresh one
+        }
+        if (!handle) {
+          throw new Error(
+            `vault login: could not land ${recipe.loginUrl} on a healthy proxied exit after ` +
+              `${PROXY_OPEN_ATTEMPTS} attempts — retry the capture`,
+          );
         }
       }
       // On a committed exit with the login page landed: drive the flow WITHOUT re-navigating (we own
@@ -87,7 +101,7 @@ export function makeGatewayLoginRunner(
       return { state, ...(stickyExitId ? { stickyExitId } : {}) };
     } finally {
       // Always release the capture session — never leave a held login session occupying the pool.
-      await gateway.closeConsumerSession(token, handle).catch(() => {});
+      if (handle) await gateway.closeConsumerSession(token, handle).catch(() => {});
     }
   };
 }
