@@ -1,111 +1,98 @@
-# HANDOFF — 2026-06-22
+# HANDOFF — 2026-06-22 (session 2: credential vault planned + B1/B5 shipped)
 
-Session began with a `/pickup` (post-#21) and the question "can we hit Total Wine now?" Probing the
-PerimeterX-gated Total Wine product page through the gateway exposed a detection false-negative,
-which we fixed across **two PRs (#24, #25)**, deployed to prod, and then hardened through a P1 code
-review. Along the way we discovered prod had **never been deployed since 2026-06-10** (so #21 only
-went live this session), and we wrote a spike plan for actually *defeating* the press-&-hold. The
-gateway now correctly **classifies** PerimeterX with diagnostics; it still does not **clear** it.
+Session opened with `/dv:pickup` (post-#24/#25). Operator chose to build the **credential / session-state
+vault** (Track B from the 2026-06-19 stealth+vault brainstorm) — the unbuilt north-star feature. We
+planned it (full Tier-2 credential vault, plan-first), then shipped the first two phases: **Phase 0
+(host hardening, B5) merged as #26** and **Phase 1 (encrypted store, B1) merged as #27**. Phase 2
+(session-touching: capture/restore + assisted-login) is **paused — operator picks it up fresh**.
 
 ## What We Built
 
-- **PR #24 (`4aacb66`) — PX 200-challenge detection, first pass. MERGED + DEPLOYED.**
-  `isPerimeterXChallenge(signal, pxHint)` = `pxHint && thin render.text`. Closed the case where a 200
-  PX challenge left the top document empty. Files: `src/browser/detect.ts`, `src/browser/index.ts`,
-  `src/verbs/retrieve.ts` (classifyBlock gate + blocked decision + proxy retry-break).
-- **PR #25 (`b1316ae`) — completed the detection. MERGED + DEPLOYED; reviewer signed off.**
-  - `hasPerimeterXChallengeCopy(html)` — matches the press-&-hold copy in page source, **decoding
-    `&amp;` first** ("Press & Hold" serializes as "Press &amp; Hold" in outerHTML).
-  - **Child-frame capture (the P1 fix):** `patchright-core.ts` `snapshot()` now walks `page.frames()`
-    and concatenates each child's `content()` into a new **`frameHtml`** field on `PageSignal` +
-    `RenderResult` — **gated on `hasPerimeterXHint(top html)`** so ordinary pages with ad iframes
-    don't pay the walk. Needed because `render.html` = `page.content()` = **top frame only**.
-  - `retrieve.ts` `hasPxChallengeCopy(render)` reads `render.html` **and** `render.frameHtml`;
-    used in the blocked decision + retry-break. `pxCopy` added to `BlockSignal`.
-  - **`scripts/validate-frame-capture.mjs`** (+ `npm run validate:frame-capture`) — real-browser proof
-    with a cross-origin `data:` child frame. 5/5 PASS.
-  - Tests: `test/retrieve.test.mjs` (top-document interstitial + iframe-only-in-`frameHtml` cases),
-    `test/block-classifier.test.mjs`. **312 unit tests green.**
-- **Solution doc:** `docs/solutions/integration-issues/perimeterx-200-iframe-challenge-false-negative.md`
-  (root cause + both follow-ups + the `page.content()`-is-top-frame-only lesson).
-- **Spike plan (gitignored):** `docs/plans/2026-06-22-001-spike-defeat-perimeterx-press-hold.local.md`
-  — Track A avoidance / Track B gesture / Track C solver, strategy gate, architecture decisions.
-- **Deployed to prod 3×** this session via `deploy-http.yml` (`-f image_tag=latest`): #24, then #25
-  (twice — the P1 fix re-deployed). Re-probe confirms `retrieve` + `drive` both return
-  `reason=perimeterx-challenge` + structured `proxyDiagnostic`.
-- **Throwaway probes (gitignored):** `scripts/probe-totalwine-gateway.local.mjs`,
-  `scripts/probe-totalwine-200-chase.local.mjs` — keep for post-deploy re-verification.
+- **Plan: `docs/plans/2026-06-22-002-credential-vault-plan.local.md`** (gitignored). Deep, 8 units / 4
+  phases, via `/ce:plan`. Research-grounded KTDs (3 parallel research agents + adversarial reviews):
+  - **node:crypto AES-256-GCM envelope**, no new dep (KEK → HKDF wrap key → per-entry random DEK).
+  - **Host-held key FILE custody** (`BGW_VAULT_KEY_FILE`, chmod 600) — origin Q#3 resolved. Blast
+    radius is irreducible on a single box; optimize exposure + rotation.
+  - Persist an **encrypted `storageState` blob, not a whole `userDataDir` profile** (KTD-3).
+  - **Assisted-login = operator-only CLI primitive, NEVER an MCP tool** (KTD-5).
+  - **TOTP via `otplib`** (speakeasy is dead).
+  - **B3 reshaped**: persist DURABLE auth (creds / TOTP seed / long-lived cookies) + bind a STABLE
+    STICKY EXIT per entry; do NOT persist IP-bound `cf_clearance`/PX tokens (rotating exits kill them).
+  - Threat model folded into the plan (origin Q#4).
+
+- **PR #26 — Phase 0 host hardening (B5). MERGED (squash `db01769`).** The prerequisite gate.
+  - **U1 — generalized the pre-swap smoke to all `--apply` mutations.** Extracted
+    `scripts/deploy/preswap-smoke.sh` (single source of truth shared by `deploy-on-host.sh` and the
+    `obscura keys|vault --apply` path); `keys --apply` now boots the staged config on a throwaway port
+    *before* recreating the live container — closes the `BGW_MAX_SESSIONS` crash-loop. New optional
+    config `smokeCmd` (`OBSCURA_SMOKE_CMD`); the script self-defaults the image to the running container.
+  - **U2 — port-owner trust check, hardened through THREE operator-found P1 rounds.**
+    `classifyPortOwner` now requires **provenance** (listener UID == current user, descends from our
+    keeper via parent-command `spec.keeperPath`) **plus** the keeper's allowlisted `-N/-T/-L` argv shape
+    with the alias as the destination operand. argv shape alone is forgeable. Learning compounded:
+    `docs/solutions/architecture-patterns/local-port-owner-verification-needs-provenance.md`.
+
+- **PR #27 — Phase 1 encrypted store (B1). MERGED (squash `839da62`).** Repo's first encryption-at-rest.
+  - `src/security/vault-crypto.ts` — AES-256-GCM envelope; AAD = **injective** length-prefixed
+    `version∥consumer∥host`; mandatory auth, fail-closed; slot-field control-char rejection.
+  - `src/security/vault-store.ts` — per-`(consumer,host)` entries (sha256-of-injective-encoding
+    filename), `put/get/list/remove/rotateVaultKey`, `loadVaultKey`/`openVault`, **fail-closed boot
+    guard**, field-aware redaction folding. NEW env **`BGW_VAULT_DIR`** + `BGW_VAULT_KEY_FILE` /
+    `BGW_VAULT_KEY` (raw key in `SECRET_KEYS`). Wired into `http-main` — **dormant unless
+    `BGW_VAULT_DIR` is set**.
+  - Survived a 6-finding adversarial review + **3 operator findings**: KEK file perms now ENFORCED
+    (reject group/world-readable or non-regular before reading); strict rotation (fails on any
+    unparseable/undecryptable `*.vault.json`, no split-brain); short `{name,value}` cookie values fold
+    into redaction without folding short names.
+
+- **Solution doc:** `docs/solutions/architecture-patterns/local-port-owner-verification-needs-provenance.md`
+  (the tunnel-ownership provenance lesson — argv is forgeable, key on UID + parentage).
 
 ## Decisions Made
 
-- **Detection keys on the challenge COPY in the page source** (top-doc HTML **+** child-frame HTML),
-  gated by `pxHint`. NOT `pxHint` alone (the `px-captcha` marker persists on a *cleared* page — a
-  cleared Total Wine page has a dormant `px-captcha-modal` iframe). NOT `render.text` alone (it is
-  top-document `innerText` only — iframe-served copy never reaches it).
-- **Child-frame walk is gated on a top-doc PX marker** for performance — verified Playwright reads a
-  **cross-origin** frame's `content()` (per-frame over CDP, not same-origin in-page JS).
-- **PX-defeat = avoidance-first.** Track A (warm-up nav homepage→category→target + session/cookie
-  persistence + IP hygiene + fingerprint coherence). Track B (gesture automation) is gated on an
-  **`isTrusted=false` kill-test** (browser-enforced; Patchright can't forge synthetic-input trust) +
-  a venture need. Track C (commercial solvers) **ruled out** — CapSolver PX "Coming Soon", 2Captcha
-  unavailable, no portable token API, `_px3` expires ~60s.
-- **Strategy gate:** defeating PX is **substrate-polish unless venture-pulled** — stop after Track A
-  if exploratory.
-- **Architecture:** gesture automation would need a **new policy-gated internal primitive below the
-  verb layer**, NOT raw input/CDP exposed to consumers (preserves the single-policy invariant).
-- **Standing workflow pref (saved to memory):** every external code-review round, after addressing
-  findings, `pbcopy` a paste-ready reviewer reply (finding → fix+sha → verification → carry-overs →
-  "please re-review") until the reviewer is satisfied.
+- **Phase order:** B5 host-hardening (#26) is the prerequisite gate — merged FIRST, then B1 store (#27).
+- **Branch-per-phase off `main`:** Phase 0 and Phase 1 touch disjoint files, so each was an independent,
+  cleanly-reviewable PR. Phase 2 branches off `main` (the store is now there).
+- **Pace Phase 2 fresh** (operator's call) — two merged PRs through 9 review findings is a clean stop.
 
-## What Didn't Work
+## What Didn't Work (caught in review)
 
-- **#24's thin-content-only test was incomplete** — missed the *boundary-length* 200 (top-doc
-  innerText just over the 200-char bar). A live 200-chase caught it still returning as content. → #25.
-- **#25's first pass (`hasPerimeterXChallengeCopy(render.html)`) was ALSO incomplete (P1 review):**
-  `render.html` = `page.content()` = top frame only, so a challenge whose copy stays inside the
-  `px-captcha-modal` child frame was still a false negative; the test put the phrase in a top-level
-  `<div>`. → child-frame capture (`frameHtml`).
-- **HTML entity gotcha:** "Press & Hold" → "Press &amp; Hold" in `outerHTML` defeats a literal
-  `/press\s*&\s*hold/` — `hasPerimeterXChallengeCopy` decodes `&amp;` first.
-- **Browserbase remote unusable** on the current API key — proxies + verified/advanced-stealth are
-  gated to paid plans (402/403). Used **local Chrome** (residential IP) for recon instead.
+- Tunnel ownership: `COMMAND==ssh` → alias-anywhere → alias-as-operand → flag-allowlist → **provenance**.
+  Each prior step was bypassable; only UID + keeper-ancestry closes the foreign-account spoof.
+- Vault AAD was space-separated (non-injective) — a host with a space could open another slot's record.
+  → injective length-prefixed AAD.
+- KEK file perms were unenforced (a `0644` key file exposed the master key) → enforced `chmod 600`.
+- `rotateVaultKey` used `list()` (which silently skips malformed files) → strict enumeration.
+- **Source hygiene:** literal control bytes (NUL) in test strings break grep/diff — use
+  `String.fromCharCode` / `\u` escapes, never literal control chars.
 
 ## What's Next
 
-1. **PX-defeat spike, Track A** (the plan's recommended first step): build warm-up navigation +
-   session/cookie persistence, then **measure the challenge-rate delta** on Total Wine through the
-   gateway. That number decides whether Track B (gesture automation) is ever needed. Gated on the
-   strategy decision (is this venture-pulled?).
-2. **Drive-path frame-capture follow-up:** drive builds its own `PageSnapshot` (ariaSnapshot), not
-   `render`/`snapshot`, so it does NOT get `frameHtml` — a fat-iframe-200 on the *drive* path still
-   slips. Explicitly out of #25's retrieve-focused scope; the tracked gap.
-3. **Cookie/session-state vault** (operator question this session): persistent per-consumer browser
-   context (cookies + store-selection + logins), encrypted at rest, R9-redacted, per-consumer
-   isolated. Scoped in the spike plan §7; overlaps Track A2. Not built.
-4. **Deferred #21 follow-ups:** audit-log `diagnostics` field; per-call `{verifyEgress}` option +
-   retrieve-path egress probe.
-5. **Operator-only:** IPRoyal monthly → PAYG (fund before cancelling; re-verify the 3 `BGW_PROXY_*`).
+1. **Phase 2 — U5 (browser-core capture/restore).** Design locked (read the code):
+   - Add `captureStorageState(): Promise<StorageState>` to `BrowserCore` + `PatchrightBrowserCore`
+     (wraps `context.storageState()`).
+   - Add `restoreState?: StorageState` to `BrowserCoreOptions`; inject in `launch()` after
+     `launchPersistentContext` via `context.addCookies` + an **origin-guarded, idempotent
+     `addInitScript`** for localStorage. Vault sessions use the clean ephemeral `userDataDir` (`""`).
+   - `scripts/validate-vault-roundtrip.mjs` (real-browser: capture → restore into a cold context →
+     logged-in), mirroring `validate-frame-capture.mjs`.
+2. **Phase 2 — U6 (assisted-login primitive).** Operator-only (via `obscura vault login` over admin
+   SSH), NOT an MCP tool. Poll async login/TOTP fields (tri-state), `otplib` TOTP, judge success on the
+   settled DOM, bind a sticky exit per entry, seeded import + refresh-on-expiry.
+3. **Phase 3 — U7 safety rails** (host-scoped no-exfil, audit, hard financial/origination boundary,
+   secret-leak kill-gate probe) + **U8 `obscura vault` CLI** (`import|login|status|revoke`).
 
 ## Gotchas & Watch-outs
 
-- **⚠️ ROTATE the Browserbase API key** — its value was echoed to the session transcript twice while
-  grepping env / `~/.claude.json`. It wasn't exfiltrated, but it's in transcript history. (browserbase.com/settings)
-- **Prod was pre-#21 until this session.** The `deploy-http` workflow had no successful run between
-  2026-06-10 and today, so this session shipped #21 + #24 + #25 to prod for the *first* time.
-  `keys new --apply` restarts with the *existing* image (no GHCR pull), so consumer onboarding never
-  deployed code. Mental-model correction vs. prior handoffs that treated #21 as live.
-- **The `:8080` tunnel is currently UP** (brought up this session via
-  `launchctl bootstrap … com.dvillavicencio.browse-gateway-tunnel.plist`). Take down with
-  `launchctl bootout gui/$(id -u)/com.dvillavicencio.browse-gateway-tunnel` if desired. Ops in `TUNNEL.local.md`.
-- **Deploy flow:** merge → CI `build-image` pushes `latest` to GHCR → `gh workflow run deploy-http.yml
-  -f image_tag=latest` → watch gate→swap→verify. The `build-image` job is **flaky on a Docker Hub
-  oauth-token fetch** (transient `connection reset` pulling the base image) — `gh run rerun <id> --failed`.
-- **Agent merges PRs (green+reviewed) but does NOT push `main`** — the main-push classifier is the
-  gated path; PR merges via `gh` are fine.
-- **PerimeterX is still CLASSIFIED, not CLEARED** — press-&-hold fires even on residential local
-  Chrome (behavioral, not IP-reputation). Defeating it is the spike, not done.
-- **`BGW_MAX_SESSIONS=7`** sits exactly at the boot floor for 3 consumers (atlas, vault, argus) — a
-  4th crosses it; bump it (or drop `perConsumerMax`) in the same change or the boot guard crash-loops.
-- **Coded language in force:** "atlas / vault / argus" are public codenames; real ids, prod host,
-  paths, tokens live only in agent memory + `*.local.md` (repo is PUBLIC).
+- **Vault is DORMANT in prod** — nothing changes until `BGW_VAULT_DIR` + a `0600` `BGW_VAULT_KEY_FILE`
+  are set. To enable: set both (key injected at deploy time, out of the image + git), expect
+  `vault: ready` in the boot log. Boot guard fails closed if entries exist but no key loads.
+- **Phase 0 isn't active until configured either** — `keys --apply` still warns-and-proceeds until
+  `OBSCURA_SMOKE_CMD=~/deploy/preswap-smoke.sh` is set in the operator config + `preswap-smoke.sh` is
+  `scp`'d to the on-host deploy dir.
+- **Local `main` has an unpushed handoff/docs commit** (agent main-push is gated — operator pushes).
+- **Known residual (accepted):** the port-owner check is check-then-use; a TOCTOU before `connect`
+  registers is theoretically possible (needs atomic port handoff — out of scope).
+- **Coded language:** atlas / vault / argus are public codenames; real ids/host/paths/tokens live only
+  in agent memory + `*.local.md`. The repo is PUBLIC.
 - **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
