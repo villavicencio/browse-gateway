@@ -8,8 +8,11 @@ import { parseCliArgs, usage } from "./args.js";
 import type { Invocation } from "./args.js";
 import { fail } from "./brand.js";
 import { loadObscuraConfig, requireConfig } from "./config.js";
+import type { ObscuraConfig } from "./config.js";
 import { keysNew, keysList, keysRevoke, inspectConsumers } from "./keys.js";
 import type { KeysDeps } from "./keys.js";
+import { vaultStatus, vaultImport, vaultRevoke } from "./vault.js";
+import type { VaultDeps } from "./vault.js";
 import { macKeychain } from "./keychain.js";
 import { sshShell } from "./prod-ssh.js";
 import { connect, sshStealthGate } from "./connect.js";
@@ -92,6 +95,48 @@ async function runStatus(invocation: Invocation): Promise<void> {
   if (!report.healthy) process.exitCode = 1;
 }
 
+function vaultDeps(config: ObscuraConfig): VaultDeps {
+  return {
+    shell: sshShell(requireConfig(config, "adminSsh")),
+    container: config.container,
+    out: (line) => console.log(line),
+  };
+}
+
+async function runVault(invocation: Invocation): Promise<void> {
+  const config = loadObscuraConfig();
+  const deps = vaultDeps(config);
+  const requireFlag = (name: "host" | "session" | "creds"): string => {
+    const v = invocation.flags[name];
+    if (v === undefined) throw new Error(`obscura vault ${invocation.subcommand} requires --${name}`);
+    return v;
+  };
+  // The consumer defaults to the configured identity (this Mac usually operates as one consumer).
+  const consumer = (): string => {
+    const id = invocation.flags.consumer ?? config.consumer;
+    if (id === undefined) throw new Error(`obscura vault ${invocation.subcommand} needs --consumer (or a configured "consumer")`);
+    return id;
+  };
+  switch (invocation.subcommand) {
+    case "status":
+      return vaultStatus(deps);
+    case "revoke":
+      return vaultRevoke(deps, consumer(), requireFlag("host"));
+    case "import":
+      return vaultImport(deps, {
+        consumerId: consumer(),
+        host: requireFlag("host"),
+        sessionPath: requireFlag("session"),
+        credsPath: requireFlag("creds"),
+        ...(invocation.flags.exit ? { exit: invocation.flags.exit } : {}),
+      });
+    case "login":
+      throw new Error("obscura vault login is not available yet (U8b) — use `vault import` for a hand-captured session");
+    default:
+      throw new Error("vault: missing subcommand");
+  }
+}
+
 async function runKeys(invocation: Invocation): Promise<void> {
   const deps = keysDeps();
   switch (invocation.subcommand) {
@@ -126,6 +171,8 @@ async function main(): Promise<void> {
       return runConnect(invocation);
     case "status":
       return runStatus(invocation);
+    case "vault":
+      return runVault(invocation);
   }
 }
 

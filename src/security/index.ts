@@ -28,6 +28,7 @@ export {
   VaultStore,
   openVault,
   loadVaultKey,
+  listVaultEntries,
   countVaultEntries,
   vaultKeyBootError,
   rotateVaultKey,

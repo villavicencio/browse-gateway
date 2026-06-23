@@ -168,21 +168,32 @@ export class VaultStore {
 
   /** Enumerate entries (consumer + host + freshness) WITHOUT decrypting — backs `vault status`. */
   list(): VaultEntryMeta[] {
-    if (!existsSync(this.#dir)) return [];
-    const out: VaultEntryMeta[] = [];
-    for (const name of readdirSync(this.#dir)) {
-      if (!name.endsWith(ENTRY_SUFFIX)) continue;
-      const path = join(this.#dir, name);
-      try {
-        const file = JSON.parse(readFileSync(path, "utf8")) as EntryFile;
-        const st = statSync(path);
-        out.push({ consumerId: file.consumerId, host: file.host, updatedAt: st.mtimeMs, bytes: st.size });
-      } catch {
-        // A corrupt/foreign file in the dir is skipped from listings rather than crashing status.
-      }
-    }
-    return out.sort((a, b) => a.consumerId.localeCompare(b.consumerId) || a.host.localeCompare(b.host));
+    return listVaultEntries(this.#dir);
   }
+}
+
+/**
+ * Keyless enumeration of entries (consumer + host + freshness + size) from a vault dir — reads only
+ * the PLAINTEXT lookup tuple + the file's mtime/size, never the sealed payload, so it needs no master
+ * key. Backs `vault status` (which must list entries even when the key is absent/misconfigured, to
+ * surface the fail-closed boot state instead of hiding it). A corrupt/foreign file is skipped rather
+ * than crashing the listing. Sorted (consumer, host) for a stable display.
+ */
+export function listVaultEntries(dir: string): VaultEntryMeta[] {
+  if (!existsSync(dir)) return [];
+  const out: VaultEntryMeta[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(ENTRY_SUFFIX)) continue;
+    const path = join(dir, name);
+    try {
+      const file = JSON.parse(readFileSync(path, "utf8")) as EntryFile;
+      const st = statSync(path);
+      out.push({ consumerId: file.consumerId, host: file.host, updatedAt: st.mtimeMs, bytes: st.size });
+    } catch {
+      // A corrupt/foreign file in the dir is skipped from listings rather than crashing status.
+    }
+  }
+  return out.sort((a, b) => a.consumerId.localeCompare(b.consumerId) || a.host.localeCompare(b.host));
 }
 
 /**
