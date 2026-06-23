@@ -81,9 +81,14 @@ function leafSecrets(value: unknown, out: Set<string>, sensitiveKey = false): vo
     // An array inherits its key's sensitivity (e.g. `tokens: ["a","b"]`).
     for (const v of value) leafSecrets(v, out, sensitiveKey);
   } else if (value && typeof value === "object") {
-    // An object RESETS sensitivity per immediate key — it does not propagate down a container key, so
-    // `cookies: [{name:"sid", value:"…"}]` folds the long value (generic floor) but NOT the short name.
-    for (const [k, v] of Object.entries(value)) leafSecrets(v, out, SENSITIVE_KEY.test(k));
+    // Sensitivity RESETS per immediate key (a container key doesn't drag short siblings in). Two
+    // sensitivity sources: a SENSITIVE_KEY name, OR the `value` of a `{name, value}` pair — the
+    // storageState cookie/localStorage shape, whose value is credential-grade even when short (a 4-char
+    // session token) while the sibling `name` ("sid") must NOT fold (it would over-redact ordinary logs).
+    const isNameValuePair = "name" in value && "value" in value;
+    for (const [k, v] of Object.entries(value)) {
+      leafSecrets(v, out, SENSITIVE_KEY.test(k) || (isNameValuePair && k === "value"));
+    }
   }
 }
 
@@ -185,11 +190,13 @@ export class VaultStore {
  * a new DEK + nonces per entry). After this returns, point BGW_VAULT_KEY_FILE at the new key; the old
  * key no longer opens anything. Returns the number of entries rotated.
  *
- * Two phases so a single bad entry can't leave a half-rotated split-brain vault: decrypt EVERY entry
- * under `oldKek` FIRST — if any fails, throw before a single file is rewritten, so the old key still
- * opens everything. Only once the whole set is verified do we re-seal in place. (Residual: a process
- * crash during the write phase can leave a partial rotation; re-run with the old key — verified
- * entries that already flipped will fail phase 1, surfacing the partial state to the operator.)
+ * Two phases so a single bad entry can't leave a half-rotated split-brain vault: STRICTLY enumerate +
+ * decrypt EVERY `*.vault.json` under `oldKek` FIRST — any file that won't parse or decrypt throws
+ * before a single file is rewritten, so the old key still opens everything. This does NOT use `list()`
+ * (which SKIPS malformed files for the lenient `vault status` path — rotation must not, or a corrupt
+ * entry would be left behind under the old key while the rest flips). Only once the whole set is
+ * verified do we re-seal in place. (Residual: a process crash during the write phase can leave a
+ * partial rotation; re-run with the old key — already-flipped entries fail phase 1, surfacing it.)
  */
 export function rotateVaultKey(
   dir: string,
@@ -197,12 +204,26 @@ export function rotateVaultKey(
   newKek: Buffer,
   canonicalizeHost: (host: string) => string,
 ): number {
-  const oldStore = new VaultStore({ kek: oldKek, dir, canonicalizeHost });
-  // Phase 1 — decrypt all under the old key. A corrupt/mismatched entry throws here, before any write.
-  const decrypted = oldStore.list().map((m) => ({ m, value: oldStore.get(m.consumerId, m.host) }));
+  const files = existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(ENTRY_SUFFIX)) : [];
+  // Phase 1 — strict: parse + decrypt the specific file (via its stored tuple's AAD), no skipping.
+  const decrypted = files.map((name) => {
+    const raw = readFileSync(join(dir, name), "utf8");
+    let file: { consumerId?: unknown; host?: unknown; record?: unknown };
+    try {
+      file = JSON.parse(raw);
+    } catch (e) {
+      throw new Error(`vault: ${name} is not valid JSON — refusing to rotate (${(e as Error).message})`);
+    }
+    if (typeof file.consumerId !== "string" || typeof file.host !== "string" || file.record == null) {
+      throw new Error(`vault: ${name} is not a valid entry (missing consumerId/host/record) — refusing to rotate`);
+    }
+    // openJson throws on a malformed record, a wrong key, or an AAD mismatch — fail closed, no write yet.
+    const value = openJson(file.record as SealedRecord, { kek: oldKek, consumerId: file.consumerId, host: file.host });
+    return { consumerId: file.consumerId, host: file.host, value };
+  });
   // Phase 2 — re-seal under the new key (pure) and write each in place (atomic temp + rename per file).
   const newStore = new VaultStore({ kek: newKek, dir, canonicalizeHost });
-  for (const { m, value } of decrypted) newStore.put(m.consumerId, m.host, value);
+  for (const e of decrypted) newStore.put(e.consumerId, e.host, e.value);
   return decrypted.length;
 }
 
@@ -220,12 +241,28 @@ export function countVaultEntries(dir: string): number {
 /**
  * Load the master key: `BGW_VAULT_KEY_FILE` (a path to a base64 key, the recommended host-held form),
  * else `BGW_VAULT_KEY` (raw base64, a convenience fallback), else null (no key configured). Throws if
- * a configured key file is unreadable or the material isn't a 32-byte key — the boot guard turns that
- * into a fail-closed boot when entries exist.
+ * a configured key file is unreadable, NOT a regular file, GROUP/WORLD-ACCESSIBLE, or the material
+ * isn't a 32-byte key — the boot guard turns that into a fail-closed boot when entries exist. The KEK
+ * is the crown jewel; a 0644 file would expose it to any local user, so the perms are ENFORCED, not
+ * just recommended (KTD-2: chmod 600).
  */
 export function loadVaultKey(env: NodeJS.ProcessEnv = process.env): Buffer | null {
   const file = env.BGW_VAULT_KEY_FILE;
   if (file) {
+    let st;
+    try {
+      st = statSync(file);
+    } catch (e) {
+      throw new Error(`BGW_VAULT_KEY_FILE not readable (${file}): ${(e as Error).message}`);
+    }
+    if (!st.isFile()) throw new Error(`BGW_VAULT_KEY_FILE is not a regular file: ${file}`);
+    if (st.mode & 0o077) {
+      const mode = (st.mode & 0o777).toString(8).padStart(3, "0");
+      throw new Error(
+        `BGW_VAULT_KEY_FILE is group/world-accessible (mode 0${mode}) — the vault master key must be ` +
+          `owner-only. Run: chmod 600 ${file}`,
+      );
+    }
     let contents: string;
     try {
       contents = readFileSync(file, "utf8");

@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -97,10 +97,15 @@ test("redaction folding: stored secret leaf values are handed to the redact hook
   const dir = tmp();
   const folded = new Set();
   const s = store(dir, KEK, (vals) => { for (const v of vals) folded.add(v); });
-  s.put("atlas", "example.com", { session: SESSION, creds: CREDS });
+  s.put("atlas", "example.com", {
+    session: { cookies: [{ name: "sid", value: "x".repeat(40) }, { name: "csrf", value: "ab12" }], origins: [] },
+    creds: CREDS,
+  });
   assert.ok(folded.has(CREDS.password), "password folded for redaction");
   assert.ok(folded.has("x".repeat(40)), "long cookie value folded");
-  assert.ok(!folded.has("sid"), "short noise (3 chars) not folded");
+  assert.ok(folded.has("ab12"), "SHORT cookie value folded — a {name,value} pair's value is credential-grade");
+  assert.ok(!folded.has("sid"), "short cookie NAME not folded (would over-redact ordinary logs)");
+  assert.ok(!folded.has("csrf"), "short cookie NAME not folded");
   // get() folds too (e.g. after a process restart that never saw the put).
   const folded2 = new Set();
   store(dir, KEK, (vals) => { for (const v of vals) folded2.add(v); }).get("atlas", "example.com");
@@ -108,16 +113,35 @@ test("redaction folding: stored secret leaf values are handed to the redact hook
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("loadVaultKey: file path, raw env, none, and unreadable file", () => {
+test("loadVaultKey: file path (0600 enforced), raw env, none, unreadable, bad size", () => {
   const dir = tmp();
   const keyB64 = randomBytes(32).toString("base64");
   const keyFile = join(dir, "vault.key");
   writeFileSync(keyFile, `${keyB64}\n`);
-  assert.equal(loadVaultKey({ BGW_VAULT_KEY_FILE: keyFile }).toString("base64"), keyB64, "from file");
+  chmodSync(keyFile, 0o600); // owner-only — the required posture
+  assert.equal(loadVaultKey({ BGW_VAULT_KEY_FILE: keyFile }).toString("base64"), keyB64, "from a 0600 file");
   assert.equal(loadVaultKey({ BGW_VAULT_KEY: keyB64 }).toString("base64"), keyB64, "from raw env");
   assert.equal(loadVaultKey({}), null, "no source → null");
   assert.throws(() => loadVaultKey({ BGW_VAULT_KEY_FILE: join(dir, "absent") }), /not readable/);
   assert.throws(() => loadVaultKey({ BGW_VAULT_KEY: randomBytes(16).toString("base64") }), /must be 32 bytes/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadVaultKey REJECTS a group/world-accessible or non-regular key file (P1: KEK perms enforced)", () => {
+  const dir = tmp();
+  const keyB64 = randomBytes(32).toString("base64");
+  const keyFile = join(dir, "vault.key");
+  writeFileSync(keyFile, `${keyB64}\n`);
+  for (const mode of [0o644, 0o640, 0o604, 0o660]) {
+    chmodSync(keyFile, mode);
+    assert.throws(() => loadVaultKey({ BGW_VAULT_KEY_FILE: keyFile }), /group\/world-accessible/, `mode 0${mode.toString(8)} rejected`);
+  }
+  chmodSync(keyFile, 0o600);
+  assert.ok(loadVaultKey({ BGW_VAULT_KEY_FILE: keyFile }), "0600 accepted");
+  // A directory (non-regular) is rejected before any read.
+  const asDir = join(dir, "akeydir");
+  mkdirSync(asDir, { mode: 0o700 });
+  assert.throws(() => loadVaultKey({ BGW_VAULT_KEY_FILE: asDir }), /not a regular file/);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -170,6 +194,26 @@ test("openVault fails closed with a clear message when BGW_VAULT_DIR is a file",
   const f = join(dir, "notadir");
   writeFileSync(f, "x");
   assert.throws(() => openVault({ env: { BGW_VAULT_DIR: f }, canonicalizeHost }), /not a directory.*refusing to boot/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey FAILS on a malformed *.vault.json instead of silently skipping it (P2)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  const s = store(dir, oldKek);
+  s.put("atlas", "a.com", { a: 1 });
+  s.put("vault", "b.com", { b: 2 });
+  // Drop in a malformed entry — list() would SKIP it; rotation must NOT (it would leave it unrotated).
+  writeFileSync(join(dir, "garbage.vault.json"), "{ not valid json");
+
+  assert.throws(() => rotateVaultKey(dir, oldKek, newKek, canonicalizeHost), /not valid JSON|refusing to rotate/);
+
+  // Nothing flipped: the two good entries still open under the OLD key (rotation aborted before writes).
+  const old = store(dir, oldKek);
+  assert.deepEqual(old.get("atlas", "a.com"), { a: 1 }, "old key still opens — not split-brained");
+  assert.deepEqual(old.get("vault", "b.com"), { b: 2 });
+  assert.throws(() => store(dir, newKek).get("atlas", "a.com"), /authenticate|decrypt/i, "new key opens nothing");
   rmSync(dir, { recursive: true, force: true });
 });
 
