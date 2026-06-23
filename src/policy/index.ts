@@ -226,6 +226,13 @@ export class PolicyEngine {
    * the site's design within the operator-trusted allowlist, not agent-driven exfil). Scheme, egress,
    * and the origination boundary still apply; the nav clamp is intersected with the consumer allowlist
    * so this guard is NEVER wider than {@link guardFor}.
+   *
+   * KNOWN LIMITATION (pre-existing, tracked separately —
+   * docs/solutions/architecture-patterns/nav-guard-redirect-bypass.md): a SERVER 3xx redirect is
+   * followed by `route.continue()` without re-invoking the guard, so a `302` from the owner host to a
+   * same-parent sibling can still carry a retained parent cookie off-host. This clamp blocks the
+   * agent's DIRECT navigation to a sibling (the leak then requires an open-redirect on the owner host);
+   * closing the redirect hop is a follow-up core-guard fix this rail depends on to be airtight.
    */
   guardForCredentialHost(consumer: Consumer, ownerHost: string): NavigationGuard {
     const owner = canonicalizeHost(ownerHost);
