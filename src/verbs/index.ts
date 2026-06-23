@@ -9,6 +9,7 @@ export type { Extraction } from "./extract.js";
 export { isCloudflareBlock, shouldEscalateToProxy, parseForceProxyHosts, hostForcesProxy } from "./escalation.js";
 export type { EscalationContext } from "./escalation.js";
 export { proxyOverrideFor, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "./drive.js";
+export { generateTotp, verifyTotp, isValidTotpSeed, normalizeTotpSeed, MIN_TOTP_SEED_BYTES } from "./totp.js";
 export { detectCaptcha, NullCaptchaSolver } from "./captcha.js";
 export type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "./captcha.js";
 export { HttpCaptchaSolver, CaptchaSolveError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "./captcha-solver.js";
