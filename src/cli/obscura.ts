@@ -11,7 +11,7 @@ import { loadObscuraConfig, requireConfig } from "./config.js";
 import type { ObscuraConfig } from "./config.js";
 import { keysNew, keysList, keysRevoke, inspectConsumers } from "./keys.js";
 import type { KeysDeps } from "./keys.js";
-import { vaultStatus, vaultImport, vaultRevoke } from "./vault.js";
+import { vaultStatus, vaultImport, vaultRevoke, vaultLogin } from "./vault.js";
 import type { VaultDeps } from "./vault.js";
 import { macKeychain } from "./keychain.js";
 import { sshShell } from "./prod-ssh.js";
@@ -106,7 +106,7 @@ function vaultDeps(config: ObscuraConfig): VaultDeps {
 async function runVault(invocation: Invocation): Promise<void> {
   const config = loadObscuraConfig();
   const deps = vaultDeps(config);
-  const requireFlag = (name: "host" | "session" | "creds"): string => {
+  const requireFlag = (name: "host" | "session" | "creds" | "recipe"): string => {
     const v = invocation.flags[name];
     if (v === undefined) throw new Error(`obscura vault ${invocation.subcommand} requires --${name}`);
     return v;
@@ -131,7 +131,12 @@ async function runVault(invocation: Invocation): Promise<void> {
         ...(invocation.flags.exit ? { exit: invocation.flags.exit } : {}),
       });
     case "login":
-      throw new Error("obscura vault login is not available yet (U8b) — use `vault import` for a hand-captured session");
+      return vaultLogin(deps, {
+        consumerId: consumer(),
+        host: requireFlag("host"),
+        recipePath: requireFlag("recipe"),
+        credsPath: requireFlag("creds"),
+      });
     default:
       throw new Error("vault: missing subcommand");
   }

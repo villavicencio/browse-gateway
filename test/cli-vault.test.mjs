@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { vaultStatus, vaultImport, vaultRevoke } from "../dist/cli/index.js";
+import { vaultStatus, vaultImport, vaultRevoke, vaultLogin } from "../dist/cli/index.js";
 
 function fakeShell(result) {
   const calls = [];
@@ -123,4 +123,55 @@ test("vault revoke reports shred vs nothing-to-shred", async () => {
 test("a nonzero on-host exit surfaces the (already-redacted) stderr to the operator", async () => {
   const shell = fakeShell({ code: 1, stdout: "", stderr: "[obscura-vault-host] consumer \"ghost\" is not in the manifest\n" });
   await assert.rejects(() => vaultStatus({ shell, container: "c", out: () => {} }), /not in the manifest/);
+});
+
+test("vault login ships recipe+creds on STDIN with a long watchdog, never on the command line", async () => {
+  const files = {
+    "r.json": JSON.stringify({ loginUrl: "https://ex.com/login", usernameField: "#u", passwordField: "#p", submit: "#s", successText: "Welcome" }),
+    "c.json": JSON.stringify({ username: "atlas-user", password: "SUPERSECRETpw", totpSeed: "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP" }),
+  };
+  const shell = fakeShell(
+    okResult({ command: "login", ok: true, consumerId: "atlas", host: "ex.com", cookieNames: ["sid"], escalated: false, bound: false, verified: true }),
+  );
+  const { out, push } = collect();
+  await vaultLogin(
+    { shell, container: "c", out: push, readLocalFile: (p) => files[p] },
+    { consumerId: "atlas", host: "ex.com", recipePath: "r.json", credsPath: "c.json" },
+  );
+  const { script, input, opts } = shell.calls[0];
+  assert.ok(input.includes("SUPERSECRETpw") && input.includes("#u"), "recipe + creds on stdin");
+  assert.ok(!script.includes("SUPERSECRETpw") && !script.includes("atlas-user"), "no secrets in the SSH command");
+  assert.match(script, /'login' --consumer 'atlas' --host 'ex\.com'/);
+  assert.equal(opts.timeoutMs, 180_000, "login uses the long watchdog (real browser flow)");
+  assert.ok(out.some((l) => /captured login for atlas @ ex\.com/.test(l) && /decrypt-verified/.test(l)));
+  assert.ok(out.some((l) => /direct datacenter exit/.test(l)), "reports the direct (non-escalated) capture");
+});
+
+test("vault login reports escalation when the runner bound a sticky exit", async () => {
+  const files = {
+    r: JSON.stringify({ loginUrl: "https://ex.com/login", usernameField: "#u", passwordField: "#p", submit: "#s", successSelector: "#out" }),
+    c: JSON.stringify({ username: "u", password: "p".repeat(16) }),
+  };
+  const shell = fakeShell(okResult({ command: "login", ok: true, consumerId: "atlas", host: "ex.com", cookieNames: ["sid"], escalated: true, bound: true, verified: true }));
+  const { out, push } = collect();
+  await vaultLogin({ shell, container: "c", out: push, readLocalFile: (p) => files[p] }, { consumerId: "atlas", host: "ex.com", recipePath: "r", credsPath: "c" });
+  assert.ok(out.some((l) => /escalated past a block/.test(l)));
+});
+
+test("vault login validates the recipe locally before any SSH round-trip", async () => {
+  const shell = fakeShell(okResult({}));
+  const missingField = { r: JSON.stringify({ loginUrl: "https://ex.com/login" }), c: JSON.stringify({ username: "u", password: "p".repeat(16) }) };
+  await assert.rejects(
+    () => vaultLogin({ shell, container: "c", out: () => {}, readLocalFile: (p) => missingField[p] }, { consumerId: "a", host: "ex.com", recipePath: "r", credsPath: "c" }),
+    /missing the "usernameField"/,
+  );
+  const noSuccess = {
+    r: JSON.stringify({ loginUrl: "https://ex.com/login", usernameField: "#u", passwordField: "#p", submit: "#s" }),
+    c: JSON.stringify({ username: "u", password: "p".repeat(16) }),
+  };
+  await assert.rejects(
+    () => vaultLogin({ shell, container: "c", out: () => {}, readLocalFile: (p) => noSuccess[p] }, { consumerId: "a", host: "ex.com", recipePath: "r", credsPath: "c" }),
+    /success condition/,
+  );
+  assert.equal(shell.calls.length, 0, "no SSH call is made when the recipe is invalid");
 });
