@@ -1,119 +1,128 @@
-# HANDOFF — 2026-06-23 (Phase 2 credential vault: U5→U6d all merged)
+# HANDOFF — 2026-06-23 (afternoon) — Phase 2 credential vault COMPLETE (U8a + U8b merged)
 
-Picked up after Phase 0 (#26) + Phase 1 (#27) and drove the **entire session-touching half of the
-credential vault to completion**: storageState capture/restore, the TOTP wrapper, the assisted-login
-primitive, the capture/import/warm orchestration, and the production gateway login-runner. Five PRs
-(#28–#32) shipped and merged, each independently reviewed (10 external P1/P2 review rounds total, all
-resolved before merge). **Phase 2's capture→store→replay machinery is now feature-complete on `main`
-and proven end-to-end through the real gateway with real Chrome.** What remains is U8 (the operator
-CLI / trigger wiring) and Phase 3/U7 (safety rails).
+Continued straight on from the morning handoff (Phase 2 capture path U5→U6d merged, #28–#32).
+This session built the **entire U8 operator front door** — the `obscura vault` CLI — and with it
+**Phase 2 of the credential vault is feature-complete on `main`**: capture → strip → encrypt →
+warm-replay (U5–U6d) plus the full operator surface (status / import / revoke / login). Two PRs
+shipped and merged (#33, #34); four external review rounds total, all resolved before merge.
+The vault remains **fully dormant in prod** — nothing is live until it's activated (see Gotchas).
 
 ## What We Built
 
-All five merged squash-commits are on `main` (tip `c2875fa`). Test suite **408 passing**.
+Both squash-commits are on `main` (tip `f43431c`). Test suite **446 passing**; two real-browser
+gates green (`validate:vault-login`, `validate:vault-host-login`); typecheck clean.
 
-- **#28 — U5: storageState capture/restore in the browser core** (squash `6c6c313`).
-  `BrowserCore.captureStorageState()` (wraps `context.storageState()`) + `BrowserCoreOptions.restoreState`
-  injected in `launch()` via `addCookies` + an origin-guarded, idempotent seed-if-absent `addInitScript`
-  (pure `buildLocalStorageSeedScript`). New `StorageState{,Cookie,Origin}` types. Gate:
-  `scripts/validate-vault-roundtrip.mjs`. **Naming: option is `restoreState`, NOT the plan's `vaultState`**
-  — the vehicle-agnostic core stays vault-concept-free. P1 fixed: a malformed persisted cookie made
-  `addCookies` reject AFTER Chrome launched → orphan-Chrome leak → extracted `restoreOrClose()`
-  (close-then-rethrow).
+- **#33 — U8a: `obscura vault status | import | revoke`** (squash `c4fc4c8`). The no-browser half
+  of the front door, entirely over the admin-SSH spine — **zero new network surface**.
+  - `src/cli/vault.ts` (Mac side) — owns no crypto/browser; marshals a request and ships it to the
+    on-host entrypoint via `docker exec -i <container> node dist/cli/vault-host.js`, renders the JSON.
+  - `src/cli/vault-host.ts` (runs INSIDE the gateway container, inherits its `BGW_VAULT_DIR` + `0600`
+    key — the KEK never leaves the box): `status` (keyless listing + boot-blocked warning), `import`
+    (strips IP-bound cookies, manifest-first guard, post-write fresh-instance decrypt verify), `revoke`
+    (crypto-shred).
+  - New keyless `listVaultEntries(dir)` in `src/security/vault-store.ts` (backs `status` without the KEK);
+    `VaultStore.list()` delegates to it.
+  - `src/cli/args.ts` generalized — single-value flags (`consumer/host/session/recipe/creds/exit`) store
+    last-value strings; `--allow` keeps comma-split accumulation via a new `multi` FlagSpec.
+  - Tests +20 (cli-args routing, cli-vault marshalling with a fake shell asserting secrets never hit
+    argv, vault-host run as a REAL subprocess vs a temp vault + 0600 key + manifest).
 
-- **#29 — U6a: TOTP wrapper** (squash `3098738`). `src/verbs/totp.ts` over **otplib v13** (see Gotchas —
-  it's a native-ESM rewrite, NOT the old `authenticator`/`totp` API). RFC-6238 Appendix-B SHA-1
-  conformance gate. P2 fixed: `isValidTotpSeed` used a regex+bit-count heuristic that accepted strings
-  the real Base32 decoder rejects (`"A".repeat(27)`) → made it authoritative (delegates to `generateTotp`).
-
-- **#30 — U6b: assisted-login primitive + readField** (squash `a1a618a`). `src/verbs/assisted-login.ts`:
-  recipe-driven orchestration over a `LoginDriver` abstraction (tri-state field polling, credential→2FA
-  ordering, settled-DOM success judge). New core method `readField(target)→FieldState`. `coreLoginDriver`
-  adapter. Gate: `scripts/validate-assisted-login.mjs` (real Chrome, server-verified 2FA, cold-restore
-  leg + an SPA leg). 3 review rounds: P1 success-judged-one-shot (async/SPA login threw) → bounded
-  `settleAfterSubmit`/`pollSuccess`; P2 `pollIntervalMs<=0` infinite loop → validate; P2 timeout not a
-  true upper bound → shared `sleepStep` clamps every loop.
-
-- **#31 — U6c: capture/import/warm orchestration + sticky-exit binding** (squash `ccf4a0d`).
-  `src/mcp/vault-login.ts` (operator-only, deliberately OFF the `DriveController` interface):
-  `VaultEntry`, `captureLoginToVault`, `importLoginToVault`, `getVaultEntry`/`revokeVaultEntry`,
-  `buildWarmOverride`. Sticky binding: `newStickyExitId()` + pinned-id `proxyOverrideFor(...,stickyExitId?)`.
-  Unit-tested through a REAL temp-dir `VaultStore`. P1 fixed: the R3 "no IP-bound tokens persisted"
-  invariant was documented but unenforced → `stripIpBoundTokens()` (denylist) on both write paths.
-
-- **#32 — U6d: production gateway login-runner + full-path capstone** (squash `c2875fa`).
-  `src/mcp/gateway-login-runner.ts` `makeGatewayLoginRunner()`. Gate: `scripts/validate-vault-login.mjs`
-  drives a fixture login + 2FA THROUGH the real `Gateway` (capture→strip→encrypt→warm-replay; a real
-  `cf_clearance` proves the R3 strip live). **3 P1 rounds, all on the runner's proxy posture** (see below).
+- **#34 — U8b: `obscura vault login` (live on-host capture)** (squash `f43431c`). Drives an assisted
+  login + TOTP on-host into the vault. **Effort: max.**
+  - **Load-bearing refactor:** new `src/mcp/runtime.ts` `buildGatewayRuntime(env, {log, secrets?,
+    policyEgress?})` factors the gateway boot (config → secrets → vault → solver → consumers →
+    pool-sizing guard → policy → gateway → escalation posture → sticky-suffix guard) out of
+    `http-main.ts`; **http-main now calls it (behavior-preserving — all prior tests green).**
+  - `src/cli/vault-host.ts login` builds a THROWAWAY Gateway via the runtime, looks up the consumer
+    token, runs `makeGatewayLoginRunner` + `captureLoginToVault`, fresh-decrypt-verifies, and tears the
+    Gateway down in `finally`. `src/cli/vault.ts vaultLogin` ships `{recipe,creds}` on stdin (180s
+    watchdog, second-Chrome note, direct-vs-escalated reporting).
+  - Real-browser gate `scripts/validate-vault-host-login.mjs` (`npm run validate:vault-host-login`):
+    fixture login + 2FA driven THROUGH `buildGatewayRuntime` → capture → strip `cf_clearance`/`__cf_bm`
+    → warm replay lands authenticated.
+  - Tests +12 then +6 (runtime construction/guards, login subprocess glue without Chrome, login
+    marshalling, force-proxy + sticky-suffix regressions).
+  - **Two review rounds resolved on-branch:** P2 force-proxy parity (`047f3b5`), P1 honest R3 binding
+    (`a366886`) — see Decisions.
 
 ## Decisions Made
 
-- **U6 was split into U6a/b/c/d** (it was far too big for one PR). U6d folded the `http-main` wiring
-  into U8 deliberately — wiring a runner nothing invokes yet would be dead code (draws a review note).
-- **`makeGatewayLoginRunner` mirrors the drive flow exactly** (forced by the 3 U6d P1 rounds):
-  - **DIRECT-FIRST, escalate-on-block (R7).** Never proxy a login the direct datacenter IP can clear;
-    open direct, probe-navigate, escalate only on `shouldEscalateDrive` (CF managed challenge / hard block).
-  - **A direct capture binds NO exit.** The `LoginRunner` contract returns `{state, stickyExitId?}` — the
-    runner *reports* the bound exit only when it escalated, instead of the caller pre-minting one.
-    `buildWarmOverride` re-pins a proxy ONLY when the entry carries a bound `stickyExitId` (direct capture
-    replays direct — R7 applies on replay too).
-  - **Retry up to `PROXY_OPEN_ATTEMPTS` fresh exits** (new sticky id each) before failing — residential
-    exits are intermittently dead/dirty; the pre-login GET is safe to retry.
-  - **Per-attempt try/finally** closes each retry session unless it's promoted to the committed handle.
-- **`assistedLogin` gained `skipInitialNavigate`** so the runner owns the single escalation-aware navigate
-  (no double-load, correct clearance budget on the proxied path).
-- **Assisted-login is NEVER an MCP tool, by construction** (KTD-5): it's off the `DriveController`
-  interface the server maps tools from; a regression test greps the compiled `server.js` to keep it so.
-- **Kept otplib v13's 128-bit RFC-4226 seed floor** (the common 80-bit/16-char Google-Auth seed is
-  rejected) rather than weakening the guardrail — surfaced as `isValidTotpSeed` at import time.
+- **`vault login` trigger = SSH → on-host process** (operator-chosen via AskUserQuestion). The CLI
+  `docker exec`s a `vault-host` entrypoint that builds its OWN throwaway Gateway in the container.
+  **Zero new network surface; stays on the admin-SSH operator plane** (like keys/connect/status).
+- **Dropped `--apply`/pre-swap-smoke from the vault CLI** (deliberate deviation from the written plan).
+  A vault entry write is **immediately live** — the running gateway re-reads the sealed file per
+  warm-session open under the same KEK, so there's nothing to "activate" via a re-create, and a bad
+  entry fails ONE warm-session open (fail-closed), never the boot. The fresh-process-verify lesson is
+  satisfied instead by a **post-write fresh-instance decrypt** inside the entrypoint.
+- **U8 split into U8a (no-browser) + U8b (login)** for size/risk, matching the U6 split discipline.
+- **`buildGatewayRuntime` extraction** justified by `login` being its second consumer in the same PR
+  (no speculative abstraction). Two seams: **`policyEgress`** is a TEST-ONLY in-process hook (both prod
+  callers omit it → real `isBlockedEgressHost`; the in-process gate passes `()=>false` to reach a
+  loopback fixture); **`secrets`** lets vault-host reuse its one redaction sink so KEK + tokens + creds
+  all scrub through it.
+- **P2 fix (`047f3b5`):** the login-runner now honors `BGW_FORCE_PROXY_HOSTS` — a forced host SKIPS the
+  direct attempt and begins on a pinned exit (mirrors drive's `#firstNavigate`), forced-without-proxy
+  fails loud. The pinned-exit retry loop is now reachable from both the forced-from-start and
+  escalate-after-block paths.
+- **P1 fix (`a366886`):** a proxied capture now REQUIRES a pinnable proxy (proxy creds + onDatacenterIp
+  + `BGW_PROXY_STICKY_SUFFIX`). Without a sticky suffix, `mintStickyProxy` ignores the id → the exit
+  rotates → a stored `stickyExitId` would be a false R3 claim. So forced-without-suffix AND
+  block-without-suffix both fail loud; the pinned-exit loop is reachable only when the suffix is set,
+  so **every recorded `stickyExitId` genuinely pins**.
 
-## What Didn't Work
+## What Didn't Work / Ruled Out
 
-- **Documented-but-unenforced invariants bit twice.** U6c shipped with "IP-bound tokens not persisted"
-  in the doc comments but no actual filter (`captureStorageState` returns ALL cookies verbatim) — caught
-  in review (#31 P1). Lesson: enforce invariants in code + a regression test, never just prose.
-- **The original U6d proxy posture was wrong on three counts** (always-on → no retry → leak-on-throw),
-  each a separate P1 round. Root cause: I built the runner fresh instead of mirroring the already-hardened
-  `GatewayDriveController` escalation from the start. When adding a proxied-session path, copy the drive
-  controller's open/retry/cleanup discipline.
-- **`isValidTotpSeed` as a char-count heuristic** silently diverged from the real Base32 decoder — always
-  validate by delegating to the authoritative path.
+- **In-process operator endpoint on the running gateway** (the "fold into http-main" idea the prior
+  handoff floated for the login trigger) — RULED OUT. It expands the consumer-facing service's surface
+  with an operator control plane, cutting against the admin-SSH-only / KTD-5 doctrine. The SSH →
+  on-host-process model was chosen instead.
+- **A subprocess real-browser gate for `vault login`** — not feasible. The egress filter blocks ALL
+  local IPs (loopback + RFC1918) as anti-SSRF, so a real subprocess (prod egress on) can't reach a
+  local fixture without an env bypass = a prod footgun. Hence the gate runs IN-PROCESS via the
+  test-only `policyEgress` hook; the subprocess arg/stdin/token-lookup glue is unit-tested without Chrome.
+- **P1 option-b (store the capture as honestly-unbound when no suffix)** — rejected. `buildWarmOverride`
+  only proxies via a bound `stickyExitId`, so an unbound forced entry would replay DIRECT — wrong for a
+  force-proxy host. Requiring a pinnable proxy (option-a) is the coherent fix.
 
 ## What's Next
 
-1. **U8 — `obscura vault` CLI** (`import | login | status | revoke`) + the `http-main`/trigger wiring.
-   This is the operator front door; **nothing invokes the runner until this lands** (the whole capture
-   path is merged but dormant). Mirror the `keys` CLI structure (`src/cli/keys.ts`): atomic prod writes,
-   `--apply` reuses the generalized pre-swap smoke (U1), read-only `status`, fresh-process verify.
-   `vault login` triggers `makeGatewayLoginRunner` + `captureLoginToVault` on-host; `vault import` →
-   `importLoginToVault`; `vault revoke` → `revokeVaultEntry` (crypto-shred). Plan: U8 in
-   `docs/plans/2026-06-22-002-credential-vault-plan.local.md`.
-2. **Phase 3 / U7 — safety rails.** Host-scoped no-exfil (a stored host-A cookie only ever injected into
-   a host-A-guarded session), audit every credentialed session, the hard financial/origination boundary
-   (deny-rule), and the secret-leak kill-gate probe (prove no stored value appears in logs/observability/
-   egress — modeled on the WebRTC probe leg).
-3. **Activation (still fully dormant in prod).** The vault is off unless `BGW_VAULT_DIR` + a `0600`
-   `BGW_VAULT_KEY_FILE` are set (expect `vault: ready` in the boot log). Nothing the vault does is live.
+1. **Phase 3 / U7 — safety rails** (the only vault work left). Prioritized:
+   - **Host-scoped no-exfil:** a stored host-A cookie must only ever be injected into a host-A-guarded
+     session (the warm-replay path must enforce the same host-scoping the capture had).
+   - **Audit every credentialed session** (which consumer, which host, when).
+   - **Hard financial/origination deny-rule** (a policy deny, below the verb layer).
+   - **Secret-leak kill-gate probe:** prove no stored value ever appears in logs/observability/egress —
+     model it on the WebRTC probe leg in `validate-stealth.mjs`.
+   - Plan: `docs/plans/2026-06-22-002-credential-vault-plan.local.md` (U7 section).
+2. **Activation** (separate, deploy-side): set `BGW_VAULT_DIR` (on a persistent volume — see Gotchas)
+   + a `0600` `BGW_VAULT_KEY_FILE`, re-create the container, confirm `vault: ready` in the boot log.
+   Until then the entire vault is dormant.
+3. **Parked, unrelated:** the PerimeterX-defeat spike (`docs/plans/2026-06-22-001-*.local.md`) and the
+   durability/external-users brainstorm (D1+D4). Neither blocks the vault.
 
 ## Gotchas & Watch-outs
 
-- **otplib v13 is a native-ESM rewrite — NOT the old API.** Use the functional `generateSync`/`verifySync`
-  (epoch in SECONDS), not `authenticator`/`totp` classes. Default `NobleCryptoPlugin` is sync-capable.
-  It enforces a 128-bit/16-byte secret floor (rejects 80-bit seeds). See `src/verbs/totp.ts`.
-- **Git hygiene footguns hit twice this session** (both: "on `main` after a merge-sync, forgot branch
-  discipline"): (1) `git rebase --onto main` used STALE LOCAL main (a `fetch` updates `origin/main`, NOT
-  local `main`) → phantom conflict; fix `git branch -f main origin/main` first. (2) committed U6d to
-  `main` directly (forgot to branch); push failed → recovered via `git branch <name>` then
-  `git reset --hard origin/main`. **Branch BEFORE committing when on `main` after a merge.**
-- **Reviewer-reply hash:** resolve the commit hash (`git rev-parse`) BEFORE composing the reply — posted
-  one with a `<this commit>` placeholder this session and had to patch the GH comment + clipboard.
-- **Clipboard SOP:** every reviewer-facing reply (`gh pr comment`) gets pbcopy'd in the SAME step — the
-  operator relays review rounds manually. Memory: `clipboard-copy-paste-content`.
-- **Source hygiene:** never embed literal control/separator bytes (NUL/U+2028/U+2029) — they break
-  grep/diff. A degraded grep tuple also silently false-positives. Use `String.fromCharCode`/`\u`/codepoint
-  sets in tests. (Hit a false-alarm sweep this session from exactly this.)
-- **Public repo** — codenames only (atlas/vault/argus); no real ids/hosts/paths in source, commits, or PRs.
-- **The capstone validator injects `egress: () => false`** into the PolicyEngine so the gateway can reach
-  the 127.0.0.1 fixture (the egress filter blocks loopback as anti-SSRF). TEST-ONLY deviation; prod
-  policy is unchanged.
+- **Vault is fully DORMANT in prod** — nothing the vault does is live until `BGW_VAULT_DIR` + a `0600`
+  `BGW_VAULT_KEY_FILE` are set. The CLI reports "vault is not enabled" until then.
+- **ACTIVATION GOTCHA: `BGW_VAULT_DIR` MUST be a persistent volume.** Otherwise every imported/captured
+  entry vanishes on the next container re-create (deploy). Pin this down before activating.
+- **`vault login` launches a SECOND headful Chrome** in the container (transient). Proven safe:
+  `userDataDir` defaults to `""` → a fresh ephemeral profile per launch (no singleton-lock clash with
+  the live gateway), and `DISPLAY=:99` is an image `ENV` so `docker exec` inherits the running Xvfb.
+  Run it at low gateway load (the CLI prints a note); the throwaway Gateway is shut down in `finally`.
+- **`buildGatewayRuntime`'s `policyEgress` is TEST-ONLY.** Both prod callers (http-main, vault-host)
+  must pass NO override → real egress. If you add a third caller, do NOT pass `policyEgress`.
+- **Force-proxy + sticky-suffix coupling:** a proxied vault capture is refused unless
+  `BGW_PROXY_STICKY_SUFFIX` is set (so the bound exit can be re-pinned on warm replay, R3). If `vault
+  login` for a forced host fails with "BGW_PROXY_STICKY_SUFFIX is unset", that's the guard, not a bug.
+- **Branch BEFORE committing when on `main` after a merge** (bit twice in the prior session). This
+  session branched cleanly for both PRs.
+- **Resolve the reviewer-reply commit hash (`git rev-parse`) BEFORE composing the reply** — no
+  `<this commit>` placeholders. Every reviewer-facing reply was pbcopy'd in the same step (operator
+  relays rounds manually); I did NOT auto-post `gh pr comment`.
+- **Public repo** — codenames only (atlas/vault/argus); no real ids/hosts/paths in source/commits/PRs.
+  Both PRs' diffs were scanned clean of fleet identifiers and control/separator bytes.
 - **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
+- **This HANDOFF commit is on local `main` but NOT pushed** — per the standing main-push gate, the
+  operator pushes `main`. `git push origin main` when ready.
