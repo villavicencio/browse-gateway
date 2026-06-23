@@ -249,6 +249,9 @@ async function doLogin(env: NodeJS.ProcessEnv, argv: string[]): Promise<void> {
     const runLogin = makeGatewayLoginRunner(runtime.gateway, runtime.secrets, spec.token, {
       onDatacenterIp: runtime.onDatacenterIp,
       ...(runtime.stickySuffix ? { stickySuffix: runtime.stickySuffix } : {}),
+      // Honor BGW_FORCE_PROXY_HOSTS just like drive/retrieve: a forced host's login starts proxied,
+      // never from the datacenter IP (issue #21).
+      forceProxyHosts: runtime.forceProxyHosts,
     });
     const entry = await captureLoginToVault({ vault: runtime.vault, runLogin }, { consumerId, host, recipe, creds });
     freshDecryptVerify(env, secrets, consumerId, host, entry);
