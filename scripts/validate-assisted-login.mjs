@@ -32,6 +32,19 @@ const twofaForm = page(
 );
 const dashboard = page(`<h1 id="dash">AUTHENTICATED DASHBOARD</h1><a href="/logout">Sign out</a>`);
 
+// SPA login: the submit is a plain button whose handler POSTs via fetch, then renders the dashboard
+// CLIENT-SIDE after a delay — so the authenticated DOM is NOT present when click() returns. This is
+// the async path the bounded success poll must wait out (the form flow above is settled at click).
+const spaLogin = page(
+  `<h1>Sign in</h1>` +
+    `<input id="username"><input id="password" type="password"><button id="submit" type="button">Sign in</button>` +
+    `<script>document.getElementById('submit').addEventListener('click', async () => {` +
+    `const u = document.getElementById('username').value, p = document.getElementById('password').value;` +
+    `const r = await fetch('/spa-auth', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'username='+encodeURIComponent(u)+'&password='+encodeURIComponent(p)});` +
+    `if (r.ok) setTimeout(() => { document.body.innerHTML = '<h1 id=\\'dash\\'>AUTHENTICATED DASHBOARD</h1>'; }, 150);` +
+    `});</script>`,
+);
+
 function readBody(req) {
   return new Promise((resolve) => {
     let data = "";
@@ -61,6 +74,15 @@ async function handler(req, res) {
   }
   if (req.method === "GET" && url.pathname === "/dashboard") {
     return html(res, hasCookie(req) ? dashboard : page("<h1>Please sign in</h1>"));
+  }
+  if (req.method === "GET" && url.pathname === "/spa") return html(res, spaLogin);
+  if (req.method === "POST" && url.pathname === "/spa-auth") {
+    const body = await readBody(req);
+    if (body.get("username") === USER && body.get("password") === PASS) {
+      return html(res, "{}", { "Set-Cookie": `${COOKIE}; Path=/`, "Content-Type": "application/json" });
+    }
+    res.writeHead(401);
+    return res.end("{}");
   }
   res.writeHead(404);
   res.end("not found");
@@ -123,6 +145,31 @@ try {
     check("captured state replays into a cold session as authenticated", /AUTHENTICATED DASHBOARD/.test(`${dash.title}\n${dash.text}`));
   } finally {
     await restored.close();
+  }
+
+  // --- SPA leg (PR #30 P1): the dashboard renders client-side ~150ms AFTER the fetch submit, so the
+  // success DOM is absent when click() returns. The bounded success poll must wait it out. ---
+  {
+    const core = await createBrowserCore(coreOpts);
+    try {
+      const recipe = {
+        loginUrl: `${srv.origin}/spa`,
+        usernameField: "#username",
+        passwordField: "#password",
+        submit: "#submit",
+        successText: "AUTHENTICATED DASHBOARD",
+      };
+      const result = await assistedLogin(
+        coreLoginDriver(core),
+        recipe,
+        { username: USER, password: PASS },
+        { fieldTimeoutMs: 8000, pollIntervalMs: 200 },
+      );
+      const spaCookie = (result.state.cookies ?? []).find((c) => COOKIE.startsWith(`${c.name}=`));
+      check("SPA login (async client-rendered dashboard) is polled to success, not failed", !!spaCookie);
+    } finally {
+      await core.close();
+    }
   }
 } finally {
   await srv.close();

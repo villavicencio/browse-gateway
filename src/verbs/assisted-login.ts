@@ -133,6 +133,50 @@ async function judgeSuccess(driver: LoginDriver, recipe: LoginRecipe): Promise<b
 }
 
 /**
+ * Poll the success condition within the bounded window. A submit can complete via fetch / client-side
+ * render, so the authenticated DOM is NOT necessarily present the instant `submit()` returns — a
+ * one-shot judge would misread an async (SPA) login as failed. Returns true as soon as success holds,
+ * false if the window elapses.
+ */
+async function pollSuccess(
+  driver: LoginDriver,
+  recipe: LoginRecipe,
+  fieldTimeoutMs: number,
+  pollIntervalMs: number,
+): Promise<boolean> {
+  let waited = 0;
+  for (;;) {
+    if (await judgeSuccess(driver, recipe)) return true;
+    if (waited >= fieldTimeoutMs) return false;
+    await driver.wait(pollIntervalMs);
+    waited += pollIntervalMs;
+  }
+}
+
+/**
+ * After a credential submit the page resolves — possibly asynchronously — to EITHER the authenticated
+ * state OR a 2FA gate. Poll for whichever lands first within the window, checking success before the
+ * 2FA field each round so a straight-to-dashboard login wins. `"neither"` = the window elapsed with
+ * no resolution (e.g. rejected credentials), surfaced as a failed login by the caller.
+ */
+async function settleAfterSubmit(
+  driver: LoginDriver,
+  recipe: LoginRecipe,
+  totpField: string | undefined,
+  fieldTimeoutMs: number,
+  pollIntervalMs: number,
+): Promise<"success" | "twofa" | "neither"> {
+  let waited = 0;
+  for (;;) {
+    if (await judgeSuccess(driver, recipe)) return "success";
+    if (totpField && (await driver.readField(totpField)).present) return "twofa";
+    if (waited >= fieldTimeoutMs) return "neither";
+    await driver.wait(pollIntervalMs);
+    waited += pollIntervalMs;
+  }
+}
+
+/**
  * Drive `recipe` to completion against `driver` and return the captured session state.
  *
  * Flow: navigate → fill username + password (each polled into existence, filled only when empty) →
@@ -153,25 +197,37 @@ export async function assistedLogin(
   }
   const fieldTimeoutMs = opts.fieldTimeoutMs ?? DEFAULT_FIELD_TIMEOUT_MS;
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_FIELD_POLL_MS;
+  // Guard the poll loops: a non-positive or non-finite interval never advances `waited`, so the bound
+  // would never be reached — validate up front rather than spin forever on a bad override.
+  if (!Number.isFinite(fieldTimeoutMs) || fieldTimeoutMs < 0) {
+    throw new Error("assisted login: fieldTimeoutMs must be a finite, non-negative number");
+  }
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw new Error("assisted login: pollIntervalMs must be a finite, positive number");
+  }
+  // Bind once so TS keeps it narrowed to `string` across the awaits in the 2FA branch below.
+  const totpField = recipe.totpField;
 
   await driver.navigate(recipe.loginUrl);
   await fillWhenReady(driver, recipe.usernameField, creds.username, "username", fieldTimeoutMs, pollIntervalMs);
   await fillWhenReady(driver, recipe.passwordField, creds.password, "password", fieldTimeoutMs, pollIntervalMs);
   await driver.submit(recipe.submit);
 
-  let success = await judgeSuccess(driver, recipe);
-  if (!success && recipe.totpField) {
-    const totp = await pollField(driver, recipe.totpField, fieldTimeoutMs, pollIntervalMs);
-    if (totp.present) {
-      if (!creds.totpSeed) {
-        throw new Error("the target prompted for a 2FA code but no TOTP seed is configured for this entry");
-      }
-      if (totp.value === "") {
-        await driver.fill(recipe.totpField, generateTotp(creds.totpSeed, opts.totpAtSeconds));
-      }
-      await driver.submit(recipe.totpSubmit ?? recipe.submit);
-      success = await judgeSuccess(driver, recipe);
+  // Wait (within the window) for the post-submit page to resolve to authenticated OR a 2FA gate —
+  // SPA-safe, since the DOM may update asynchronously after submit() returns.
+  const phase = await settleAfterSubmit(driver, recipe, totpField, fieldTimeoutMs, pollIntervalMs);
+  let success = phase === "success";
+  if (phase === "twofa" && totpField) {
+    if (!creds.totpSeed) {
+      throw new Error("the target prompted for a 2FA code but no TOTP seed is configured for this entry");
     }
+    const totp = await driver.readField(totpField); // settleAfterSubmit confirmed it is present
+    if (totp.value === "") {
+      await driver.fill(totpField, generateTotp(creds.totpSeed, opts.totpAtSeconds));
+    }
+    await driver.submit(recipe.totpSubmit ?? recipe.submit);
+    // The 2FA submit can also render the dashboard asynchronously — poll, don't one-shot.
+    success = await pollSuccess(driver, recipe, fieldTimeoutMs, pollIntervalMs);
   }
   if (!success) {
     throw new Error(
