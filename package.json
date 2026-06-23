@@ -16,6 +16,7 @@
     "validate:stealth": "npm run build && node scripts/validate-stealth.mjs",
     "validate:http": "npm run build && node scripts/validate-http.mjs",
     "validate:frame-capture": "npm run build && node scripts/validate-frame-capture.mjs",
+    "validate:vault-roundtrip": "npm run build && node scripts/validate-vault-roundtrip.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {

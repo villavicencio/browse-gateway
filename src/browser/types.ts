@@ -20,6 +20,43 @@ export interface ProxyConfig {
   password?: string;
 }
 
+/**
+ * A single cookie in a captured {@link StorageState} — the Playwright `storageState()` cookie
+ * shape, carried verbatim so capture/restore round-trips through `context.addCookies` with no
+ * field translation. `expires` is Unix time in **seconds** (`-1` for a session cookie, not an
+ * absolute expiry); `sameSite` is the `Strict`/`Lax`/`None` enum (KTD-4).
+ */
+export interface StorageStateCookie {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  /** Unix expiry in SECONDS; `-1` for a session cookie. */
+  expires: number;
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: "Strict" | "Lax" | "None";
+}
+
+/** Per-origin localStorage captured in a {@link StorageState}. `sessionStorage` is not included by
+ * `storageState()` and is out of scope (KTD-4). */
+export interface StorageStateOrigin {
+  origin: string;
+  localStorage: Array<{ name: string; value: string }>;
+}
+
+/**
+ * A serializable browser session snapshot — cookies + per-origin localStorage — matching
+ * Playwright's `BrowserContext.storageState()` return shape. The vault persists this as an opaque
+ * encrypted blob (U4) and replays it into a cold session (KTD-3): cookies via `addCookies`,
+ * localStorage via an origin-guarded init script (KTD-4). Capture/replay should stay on the same
+ * Chrome major so partitioned-cookie (CHIPS) parity holds.
+ */
+export interface StorageState {
+  cookies: StorageStateCookie[];
+  origins: StorageStateOrigin[];
+}
+
 export interface BrowserCoreOptions {
   /**
    * Strict headless. Defaults to `false` (headful) because the spike proved strict
@@ -43,6 +80,16 @@ export interface BrowserCoreOptions {
   navigationTimeoutMs?: number;
   /** Upstream proxy for this session. Absent = direct connection. */
   proxy?: ProxyConfig;
+  /**
+   * Session state to restore into a cold session at launch (KTD-3/4): cookies are injected via
+   * `addCookies` and per-origin localStorage via an origin-guarded init script, so the first
+   * navigation is already logged-in. Applied AFTER `launchPersistentContext`, like the runtime
+   * `solver` (it is not a launch arg). A vault session pairs this with a clean ephemeral
+   * `userDataDir` (`""`) so the throwaway profile can't shadow the seeded state. Concept-agnostic
+   * at this layer — the "vault" meaning lives above the browser core; here it is just state to
+   * restore. Absent = a cold, stateless session (the default).
+   */
+  restoreState?: StorageState;
   /**
    * Injected CAPTCHA solver for the interactive drive path: when set, the core auto-solves a
    * detected, blocking interactive CAPTCHA (reCAPTCHA/Turnstile/hCaptcha) during its post-action
@@ -160,6 +207,12 @@ export interface BrowserCore {
   readonly kind: string;
   /** Navigate to `url`, wait for clearance, and return a DOM snapshot (stateless `retrieve` path). */
   render(url: string, opts?: RenderOptions): Promise<RenderResult>;
+  /**
+   * Serialize the context's current session state (cookies + per-origin localStorage) for the vault
+   * to persist (KTD-3). The counterpart to {@link BrowserCoreOptions.restoreState}; the captured
+   * blob replays into a later cold session as logged-in. `sessionStorage` is not included (KTD-4).
+   */
+  captureStorageState(): Promise<StorageState>;
   /**
    * Install a guard consulted for every request via network-layer interception. Replaces
    * any previously installed guard without leaving an unguarded window. A core with NO guard

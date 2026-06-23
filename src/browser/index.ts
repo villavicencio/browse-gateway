@@ -17,6 +17,9 @@ export type {
   ProxyConfig,
   RenderOptions,
   RenderResult,
+  StorageState,
+  StorageStateCookie,
+  StorageStateOrigin,
   WaitCondition,
 } from "./types.js";
 export { createBrowserCore, PatchrightBrowserCore, targetToSelector } from "./patchright-core.js";
@@ -47,6 +50,7 @@ export {
 } from "./detect.js";
 export {
   buildLaunchOptions,
+  buildLocalStorageSeedScript,
   resolveCoreOptions,
   DEFAULT_CORE_OPTIONS,
   WEBRTC_IP_HANDLING_ARG,
