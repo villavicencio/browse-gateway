@@ -95,7 +95,50 @@ test("flags are validated per command — no silent cross-command leakage", () =
 
 test("usage names every command", () => {
   const text = usage();
-  for (const word of ["keys new", "keys list", "keys revoke", "connect", "status"]) {
+  for (const word of ["keys new", "keys list", "keys revoke", "connect", "status", "vault status", "vault import", "vault login", "vault revoke"]) {
     assert.ok(text.includes(word), `usage mentions ${word}`);
   }
+});
+
+test("vault subcommands route with single-value flags (not allow-accumulation)", () => {
+  const status = parseCliArgs(["vault", "status"]);
+  assert.equal(status.ok, true);
+  assert.equal(status.invocation.command, "vault");
+  assert.equal(status.invocation.subcommand, "status");
+  assert.deepEqual(status.invocation.flags, {});
+
+  const imp = parseCliArgs(["vault", "import", "--consumer", "atlas", "--host", "ex.com", "--session", "s.json", "--creds", "c.json", "--exit", "feed0000"]);
+  assert.equal(imp.ok, true);
+  assert.equal(imp.invocation.subcommand, "import");
+  // Single-value flags store a STRING, not the comma-split list `allow` uses.
+  assert.equal(imp.invocation.flags.consumer, "atlas");
+  assert.equal(imp.invocation.flags.host, "ex.com");
+  assert.equal(imp.invocation.flags.session, "s.json");
+  assert.equal(imp.invocation.flags.creds, "c.json");
+  assert.equal(imp.invocation.flags.exit, "feed0000");
+  assert.equal(imp.invocation.flags.allow, undefined);
+
+  const login = parseCliArgs(["vault", "login", "--consumer", "atlas", "--host", "ex.com", "--recipe", "r.json", "--creds", "c.json"]);
+  assert.equal(login.ok, true);
+  assert.equal(login.invocation.flags.recipe, "r.json");
+});
+
+test("vault: a value with a comma is NOT split (a host/path is one token)", () => {
+  const r = parseCliArgs(["vault", "revoke", "--consumer", "atlas", "--host", "a.com,b.com"]);
+  assert.equal(r.ok, true);
+  assert.equal(r.invocation.flags.host, "a.com,b.com"); // last-value string, never a list
+});
+
+test("vault rejects unknown subcommands, unknown flags, and missing values", () => {
+  const badSub = parseCliArgs(["vault", "destroy"]);
+  assert.equal(badSub.ok, false);
+  assert.match(badSub.error, /usage: obscura vault <status\|import\|login\|revoke>/);
+
+  const badFlag = parseCliArgs(["vault", "status", "--consumer", "x"]);
+  assert.equal(badFlag.ok, false);
+  assert.match(badFlag.error, /unknown flag for vault status: --consumer/);
+
+  const noValue = parseCliArgs(["vault", "revoke", "--host"]);
+  assert.equal(noValue.ok, false);
+  assert.match(noValue.error, /--host requires a value/);
 });
