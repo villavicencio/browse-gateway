@@ -26,6 +26,7 @@ import type {
   FieldState,
   NavigationDecision,
   NavigationGuard,
+  NavigationRequest,
   PageSnapshot,
   RenderOptions,
   RenderResult,
@@ -39,7 +40,62 @@ type PatchrightContext = Awaited<
 >;
 type PatchrightPage = Awaited<ReturnType<PatchrightContext["newPage"]>>;
 type PatchrightLocator = ReturnType<PatchrightPage["locator"]>;
-type RouteHandler = Parameters<PatchrightContext["route"]>[1];
+type PatchrightBrowser = NonNullable<ReturnType<PatchrightContext["browser"]>>;
+/** Browser-level CDP session type, derived so we don't depend on a named patchright export. */
+type CDPSession = Awaited<ReturnType<PatchrightBrowser["newBrowserCDPSession"]>>;
+
+/** The subset of the CDP `Fetch.requestPaused` event the navigation guard reads. */
+interface FetchRequestPaused {
+  requestId: string;
+  request: { url: string };
+  resourceType: string;
+}
+
+/**
+ * Map a paused CDP Fetch request onto the {@link NavigationRequest} the guard consumes. Pure and
+ * exported so the highest-risk part of the CDP rewrite is unit-testable without a browser: CDP
+ * emits TitleCase `resourceType` ("Document"/"XHR") which we lowercase to preserve the prior
+ * Playwright-shaped value the audit log records, and CDP has no `isNavigationRequest` field so a
+ * top-level/subframe document load (`resourceType === "Document"`) is treated as the navigation.
+ */
+export function cdpRequestToNavigation(resourceType: string, url: string): NavigationRequest {
+  return {
+    url,
+    host: hostFromUrl(url),
+    resourceType: typeof resourceType === "string" ? resourceType.toLowerCase() : "",
+    // Speculative Document loads (prefetch/prerender) over-classify as navigation here (CDP gives no
+    // loaderId in this subset); that only ever OVER-applies the owner-host clamp (fail-safe), never
+    // exempts a real navigation from it.
+    isNavigationRequest: resourceType === "Document",
+  };
+}
+
+/**
+ * Decide a paused request, fail-closed. Pure + exported so the decision branches (no guard → block;
+ * guard throws → block; otherwise the guard's verdict) are unit-tested without a browser — the
+ * second-highest-risk part of the rewrite after {@link cdpRequestToNavigation}. `onError` lets the
+ * caller surface a throwing guard (which is otherwise silent because the throw happens before the
+ * guard's own audit record runs).
+ */
+export function decideRequest(
+  guard: NavigationGuard | undefined,
+  event: FetchRequestPaused,
+  onError?: (err: unknown) => void,
+): NavigationDecision {
+  if (!guard) return "block";
+  try {
+    return guard(cdpRequestToNavigation(event.resourceType, event.request?.url ?? ""));
+  } catch (err) {
+    onError?.(err);
+    return "block";
+  }
+}
+
+/** A short, URL-stripped reason for a diagnostic line — never leak a target/secret into logs (R9). */
+function errCode(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.replace(/https?:\/\/\S+/gi, "<url>").slice(0, 80);
+}
 
 const DEFAULT_CLEARANCE_TIMEOUT_MS = 20_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
@@ -167,7 +223,32 @@ export class PatchrightBrowserCore implements BrowserCore {
   readonly #resolved: ResolvedCoreOptions;
   /** Injected solver for the drive path; absent = a detected CAPTCHA is left to fail. */
   readonly #solver?: CaptchaSolver;
-  #routeHandler?: RouteHandler;
+  /**
+   * The currently-installed navigation guard. The single persistent CDP `Fetch.requestPaused`
+   * listener reads this on every request, so swapping guards is an atomic reassignment — no
+   * unguarded window, no Fetch re-enable. Absent until the first setNavigationGuard().
+   */
+  #activeGuard?: NavigationGuard;
+  /**
+   * Browser-level CDP session that owns request interception, installed lazily on the first
+   * setNavigationGuard(). One session with auto-attach (flatten) covers every present + future
+   * page/popup/frame, and re-pauses each server-redirect hop so the guard re-decides it. Undefined
+   * = no guard ever installed = no interception = fail-open (only the kill-gate drives a core so).
+   */
+  #cdpGuardSession?: CDPSession;
+  /**
+   * Single-flight latch for the lazy first install. A second setNavigationGuard() that arrives while
+   * the first install's CDP round-trips are still in flight awaits this instead of opening a SECOND
+   * browser session + Fetch.enable (which would be the double-consumer / InterceptionId collision the
+   * whole design avoids). Cleared once the install settles.
+   */
+  #cdpInstall?: Promise<void>;
+  /**
+   * Set while close() tears the session down. `Fetch.disable` releases any still-paused request by
+   * CONTINUING it (allow), so during teardown #onRequestPaused fail-closes instead — a redirect hop
+   * paused at the close instant must not be auto-allowed past the guard.
+   */
+  #closing = false;
   /** The single persistent page the interactive `drive` verbs act on (absent until navigate()). */
   #activePage?: PatchrightPage;
   /**
@@ -257,37 +338,101 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   async setNavigationGuard(guard: NavigationGuard): Promise<void> {
-    const handler: RouteHandler = async (route) => {
-      const request = route.request();
-      const url = request.url();
-      // Fail closed: if the guard throws, block.
-      let decision: NavigationDecision = "block";
-      try {
-        decision = guard({
-          url,
-          host: hostFromUrl(url),
-          resourceType: request.resourceType(),
-          isNavigationRequest: request.isNavigationRequest(),
+    // Atomic swap first: the persistent Fetch.requestPaused listener reads #activeGuard on every
+    // request, so reassigning it replaces the guard with no unguarded window (the role the route
+    // handler swap played before) and without re-enabling Fetch.
+    this.#activeGuard = guard;
+    if (this.#cdpGuardSession) return;
+    // Single-flight the lazy first install so two concurrent setNavigationGuard() calls share ONE
+    // browser session (a second install would be the double-Fetch-consumer collision we removed
+    // context.route to avoid). Cleared when the install settles so a failed install can be retried.
+    if (!this.#cdpInstall) {
+      this.#cdpInstall = this.#installFetchGuard().finally(() => {
+        this.#cdpInstall = undefined;
+      });
+    }
+    await this.#cdpInstall;
+  }
+
+  /**
+   * Install the one browser-level CDP Fetch interceptor that owns request guarding, replacing
+   * context.route(). Two reasons for CDP over a route: (1) correctness — route.continue() auto-follows
+   * a server 3xx chain WITHOUT re-invoking the route handler, so the guard saw only hop 0 (the
+   * documented redirect bypass); a CDP Request-stage interceptor re-pauses every redirect hop, so the
+   * guard re-decides each hop while Fetch.continueRequest keeps it in Chrome's NATIVE network stack
+   * (TLS/HTTP fingerprint preserved — route.fetch would not). (2) No double consumer — Patchright's own
+   * CRNetworkManager enables Fetch whenever a context.route is registered, so a route + a raw Fetch
+   * session would collide on the InterceptionId. Target.setAutoAttach(flatten) extends the one session
+   * to every present + future page, popup and frame (a per-page attach races a popup's first navigation
+   * and misses it). This rides the existing CDP pipe — no debugging port — so it does not weaken
+   * assertLocalCdpOnly (R13/R17). handleAuthRequests is deliberately omitted: proxy auth is answered at
+   * the context/proxy layer, and enabling it here without a Fetch.authRequired handler would hang
+   * auth-challenged requests.
+   */
+  async #installFetchGuard(): Promise<void> {
+    const browser = this.#context.browser();
+    if (!browser) {
+      throw new Error(
+        "cannot install navigation guard: context exposes no browser session for CDP interception",
+      );
+    }
+    const cdp = await browser.newBrowserCDPSession();
+    try {
+      cdp.on("Fetch.requestPaused", (event) => {
+        void this.#onRequestPaused(cdp, event);
+      });
+      await cdp.send("Fetch.enable", {
+        patterns: [{ urlPattern: "*", requestStage: "Request" }],
+      });
+      // An already-open child target is covered once setAutoAttach completes (it flattens that
+      // target's Fetch.requestPaused onto this session); current callers install the guard before any
+      // page issues a request, so there is no live window.
+      await cdp.send("Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      });
+      this.#cdpGuardSession = cdp;
+    } catch (err) {
+      // Partial install: detach the half-armed session so it does not leak with Fetch still enabled,
+      // and leave #cdpGuardSession unset so a retry installs cleanly rather than double-enabling.
+      await cdp.send("Fetch.disable").catch(() => {});
+      await cdp.detach().catch(() => {});
+      throw err;
+    }
+  }
+
+  /**
+   * The single interception handler. Runs the active guard for a paused request and continues or
+   * fails it. Fail-closed: a missing or throwing guard — or teardown in progress — blocks. Each paused
+   * request, including every redirect hop (CDP re-pauses them), gets exactly one continue/fail when the
+   * send succeeds; a failed send is surfaced (not silently dropped) because it can leave a request
+   * paused until the navigation timeout.
+   */
+  async #onRequestPaused(cdp: CDPSession, event: FetchRequestPaused): Promise<void> {
+    const { requestId } = event;
+    // During close() Fetch.disable would auto-CONTINUE a still-paused request (allow); fail it instead.
+    const decision: NavigationDecision = this.#closing
+      ? "block"
+      : decideRequest(this.#activeGuard, event, (err) => {
+          process.stderr.write(`[browse-gateway] navigation guard threw; request blocked (${errCode(err)})\n`);
         });
-      } catch {
-        decision = "block";
-      }
+    try {
       if (decision === "allow") {
-        await route.continue().catch(() => {});
+        // No url/header overrides: the request egresses unchanged via the context-level proxy and
+        // Chrome's native stack.
+        await cdp.send("Fetch.continueRequest", { requestId });
       } else {
-        await route.abort("blockedbyclient").catch(() => {});
+        await cdp.send("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" });
       }
-    };
-    // Install the new handler BEFORE removing the old one so there is never an unguarded
-    // window: Playwright tries the most-recently-added handler first, so the new guard wins
-    // for any in-flight request during the swap. Intercept every request, context-wide
-    // (Playwright routing uses CDP Fetch under the hood, so this also catches a raw CDP
-    // Page.navigate — the below-the-verb-layer guarantee).
-    const prev = this.#routeHandler;
-    await this.#context.route("**/*", handler);
-    this.#routeHandler = handler;
-    if (prev) {
-      await this.#context.unroute("**/*", prev).catch(() => {});
+    } catch (err) {
+      // During teardown (close() detaches the session) a send naturally fails — expected and benign,
+      // so stay quiet. Outside teardown, the target detached or a redirect superseded the request
+      // (invalid InterceptionId) is usually benign too, but a genuine send failure can leave a request
+      // paused until navigationTimeoutMs, so surface it (typed code only, no URL/secret).
+      if (!this.#closing) {
+        process.stderr.write(`[browse-gateway] fetch ${decision} send failed (${errCode(err)})\n`);
+      }
     }
   }
 
@@ -603,6 +748,16 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   async close(): Promise<void> {
+    // Flip fail-closed FIRST so #onRequestPaused stops allowing during teardown. Then DETACH the
+    // session (not Fetch.disable): Fetch.disable releases every still-paused request by CONTINUING it
+    // (auto-allow — a redirect hop paused at the close instant must not slip the guard), whereas detach
+    // drops the interception and the paused requests die with the context.close() that follows. No
+    // Fetch consumer outlives Chrome.
+    this.#closing = true;
+    if (this.#cdpGuardSession) {
+      await this.#cdpGuardSession.detach().catch(() => {});
+      this.#cdpGuardSession = undefined;
+    }
     await this.#context.close().catch(() => {});
   }
 }
