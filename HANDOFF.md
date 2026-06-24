@@ -1,106 +1,91 @@
-# HANDOFF — 2026-06-23 (night, PST)
+# HANDOFF — 2026-06-24 (morning, PST)
 
-Continued from the evening handoff (U7 vault safety rails built, PR #35 review-clean). This session
-**merged #35, then built and merged the server-3xx redirect-bypass fix (#36) end-to-end** — the
-core-guard change that GATED U9 (consumer warm-open) — and validated it in-container with a
-controlled fingerprint A/B. The redirect bypass is now closed; **U9 is unblocked and is the next
-build step** (deferred to a fresh session by request).
+This session **built, review-hardened, and MERGED U9 — consumer warm-open** (vault-restored
+logged-in drive sessions), the headline credential-vault feature. It was driven end-to-end through
+the **first live run of the Codex review-loop SOP**: a 6-round autonomous Claude↔Codex
+adversarial-review loop that caught **four real security bugs** my own self-review missed, converging
+to **Codex `approve`, 0 findings**. U9 is on `main`; the credential vault is still **DORMANT in prod**
+(no behavior change until activated — steps below).
 
-## What We Built
+## What We Shipped (all on `main`)
 
-- **Merged PR #35 — U7 vault safety rails** (squash `7c0c26c`): host-scoped no-exfil + nav clamp +
-  origination boundary + secret-leak gate. Now on `main`.
-- **PR #36 — server-3xx redirect-bypass fix** (squash `95174ab`). The nav guard rode
-  `context.route` + `route.continue()`, which auto-follows a server redirect chain WITHOUT
-  re-invoking the handler — so the guard decided only hop 0 and a `302` from a credential owner host
-  to a same-parent sibling carried a retained parent cookie off-host. Replaced with **ONE
-  browser-level CDP `Fetch` session** (Request stage) + `Target.setAutoAttach({flatten})` in
-  `src/browser/patchright-core.ts` (`setNavigationGuard`/`#installFetchGuard`/`#onRequestPaused`):
-  - CDP re-pauses every redirect hop → guard re-decides each; `Fetch.continueRequest` (no overrides)
-    keeps each hop in Chrome's NATIVE network stack (TLS/HTTP fingerprint preserved).
-  - `context.route` REMOVED (it was the sole consumer; Patchright auto-enables Fetch when a route is
-    registered, so route + raw session would collide on `InterceptionId`).
-  - `isNavigationRequest = resourceType==="Document"`; CDP TitleCase resourceType lowercased for the
-    audit log. Pure helpers `cdpRequestToNavigation` + `decideRequest` extracted and exported.
-  - Review hardening: single-flight install + partial-cleanup; **detach-first teardown** (`close()`
-    detaches the CDP session instead of `Fetch.disable`, which auto-CONTINUES paused requests);
-    diagnostics on guard-throw and on non-teardown send-failure; `validate:stealth` made **guard-on**.
-- **New tests/gates:** `test/nav-guard-mapping.test.mjs` (mapping + `decideRequest`),
-  `test/nav-guard-redirect-hops.test.mjs` (real policy clamp over a CDP-mapped chain), and
-  `scripts/validate-redirect-guard.mjs` (real browser, **11/11 in-container** — per-hop block, allowed
-  chain lands, off-host subresource/popup/worker guarded, fail-closed). **480 unit tests green.**
-- **`561c74a`** — solution-doc provenance: the prod-direct datacenter-IP gotcha + the A/B result.
-- **`12c58bf`** — `validate-stealth` gained an optional **`BGW_PROXY_*` path** so a prod run routes the
-  CF/DataDome legs through a residential exit (representative fingerprint check); default stays direct.
-- **Q2 validation (in-container, local colima, amd64 via Rosetta, headful under Xvfb):** guard-on
-  `validate:stealth` PASS, AND a controlled interleaved clean-IP A/B cleared CF **guard-on 12/12 =
-  guard-off 12/12** → the CDP-Fetch interception does NOT regress the fingerprint.
+- **U9 — consumer warm-open** (squash `f8df7cd`, from a 7-commit branch). Implicit auto-warm at
+  `GatewayDriveController.#firstNavigate`: when a consumer navigates to a host that's on its allowlist
+  AND has a vault entry, it opens a **logged-in** session instead of a cold one; otherwise it falls
+  through to the existing cold/escalation path. No new MCP param. Warm takes precedence over
+  force-proxy/direct-first (R3 — must replay on the exact captured exit). Single-host nav-clamp (cross-host
+  is blocked). Policy stays below the verb layer — the trigger only SELECTS a sealed override; all
+  enforcement (seal refusal, owner-host nav clamp, origination boundary, host-scoped jar, credentialed
+  audit) is unchanged. Both entrypoints (`http-main` prod, `main.ts` stdio rollback) wire
+  vault + consumerId + allowlist; `main.ts` gained a lockstep `openVault` so the rollback launcher
+  doesn't diverge (cold while prod is warm).
+- **Deploy mount** (`b9628de`): `scripts/deploy/launch-http.sh` gained an optional
+  `BGW_VAULT_HOST_PATH` bind-mount → `/run/vault` (rw). Unset → no mount, vault dormant — a no-op for
+  non-vault hosts, safe to land ahead of activation.
+- **Runtime gate** `scripts/validate-vault-warm-open.mjs` (`npm run validate:vault-warm-open`): drives
+  the REAL consumer trigger (`controller.navigate`, never `buildWarmOverride`) through a real gateway +
+  headful Chrome. **In-container 14/14, full coverage.** **499 unit tests green.**
+
+## The Codex Loop Earned Its Keep — 4 real bugs, each fixed + re-gated
+
+My self-review (a 3-lens workflow) was clean. Codex found these:
+
+1. **R1 (high) — parent-domain SSO cookie → sibling-subresource exfil.** The nav-clamp clamps only
+   NAVIGATION; subresources keep the consumer allowlist. A retained `.example.com` cookie for owner
+   `accounts.example.com` could ride an allowed sibling subresource (`static.example.com`) off-host.
+   **Fix:** re-scope a retained parent-domain cookie to the owner host at restore
+   (`hostScopeSession`/`clampCookieToOwner`) — server-transparent, breaks nothing.
+2. **R2 (med) — revoked credential silently downgraded a logged-in session to cold.** On
+   reopen-after-reap, a revoked entry silently reopened cold (anonymous) with no consumer-visible error.
+   **Fix:** loud terminal error; never a silent cold fallback.
+3. **R3 (high, three rounds) — bound credential replayed from the WRONG exit.** A bound (residential-exit)
+   credential could replay from (a) the direct/datacenter exit when no proxy, (b) a ROTATING exit when a
+   proxy was configured but no sticky suffix, or (c) an exit "verified" only by an incidental substring in
+   the base password. **Fix:** `proxyOverrideForPinned` verifies the pin **STRUCTURALLY** (datacenter + a
+   `{id}`-bearing sticky suffix + base password; minted password == `base + suffix-with-id`).
+   `buildWarmOverride` **fails closed** otherwise.
+4. **Round 6 → `approve`, 0 findings.**
 
 ## Decisions Made
 
-- **Mechanism = CDP-native, browser-session flatten auto-attach.** Rejected `route.fetch` (replays
-  through Playwright's API stack → changes the TLS/HTTP fingerprint) and per-page `newCDPSession`
-  attach (RACES a popup's first navigation — spike-proven). Scope = per-hop re-assertion on **all**
-  requests (free under CDP; the owner-clamp's nav-only asymmetry lives inside `guardForCredentialHost`).
-- **WebSocket-exfil decision RESOLVED → Option B.** Operator confirmed U9 credential owner-hosts are
-  **trusted** (not serving hostile JS). So: accept the WS residual; the container-network egress
-  sidecar is the boundary. Closing it via CDP `Network.webSocketCreated` host-check is a **hardening
-  follow-up, NOT a U9 blocker**.
-- **Agent now authorized to push `main` directly when safe** (reverses the old operator-pushes gate).
-  Recorded in memory `authorized-to-push-main`. Already exercised: `561c74a`, `12c58bf`.
-- **`validate:stealth` is now guard-on** by default (prod parity); `BGW_STEALTH_NO_GUARD=1` for a
-  guard-off A/B baseline.
-
-## What Didn't Work
-
-- **`route.fetch`/`route.fulfill`** (the original solution-doc sketch) — SUPERSEDED: it would change
-  the anti-bot fingerprint. CDP `continueRequest` is the native-stack-preserving path.
-- **Per-page CDP attach** (`context.on('page')` + `newCDPSession`) — the popup's first navigation
-  fires before Fetch arms; it leaked the popup (proven in spike). Browser-session flatten auto-attach
-  is the fix.
-- **Prod-direct `validate:stealth` as a fingerprint test** — FAILS the CF leg on prod's **datacenter
-  IP** (reputation), a false negative, NOT a regression. Proven: udemy 403'd direct on prod but
-  cleared 6/6 on a clean residential IP in both guard conditions. Use `BGW_PROXY_*` for a real run.
-- **`#closing` fail-closed via `failRequest` after `Fetch.disable`** — `Fetch.disable` auto-continues
-  paused requests AND the late `failRequest` raced a disabled domain (logged "Fetch domain is not
-  enabled"). Switched to detach-first.
+- **Trigger style: implicit auto-warm** (operator-confirmed). Navigate to a warm host → logged-in
+  session, no flag/verb. The credentialed-session audit makes it traceable.
+- **Cross-host: single-host warm** (operator-confirmed). The nav-clamp blocks an off-owner navigate;
+  use a new drive session for another host.
+- **Owner-subtree cookie residual: ACCEPTED** (operator-ratified). A domain-scoped owner cookie can
+  still reach the owner's OWN subdomains on a subresource — within the owner subtree, never a
+  sibling/parent/third party (those are closed). Accepted under the trusted-owner model (Option B;
+  egress sidecar is the boundary), same class as the WS residual. Documented at `hostScopeSession`.
+  Mitigation: scope a warm host's consumer allowlist to the owner host (avoid `*.parent`). Full
+  exact-host cookie lockdown is tracked as optional hardening (it breaks legitimate cross-subdomain XHR).
 
 ## What's Next
 
-1. **U9 — consumer warm-open wiring** (the next build unit). Proceed under WebSocket **Option B**.
-   **Run U9 through the new Codex review-loop SOP** (memory `codex-review-loop-sop`): implement +
-   self-review → commit → drive `codex-companion.mjs adversarial-review --base origin/main` autonomously
-   until Codex returns `approve`, THEN present — operator stays out until the end. (The `codex` plugin
-   was installed + authed this session; the loop's first live run is U9.)
-   The warm-replay machinery (`buildWarmOverride` → sealed `restoreState` → guarded credentialed
-   session) exists; U9 wires a consumer-facing trigger to open one. **Vault is still DORMANT in prod**
-   — needs `BGW_VAULT_DIR` on a **persistent volume** + a `0600 BGW_VAULT_KEY_FILE` before anything is
-   live.
-2. **Pre-U9-activation gate (in-container):** run `validate:stealth` on prod **with `BGW_PROXY_*` set**
-   (now supported, `12c58bf`) to confirm the proxy path clears CF (representative fingerprint check —
-   not yet run in-prod), plus `validate:redirect-guard` / `validate:proxy-escalation` / `validate:drive`.
-3. **Follow-ups (tracked, none blocking U9 under Option B):** WS hardening via
-   `Network.webSocketCreated` (only if the credential set ever includes lower-trust hosts);
-   narrow-allowlist `retrieve` now hard-fails off-allowlist redirects (validate vs real targets);
-   cross-origin OOPIF off-host container fixture for `validate-redirect-guard` (needs a `127.0.0.2`
-   loopback alias the Mac run omits).
+1. **Activate the vault in prod** (U9 is inert until then). Short version: provision a persistent
+   `~/vault/entries` dir + a `0600` base64 KEK (`openssl rand -base64 32`); add
+   `BGW_VAULT_DIR=/run/vault/entries`, `BGW_VAULT_KEY_FILE=/run/vault/kek`,
+   `BGW_VAULT_HOST_PATH=~/vault` to the on-host env file; re-scp `launch-http.sh`; deploy
+   (`gh workflow run deploy-http.yml`); confirm the boot log shows `vault: ready`; then
+   `obscura vault login` to capture a credential; verify a consumer warm-opens.
+2. **Pre-activation gates** (in-container, as `node`): `validate:vault-warm-open` (14/14),
+   `validate:stealth` with `BGW_PROXY_*`, `validate:redirect-guard`, `validate:drive`.
+3. **Hardening follow-ups (none blocking):** WS exfil close via `Network.webSocketCreated` (Option B);
+   full exact-host cookie lockdown; narrow-allowlist `retrieve` redirect hard-fail; cross-origin OOPIF
+   container fixture; one in-prod `validate-stealth` `BGW_PROXY_*` run.
 
 ## Gotchas & Watch-outs
 
-- **A prod-direct `validate:stealth` CF failure is datacenter-IP reputation, NOT a fingerprint
-  regression** — documented in `docs/solutions/architecture-patterns/nav-guard-redirect-bypass.md`.
-  Run with `BGW_PROXY_*` for a representative result; production serves CF via a residential proxy,
-  never the bare datacenter IP.
-- **The `validate-stealth` `BGW_PROXY_*` path has not been run in-prod yet** (no proxy creds locally).
-  One prod run is the confirmation; it cannot affect the default direct path.
-- **WS exfil residual is accepted** under Option B (owner-hosts trusted). If U9's credential set ever
-  expands to hosts you don't fully trust to be XSS-free, revisit and do the `Network.webSocketCreated`
-  close before activating those.
-- **Run container gates as `node` (rootless), NOT root.** Build the branch image locally (colima:
-  `colima start`, then `docker build --platform linux/amd64 ...`) or pull the post-merge GHCR image on
-  prod. Prod has no source tree — it pulls images.
-- **Agent now pushes `main` when safe** — but still HOLD on: unvalidatable prod-runtime changes, red/
-  uncertain diffs, history rewrites/force-pushes, or anything touching secrets/fleet identifiers.
-- **Public repo** — codenames/generic refs only; no fleet host/path/token in source, commits, or this
-  doc. Untracked `.claude/` + `AGENTS.md` left as-is (pre-existing).
-- Local `main` is in sync with `origin/main` (tip `12c58bf`); nothing unpushed.
+- **BOUND credentials need the sticky suffix.** If a capture escalated to a residential exit, the entry
+  is bound; warm-open **fails closed** (loud) unless `BGW_PROXY_STICKY_SUFFIX` (with `{id}`) +
+  `BGW_ON_DATACENTER_IP=1` + proxy are set. That's the R3 guard working — don't "fix" it by dropping the
+  binding. Direct captures don't need it.
+- **Vault dir MUST persist** and the **key file MUST be `0600`.** Entries-on-disk + missing key fails
+  boot closed by design; a container re-create without the bind-mount loses entries.
+- **Codex loop mechanics:** run `codex-companion.mjs adversarial-review --wait` inside a **detached
+  harness bg task** — plain `--background` got killed by the 2-minute shell timeout mid-handshake and
+  orphaned the worker in a frozen "running" state. Verify a job is alive by its **pid + log mtime**, not
+  just the status field (which can go stale).
+- **Pool floor:** a held warm session consumes a session slot — re-verify `BGW_MAX_SESSIONS` /
+  `perConsumerMax` cover every consumer after adding warm load.
+- **Public repo** — codenames/placeholders only; the deploy script is fleet-clean (host paths via env).
+- Local `main` == `origin/main` (tip `b9628de`); nothing unpushed.
