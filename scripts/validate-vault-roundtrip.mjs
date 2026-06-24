@@ -121,7 +121,7 @@ try {
   check("captured the per-origin localStorage token", lsEntry?.value === LS_VAL);
 
   // --- Restore phase: a COLD core (clean ephemeral profile) seeded only with the captured state. ---
-  const restored = await createBrowserCore({ ...coreOpts, userDataDir: "", restoreState: state });
+  const restored = await createBrowserCore({ ...coreOpts, userDataDir: "", restoreState: { state, ownerHost: "127.0.0.1" } });
   try {
     const appA = await restored.render(`${a.origin}/app`, FAST);
     const textA = `${appA.title}\n${appA.text}`;
@@ -145,7 +145,7 @@ try {
   let rejected = false;
   try {
     const bad = { cookies: [{ name: "sid", value: "x" }], origins: [] }; // no domain/url → addCookies throws
-    const leaky = await createBrowserCore({ ...coreOpts, userDataDir: "", restoreState: bad });
+    const leaky = await createBrowserCore({ ...coreOpts, userDataDir: "", restoreState: { state: bad, ownerHost: "127.0.0.1" } });
     await leaky.close(); // should not be reached; clean up if it somehow was
   } catch {
     rejected = true;

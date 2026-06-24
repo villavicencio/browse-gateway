@@ -3,7 +3,7 @@
  * metadata/internal ranges, and BYO secrets are isolated and never logged.
  */
 export { isBlockedEgressHost, EGRESS_DENY_REASON } from "./egress.js";
-export { canonicalizeHost, canonicalizeHostForIp, hostFromUrl, isHttpUrl } from "./url.js";
+export { canonicalizeHost, canonicalizeHostForIp, hostFromUrl, isHttpUrl, cookieBelongsToHost } from "./url.js";
 export { assertLocalCdpOnly } from "./cdp.js";
 export {
   SecretStore,

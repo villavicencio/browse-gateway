@@ -11,8 +11,10 @@
  * live proof land in the follow-up wiring unit.
  */
 import type { BrowserCoreOptions, StorageState } from "../browser/index.js";
+import { sealRestoreState } from "../browser/index.js";
 import type { LoginCredentials, LoginRecipe } from "../verbs/index.js";
 import { proxyOverrideFor, isValidTotpSeed } from "../verbs/index.js";
+import { cookieBelongsToHost, hostFromUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 
 /**
@@ -149,6 +151,24 @@ export function getVaultEntry(vault: VaultEntryStore, consumerId: string, host: 
   return vault.get<VaultEntry>(consumerId, host);
 }
 
+/**
+ * Restrict a captured {@link StorageState} to the entry's owning host (R4 host-scoped no-exfil): keep
+ * only the cookies and localStorage origins that {@link cookieBelongsToHost} `ownerHost`, dropping the
+ * rest. `storageState()` captures the WHOLE jar — third-party analytics/CDN cookies, and any host-B
+ * cookie a mis-filed/seeded blob carried — so a warm replay that injected the blob verbatim could send
+ * host-B's cookie wherever host-B is reachable. This is the choke point that makes "a stored host-A
+ * cookie is only ever injected into a host-A session" true: it is a FILTER, not an assertion, because
+ * a real login jar legitimately contains third-party cookies that must simply be left out, not treated
+ * as fatal. The owner-host cookies that remain are exactly the durable identity for this entry.
+ */
+export function hostScopeSession(state: StorageState, ownerHost: string): StorageState {
+  return {
+    ...state,
+    cookies: (state.cookies ?? []).filter((c) => cookieBelongsToHost(c.domain, ownerHost)),
+    origins: (state.origins ?? []).filter((o) => cookieBelongsToHost(hostFromUrl(o.origin), ownerHost)),
+  };
+}
+
 /** Crypto-shred an entry (drop the wrapped DEK). Returns whether one was removed. */
 export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, host: string): boolean {
   return vault.remove(consumerId, host);
@@ -164,14 +184,29 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
  * a bound `stickyExitId` (and a proxy is configured + on a datacenter IP). The stored `session` was
  * already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound clearance is
  * replayed here.
+ *
+ * The owner host is the host the entry is LOOKED UP by — this function does the vault `get` itself, so
+ * the owner is NEVER a caller-supplied value. It does double duty, atomically: the restored state is
+ * {@link hostScopeSession}-filtered to it (R4 no-exfil — only owner-host cookies/origins are injected)
+ * AND it is sealed onto the returned {@link RestoreState} as `ownerHost`, which the gateway clamps the
+ * session's navigation to. Because the SAME looked-up host both selects the entry, filters its jar, and
+ * bounds navigation, a caller cannot pair one entry's cookies with a different (sibling) owner: to get
+ * entry X you look it up by host X, and host X is then the owner. A successful `get` also AAD-verifies
+ * the entry was sealed for exactly `(consumerId, host)`. Returns `null` when no entry exists for the pair.
  */
 export function buildWarmOverride(
-  entry: VaultEntry,
+  vault: VaultEntryStore,
   secrets: SecretStore,
-  opts: { onDatacenterIp: boolean; stickySuffix?: string },
-): BrowserCoreOptions {
+  args: { consumerId: string; host: string; onDatacenterIp: boolean; stickySuffix?: string },
+): BrowserCoreOptions | null {
+  const ownerHost = canonicalizeHost(args.host);
+  const entry = vault.get<VaultEntry>(args.consumerId, ownerHost);
+  if (!entry) return null;
   const proxyOverride = entry.stickyExitId
-    ? proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, entry.stickyExitId)
+    ? proxyOverrideFor(secrets, args.onDatacenterIp, args.stickySuffix, entry.stickyExitId)
     : undefined;
-  return { restoreState: entry.session, ...(proxyOverride ?? {}) };
+  return {
+    restoreState: sealRestoreState(hostScopeSession(entry.session, ownerHost), ownerHost),
+    ...(proxyOverride ?? {}),
+  };
 }

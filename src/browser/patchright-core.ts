@@ -29,6 +29,7 @@ import type {
   PageSnapshot,
   RenderOptions,
   RenderResult,
+  RestoreState,
   StorageState,
   WaitCondition,
 } from "./types.js";
@@ -136,11 +137,13 @@ async function applyRestoreState(
  */
 export async function restoreOrClose(
   context: PatchrightContext,
-  state?: StorageState,
+  restore?: RestoreState,
 ): Promise<void> {
-  if (!state) return;
+  if (!restore) return;
   try {
-    await applyRestoreState(context, state);
+    // The core injects the bound `.state`; the `.ownerHost` is the gateway's navigation-clamp scope
+    // (the core is a dumb injector — host-scoping the cookies is the vault layer's job upstream).
+    await applyRestoreState(context, restore.state);
   } catch (err) {
     await context.close().catch(() => {});
     throw err;

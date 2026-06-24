@@ -57,6 +57,45 @@ export interface StorageState {
   origins: StorageStateOrigin[];
 }
 
+/**
+ * A warm-restore value bound atomically to its OWNER HOST — the single authoritative host the restored
+ * `state` belongs to. Carrying the owner WITH the state (rather than as a separate parameter alongside
+ * it) is a safety invariant: the gateway clamps the credentialed session's navigation to exactly this
+ * `ownerHost` (R4 no-exfil), so the host the cookies were scoped to and the host the session may
+ * navigate can never diverge or be omitted by a caller.
+ *
+ * It is also SEALED: a valid RestoreState can only be produced by {@link sealRestoreState} (which the
+ * vault's `buildWarmOverride` calls, deriving `ownerHost` from the vault LOOKUP — never a caller input).
+ * The gateway refuses a credentialed open whose `restoreState` is not sealed ({@link isSealedRestore}),
+ * so a freely hand-constructed `{ state, ownerHost }` literal — which could pair a jar with a forged
+ * owner — can't reach a guarded session.
+ */
+export interface RestoreState {
+  state: StorageState;
+  /** The authoritative owner host the `state` belongs to; the gateway clamps navigation to it. */
+  ownerHost: string;
+}
+
+/** Module-private seal: a non-enumerable brand, so it survives object-spread but is invisible to
+ *  `deepEqual`/`JSON.stringify`, and cannot be set by code that doesn't hold this symbol. */
+const SEALED_RESTORE = Symbol("bgw.sealed-restore");
+
+/**
+ * Mint a sealed {@link RestoreState}. The ONLY way to produce one the gateway will accept for a
+ * credentialed session — the vault layer calls it with an `ownerHost` derived from a successful vault
+ * lookup, so the seal certifies "this came through the vault producer," not a hand-built literal.
+ */
+export function sealRestoreState(state: StorageState, ownerHost: string): RestoreState {
+  const restore: RestoreState = { state, ownerHost };
+  Object.defineProperty(restore, SEALED_RESTORE, { value: true, enumerable: false });
+  return restore;
+}
+
+/** True only for a {@link RestoreState} minted by {@link sealRestoreState}. */
+export function isSealedRestore(value: RestoreState | undefined): boolean {
+  return !!value && (value as unknown as Record<symbol, unknown>)[SEALED_RESTORE] === true;
+}
+
 export interface BrowserCoreOptions {
   /**
    * Strict headless. Defaults to `false` (headful) because the spike proved strict
@@ -85,11 +124,12 @@ export interface BrowserCoreOptions {
    * `addCookies` and per-origin localStorage via an origin-guarded init script, so the first
    * navigation is already logged-in. Applied AFTER `launchPersistentContext`, like the runtime
    * `solver` (it is not a launch arg). A vault session pairs this with a clean ephemeral
-   * `userDataDir` (`""`) so the throwaway profile can't shadow the seeded state. Concept-agnostic
-   * at this layer — the "vault" meaning lives above the browser core; here it is just state to
-   * restore. Absent = a cold, stateless session (the default).
+   * `userDataDir` (`""`) so the throwaway profile can't shadow the seeded state. The core injects
+   * the `.state`; the bound `.ownerHost` is the authoritative host the gateway clamps the session's
+   * navigation to (R4 no-exfil — owner travels with the state, never a separate caller param).
+   * Absent = a cold, stateless session (the default).
    */
-  restoreState?: StorageState;
+  restoreState?: RestoreState;
   /**
    * Injected CAPTCHA solver for the interactive drive path: when set, the core auto-solves a
    * detected, blocking interactive CAPTCHA (reCAPTCHA/Turnstile/hCaptcha) during its post-action

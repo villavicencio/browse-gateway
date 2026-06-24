@@ -5,13 +5,19 @@
 import { redactSecrets } from "../security/secrets.js";
 import type { SecretStore } from "../security/secrets.js";
 
-export type AuditDecision = "auth-ok" | "auth-reject" | "allow" | "block";
+export type AuditDecision = "auth-ok" | "auth-reject" | "allow" | "block" | "open";
 
 export interface AuditRecord {
   ts: number;
   /** The consumer the action is attributed to, or `null` for a rejected authentication. */
   consumerId: string | null;
-  action: "authenticate" | "navigate";
+  /**
+   * `session-open` marks a CREDENTIALED session (R4/R18) — one opened with a stored credential
+   * RESTORED into the cookie jar (warm replay) — attributable on the trail by consumer + owning host.
+   * Cold (stateless) sessions do not emit it, and neither does the cold login-CAPTURE session, which
+   * MINTS auth rather than restoring it (its login navigation is audited as a `navigate`).
+   */
+  action: "authenticate" | "navigate" | "session-open";
   decision: AuditDecision;
   host?: string;
   url?: string;

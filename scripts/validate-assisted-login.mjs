@@ -139,7 +139,7 @@ try {
   check("assisted login reached the dashboard and captured a session cookie", !!cookie);
 
   // --- Cold-restore proof (ties capture → U5 restore): the captured state lands authenticated. ---
-  const restored = await createBrowserCore({ ...coreOpts, userDataDir: "", restoreState: state });
+  const restored = await createBrowserCore({ ...coreOpts, userDataDir: "", restoreState: { state, ownerHost: "127.0.0.1" } });
   try {
     const dash = await restored.render(`${srv.origin}/dashboard`, { clearedTextLength: 0, clearanceTimeoutMs: 3000 });
     check("captured state replays into a cold session as authenticated", /AUTHENTICATED DASHBOARD/.test(`${dash.title}\n${dash.text}`));

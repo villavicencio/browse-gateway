@@ -11,6 +11,7 @@ import { InMemoryAuditSink } from "./audit.js";
 import type { AuditSink } from "./audit.js";
 import { ConsumerRegistry } from "./consumer.js";
 import type { Consumer } from "./consumer.js";
+import { OriginationBoundary, ORIGINATION_DENY_REASON } from "./origination.js";
 
 /** Returns true when a host must be blocked for egress reasons (private/metadata ranges). */
 export type EgressFilter = (host: string) => boolean;
@@ -31,6 +32,12 @@ export interface PolicyEngineOptions {
   audit?: AuditSink;
   /** Egress deny-filter, applied before the allowlist. Defaults to private/metadata ranges. */
   egress?: EgressFilter;
+  /**
+   * Origination boundary (R4), applied to top-level navigations before the allowlist. Defaults to the
+   * public deny set (no env extensions); production passes {@link OriginationBoundary.fromEnv}. Always
+   * on — there is no "off": the boundary is a feature.
+   */
+  originationBoundary?: OriginationBoundary;
 }
 
 /**
@@ -48,11 +55,13 @@ export class PolicyEngine {
   readonly #registry: ConsumerRegistry;
   readonly #audit: AuditSink;
   readonly #egress: EgressFilter;
+  readonly #origination: OriginationBoundary;
 
   constructor(opts: PolicyEngineOptions) {
     this.#registry = opts.registry;
     this.#audit = opts.audit ?? new InMemoryAuditSink();
     this.#egress = opts.egress ?? isBlockedEgressHost;
+    this.#origination = opts.originationBoundary ?? new OriginationBoundary();
   }
 
   get audit(): AuditSink {
@@ -117,6 +126,22 @@ export class PolicyEngine {
           host: req.host,
           url: req.url,
           reason: EGRESS_DENY_REASON,
+        });
+        return "block";
+      }
+      // Origination boundary (R4): refuse a TOP-LEVEL navigation that would originate account creation
+      // or money movement — even to an allowlisted host. Gated on navigation requests only, so an
+      // embedded payment SDK/pixel (a subresource on a legit page) is not blocked; this targets the
+      // hand-off navigation, not page display. Like egress, it wins over the allowlist and is audited.
+      if (req.isNavigationRequest && this.#origination.denies(req.host, req.url)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: ORIGINATION_DENY_REASON,
         });
         return "block";
       }
@@ -186,6 +211,92 @@ export class PolicyEngine {
       return allowed ? "allow" : "block";
     };
   }
+
+  /**
+   * Build a navigation guard for a CREDENTIALED (warm-replay) session — one opened with a stored
+   * credential restored into the cookie jar. Unlike {@link guardFor}, top-level NAVIGATION is clamped
+   * to the credential's OWNER HOST (exact, canonicalized), NOT the consumer's full allowlist. This is
+   * the second half of R4 no-exfil: jar-filtering keeps an entry's cookies host-scoped, but a retained
+   * parent-domain cookie (`.example.com` for an `accounts.example.com` entry) is still broadcast by
+   * Chrome to ANY `*.example.com` host the session reaches — so a `*.example.com` allowlist would let a
+   * navigation to a sibling (`evil.example.com`) carry it off. The agent-controlled exfil vector IS
+   * navigation (the drive verbs navigate/click/submit; they cannot issue an arbitrary cross-origin
+   * request — KTD-5), so clamping navigation to the owner host closes it. SUBRESOURCES keep the
+   * consumer allowlist so the owner-host page still renders (a page's own cross-subdomain asset/XHR is
+   * the site's design within the operator-trusted allowlist, not agent-driven exfil). Scheme, egress,
+   * and the origination boundary still apply; the nav clamp is intersected with the consumer allowlist
+   * so this guard is NEVER wider than {@link guardFor}.
+   *
+   * KNOWN LIMITATION (pre-existing, tracked separately —
+   * docs/solutions/architecture-patterns/nav-guard-redirect-bypass.md): a SERVER 3xx redirect is
+   * followed by `route.continue()` without re-invoking the guard, so a `302` from the owner host to a
+   * same-parent sibling can still carry a retained parent cookie off-host. This clamp blocks the
+   * agent's DIRECT navigation to a sibling (the leak then requires an open-redirect on the owner host);
+   * closing the redirect hop is a follow-up core-guard fix this rail depends on to be airtight.
+   */
+  guardForCredentialHost(consumer: Consumer, ownerHost: string): NavigationGuard {
+    const owner = canonicalizeHost(ownerHost);
+    return (req) => {
+      if (!isHttpUrl(req.url)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: "scheme not allowed (only http/https)",
+        });
+        return "block";
+      }
+      if (this.#egress(req.host)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: EGRESS_DENY_REASON,
+        });
+        return "block";
+      }
+      if (req.isNavigationRequest && this.#origination.denies(req.host, req.url)) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: "block",
+          host: req.host,
+          url: req.url,
+          reason: ORIGINATION_DENY_REASON,
+        });
+        return "block";
+      }
+      const inAllowlist = consumer.allowlist.allows(req.host);
+      // NAVIGATION is clamped to the exact owner host (∩ allowlist, so never wider than the consumer
+      // guard); a subresource keeps the consumer allowlist so the page renders.
+      const allowed = req.isNavigationRequest ? canonicalizeHost(req.host) === owner && inAllowlist : inAllowlist;
+      if (!allowed || req.isNavigationRequest) {
+        this.#audit.record({
+          ts: Date.now(),
+          consumerId: consumer.id,
+          action: "navigate",
+          decision: allowed ? "allow" : "block",
+          host: req.host,
+          url: req.url,
+          ...(allowed
+            ? {}
+            : {
+                reason: req.isNavigationRequest
+                  ? "credential scope: navigation is not the credential owner host"
+                  : "host not in consumer allowlist",
+              }),
+        });
+      }
+      return allowed ? "allow" : "block";
+    };
+  }
 }
 
 export { Allowlist, normalizeHost } from "./allowlist.js";
@@ -195,3 +306,9 @@ export { tokenEnvKey, parseConsumerManifest, buildConsumerSpecs } from "./consum
 export type { ConsumerManifestEntry, BuiltConsumers } from "./consumer-config.js";
 export { InMemoryAuditSink, consoleAuditSink, RedactingAuditSink } from "./audit.js";
 export type { AuditRecord, AuditSink, AuditDecision } from "./audit.js";
+export {
+  OriginationBoundary,
+  ORIGINATION_DENY_REASON,
+  DEFAULT_ORIGINATION_DENY_HOSTS,
+  DEFAULT_ORIGINATION_DENY_PATHS,
+} from "./origination.js";

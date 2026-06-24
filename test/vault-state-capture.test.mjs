@@ -140,15 +140,18 @@ test("restoreOrClose: closes the context and rethrows the original error when re
   const ctx = fakeContext({ cookiesThrow: boom });
   // A legacy/malformed persisted cookie (no domain/path) — the real addCookies-rejection trigger.
   const bad = { cookies: [{ name: "sid", value: "x" }], origins: [] };
-  await assert.rejects(() => restoreOrClose(ctx, bad), (e) => e === boom, "rethrows the ORIGINAL error");
+  await assert.rejects(() => restoreOrClose(ctx, { state: bad, ownerHost: "ex.com" }), (e) => e === boom, "rethrows the ORIGINAL error");
   assert.equal(ctx.closed, 1, "context closed exactly once on failure (no orphan Chrome)");
 });
 
 test("restoreOrClose: success path applies state and never closes the context", async () => {
   const ctx = fakeContext();
   await restoreOrClose(ctx, {
-    cookies: [{ name: "sid", value: "x", domain: "ex.com", path: "/" }],
-    origins: [{ origin: "https://ex.com", localStorage: [{ name: "k", value: "v" }] }],
+    state: {
+      cookies: [{ name: "sid", value: "x", domain: "ex.com", path: "/" }],
+      origins: [{ origin: "https://ex.com", localStorage: [{ name: "k", value: "v" }] }],
+    },
+    ownerHost: "ex.com",
   });
   assert.equal(ctx.closed, 0, "a successful restore leaves the context open");
   assert.ok(ctx.cookies, "cookies applied");
