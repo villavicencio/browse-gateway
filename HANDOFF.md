@@ -68,6 +68,10 @@ build step** (deferred to a fresh session by request).
 ## What's Next
 
 1. **U9 — consumer warm-open wiring** (the next build unit). Proceed under WebSocket **Option B**.
+   **Run U9 through the new Codex review-loop SOP** (memory `codex-review-loop-sop`): implement +
+   self-review → commit → drive `codex-companion.mjs adversarial-review --base origin/main` autonomously
+   until Codex returns `approve`, THEN present — operator stays out until the end. (The `codex` plugin
+   was installed + authed this session; the loop's first live run is U9.)
    The warm-replay machinery (`buildWarmOverride` → sealed `restoreState` → guarded credentialed
    session) exists; U9 wires a consumer-facing trigger to open one. **Vault is still DORMANT in prod**
    — needs `BGW_VAULT_DIR` on a **persistent volume** + a `0600 BGW_VAULT_KEY_FILE` before anything is
