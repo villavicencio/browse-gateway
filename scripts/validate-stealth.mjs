@@ -49,9 +49,22 @@ const NEGATIVE_URL =
 
 const coreOpts = { channel: CHANNEL, noSandbox: NO_SANDBOX };
 
+// Production installs a navigation guard on every session BEFORE navigating, so all real anti-bot
+// traffic egresses THROUGH the CDP-Fetch interception (setNavigationGuard). Engage that same path
+// here (an allow-all guard changes nothing about which requests go out — it only turns on the
+// interception machinery) so this kill-gate actually proves the CDP-Fetch backend did not regress
+// the fingerprint. Set BGW_STEALTH_NO_GUARD=1 for a guard-off A/B baseline.
+const GUARD_ON = process.env.BGW_STEALTH_NO_GUARD !== "1";
+const ALLOW_ALL = () => "allow";
+async function guardedCore(opts) {
+  const core = await createBrowserCore(opts);
+  if (GUARD_ON) await core.setNavigationGuard(ALLOW_ALL);
+  return core;
+}
+
 /** One cold attempt: fresh context → render → classify. Returns the assessment + result. */
 async function attempt(url, { headless = false } = {}) {
-  const core = await createBrowserCore({ ...coreOpts, headless });
+  const core = await guardedCore({ ...coreOpts, headless });
   try {
     const result = await core.render(url, {
       clearanceTimeoutMs: CLEARANCE_TIMEOUT_MS,
@@ -100,7 +113,7 @@ async function runGroup(category, urls) {
  */
 async function runWebrtcLeakCheck() {
   console.log(`\n── webrtc: no non-proxied ICE candidates (managed policy) ──`);
-  const core = await createBrowserCore({ ...coreOpts });
+  const core = await guardedCore({ ...coreOpts });
   try {
     const page = await core.context.newPage();
     await page
@@ -153,7 +166,7 @@ async function runWebrtcLeakCheck() {
  */
 async function runWebglCheck() {
   console.log(`\n── webgl: a real context exists (software-GL args) ──`);
-  const core = await createBrowserCore({ ...coreOpts });
+  const core = await guardedCore({ ...coreOpts });
   try {
     const page = await core.context.newPage();
     await page
