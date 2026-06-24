@@ -1,107 +1,102 @@
-# HANDOFF — 2026-06-23 (evening) — U7 vault safety rails BUILT, PR #35 review-clean (4 P1 rounds), ready to merge
+# HANDOFF — 2026-06-23 (night, PST)
 
-Continued straight on from the afternoon handoff (Phase 2 vault complete, U5→U8b on `main`). This
-session built **Phase 3 / U7 — the credential-vault safety rails** end to end on branch
-`feat/vault-u7-safety-rails` (**PR #35, OPEN**), then drove it through **four external review rounds**
-(all P1s) plus an internal 6-dimension adversarial review. Re-review **PASSED**; the PR is clean and
-**ready for your merge**. U7 is **rails-only** — the consumer warm-open path stays unwired (that's U9),
-which is now **gated on a redirect-bypass fix** the review surfaced. **467 tests pass, typecheck clean.**
+Continued from the evening handoff (U7 vault safety rails built, PR #35 review-clean). This session
+**merged #35, then built and merged the server-3xx redirect-bypass fix (#36) end-to-end** — the
+core-guard change that GATED U9 (consumer warm-open) — and validated it in-container with a
+controlled fingerprint A/B. The redirect bypass is now closed; **U9 is unblocked and is the next
+build step** (deferred to a fresh session by request).
 
 ## What We Built
 
-Six commits on `feat/vault-u7-safety-rails` (tip `c9d97fe`); PR #35.
-
-- **`df9b984` — U7 four rails.**
-  - **Rail 1 (host-scoped no-exfil):** `cookieBelongsToHost(domain, ownerHost)` in `src/security/url.ts`
-    (dependency-free; exact / subdomain / dotted-parent SSO-apex; single-label + bare-TLD owner rejected;
-    ASCII/punycode-folded). `hostScopeSession` filters a warm jar to its owner. A credentialed session's
-    NAVIGATION is clamped to the owner host via new `PolicyEngine.guardForCredentialHost` (`src/policy/index.ts`)
-    installed by `Gateway.openConsumerSession` (`src/gateway/index.ts`).
-  - **Rail 2 (audit):** new `session-open`/`open` `AuditRecord` (`src/policy/audit.ts`) carrying only
-    consumerId + host (both redaction-safe), emitted at `openConsumerSession`.
-  - **Rail 3 (origination boundary):** `src/policy/origination.ts` — always-on policy deny of
-    account-creation / money-movement navigations by host+path, in `guardFor` after egress / before allowlist,
-    gated on `isNavigationRequest`. Public defaults + `BGW_ORIGINATION_DENY_HOSTS` / `_PATHS` env extension.
-  - **Rail 4 (secret-leak kill-gate):** browserless `runSecretLeakCheck` leg in `scripts/validate-stealth.mjs`
-    (positive control, no real secret) proving stored values never survive the redaction surfaces.
-  - Tests: new `test/vault-safety.test.mjs`; gap doc `docs/solutions/architecture-patterns/vault-observability-redaction-gap.md`.
-- **`a76dc8f` — review round 1 P1s.** Origination matched the RAW `URL.pathname` (so `/sign%75p` evaded
-  `/signup`) → now matches the **decoded + server-normalized** path (`decodedPathVariants` + `serverNormalizedPath`:
-  iterated percent-decode, strip matrix-params `;`, truncate NUL `%00`). Added the credentialed nav clamp.
-- **`b9c1f0c` / `75daced` — docs.** Tracked the server-redirect bypass (below) as a P1 follow-up that **gates U9**.
-- **`df8bc90` — review round 3 P1.** Made `restoreState` an atomic `{ state, ownerHost }` (`RestoreState`);
-  clamp + audit derive from `restoreState.ownerHost` — removed the separate `credentialHost` param.
-- **`c9d97fe` — review round 4 P1 (the load-bearing one).** `buildWarmOverride(vault, secrets, {consumerId, host, …})`
-  now does the vault `get` ITSELF, so the owner **is** the looked-up host (no caller `ownerHost` to mismatch).
-  `RestoreState` is **sealed** (`sealRestoreState`/`isSealedRestore`, non-enumerable brand in `src/browser/types.ts`);
-  `openConsumerSession` REFUSES a restoreState that isn't sealed. Updated `src/browser/index.ts` (exports),
-  the two warm validators, and the unit tests.
+- **Merged PR #35 — U7 vault safety rails** (squash `7c0c26c`): host-scoped no-exfil + nav clamp +
+  origination boundary + secret-leak gate. Now on `main`.
+- **PR #36 — server-3xx redirect-bypass fix** (squash `95174ab`). The nav guard rode
+  `context.route` + `route.continue()`, which auto-follows a server redirect chain WITHOUT
+  re-invoking the handler — so the guard decided only hop 0 and a `302` from a credential owner host
+  to a same-parent sibling carried a retained parent cookie off-host. Replaced with **ONE
+  browser-level CDP `Fetch` session** (Request stage) + `Target.setAutoAttach({flatten})` in
+  `src/browser/patchright-core.ts` (`setNavigationGuard`/`#installFetchGuard`/`#onRequestPaused`):
+  - CDP re-pauses every redirect hop → guard re-decides each; `Fetch.continueRequest` (no overrides)
+    keeps each hop in Chrome's NATIVE network stack (TLS/HTTP fingerprint preserved).
+  - `context.route` REMOVED (it was the sole consumer; Patchright auto-enables Fetch when a route is
+    registered, so route + raw session would collide on `InterceptionId`).
+  - `isNavigationRequest = resourceType==="Document"`; CDP TitleCase resourceType lowercased for the
+    audit log. Pure helpers `cdpRequestToNavigation` + `decideRequest` extracted and exported.
+  - Review hardening: single-flight install + partial-cleanup; **detach-first teardown** (`close()`
+    detaches the CDP session instead of `Fetch.disable`, which auto-CONTINUES paused requests);
+    diagnostics on guard-throw and on non-teardown send-failure; `validate:stealth` made **guard-on**.
+- **New tests/gates:** `test/nav-guard-mapping.test.mjs` (mapping + `decideRequest`),
+  `test/nav-guard-redirect-hops.test.mjs` (real policy clamp over a CDP-mapped chain), and
+  `scripts/validate-redirect-guard.mjs` (real browser, **11/11 in-container** — per-hop block, allowed
+  chain lands, off-host subresource/popup/worker guarded, fail-closed). **480 unit tests green.**
+- **`561c74a`** — solution-doc provenance: the prod-direct datacenter-IP gotcha + the A/B result.
+- **`12c58bf`** — `validate-stealth` gained an optional **`BGW_PROXY_*` path** so a prod run routes the
+  CF/DataDome legs through a residential exit (representative fingerprint check); default stays direct.
+- **Q2 validation (in-container, local colima, amd64 via Rosetta, headful under Xvfb):** guard-on
+  `validate:stealth` PASS, AND a controlled interleaved clean-IP A/B cleared CF **guard-on 12/12 =
+  guard-off 12/12** → the CDP-Fetch interception does NOT regress the fingerprint.
 
 ## Decisions Made
 
-- **U7 is RAILS-ONLY (operator-approved via AskUserQuestion).** The consumer warm-open path is NOT wired here
-  — that's U9. Rails are correct-by-construction; tests/validators exercise the seams directly.
-- **Origination boundary = honest guardrail, not airtight.** The policy guard can't see POST bodies or
-  form-field types (`NavigationRequest` is url/host only), so money-movement is host-only and account-creation
-  is path-only. Deny by **host+path, never "has a password field"** — so it never blocks the sanctioned logins
-  the vault exists for. Documented as such in `origination.ts`.
-- **Rail 4 covers log + audit surfaces only;** the observability-output (rendered HTML/screenshots) + egress-payload
-  redaction gap is documented (`vault-observability-redaction-gap.md`), not closed.
-- **Warm-restore owner binding (the 4-round arc):** owner must come from the vault LOOKUP and be SEALED into the
-  restore value, so it can be neither omitted, set as a separate param, nor passed to a builder as a free input.
-  `buildWarmOverride` does the lookup; the gateway rejects unsealed restores.
-- **Accepted residual (reviewer signed off):** `sealRestoreState` is exported across the browser→mcp layer, so it's
-  technically callable with a forged owner. `buildWarmOverride` is the sole sanctioned producer that binds owner to
-  the lookup; the browser layer can't depend on the vault to enforce more. Reviewer: "an in-process API trust
-  boundary, not a remotely reachable bypass… not a blocker."
+- **Mechanism = CDP-native, browser-session flatten auto-attach.** Rejected `route.fetch` (replays
+  through Playwright's API stack → changes the TLS/HTTP fingerprint) and per-page `newCDPSession`
+  attach (RACES a popup's first navigation — spike-proven). Scope = per-hop re-assertion on **all**
+  requests (free under CDP; the owner-clamp's nav-only asymmetry lives inside `guardForCredentialHost`).
+- **WebSocket-exfil decision RESOLVED → Option B.** Operator confirmed U9 credential owner-hosts are
+  **trusted** (not serving hostile JS). So: accept the WS residual; the container-network egress
+  sidecar is the boundary. Closing it via CDP `Network.webSocketCreated` host-check is a **hardening
+  follow-up, NOT a U9 blocker**.
+- **Agent now authorized to push `main` directly when safe** (reverses the old operator-pushes gate).
+  Recorded in memory `authorized-to-push-main`. Already exercised: `561c74a`, `12c58bf`.
+- **`validate:stealth` is now guard-on** by default (prod parity); `BGW_STEALTH_NO_GUARD=1` for a
+  guard-off A/B baseline.
 
 ## What Didn't Work
 
-- **Re-filtering a warm jar by a caller-supplied clamp host (the round-3 "validate it matches" idea) — RULED OUT.**
-  A `.example.com` parent cookie legitimately *belongs to* `evil.example.com` (a subdomain), so re-filtering an
-  `accounts` jar against `ownerHost: evil` KEEPS the parent cookie → still leaks. The owner had to be lookup-bound,
-  not validated.
-- **Colocating owner with state but keeping a `buildWarmOverride` `ownerHost` param (round-3 fix) — INSUFFICIENT.**
-  It just moved the mismatch into `buildWarmOverride`'s input (reviewer reproduced it). Fixed in round 4 by doing
-  the lookup inside `buildWarmOverride`.
-- **Folding the server-redirect fix into U7 — declined (operator-approved).** It's high-blast-radius core-surgery
-  (`route.fetch({maxRedirects:0})` + per-hop guard) that must clear the container stealth/proxy/drive gates, so it's
-  its own unit, not a blind drive-by in this PR.
+- **`route.fetch`/`route.fulfill`** (the original solution-doc sketch) — SUPERSEDED: it would change
+  the anti-bot fingerprint. CDP `continueRequest` is the native-stack-preserving path.
+- **Per-page CDP attach** (`context.on('page')` + `newCDPSession`) — the popup's first navigation
+  fires before Fetch arms; it leaked the popup (proven in spike). Browser-session flatten auto-attach
+  is the fix.
+- **Prod-direct `validate:stealth` as a fingerprint test** — FAILS the CF leg on prod's **datacenter
+  IP** (reputation), a false negative, NOT a regression. Proven: udemy 403'd direct on prod but
+  cleared 6/6 on a clean residential IP in both guard conditions. Use `BGW_PROXY_*` for a real run.
+- **`#closing` fail-closed via `failRequest` after `Fetch.disable`** — `Fetch.disable` auto-continues
+  paused requests AND the late `failRequest` raced a disabled domain (logged "Fetch domain is not
+  enabled"). Switched to detach-first.
 
 ## What's Next
 
-1. **Merge PR #35** (your call — review is clean, 467 green, typecheck clean). Then it's on `main` as the last
-   piece of the vault before U9.
-2. **Paste the round-4 reviewer reply** (it was pbcopy'd to your clipboard; also at
-   `…/scratchpad/u7-reply-round4.md`) into the PR thread, if not already done.
-3. **U9 — wire the consumer warm-open path**, BUT it is **GATED on the server-redirect fix** below. When wiring,
-   `openConsumerSession` derives clamp+audit from the sealed `restoreState.ownerHost` automatically — use
-   `buildWarmOverride(vault, secrets, {consumerId, host, …})` (it does the lookup; returns null if absent).
-4. **CRITICAL FOLLOW-UP — close the nav-guard server-3xx-redirect bypass**
-   (`docs/solutions/architecture-patterns/nav-guard-redirect-bypass.md`). `route.continue()` follows a server
-   redirect chain inside Chrome WITHOUT re-invoking the route handler, so a redirected hop bypasses the credential
-   clamp AND the base allowlist/egress guards (pre-existing, gateway-wide). Fix = `route.fetch({maxRedirects:0})` +
-   per-hop guard check in `setNavigationGuard` (`src/browser/patchright-core.ts`). Needs the container kill-gate +
-   stealth + proxy + drive validation (can't run on the Mac).
-5. **Close the observability-output / egress-payload redaction gap** (`vault-observability-redaction-gap.md`).
-6. **Activate the vault** (separate, deploy-side): `BGW_VAULT_DIR` (PERSISTENT VOLUME) + `0600` `BGW_VAULT_KEY_FILE`,
-   re-create container, confirm `vault: ready` in the boot log.
+1. **U9 — consumer warm-open wiring** (the next build unit). Proceed under WebSocket **Option B**.
+   The warm-replay machinery (`buildWarmOverride` → sealed `restoreState` → guarded credentialed
+   session) exists; U9 wires a consumer-facing trigger to open one. **Vault is still DORMANT in prod**
+   — needs `BGW_VAULT_DIR` on a **persistent volume** + a `0600 BGW_VAULT_KEY_FILE` before anything is
+   live.
+2. **Pre-U9-activation gate (in-container):** run `validate:stealth` on prod **with `BGW_PROXY_*` set**
+   (now supported, `12c58bf`) to confirm the proxy path clears CF (representative fingerprint check —
+   not yet run in-prod), plus `validate:redirect-guard` / `validate:proxy-escalation` / `validate:drive`.
+3. **Follow-ups (tracked, none blocking U9 under Option B):** WS hardening via
+   `Network.webSocketCreated` (only if the credential set ever includes lower-trust hosts);
+   narrow-allowlist `retrieve` now hard-fails off-allowlist redirects (validate vs real targets);
+   cross-origin OOPIF off-host container fixture for `validate-redirect-guard` (needs a `127.0.0.2`
+   loopback alias the Mac run omits).
 
 ## Gotchas & Watch-outs
 
-- **U9 MUST NOT activate before the redirect-bypass fix lands** — a live warm session makes the redirect hop a live
-  cookie-exfil vector against a real stored credential.
-- **`openConsumerSession` now THROWS on an unsealed `restoreState`** ("must be produced by the vault layer"). Any
-  warm session must build its override via `buildWarmOverride` / `sealRestoreState`. Direct `createBrowserCore`
-  callers (the roundtrip/assisted validators) pass `restoreState` to the CORE, which is seal-agnostic — that's fine.
-- **`buildWarmOverride` signature changed** to `(vault, secrets, {consumerId, host, onDatacenterIp, stickySuffix})`
-  and returns `BrowserCoreOptions | null`. The old `(entry, secrets, {ownerHost})` form is gone.
-- **The sealed `RestoreState` brand is non-enumerable** — survives object-spread but is invisible to
-  `deepEqual`/`JSON.stringify` (so existing deepEqual tests still pass). Don't deep-clone a restoreState or the brand
-  is lost; the gateway checks the seal at entry, before any merge.
-- **Vault still FULLY DORMANT in prod.** Activation gotcha stands: `BGW_VAULT_DIR` must be a persistent volume or
-  entries vanish on the next container re-create.
-- **Public repo** — codenames only (atlas/vault/argus); the whole U7 diff was scanned clean of fleet identifiers
-  (origination's payment-processor hosts are generic/public, intentional).
-- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing, every U7 commit explicitly excluded them).
-- **PR #35 is on a feature branch, already pushed.** `main` is unchanged this session (no main-push needed).
+- **A prod-direct `validate:stealth` CF failure is datacenter-IP reputation, NOT a fingerprint
+  regression** — documented in `docs/solutions/architecture-patterns/nav-guard-redirect-bypass.md`.
+  Run with `BGW_PROXY_*` for a representative result; production serves CF via a residential proxy,
+  never the bare datacenter IP.
+- **The `validate-stealth` `BGW_PROXY_*` path has not been run in-prod yet** (no proxy creds locally).
+  One prod run is the confirmation; it cannot affect the default direct path.
+- **WS exfil residual is accepted** under Option B (owner-hosts trusted). If U9's credential set ever
+  expands to hosts you don't fully trust to be XSS-free, revisit and do the `Network.webSocketCreated`
+  close before activating those.
+- **Run container gates as `node` (rootless), NOT root.** Build the branch image locally (colima:
+  `colima start`, then `docker build --platform linux/amd64 ...`) or pull the post-merge GHCR image on
+  prod. Prod has no source tree — it pulls images.
+- **Agent now pushes `main` when safe** — but still HOLD on: unvalidatable prod-runtime changes, red/
+  uncertain diffs, history rewrites/force-pushes, or anything touching secrets/fleet identifiers.
+- **Public repo** — codenames/generic refs only; no fleet host/path/token in source, commits, or this
+  doc. Untracked `.claude/` + `AGENTS.md` left as-is (pre-existing).
+- Local `main` is in sync with `origin/main` (tip `12c58bf`); nothing unpushed.
