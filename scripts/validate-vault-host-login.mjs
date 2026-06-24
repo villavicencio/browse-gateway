@@ -126,7 +126,7 @@ try {
   check("direct capture bound no sticky exit (R7 — proxy is trigger-only)", entry?.stickyExitId === undefined);
 
   // Warm replay through a fresh session built from the stored entry → lands authenticated.
-  const override = buildWarmOverride(entry, runtime.secrets, { onDatacenterIp: false, ownerHost: "127.0.0.1" });
+  const override = buildWarmOverride(runtime.vault, runtime.secrets, { consumerId: CONSUMER, host: "127.0.0.1", onDatacenterIp: false });
   const handle = await runtime.gateway.openConsumerSession(TOKEN, override); // clamp derives from override.restoreState.ownerHost
   try {
     const snap = await runtime.gateway.useConsumerSession(TOKEN, handle, (s) =>

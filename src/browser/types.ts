@@ -62,13 +62,38 @@ export interface StorageState {
  * `state` belongs to. Carrying the owner WITH the state (rather than as a separate parameter alongside
  * it) is a safety invariant: the gateway clamps the credentialed session's navigation to exactly this
  * `ownerHost` (R4 no-exfil), so the host the cookies were scoped to and the host the session may
- * navigate can never diverge or be omitted by a caller. Build it via the vault's `buildWarmOverride`,
- * which sets `ownerHost` to the entry's host and filters `state` to it.
+ * navigate can never diverge or be omitted by a caller.
+ *
+ * It is also SEALED: a valid RestoreState can only be produced by {@link sealRestoreState} (which the
+ * vault's `buildWarmOverride` calls, deriving `ownerHost` from the vault LOOKUP — never a caller input).
+ * The gateway refuses a credentialed open whose `restoreState` is not sealed ({@link isSealedRestore}),
+ * so a freely hand-constructed `{ state, ownerHost }` literal — which could pair a jar with a forged
+ * owner — can't reach a guarded session.
  */
 export interface RestoreState {
   state: StorageState;
   /** The authoritative owner host the `state` belongs to; the gateway clamps navigation to it. */
   ownerHost: string;
+}
+
+/** Module-private seal: a non-enumerable brand, so it survives object-spread but is invisible to
+ *  `deepEqual`/`JSON.stringify`, and cannot be set by code that doesn't hold this symbol. */
+const SEALED_RESTORE = Symbol("bgw.sealed-restore");
+
+/**
+ * Mint a sealed {@link RestoreState}. The ONLY way to produce one the gateway will accept for a
+ * credentialed session — the vault layer calls it with an `ownerHost` derived from a successful vault
+ * lookup, so the seal certifies "this came through the vault producer," not a hand-built literal.
+ */
+export function sealRestoreState(state: StorageState, ownerHost: string): RestoreState {
+  const restore: RestoreState = { state, ownerHost };
+  Object.defineProperty(restore, SEALED_RESTORE, { value: true, enumerable: false });
+  return restore;
+}
+
+/** True only for a {@link RestoreState} minted by {@link sealRestoreState}. */
+export function isSealedRestore(value: RestoreState | undefined): boolean {
+  return !!value && (value as unknown as Record<symbol, unknown>)[SEALED_RESTORE] === true;
 }
 
 export interface BrowserCoreOptions {

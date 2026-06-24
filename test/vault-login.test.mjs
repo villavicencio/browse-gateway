@@ -47,6 +47,9 @@ function fakeRunner(state, stickyExitId) {
   const calls = [];
   return { calls, run: async (args) => (calls.push(args), { state, ...(stickyExitId ? { stickyExitId } : {}) }) };
 }
+/** A minimal VaultEntryStore returning `entry` for any (consumer, host) — buildWarmOverride does the
+ *  lookup itself now (the owner host is the looked-up host, never a caller input). */
+const vaultOf = (entry) => ({ get: () => entry, has: () => !!entry, put() {}, remove: () => false });
 
 test("captureLoginToVault: drives the login and persists the bound exit the runner reports (escalated capture)", async () => {
   const { vault, dir } = tmpVault();
@@ -131,8 +134,8 @@ test("an invalid TOTP seed is rejected at STORE time, before driving the login (
 test("buildWarmOverride: restores the captured state AND re-pins the bound sticky exit (R3)", () => {
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  const override = buildWarmOverride(entry, secrets, { onDatacenterIp: true, stickySuffix: "_session-{id}", ownerHost: "ex.com" });
-  assert.deepEqual(override.restoreState, { state: SESSION, ownerHost: "ex.com" }, "warm session restores the captured state, owner-bound to ex.com");
+  const override = buildWarmOverride(vaultOf(entry), secrets, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true, stickySuffix: "_session-{id}" });
+  assert.deepEqual(override.restoreState, { state: SESSION, ownerHost: "ex.com" }, "warm session restores the captured state, owner-bound to the looked-up host ex.com");
   assert.ok(override.proxy, "proxy applied (configured + on datacenter IP)");
   assert.ok(override.proxy.password.startsWith("pw"), "base proxy password preserved");
   assert.ok(override.proxy.password.includes("abcd1234"), "the BOUND exit id is pinned, not a fresh one");
@@ -141,19 +144,19 @@ test("buildWarmOverride: restores the captured state AND re-pins the bound stick
 test("buildWarmOverride: a DIRECT-captured entry (no bound exit) replays direct even with proxy configured (R7)", () => {
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, updatedAt: 1 }; // no stickyExitId → direct capture
-  assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: true, stickySuffix: "_session-{id}", ownerHost: "ex.com" }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
+  assert.deepEqual(buildWarmOverride(vaultOf(entry), secrets, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true, stickySuffix: "_session-{id}" }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
 });
 
 test("buildWarmOverride: warm session is direct (state only) when no proxy is configured", () => {
   const bare = new SecretStore(() => ({}));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  assert.deepEqual(buildWarmOverride(entry, bare, { onDatacenterIp: true, ownerHost: "ex.com" }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
+  assert.deepEqual(buildWarmOverride(vaultOf(entry), bare, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
 });
 
 test("buildWarmOverride: no proxy when not on a datacenter IP, even with proxy configured", () => {
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  assert.deepEqual(buildWarmOverride(entry, secrets, { onDatacenterIp: false, stickySuffix: "_session-{id}", ownerHost: "ex.com" }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
+  assert.deepEqual(buildWarmOverride(vaultOf(entry), secrets, { consumerId: "atlas", host: "ex.com", onDatacenterIp: false, stickySuffix: "_session-{id}" }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
 });
 
 test("capture drops IP-bound challenge tokens; the durable cookie + localStorage survive capture→vault→warm (PR #31 P1)", async () => {
@@ -166,7 +169,7 @@ test("capture drops IP-bound challenge tokens; the durable cookie + localStorage
     // it round-trips through the encrypted store stripped...
     assert.deepEqual(getVaultEntry(vault, "atlas", "ex.com").session.cookies.map((c) => c.name), ["sid"]);
     // ...and the warm-replay override carries no IP-bound clearance either.
-    const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: true, ownerHost: "ex.com" });
+    const override = buildWarmOverride(vault, new SecretStore(() => ({})), { consumerId: "atlas", host: "ex.com", onDatacenterIp: true });
     assert.deepEqual(override.restoreState.state.cookies.map((c) => c.name), ["sid"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });

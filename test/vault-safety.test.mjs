@@ -32,10 +32,13 @@ import {
   ORIGINATION_DENY_REASON,
 } from "../dist/policy/index.js";
 import { Gateway } from "../dist/gateway/index.js";
+import { sealRestoreState } from "../dist/browser/index.js";
 
 const ck = (name, domain) => ({ name, value: "v".repeat(12), domain, path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "Lax" });
 const SESSION = { cookies: [ck("sid", "ex.com")], origins: [{ origin: "https://ex.com", localStorage: [{ name: "t", value: "y".repeat(16) }] }] };
 const CREDS = { username: "atlas-user", password: "p".repeat(16) };
+/** Minimal VaultEntryStore returning `entry` — buildWarmOverride does the (consumer,host) lookup itself. */
+const vaultOf = (entry) => ({ get: () => entry, has: () => !!entry, put() {}, remove: () => false });
 
 // ───────────────────────────── Rail 1: host-scoped no-exfil ─────────────────────────────
 
@@ -87,13 +90,19 @@ test("buildWarmOverride: a smuggled off-host cookie can NEVER reach the restored
     creds: CREDS,
     updatedAt: 1,
   };
-  const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: false, ownerHost: "ex.com" });
+  // The owner is the host the entry is LOOKED UP by (here "ex.com") — there is no ownerHost parameter,
+  // so the cookies' scope and the carried owner are the same vault-keyed host by construction.
+  const override = buildWarmOverride(vaultOf(entry), new SecretStore(() => ({})), { consumerId: "atlas", host: "ex.com", onDatacenterIp: false });
   assert.deepEqual(
     override.restoreState.state.cookies.map((c) => c.name),
     ["sid"],
     "only the owning-host cookie is injected; the off-host cookie is filtered out before it can reach the jar",
   );
-  assert.equal(override.restoreState.ownerHost, "ex.com", "the restored state carries its authoritative owner host");
+  assert.equal(override.restoreState.ownerHost, "ex.com", "the restored state carries its authoritative (looked-up) owner host");
+});
+
+test("buildWarmOverride: returns null when no entry exists for (consumer, host)", () => {
+  assert.equal(buildWarmOverride(vaultOf(null), new SecretStore(() => ({})), { consumerId: "atlas", host: "ex.com", onDatacenterIp: false }), null);
 });
 
 test("cross-consumer: an entry stored for one consumer is never readable as another (injection-layer ownership)", () => {
@@ -139,7 +148,7 @@ test("Rail 2: a credentialed open emits a session-open audit record (consumer + 
   const { factory } = makeFactory();
   const gw = Gateway.create(config(3), factory, policy);
 
-  const handle = await gw.openConsumerSession("tok", { restoreState: { state: SESSION, ownerHost: "ex.com" } });
+  const handle = await gw.openConsumerSession("tok", { restoreState: sealRestoreState(SESSION, "ex.com") });
   const rec = audit.records.find((r) => r.action === "session-open");
   assert.ok(rec, "a session-open record was emitted");
   assert.equal(rec.decision, "open");
@@ -288,9 +297,9 @@ test("Rail 1+2: a restored session DERIVES its clamp + audit from restoreState.o
   const { factory, cores } = makeFactory();
   const gw = Gateway.create(config(3), factory, policy);
 
-  // The ONLY way to open a warm session is to pass restoreState, which carries its ownerHost — there is
-  // no separate credentialHost arg to omit or point elsewhere. Clamp + audit both derive from it.
-  const handle = await gw.openConsumerSession("tok", { restoreState: { state: SESSION, ownerHost: "accounts.example.com" } });
+  // The ONLY way to open a warm session is to pass a SEALED restoreState, which carries its ownerHost —
+  // there is no separate credentialHost arg to omit or point elsewhere. Clamp + audit both derive from it.
+  const handle = await gw.openConsumerSession("tok", { restoreState: sealRestoreState(SESSION, "accounts.example.com") });
   const guard = cores[0].guard; // the guard installed on the session's core
   assert.equal(guard(navReq("accounts.example.com", "/")), "allow");
   assert.equal(guard(navReq("evil.example.com", "/")), "block", "sibling blocked by the credential clamp, not just the consumer allowlist");
@@ -301,29 +310,40 @@ test("Rail 1+2: a restored session DERIVES its clamp + audit from restoreState.o
   await gw.closeConsumerSession("tok", handle);
 });
 
-test("Rail 1: the clamp host can NEVER diverge from the restored jar's owner (omitted/mismatched-host regression)", async () => {
+test("Rail 1: the owner host is bound to the vault LOOKUP — you can't pair an entry with a sibling owner", () => {
+  // An accounts.example.com entry carries the SSO parent cookie. buildWarmOverride takes (vault, host)
+  // and does the lookup itself, so the owner is the looked-up host. To obtain THIS entry's jar you look
+  // it up by its host; there is no ownerHost input to set to a sibling. Looking up "evil.example.com"
+  // (the attack the reviewer reproduced) returns evil's entry — never accounts' cookies under evil.
+  const accountsEntry = { session: { cookies: [ck("apex", ".example.com")], origins: [] }, creds: CREDS, updatedAt: 1 };
+  const store = { get: (_c, host) => (host === "accounts.example.com" ? accountsEntry : null) };
+  const override = buildWarmOverride(store, new SecretStore(() => ({})), { consumerId: "atlas", host: "accounts.example.com", onDatacenterIp: false });
+  assert.equal(override.restoreState.ownerHost, "accounts.example.com", "owner is the looked-up host, not a caller input");
+  // Asking for the accounts jar under an evil owner is impossible: that lookup misses → null.
+  assert.equal(buildWarmOverride(store, new SecretStore(() => ({})), { consumerId: "atlas", host: "evil.example.com", onDatacenterIp: false }), null);
+});
+
+test("Rail 1: a warm session's clamp blocks a sibling; a hand-constructed (unsealed) restoreState is refused", async () => {
   const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["*.example.com"] }]) });
   const { factory, cores } = makeFactory();
   const gw = Gateway.create(config(3), factory, policy);
 
-  // buildWarmOverride binds the filtered jar AND the ownerHost to the SAME value, atomically — a caller
-  // resolving an entry for accounts.example.com cannot produce a warm override that clamps to a sibling.
   const entry = { session: { cookies: [ck("apex", ".example.com")], origins: [] }, creds: CREDS, updatedAt: 1 };
-  const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: false, ownerHost: "accounts.example.com" });
-  assert.equal(override.restoreState.ownerHost, "accounts.example.com");
+  const override = buildWarmOverride(vaultOf(entry), new SecretStore(() => ({})), { consumerId: "atlas", host: "accounts.example.com", onDatacenterIp: false });
 
-  // Opening it: there is no second host parameter. The retained `.example.com` parent cookie is in the
-  // jar, but the clamp (derived from ownerHost) blocks navigating to the sibling it would otherwise ride to.
+  // The retained `.example.com` parent cookie is in the jar, but the clamp (derived from the sealed
+  // ownerHost) blocks navigating to the sibling it would otherwise ride to.
   const handle = await gw.openConsumerSession("tok", override);
-  const guard = cores[0].guard;
-  assert.equal(guard(navReq("evil.example.com", "/")), "block", "the parent cookie cannot ride to a sibling — clamp is bound to the jar's owner");
-  assert.equal(guard(navReq("accounts.example.com", "/")), "allow");
-  await gw.closeConsumerSession("tok", handle); // free the per-consumer slot before the next open
+  assert.equal(cores[0].guard(navReq("evil.example.com", "/")), "block", "the parent cookie cannot ride to a sibling");
+  assert.equal(cores[0].guard(navReq("accounts.example.com", "/")), "allow");
+  await gw.closeConsumerSession("tok", handle);
 
-  // A COLD open (no restoreState) is the only way to get the plain consumer guard — and it carries no jar.
-  const cold = await gw.openConsumerSession("tok");
-  assert.equal(cores[1].guard(navReq("evil.example.com", "/")), "allow", "a cold session has no credential to protect, so the consumer allowlist applies");
-  await gw.closeConsumerSession("tok", cold);
+  // A freely hand-constructed restoreState (not from buildWarmOverride/sealRestoreState) is refused — a
+  // caller cannot smuggle a forged owner past the gateway by building the value directly.
+  await assert.rejects(
+    () => gw.openConsumerSession("tok", { restoreState: { state: SESSION, ownerHost: "evil.example.com" } }),
+    /must be produced by the vault layer/,
+  );
 });
 
 // ─────────────────── Rail 4: secret-leak (deterministic unit half) ───────────────────

@@ -15,6 +15,7 @@ import type { Session } from "./session.js";
 import type { PolicyEngine } from "../policy/index.js";
 import type { Consumer } from "../policy/index.js";
 import type { BrowserCoreOptions } from "../browser/index.js";
+import { isSealedRestore } from "../browser/index.js";
 
 export class Gateway {
   readonly #config: GatewayConfig;
@@ -112,12 +113,19 @@ export class Gateway {
   ): Promise<string> {
     const policy = this.#requirePolicy();
     const consumer = policy.authenticate(token);
+    // A restored credential MUST come from the vault producer (`sealRestoreState`, via
+    // `buildWarmOverride`, whose owner is bound to the vault lookup). Refuse a freely hand-constructed
+    // `restoreState` — which could pair a jar with a forged owner the nav clamp would then trust —
+    // before any session opens.
+    if (coreOverrides?.restoreState && !isSealedRestore(coreOverrides.restoreState)) {
+      throw new Error("openConsumerSession: restoreState must be produced by the vault layer (sealRestoreState)");
+    }
     const session = await this.#sessions.acquire(coreOverrides, { consumerId: consumer.id });
     try {
-      // The credential owner host travels WITH the restored state (`restoreState.ownerHost`), so a
-      // credentialed (warm-replay) session is DEFINED by its restored state — there is no separate,
+      // The credential owner host travels WITH the (sealed) restored state (`restoreState.ownerHost`),
+      // so a credentialed (warm-replay) session is DEFINED by its restored state — there is no separate,
       // omittable/mismatchable `credentialHost` parameter. If a credential is restored, its nav clamp
-      // is derived from the exact host the cookies were scoped to.
+      // is derived from the exact host the cookies were scoped to (the vault-keyed host).
       const credentialHost = coreOverrides?.restoreState?.ownerHost;
       // A diagnostics probe (the opt-in egress check) is guarded to the policy-owned approved host
       // set ONLY — never the consumer's allowlist — so a restrictive allowlist can't block a

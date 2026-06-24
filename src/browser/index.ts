@@ -24,6 +24,7 @@ export type {
   StorageStateOrigin,
   WaitCondition,
 } from "./types.js";
+export { sealRestoreState, isSealedRestore } from "./types.js";
 export { createBrowserCore, PatchrightBrowserCore, restoreOrClose, targetToSelector } from "./patchright-core.js";
 export {
   assess,

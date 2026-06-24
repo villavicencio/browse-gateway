@@ -11,9 +11,10 @@
  * live proof land in the follow-up wiring unit.
  */
 import type { BrowserCoreOptions, StorageState } from "../browser/index.js";
+import { sealRestoreState } from "../browser/index.js";
 import type { LoginCredentials, LoginRecipe } from "../verbs/index.js";
 import { proxyOverrideFor, isValidTotpSeed } from "../verbs/index.js";
-import { cookieBelongsToHost, hostFromUrl } from "../security/index.js";
+import { cookieBelongsToHost, hostFromUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 
 /**
@@ -184,24 +185,28 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
  * already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound clearance is
  * replayed here.
  *
- * `ownerHost` is the host the entry is keyed on (the lookup key the caller resolved it by). It does
- * double duty, ATOMICALLY: the restored state is {@link hostScopeSession}-filtered to it (R4 no-exfil —
- * only owner-host cookies/origins are ever injected) AND it is carried on the returned
- * {@link RestoreState} as `ownerHost`, which the gateway clamps the session's navigation to. Because
- * the same value both filters the jar and bounds navigation — and travels WITH the state, not as a
- * separate `openConsumerSession` parameter — a caller cannot omit the clamp or point it at a different
- * (sibling) host than the cookies were scoped to. It is REQUIRED, enforced by the type.
+ * The owner host is the host the entry is LOOKED UP by — this function does the vault `get` itself, so
+ * the owner is NEVER a caller-supplied value. It does double duty, atomically: the restored state is
+ * {@link hostScopeSession}-filtered to it (R4 no-exfil — only owner-host cookies/origins are injected)
+ * AND it is sealed onto the returned {@link RestoreState} as `ownerHost`, which the gateway clamps the
+ * session's navigation to. Because the SAME looked-up host both selects the entry, filters its jar, and
+ * bounds navigation, a caller cannot pair one entry's cookies with a different (sibling) owner: to get
+ * entry X you look it up by host X, and host X is then the owner. A successful `get` also AAD-verifies
+ * the entry was sealed for exactly `(consumerId, host)`. Returns `null` when no entry exists for the pair.
  */
 export function buildWarmOverride(
-  entry: VaultEntry,
+  vault: VaultEntryStore,
   secrets: SecretStore,
-  opts: { onDatacenterIp: boolean; stickySuffix?: string; ownerHost: string },
-): BrowserCoreOptions {
+  args: { consumerId: string; host: string; onDatacenterIp: boolean; stickySuffix?: string },
+): BrowserCoreOptions | null {
+  const ownerHost = canonicalizeHost(args.host);
+  const entry = vault.get<VaultEntry>(args.consumerId, ownerHost);
+  if (!entry) return null;
   const proxyOverride = entry.stickyExitId
-    ? proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, entry.stickyExitId)
+    ? proxyOverrideFor(secrets, args.onDatacenterIp, args.stickySuffix, entry.stickyExitId)
     : undefined;
   return {
-    restoreState: { state: hostScopeSession(entry.session, opts.ownerHost), ownerHost: opts.ownerHost },
+    restoreState: sealRestoreState(hostScopeSession(entry.session, ownerHost), ownerHost),
     ...(proxyOverride ?? {}),
   };
 }
