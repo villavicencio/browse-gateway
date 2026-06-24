@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { proxyOverrideFor, navFailed, shouldEscalateDrive, newStickyExitId } from "../dist/verbs/index.js";
+import { proxyOverrideFor, proxyOverrideForPinned, navFailed, shouldEscalateDrive, newStickyExitId } from "../dist/verbs/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { SecretStore } from "../dist/security/index.js";
 
@@ -41,6 +41,26 @@ test("proxyOverrideFor: a PINNED stickyExitId re-pins the SAME held exit across 
   assert.equal(a?.proxy?.password, b?.proxy?.password, "same id → same exit, every replay");
   // A pinned id differs from a fresh mint, and 3-arg callers are unchanged (fresh per call).
   assert.notEqual(proxyOverrideFor(secrets, true, "_s-{id}")?.proxy?.password, "pw_s-abcd1234");
+});
+
+test("proxyOverrideForPinned: returns the override ONLY when the exit is VERIFIABLY pinned (R3 fail-closed)", () => {
+  const full = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  // Truly pinned: proxy + datacenter + a sticky suffix that applies the id.
+  assert.equal(proxyOverrideForPinned(full, true, "_s-{id}", "abcd1234")?.proxy?.password, "pw_s-abcd1234");
+  // NOT pinnable → undefined so the caller fails closed (never a wrong/rotating-exit replay):
+  assert.equal(proxyOverrideForPinned(full, true, undefined, "abcd1234"), undefined, "no sticky suffix → base (rotating) proxy → undefined");
+  assert.equal(proxyOverrideForPinned(full, true, "_s-static", "abcd1234"), undefined, "suffix without {id} → id not applied → undefined");
+  assert.equal(proxyOverrideForPinned(full, false, "_s-{id}", "abcd1234"), undefined, "not on a datacenter IP → undefined");
+  assert.equal(proxyOverrideForPinned(noSecrets(), true, "_s-{id}", "abcd1234"), undefined, "no proxy → undefined");
+  const noPw = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1" })); // no password to suffix
+  assert.equal(proxyOverrideForPinned(noPw, true, "_s-{id}", "abcd1234"), undefined, "no proxy password → can't apply the id → undefined");
+  // Collision-resistance (structural, not substring): a base password that ALREADY contains the exit id
+  // must NOT be mistaken for a real pin when the suffix can't actually apply it.
+  const collide = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pre-abcd1234-x" }));
+  assert.equal(proxyOverrideForPinned(collide, true, undefined, "abcd1234"), undefined, "no suffix → unpinned even though base pw contains the id");
+  assert.equal(proxyOverrideForPinned(collide, true, "_s-static", "abcd1234"), undefined, "suffix without {id} → unpinned even though base pw contains the id");
+  // A REAL pin on top of a colliding base still works (minted pw == base + suffix-with-id, exactly).
+  assert.equal(proxyOverrideForPinned(collide, true, "_s-{id}", "abcd1234")?.proxy?.password, "pre-abcd1234-x_s-abcd1234");
 });
 
 test("newStickyExitId: an 8-hex id (the IPRoyal quantum), distinct across calls", () => {

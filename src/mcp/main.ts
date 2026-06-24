@@ -5,8 +5,8 @@
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Gateway, loadConfig } from "../gateway/index.js";
-import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary } from "../policy/index.js";
-import { SecretStore, redactSecrets } from "../security/index.js";
+import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary, Allowlist } from "../policy/index.js";
+import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
 import { retrieve, stickySuffixBootError, parseForceProxyHosts, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
@@ -32,6 +32,12 @@ async function main(): Promise<void> {
   if (consumer.allow.length === 0) throw new Error("BGW_MCP_ALLOWLIST is required (no hosts allowed)");
 
   const secrets = new SecretStore();
+  // Credential/session-state vault (B1) for U9 warm-open: off unless BGW_VAULT_DIR is set. Mirror the
+  // http-main/runtime construction so this stdio rollback launcher doesn't silently diverge (cold-only
+  // while prod is warm). Constructing it here runs the fail-closed boot guard (entries on disk but no
+  // master key → refuse to boot) and folds the KEK into the redaction set.
+  const vault = openVault({ env: process.env, canonicalizeHost, redact: (vals) => secrets.addRedactable(vals) });
+  if (vault) log("vault: ready (encrypted credential store enabled)");
   const policy = new PolicyEngine({
     registry: new ConsumerRegistry([{ id: consumer.id, token: consumer.token, allow: consumer.allow }]),
     // Durable-trail default for the live path: bounded in-memory store wrapped in the
@@ -59,7 +65,17 @@ async function main(): Promise<void> {
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
   // The interactive `drive` surface: a persistent, consumer-bound session driven via browser_* tools.
   // Proxied (with healthy-exit retry) when a residential proxy is configured and we're on a DC IP.
-  const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress });
+  const drive = new GatewayDriveController(gateway, secrets, consumer.token, {
+    onDatacenterIp,
+    stickySuffix,
+    forceProxyHosts,
+    verifyEgress,
+    // U9 warm-open: a navigate to an approved host with a stored login opens a logged-in session
+    // (vault dormant → null → cold-only). The allowlist here is the same scope the gateway guard clamps to.
+    vault,
+    consumerId: consumer.id,
+    allowlist: new Allowlist(consumer.allow),
+  });
 
   const server = createGatewayMcpServer({
     version: "0.1.0",

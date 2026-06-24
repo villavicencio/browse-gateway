@@ -8,6 +8,8 @@ import assert from "node:assert/strict";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { PROXY_CLEARANCE_TIMEOUT_MS } from "../dist/verbs/index.js";
 import { SecretStore } from "../dist/security/index.js";
+import { isSealedRestore } from "../dist/browser/index.js";
+import { Allowlist } from "../dist/policy/index.js";
 
 function makeFakeGateway() {
   let nextId = 1;
@@ -300,4 +302,263 @@ test("controller: a driver error carrying proxy credentials is redacted before r
     assert.ok(!e.message.includes(proxyUrl), "the proxy URL must be redacted");
     return true;
   });
+});
+
+// --- U9 warm-open (consumer-facing trigger) --------------------------------------------------------
+
+/** A recording gateway that captures every open's coreOverrides + navigate opts + closed handles, and
+ *  returns a controllable sequence of navigate snapshots (default: a 200 OK page). */
+function makeRecordingGateway(navSeq) {
+  let nextId = 1;
+  const open = new Map();
+  const opens = []; // coreOverrides per openConsumerSession (undefined = cold)
+  const navOpts = [];
+  const closed = [];
+  let navs = 0;
+  const ok = (url) => ({ url, title: "ok", tree: "- x [ref=e1]", status: 200 });
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession(_t, override) {
+      opens.push(override);
+      const id = "h" + nextId++;
+      open.set(id, {
+        core: {
+          async navigate(url, opts) {
+            navOpts.push(opts);
+            const seq = navSeq ? navSeq[Math.min(navs, navSeq.length - 1)] : undefined;
+            navs++;
+            return seq ? { ...ok(url), ...seq } : ok(url);
+          },
+          async snapshot() { return ok("u"); },
+        },
+      });
+      return id;
+    },
+    async useConsumerSession(_t, handle, fn) {
+      const s = open.get(handle);
+      if (!s) throw new Error(`no open session for handle ${handle}`);
+      return fn(s);
+    },
+    async closeConsumerSession(_t, h) { if (open.delete(h)) closed.push(h); },
+  };
+  return { gateway, open, opens, navOpts, closed };
+}
+
+/** A duck-typed VaultEntryStore returning a captured entry for exactly the given (consumerId, host). */
+function makeVault(consumerId, host, entry) {
+  return {
+    get(cid, h) { return cid === consumerId && h === host ? entry : null; },
+    has(cid, h) { return cid === consumerId && h === host; },
+    put() {},
+    remove() { return false; },
+  };
+}
+
+/** A captured vault entry whose durable cookie belongs to `host`. A bound `stickyExitId` makes warm
+ *  replay re-pin a residential exit (R3); absent = a direct capture (replays direct). */
+function warmEntry(host, opts = {}) {
+  return {
+    session: { cookies: [{ name: "sid", value: "logged-in", domain: host, path: "/" }], origins: [] },
+    creds: { username: "u", password: "p" },
+    ...(opts.stickyExitId ? { stickyExitId: opts.stickyExitId } : {}),
+    updatedAt: 1,
+  };
+}
+
+const allowAll = new Allowlist(["*"]);
+const proxySecrets = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+
+test("warm-open: an approved host with a vault entry opens a SEALED, host-scoped warm session", async () => {
+  const { gateway, opens, open } = makeRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  const snap = await c.navigate("https://example.com/dashboard");
+  assert.equal(snap.status, 200, "warm navigate landed");
+  assert.equal(opens.length, 1, "exactly one session opened (no cold pre-open)");
+  const ov = opens[0];
+  assert.ok(ov?.restoreState, "the open carried a restoreState (warm), not a cold open");
+  assert.ok(isSealedRestore(ov.restoreState), "the restoreState is SEALED (gateway will accept it)");
+  assert.equal(ov.restoreState.ownerHost, "example.com", "owner host is the vault-keyed host");
+  assert.equal(
+    ov.restoreState.state.cookies.length, 1,
+    "only the owner-host cookie survived host-scoping",
+  );
+  assert.equal(ov.proxy, undefined, "a direct-captured entry replays DIRECT (no proxy)");
+  assert.equal(open.size, 1);
+});
+
+test("warm-open: a host NOT on the consumer's allowlist opens COLD (no credential injected)", async () => {
+  const { gateway, opens } = makeRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: new Allowlist(["other.test"]),
+  });
+  await c.navigate("https://example.com/");
+  assert.equal(opens[0], undefined, "cold open (no restoreState) — host is not approved");
+});
+
+test("warm-open: vault dormant (null) opens COLD", async () => {
+  const { gateway, opens } = makeRecordingGateway();
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault: null, consumerId: "vault", allowlist: allowAll,
+  });
+  await c.navigate("https://example.com/");
+  assert.equal(opens[0], undefined, "cold open when the vault feature is off");
+});
+
+test("warm-open: no entry for the host opens COLD (graceful fallthrough)", async () => {
+  const { gateway, opens } = makeRecordingGateway();
+  const vault = makeVault("vault", "other.com", warmEntry("other.com")); // entry exists, but not for example.com
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  await c.navigate("https://example.com/");
+  assert.equal(opens[0], undefined, "cold open when no entry matches the navigated host");
+});
+
+test("warm-open: a pre-opened cold session is discarded before the warm open (no double-acquire)", async () => {
+  const { gateway, opens, closed, open } = makeRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  await c.open(); // pre-opens a cold direct session (handle h1)
+  assert.equal(open.size, 1);
+  await c.navigate("https://example.com/"); // must discard h1, then open warm
+  assert.equal(opens[0], undefined, "first open was the cold pre-open");
+  assert.ok(opens[1]?.restoreState, "second open is the warm session");
+  assert.deepEqual(closed, ["h1"], "the pre-opened cold session was closed before warming");
+  assert.equal(open.size, 1, "exactly one live session (no leak against the per-consumer cap)");
+});
+
+test("warm-open: a stale/blocked warm replay surfaces a re-capture error and does NOT fall back to cold", async () => {
+  // The warm navigate lands a hard block (the stored login expired). The path must NOT silently
+  // re-open cold (which would mask the staleness) — it surfaces an actionable operator-refresh error.
+  const { gateway, opens, open } = makeRecordingGateway([{ status: 403, title: "Forbidden", tree: "Forbidden" }]);
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  await assert.rejects(c.navigate("https://example.com/"), /warm.*failed|re-capture/i);
+  assert.equal(opens.length, 1, "no cold fallback open after the warm failure");
+  assert.equal(open.size, 0, "the failed warm session was discarded");
+});
+
+test("warm-open: a reaped DIRECT warm session re-warms on reopen (stays logged-in, never proxied)", async () => {
+  const { gateway, opens, open } = makeRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com")); // direct capture (no exit)
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  await c.navigate("https://example.com/"); // warm-open, pinned
+  const first = [...open.keys()][0];
+  open.delete(first); // idle reap closes the held session out from under us
+  await assert.rejects(c.navigate("https://example.com/"), /no open session/); // gone-session resets the handle
+  await c.navigate("https://example.com/again"); // pinned-reopen path
+  const reopen = opens[opens.length - 1];
+  assert.ok(reopen?.restoreState && isSealedRestore(reopen.restoreState), "reopen re-warmed (sealed restore), not cold");
+  assert.equal(reopen.restoreState.ownerHost, "example.com");
+  assert.equal(reopen.proxy, undefined, "a direct warm session reopens DIRECT — #proxiedSession stayed false");
+});
+
+test("warm-open: a reaped BOUND warm session re-pins the SAME captured exit on reopen (R3)", async () => {
+  const { gateway, opens, open } = makeRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com", { stickyExitId: "abcd1234" }));
+  const c = new GatewayDriveController(gateway, proxySecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll, onDatacenterIp: true, stickySuffix: "_s-{id}",
+  });
+  await c.navigate("https://example.com/"); // warm-open, re-pinned residential exit
+  assert.ok(opens[0]?.proxy?.password, "bound entry replays through a re-pinned proxied exit");
+  const pinnedPw = opens[0].proxy.password;
+  const first = [...open.keys()][0];
+  open.delete(first);
+  await assert.rejects(c.navigate("https://example.com/"), /no open session/);
+  await c.navigate("https://example.com/again");
+  const reopen = opens[opens.length - 1];
+  assert.ok(reopen?.restoreState, "reopen re-warmed");
+  assert.equal(reopen.proxy?.password, pinnedPw, "reopen re-pinned the SAME captured exit (R3 stability)");
+});
+
+test("warm-open: a reaped warm session that re-warms STALE fails LOUD with the recapture error (reopen path)", async () => {
+  // The loud-failure guarantee must hold on the reopen-after-reap path too, not just first-navigate —
+  // and must NOT be the generic "retry for a fresh exit" (wrong for a bound entry that re-pins the same exit).
+  const { gateway, open } = makeRecordingGateway([undefined, { status: 403, title: "Forbidden", tree: "Forbidden" }]);
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  await c.navigate("https://example.com/"); // warm-open succeeds, pinned
+  open.delete([...open.keys()][0]); // idle reap
+  await assert.rejects(c.navigate("https://example.com/"), /no open session/); // gone-session resets handle
+  await assert.rejects(c.navigate("https://example.com/again"), (e) => {
+    assert.match(e.message, /re-capture this credential/);
+    assert.doesNotMatch(e.message, /retry navigate for a fresh exit/);
+    return true;
+  });
+});
+
+test("warm-open: a foreign-host cookie in the entry is DROPPED from the restored override (R4 filter)", async () => {
+  const { gateway, opens } = makeRecordingGateway();
+  const entry = warmEntry("example.com");
+  entry.session.cookies.push({ name: "evil", value: "x", domain: "other.test", path: "/" }); // not owner-host
+  const vault = makeVault("vault", "example.com", entry);
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  await c.navigate("https://example.com/");
+  const cookies = opens[0].restoreState.state.cookies;
+  assert.ok(cookies.some((ck) => ck.name === "sid"), "owner-host cookie survives host-scoping");
+  assert.ok(!cookies.some((ck) => ck.name === "evil"), "foreign-host cookie is filtered out (no exfil jar)");
+});
+
+test("warm-open: a reaped warm session whose entry was REVOKED fails LOUD on reopen (no silent cold downgrade)", async () => {
+  const { gateway, opens, open } = makeRecordingGateway();
+  let live = warmEntry("example.com", { stickyExitId: "abcd1234" });
+  const vault = {
+    get(cid, h) { return cid === "vault" && h === "example.com" ? live : null; },
+    has(cid, h) { return cid === "vault" && h === "example.com" && live !== null; },
+    put() {}, remove() { return false; },
+  };
+  const c = new GatewayDriveController(gateway, proxySecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll, onDatacenterIp: true, stickySuffix: "_s-{id}",
+  });
+  await c.navigate("https://example.com/"); // bound warm-open (proxied), pinned
+  assert.ok(opens[0]?.proxy, "bound warm session opened proxied");
+  open.delete([...open.keys()][0]); // reap
+  live = null; // entry revoked while the session was reaped
+  await assert.rejects(c.navigate("https://example.com/"), /no open session/); // gone-session resets handle
+  // Reopen finds no entry → must fail LOUD (a logged-in session must not silently become anonymous),
+  // NOT silently reopen cold.
+  await assert.rejects(c.navigate("https://example.com/again"), /revoked or is no longer available|session ended/);
+  // State is reset, so a DELIBERATE subsequent navigate opens cold (entry is gone).
+  await c.navigate("https://example.com/cold");
+  assert.equal(opens[opens.length - 1], undefined, "after the loud error, a fresh navigate opens cold");
+});
+
+test("warm-open: a BOUND entry whose exit can't be re-pinned fails the navigate LOUD (fail-closed, no cold/wrong-exit)", async () => {
+  // noSecrets → no proxy → a bound (residential-exit) entry cannot re-pin → buildWarmOverride throws →
+  // the navigate rejects loudly rather than silently replaying the login from the wrong exit or going cold.
+  const { gateway, opens } = makeRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com", { stickyExitId: "abcd1234" }));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll, onDatacenterIp: true,
+  });
+  await assert.rejects(c.navigate("https://example.com/"), /cannot be re-pinned|wrong network posture/i);
+  assert.equal(opens.length, 0, "fail-closed before any session opened (no cold fallback, no wrong-exit replay)");
+});
+
+test("warm-open: warm takes precedence over forceProxy (replays its captured posture, not a fresh exit)", async () => {
+  // A direct-captured entry on a forceProxy host still replays DIRECT — warm posture is authoritative
+  // (R3); it must not be overridden onto a fresh residential exit the login was never minted on.
+  const { gateway, opens } = makeRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, proxySecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll, onDatacenterIp: true, stickySuffix: "_s-{id}",
+  });
+  const snap = await c.navigate("https://example.com/", { forceProxy: true });
+  assert.equal(snap.status, 200);
+  assert.ok(opens[0]?.restoreState, "warm-open won over forceProxy");
+  assert.equal(opens[0].proxy, undefined, "direct-captured warm entry replays direct despite forceProxy");
 });

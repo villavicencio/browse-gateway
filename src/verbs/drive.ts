@@ -53,6 +53,35 @@ export function proxyOverrideFor(
 }
 
 /**
+ * Like {@link proxyOverrideFor}, but for a BOUND vault entry that MUST re-pin a SPECIFIC captured exit
+ * (R3 warm replay): returns the override ONLY when the exit is VERIFIABLY pinned, else `undefined`.
+ * `proxyOverrideFor` (via `mintStickyProxy`) returns the BASE proxy UNCHANGED when the sticky suffix is
+ * absent (or has no `{id}`, or the proxy has no password) — a rotating/unpinned exit. Restoring a
+ * logged-in session through that is the exact wrong-network-posture replay R3 forbids.
+ *
+ * Verification is STRUCTURAL, not a substring match: the pin is real iff we are on a datacenter IP, the
+ * sticky suffix is present AND carries the `{id}` placeholder, a base proxy password exists, and the
+ * minted password equals EXACTLY `basePassword + suffix-with-id`. A bare `includes(stickyExitId)` could
+ * be fooled by a base password (or static suffix) that incidentally contains the 8-hex id — reachable
+ * for operator-imported entries whose `stickyExitId` is supplied — and that is NOT a real pin. The caller
+ * ({@link buildWarmOverride}) fails closed on `undefined`.
+ */
+export function proxyOverrideForPinned(
+  secrets: SecretStore,
+  onDatacenterIp: boolean,
+  stickySuffix: string | undefined,
+  stickyExitId: string,
+): BrowserCoreOptions | undefined {
+  if (!onDatacenterIp) return undefined;
+  if (!stickySuffix || !stickySuffix.includes("{id}")) return undefined;
+  const base = proxyFromSecrets(secrets);
+  if (!base?.password) return undefined;
+  const expected = base.password + stickySuffix.replaceAll("{id}", stickyExitId);
+  const override = proxyOverrideFor(secrets, onDatacenterIp, stickySuffix, stickyExitId);
+  return override?.proxy?.password === expected ? override : undefined;
+}
+
+/**
  * True when a navigation did not land real content: no response captured (`status === null`), a
  * Chrome error page (`chrome-error://…` — a dead exit / reset socket / unreachable host that
  * produced no response, so the snapshot can inherit a stale status), a still-visible anti-bot

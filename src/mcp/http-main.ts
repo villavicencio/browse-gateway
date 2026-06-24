@@ -40,7 +40,7 @@ async function main(): Promise<void> {
   // Build the shared gateway runtime (config, secrets, vault, consumers, policy, gateway, escalation
   // posture) with every fail-closed boot guard. Identical construction is used by the on-host
   // `obscura vault login` capture (cli/vault-host.ts) so the two never drift.
-  const { gateway, secrets, policy, specs, config, onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress } =
+  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress } =
     buildGatewayRuntime(process.env, { log });
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
@@ -57,8 +57,18 @@ async function main(): Promise<void> {
     buildServer: (consumer: Consumer): ConsumerServer => {
       // One consumer-bound graph per connection: a fresh stateful drive controller + a retrieve
       // closure pinned to this consumer's token. The session pool / per-consumer cap / reaper stay
-      // GLOBAL on the gateway (do not reintroduce the e431101 per-consumer-cap race).
-      const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress });
+      // GLOBAL on the gateway (do not reintroduce the e431101 per-consumer-cap race). The vault +
+      // this consumer's id + allowlist enable U9 warm-open: a navigate to an approved host that has a
+      // stored login transparently opens a logged-in session (vault dormant → vault null → cold-only).
+      const drive = new GatewayDriveController(gateway, secrets, consumer.token, {
+        onDatacenterIp,
+        stickySuffix,
+        forceProxyHosts,
+        verifyEgress,
+        vault,
+        consumerId: consumer.id,
+        allowlist: consumer.allowlist,
+      });
       const server = createGatewayMcpServer({
         version: "0.1.0",
         drive,

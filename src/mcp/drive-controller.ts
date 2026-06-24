@@ -30,6 +30,8 @@ import {
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck } from "../verbs/index.js";
+import { buildWarmOverride } from "./vault-login.js";
+import type { VaultEntryStore } from "./vault-login.js";
 import type { DriveController } from "./server.js";
 
 /** The egress probe renders an ip-info JSON endpoint on the policy-owned approved diagnostics host
@@ -43,6 +45,13 @@ export class GatewayDriveController implements DriveController {
   #pinned = false;
   /** Whether the current session was opened proxied (vs direct) — drives reopen-after-reap + messaging. */
   #proxiedSession = false;
+  /**
+   * Canonical owner host of the current WARM (vault-restored) session, or undefined for a cold one.
+   * Set the moment a warm session opens (from its sealed `restoreState.ownerHost`); drives re-warming
+   * across an idle reap so a logged-in session is restored on reopen instead of silently downgrading
+   * to a cold (logged-out) one. Cleared on discard/close.
+   */
+  #warmHost?: string;
   readonly #gateway: Gateway;
   readonly #secrets: SecretStore;
   readonly #token: string;
@@ -54,6 +63,17 @@ export class GatewayDriveController implements DriveController {
   readonly #forceProxyHosts: readonly string[];
   /** Opt-in: on an escalation failure, probe the proxy's exit and classify residential vs datacenter. */
   readonly #verifyEgressEnabled: boolean;
+  /**
+   * Encrypted credential store (U9 warm-open), or null/undefined when the vault is dormant
+   * (BGW_VAULT_DIR unset) or this controller was constructed without vault wiring. Warm-open only
+   * activates when the vault, the consumer id, AND the allowlist are all present.
+   */
+  readonly #vault?: VaultEntryStore | null;
+  /** This controller's consumer id — one half of the vault entry key (the other is the host). */
+  readonly #consumerId?: string;
+  /** This consumer's allowlist — warm-open only restores a credential for an APPROVED host (the same
+   *  allowlist the gateway's nav guard clamps to, so the warm gate and the guard agree). */
+  readonly #allowlist?: { allows(host: string): boolean };
 
   constructor(
     gateway: Gateway,
@@ -64,6 +84,11 @@ export class GatewayDriveController implements DriveController {
       stickySuffix?: string;
       forceProxyHosts?: readonly string[];
       verifyEgress?: boolean;
+      /** Warm-open (U9): the encrypted vault, this consumer's id, and its allowlist. All three are
+       *  required for warm-open to activate; any omitted keeps every session cold (the default). */
+      vault?: VaultEntryStore | null;
+      consumerId?: string;
+      allowlist?: { allows(host: string): boolean };
     } = {},
   ) {
     this.#gateway = gateway;
@@ -73,6 +98,9 @@ export class GatewayDriveController implements DriveController {
     this.#stickySuffix = opts.stickySuffix;
     this.#forceProxyHosts = opts.forceProxyHosts ?? [];
     this.#verifyEgressEnabled = opts.verifyEgress ?? false;
+    this.#vault = opts.vault;
+    this.#consumerId = opts.consumerId;
+    this.#allowlist = opts.allowlist;
   }
 
   /**
@@ -191,6 +219,10 @@ export class GatewayDriveController implements DriveController {
     // re-runs the direct-first escalation rather than stranding the caller on a known-bad exit. We
     // surface the failure rather than swap the exit live under the page (that would lose state, KTD-5).
     await this.#ensureOpen();
+    // Capture warmth AFTER #ensureOpen (which may have RE-WARMED a reaped session): a stale warm replay
+    // must fail LOUD with the operator-recapture signal on the reopen path too — not the generic "retry
+    // for a fresh exit", which is actively wrong for a bound entry whose retry re-pins the SAME exit.
+    const warm = this.#warmHost !== undefined;
     // A reopened PROXIED session (e.g. after an idle reap) lands a fresh exit + empty profile and can
     // re-hit the CF interstitial — which needs the escalated clearance budget. The default would time
     // out mid-challenge, the very failure this feature fixes.
@@ -199,6 +231,7 @@ export class GatewayDriveController implements DriveController {
     );
     if (navFailed(snap)) {
       await this.#discardSession();
+      if (warm) throw this.#warmStaleError(url, snap.status ?? null);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
       throw new Error(
         `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
@@ -216,6 +249,17 @@ export class GatewayDriveController implements DriveController {
    * session can't swap its exit mid-flow without losing page state (KTD-5).
    */
   async #firstNavigate(url: string, forced: boolean): Promise<PageSnapshot> {
+    // Warm-open (U9): if this consumer has a stored login for the (approved) target host, open a
+    // logged-in session restored from the vault instead of a cold one. This takes precedence over BOTH
+    // the force-proxy and the direct-first escalation: a warm session replays on the EXACT exit it was
+    // captured on (R3, re-pinned inside buildWarmOverride for a bound capture; direct for a direct
+    // capture), so it must not re-roll or re-escalate the exit. Falls through to the cold path below
+    // when the vault is dormant/unwired, the host is not on the consumer's allowlist, or no entry exists.
+    const warm = this.#buildWarmOverride(new URL(url).hostname);
+    if (warm) {
+      await this.#discardSession(); // drop any pre-opened (open()'d) cold session before opening warm
+      return this.#openWarmAndNavigate(url, warm);
+    }
     // Force-proxy: skip the direct attempt entirely and go residential from the first request.
     if (forced) {
       if (this.#resolveProxyOverride() === undefined) {
@@ -286,6 +330,7 @@ export class GatewayDriveController implements DriveController {
     return this.#serialize(async () => {
       this.#pinned = false;
       this.#proxiedSession = false;
+      this.#warmHost = undefined;
       const handle = this.#handle;
       if (!handle) return;
       this.#handle = undefined;
@@ -293,12 +338,31 @@ export class GatewayDriveController implements DriveController {
     });
   }
 
-  /** Reopen the pinned session if an idle reap closed it, with the mode it committed to (direct or
-   *  proxied; rotation-safe for the proxied case). Used on the pinned one-shot path. */
+  /** Reopen the pinned session if an idle reap closed it, with the mode it committed to. A WARM session
+   *  re-warms: rebuild the sealed override (re-pinning the SAME captured exit, R3) so a reaped logged-in
+   *  session is restored rather than silently downgraded to cold. If the entry was revoked since (rebuild
+   *  → undefined), FAIL LOUD — a session that was operating as logged-in must not silently become
+   *  anonymous (the stale-warm-never-silent-cold contract). A non-warm proxied session re-resolves a
+   *  fresh exit (rotation-safe); a direct one reopens direct. */
   async #ensureOpen(): Promise<void> {
-    if (!this.#handle) {
-      await this.#openSession(this.#proxiedSession ? this.#resolveProxyOverride() : undefined);
+    if (this.#handle) return;
+    if (this.#warmHost) {
+      const warm = this.#buildWarmOverride(this.#warmHost);
+      if (warm) {
+        await this.#openSessionWarm(warm);
+        return;
+      }
+      // The warm entry was revoked/removed while this logged-in session was reaped. Fail LOUD rather
+      // than silently reopening cold (which would mask the credential loss as an ordinary anonymous
+      // page). Reset state so a DELIBERATE next navigate opens cold; this navigate ends with a clear,
+      // actionable error.
+      await this.#discardSession();
+      throw new Error(
+        "warm (logged-in) session ended: the stored credential was revoked or is no longer available — " +
+          "close this drive session and start a new one (it will open cold), or ask the operator to re-capture",
+      );
     }
+    await this.#openSession(this.#proxiedSession ? this.#resolveProxyOverride() : undefined);
   }
 
   /** Open a consumer session with the given core override (a proxied exit, or undefined for direct),
@@ -306,6 +370,80 @@ export class GatewayDriveController implements DriveController {
   async #openSession(override: BrowserCoreOptions | undefined): Promise<void> {
     this.#handle = await this.#gateway.openConsumerSession(this.#token, override);
     this.#proxiedSession = override !== undefined;
+  }
+
+  /**
+   * Build the sealed warm-open override for `host` when warm-open is fully wired (vault + consumer id +
+   * allowlist all present) AND the host is on this consumer's allowlist AND a vault entry exists for
+   * `(consumer, host)`. Returns undefined otherwise (→ cold open). The allowlist gate is the SAME one
+   * the gateway's nav guard clamps to, so we never decrypt+inject a credential for a host the session
+   * could not then navigate. `buildWarmOverride` owns ownerHost (derived from its own vault lookup, the
+   * R4/seal invariant — never a caller value) and re-pins the captured sticky exit for a bound entry.
+   */
+  #buildWarmOverride(host: string): BrowserCoreOptions | undefined {
+    if (!this.#vault || !this.#consumerId || !this.#allowlist) return undefined;
+    // This gate is deliberately the LOOSER of the two host checks: Allowlist.allows strips a leading
+    // `www.` while the vault lookup + nav clamp (canonicalizeHost, no www-strip per #21/#36) do not.
+    // Stripping only ever ADMITS more hosts to the decrypt attempt; the authoritative selection
+    // (vault.get on the exact canonical host) and the clamp agree with each other, so a www/non-www
+    // mismatch yields a cold open (no entry) or a correctly-clamped warm open — never a credential on
+    // an off-owner-navigable session. Do not "fix" this into a divergent stricter form.
+    if (!this.#allowlist.allows(host)) return undefined;
+    return (
+      buildWarmOverride(this.#vault, this.#secrets, {
+        consumerId: this.#consumerId,
+        host,
+        onDatacenterIp: this.#onDatacenterIp,
+        ...(this.#stickySuffix !== undefined ? { stickySuffix: this.#stickySuffix } : {}),
+      }) ?? undefined
+    );
+  }
+
+  /**
+   * Open a WARM (logged-in) session from a vault-built override and record its owner host so an idle
+   * reap re-warms (via {@link #ensureOpen}) rather than silently reopening cold. `#proxiedSession` is
+   * derived from the override's PROXY posture — NOT merely "an override is present" — because a
+   * direct-captured warm override carries `restoreState` but no proxy, and mis-flagging it proxied
+   * would make reopen-after-reap wrongly resolve a fresh proxy exit. The owner host comes from the
+   * sealed `restoreState.ownerHost` (the authoritative, vault-derived value), never a caller input.
+   */
+  async #openSessionWarm(override: BrowserCoreOptions): Promise<void> {
+    this.#handle = await this.#gateway.openConsumerSession(this.#token, override);
+    this.#proxiedSession = override.proxy !== undefined;
+    this.#warmHost = override.restoreState?.ownerHost;
+  }
+
+  /**
+   * Open a warm session and run the first navigate. The override is sealed and carries its own exit
+   * posture (R3), so this path does NOT escalate or re-roll on failure: a warm replay that lands
+   * blocked or logged-out means the stored login is stale/expired — operator-refresh territory
+   * (re-rolling would break the captured-exit re-pin). On failure we discard and surface a clean,
+   * actionable error rather than silently falling back to a cold (unauthenticated) session, which
+   * would mask the staleness. On success the session is pinned.
+   */
+  async #openWarmAndNavigate(url: string, override: BrowserCoreOptions): Promise<PageSnapshot> {
+    await this.#openSessionWarm(override);
+    const snap = await this.#run((s) =>
+      s.core.navigate(url, override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}),
+    );
+    if (navFailed(snap)) {
+      await this.#discardSession();
+      throw this.#warmStaleError(url, snap.status ?? null);
+    }
+    this.#pinned = true;
+    return snap;
+  }
+
+  /** The loud, actionable error for a warm replay that landed stale/blocked: the stored login is
+   *  expired or blocked and only an operator re-capture can fix it (re-rolling the exit would break
+   *  the R3 re-pin, and a bound entry re-pins the SAME captured exit on retry). Used on BOTH the
+   *  first-navigate warm path and the reopen-after-reap warm path, so the "stale warm fails LOUD"
+   *  guarantee does not depend on whether the session happened to be idle-reaped. */
+  #warmStaleError(url: string, status: number | null): Error {
+    return new Error(
+      `warm (logged-in) navigation to ${url} failed (status=${status ?? "n/a"}): the stored session ` +
+        `is likely expired or blocked — ask the operator to re-capture this credential`,
+    );
   }
 
   /**
@@ -363,6 +501,7 @@ export class GatewayDriveController implements DriveController {
     this.#handle = undefined;
     this.#pinned = false;
     this.#proxiedSession = false;
+    this.#warmHost = undefined; // a discarded session does not auto-re-warm
     if (handle) await this.#gateway.closeConsumerSession(this.#token, handle).catch(() => {});
   }
 

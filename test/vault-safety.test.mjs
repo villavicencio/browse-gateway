@@ -84,6 +84,29 @@ test("hostScopeSession: keeps only owner-host cookies + origins, drops third-par
   assert.deepEqual(scoped.origins.map((o) => o.origin), ["https://ex.com"], "off-host localStorage origin dropped");
 });
 
+test("hostScopeSession: re-scopes a parent-domain (SSO) cookie to the owner so it can't ride a sibling subresource", () => {
+  // The credential nav-clamp only clamps NAVIGATION; a subresource keeps the consumer allowlist. So a
+  // retained parent-domain cookie (.ex.com) for owner accounts.ex.com could attach to an allowed sibling
+  // subresource (static.ex.com). Pinning the Domain to the owner closes that without breaking the owner
+  // session (the Cookie value the owner server sees is unchanged) — a single-host warm session never
+  // talks to a sibling anyway. Exact-host and owner-subdomain cookies are left untouched.
+  const state = {
+    cookies: [ck("sso", ".ex.com"), ck("self", "accounts.ex.com"), ck("sub", "api.accounts.ex.com")],
+    origins: [],
+  };
+  const scoped = hostScopeSession(state, "accounts.ex.com");
+  const byName = Object.fromEntries(scoped.cookies.map((c) => [c.name, c.domain]));
+  assert.equal(byName.sso, "accounts.ex.com", "parent-domain cookie pinned to the owner (no sibling reach)");
+  assert.equal(byName.self, "accounts.ex.com", "exact-host cookie unchanged");
+  assert.equal(byName.sub, "api.accounts.ex.com", "owner-subdomain cookie unchanged (cannot reach a sibling)");
+});
+
+test("buildWarmOverride: the restored override re-scopes a parent-domain cookie to the looked-up owner host", () => {
+  const entry = { session: { cookies: [ck("sso", ".ex.com")], origins: [] }, creds: CREDS, updatedAt: 1 };
+  const override = buildWarmOverride(vaultOf(entry), new SecretStore(() => ({})), { consumerId: "atlas", host: "accounts.ex.com", onDatacenterIp: false });
+  assert.equal(override.restoreState.state.cookies[0].domain, "accounts.ex.com", "parent cookie pinned to the owner before it can reach the jar");
+});
+
 test("buildWarmOverride: a smuggled off-host cookie can NEVER reach the restored session (R4 no-exfil)", () => {
   const entry = {
     session: { cookies: [ck("sid", "ex.com"), ck("evil", "attacker.test")], origins: [] },

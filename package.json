@@ -19,6 +19,7 @@
     "validate:vault-roundtrip": "npm run build && node scripts/validate-vault-roundtrip.mjs",
     "validate:assisted-login": "npm run build && node scripts/validate-assisted-login.mjs",
     "validate:vault-login": "npm run build && node scripts/validate-vault-login.mjs",
+    "validate:vault-warm-open": "npm run build && node scripts/validate-vault-warm-open.mjs",
     "validate:vault-host-login": "npm run build && node scripts/validate-vault-host-login.mjs",
     "validate:redirect-guard": "npm run build && node scripts/validate-redirect-guard.mjs",
     "test": "npm run build && node --test test/*.test.mjs"

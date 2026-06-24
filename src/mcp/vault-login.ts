@@ -13,7 +13,7 @@
 import type { BrowserCoreOptions, StorageState } from "../browser/index.js";
 import { sealRestoreState } from "../browser/index.js";
 import type { LoginCredentials, LoginRecipe } from "../verbs/index.js";
-import { proxyOverrideFor, isValidTotpSeed } from "../verbs/index.js";
+import { proxyOverrideForPinned, isValidTotpSeed } from "../verbs/index.js";
 import { cookieBelongsToHost, hostFromUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 
@@ -152,20 +152,58 @@ export function getVaultEntry(vault: VaultEntryStore, consumerId: string, host: 
 }
 
 /**
+ * Re-scope a PARENT-DOMAIN cookie (one whose `Domain` is a dotted parent of `owner`, kept by
+ * {@link cookieBelongsToHost} for the SSO/apex case) DOWN to the owner host, so the browser can only
+ * ever send it to the owner — never to a SIBLING host under the shared parent. Without this, a restored
+ * `.example.com` cookie for owner `accounts.example.com` would also attach to an allowed sibling
+ * SUBRESOURCE (e.g. `static.example.com`): the credential nav-clamp only clamps NAVIGATION to the owner
+ * (a subresource keeps the consumer allowlist so the page can render), so a parent cookie could ride a
+ * sibling subresource off the owner host. A single-host warm session only ever talks to its clamped
+ * owner host, so narrowing `Domain` to the owner is server-transparent (the `Cookie` header VALUE is
+ * unchanged) and loses nothing the session can use. Exact-host and owner-subdomain cookies are returned
+ * unchanged — they already cannot reach a sibling.
+ */
+function clampCookieToOwner<T extends { domain?: string }>(cookie: T, owner: string): T {
+  const raw = cookie.domain ?? "";
+  const d = canonicalizeHost(raw.startsWith(".") ? raw.slice(1) : raw);
+  // owner is a strict subdomain of the (dotted) cookie domain → the cookie also reaches the parent's
+  // OTHER children (siblings). Pin it to the owner host. Mirrors cookieBelongsToHost's parent branch.
+  if (d && d !== owner && d.includes(".") && owner.endsWith("." + d)) {
+    return { ...cookie, domain: owner };
+  }
+  return cookie;
+}
+
+/**
  * Restrict a captured {@link StorageState} to the entry's owning host (R4 host-scoped no-exfil): keep
  * only the cookies and localStorage origins that {@link cookieBelongsToHost} `ownerHost`, dropping the
- * rest. `storageState()` captures the WHOLE jar — third-party analytics/CDN cookies, and any host-B
- * cookie a mis-filed/seeded blob carried — so a warm replay that injected the blob verbatim could send
- * host-B's cookie wherever host-B is reachable. This is the choke point that makes "a stored host-A
- * cookie is only ever injected into a host-A session" true: it is a FILTER, not an assertion, because
- * a real login jar legitimately contains third-party cookies that must simply be left out, not treated
- * as fatal. The owner-host cookies that remain are exactly the durable identity for this entry.
+ * rest, AND re-scope any retained parent-domain cookie to the owner ({@link clampCookieToOwner}) so it
+ * cannot ride a sibling subresource. `storageState()` captures the WHOLE jar — third-party analytics/CDN
+ * cookies, and any host-B cookie a mis-filed/seeded blob carried — so a warm replay that injected the
+ * blob verbatim could send host-B's cookie wherever host-B is reachable. This is the choke point that
+ * makes "a stored host-A cookie is only ever injected into a host-A session AND only ever sent to host-A"
+ * true: it is a FILTER (+ domain clamp), not an assertion, because a real login jar legitimately contains
+ * third-party cookies that must simply be left out, not treated as fatal. The owner-host cookies that
+ * remain are exactly the durable identity for this entry.
+ *
+ * ACCEPTED RESIDUAL (operator-ratified, 2026-06-24): a domain-scoped cookie retained for the owner can
+ * still be sent to the owner's OWN SUBDOMAINS on an allowed subresource (the credential nav-clamp pins
+ * NAVIGATION to the exact owner host, but a subresource keeps the consumer allowlist so the page can
+ * render). This stays within the owner's subtree — never a sibling, parent, or third party (those are
+ * closed above) — and is accepted under the "owner-hosts trusted" model (Option B; the egress sidecar is
+ * the boundary), the same residual class as the WebSocket one. Scope a warm host's consumer allowlist to
+ * the owner host (avoid a broad `*.parent` wildcard) to close it operationally. Full exact-owner-host
+ * cookie lockdown (host-only restore + drop owner-subdomain cookies) is tracked as optional hardening;
+ * it is deliberately NOT done here because it breaks legitimate cross-subdomain authenticated XHR.
  */
 export function hostScopeSession(state: StorageState, ownerHost: string): StorageState {
+  const owner = canonicalizeHost(ownerHost);
   return {
     ...state,
-    cookies: (state.cookies ?? []).filter((c) => cookieBelongsToHost(c.domain, ownerHost)),
-    origins: (state.origins ?? []).filter((o) => cookieBelongsToHost(hostFromUrl(o.origin), ownerHost)),
+    cookies: (state.cookies ?? [])
+      .filter((c) => cookieBelongsToHost(c.domain, owner))
+      .map((c) => clampCookieToOwner(c, owner)),
+    origins: (state.origins ?? []).filter((o) => cookieBelongsToHost(hostFromUrl(o.origin), owner)),
   };
 }
 
@@ -181,8 +219,10 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
  * (R3). A DIRECT capture (no bound exit) replays DIRECT — its durable cookies are not IP-bound, and
  * proxying a session captured on the direct IP would needlessly burn residential egress (R7) and
  * change the exit from the one it was minted on. So a proxy is re-pinned ONLY when the entry carries
- * a bound `stickyExitId` (and a proxy is configured + on a datacenter IP). The stored `session` was
- * already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound clearance is
+ * a bound `stickyExitId`. A BOUND entry whose exit cannot be re-pinned here (no residential proxy
+ * configured, or not on a datacenter IP) FAILS CLOSED (throws) — it is never downgraded to a direct
+ * replay, which would present the stored auth from the wrong network posture (R3). The stored `session`
+ * was already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound clearance is
  * replayed here.
  *
  * The owner host is the host the entry is LOOKED UP by — this function does the vault `get` itself, so
@@ -202,9 +242,24 @@ export function buildWarmOverride(
   const ownerHost = canonicalizeHost(args.host);
   const entry = vault.get<VaultEntry>(args.consumerId, ownerHost);
   if (!entry) return null;
-  const proxyOverride = entry.stickyExitId
-    ? proxyOverrideFor(secrets, args.onDatacenterIp, args.stickySuffix, entry.stickyExitId)
-    : undefined;
+  let proxyOverride: BrowserCoreOptions | undefined;
+  if (entry.stickyExitId) {
+    // R3 FAIL-CLOSED: a BOUND entry was captured on a specific residential sticky exit and MUST be
+    // re-pinned to exactly it. proxyOverrideForPinned returns undefined unless the exit is VERIFIABLY
+    // pinned — covering not just "no proxy / not on a datacenter IP" but also "proxy configured yet no
+    // sticky suffix", where the base (rotating) proxy would otherwise pass a naive truthiness check.
+    // Replaying logged-in auth through the direct/current OR a rotating exit presents the WRONG network
+    // posture (stale/blocked session or an account-risk event). Refuse rather than downgrade.
+    proxyOverride = proxyOverrideForPinned(secrets, args.onDatacenterIp, args.stickySuffix, entry.stickyExitId);
+    if (!proxyOverride) {
+      throw new Error(
+        "warm-open: this credential is bound to a residential exit that cannot be re-pinned here " +
+          "(needs a residential proxy + BGW_ON_DATACENTER_IP + a BGW_PROXY_STICKY_SUFFIX that pins the " +
+          "exit) — refusing to replay it from the wrong network posture; fix the proxy config, or " +
+          "re-capture the credential direct",
+      );
+    }
+  }
   return {
     restoreState: sealRestoreState(hostScopeSession(entry.session, ownerHost), ownerHost),
     ...(proxyOverride ?? {}),

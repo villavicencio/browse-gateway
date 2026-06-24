@@ -147,16 +147,55 @@ test("buildWarmOverride: a DIRECT-captured entry (no bound exit) replays direct 
   assert.deepEqual(buildWarmOverride(vaultOf(entry), secrets, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true, stickySuffix: "_session-{id}" }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
 });
 
-test("buildWarmOverride: warm session is direct (state only) when no proxy is configured", () => {
+test("buildWarmOverride: a BOUND entry FAILS CLOSED when no proxy is configured (never a wrong-exit replay, R3)", () => {
   const bare = new SecretStore(() => ({}));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  assert.deepEqual(buildWarmOverride(vaultOf(entry), bare, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
+  assert.throws(
+    () => buildWarmOverride(vaultOf(entry), bare, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true }),
+    /cannot be re-pinned|wrong network posture/i,
+    "a bound entry must refuse rather than downgrade to a direct (wrong-exit) replay",
+  );
 });
 
-test("buildWarmOverride: no proxy when not on a datacenter IP, even with proxy configured", () => {
+test("buildWarmOverride: a BOUND entry FAILS CLOSED when not on a datacenter IP (cannot re-pin the captured exit)", () => {
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
   const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
-  assert.deepEqual(buildWarmOverride(vaultOf(entry), secrets, { consumerId: "atlas", host: "ex.com", onDatacenterIp: false, stickySuffix: "_session-{id}" }), { restoreState: { state: SESSION, ownerHost: "ex.com" } });
+  assert.throws(
+    () => buildWarmOverride(vaultOf(entry), secrets, { consumerId: "atlas", host: "ex.com", onDatacenterIp: false, stickySuffix: "_session-{id}" }),
+    /cannot be re-pinned|wrong network posture/i,
+  );
+});
+
+test("buildWarmOverride: a BOUND entry FAILS CLOSED when a proxy is configured but NO sticky suffix pins the exit", () => {
+  // The deeper fail-open: proxy + datacenter but no BGW_PROXY_STICKY_SUFFIX → proxyOverrideFor returns the
+  // BASE (rotating) proxy, which a naive truthiness check would accept → wrong-exit replay. Must fail closed.
+  const noSuffix = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
+  assert.throws(
+    () => buildWarmOverride(vaultOf(entry), noSuffix, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true }), // no stickySuffix
+    /cannot be re-pinned|wrong network posture|STICKY_SUFFIX/i,
+  );
+});
+
+test("buildWarmOverride: a BOUND entry FAILS CLOSED even if the base proxy password contains the exit id (no incidental-substring pin)", () => {
+  // Structural pin check: a base password coincidentally containing the stored 8-hex id (reachable for
+  // operator-imported entries) must NOT be accepted as a re-pin when no {id} suffix actually applied it.
+  const collide = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pre-abcd1234-x" }));
+  const entry = { session: SESSION, creds: CREDS, stickyExitId: "abcd1234", updatedAt: 1 };
+  assert.throws(
+    () => buildWarmOverride(vaultOf(entry), collide, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true }), // no stickySuffix
+    /cannot be re-pinned|wrong network posture/i,
+  );
+});
+
+test("buildWarmOverride: a DIRECT entry (no bound exit) still replays state-only when no proxy — that is correct, not a downgrade", () => {
+  const bare = new SecretStore(() => ({}));
+  const entry = { session: SESSION, creds: CREDS, updatedAt: 1 }; // no stickyExitId
+  assert.deepEqual(
+    buildWarmOverride(vaultOf(entry), bare, { consumerId: "atlas", host: "ex.com", onDatacenterIp: true }),
+    { restoreState: { state: SESSION, ownerHost: "ex.com" } },
+    "a direct capture has no exit to re-pin, so state-only is the intended posture (not a fail-open)",
+  );
 });
 
 test("capture drops IP-bound challenge tokens; the durable cookie + localStorage survive capture→vault→warm (PR #31 P1)", async () => {
