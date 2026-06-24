@@ -1,128 +1,107 @@
-# HANDOFF — 2026-06-23 (afternoon) — Phase 2 credential vault COMPLETE (U8a + U8b merged)
+# HANDOFF — 2026-06-23 (evening) — U7 vault safety rails BUILT, PR #35 review-clean (4 P1 rounds), ready to merge
 
-Continued straight on from the morning handoff (Phase 2 capture path U5→U6d merged, #28–#32).
-This session built the **entire U8 operator front door** — the `obscura vault` CLI — and with it
-**Phase 2 of the credential vault is feature-complete on `main`**: capture → strip → encrypt →
-warm-replay (U5–U6d) plus the full operator surface (status / import / revoke / login). Two PRs
-shipped and merged (#33, #34); four external review rounds total, all resolved before merge.
-The vault remains **fully dormant in prod** — nothing is live until it's activated (see Gotchas).
+Continued straight on from the afternoon handoff (Phase 2 vault complete, U5→U8b on `main`). This
+session built **Phase 3 / U7 — the credential-vault safety rails** end to end on branch
+`feat/vault-u7-safety-rails` (**PR #35, OPEN**), then drove it through **four external review rounds**
+(all P1s) plus an internal 6-dimension adversarial review. Re-review **PASSED**; the PR is clean and
+**ready for your merge**. U7 is **rails-only** — the consumer warm-open path stays unwired (that's U9),
+which is now **gated on a redirect-bypass fix** the review surfaced. **467 tests pass, typecheck clean.**
 
 ## What We Built
 
-Both squash-commits are on `main` (tip `f43431c`). Test suite **446 passing**; two real-browser
-gates green (`validate:vault-login`, `validate:vault-host-login`); typecheck clean.
+Six commits on `feat/vault-u7-safety-rails` (tip `c9d97fe`); PR #35.
 
-- **#33 — U8a: `obscura vault status | import | revoke`** (squash `c4fc4c8`). The no-browser half
-  of the front door, entirely over the admin-SSH spine — **zero new network surface**.
-  - `src/cli/vault.ts` (Mac side) — owns no crypto/browser; marshals a request and ships it to the
-    on-host entrypoint via `docker exec -i <container> node dist/cli/vault-host.js`, renders the JSON.
-  - `src/cli/vault-host.ts` (runs INSIDE the gateway container, inherits its `BGW_VAULT_DIR` + `0600`
-    key — the KEK never leaves the box): `status` (keyless listing + boot-blocked warning), `import`
-    (strips IP-bound cookies, manifest-first guard, post-write fresh-instance decrypt verify), `revoke`
-    (crypto-shred).
-  - New keyless `listVaultEntries(dir)` in `src/security/vault-store.ts` (backs `status` without the KEK);
-    `VaultStore.list()` delegates to it.
-  - `src/cli/args.ts` generalized — single-value flags (`consumer/host/session/recipe/creds/exit`) store
-    last-value strings; `--allow` keeps comma-split accumulation via a new `multi` FlagSpec.
-  - Tests +20 (cli-args routing, cli-vault marshalling with a fake shell asserting secrets never hit
-    argv, vault-host run as a REAL subprocess vs a temp vault + 0600 key + manifest).
-
-- **#34 — U8b: `obscura vault login` (live on-host capture)** (squash `f43431c`). Drives an assisted
-  login + TOTP on-host into the vault. **Effort: max.**
-  - **Load-bearing refactor:** new `src/mcp/runtime.ts` `buildGatewayRuntime(env, {log, secrets?,
-    policyEgress?})` factors the gateway boot (config → secrets → vault → solver → consumers →
-    pool-sizing guard → policy → gateway → escalation posture → sticky-suffix guard) out of
-    `http-main.ts`; **http-main now calls it (behavior-preserving — all prior tests green).**
-  - `src/cli/vault-host.ts login` builds a THROWAWAY Gateway via the runtime, looks up the consumer
-    token, runs `makeGatewayLoginRunner` + `captureLoginToVault`, fresh-decrypt-verifies, and tears the
-    Gateway down in `finally`. `src/cli/vault.ts vaultLogin` ships `{recipe,creds}` on stdin (180s
-    watchdog, second-Chrome note, direct-vs-escalated reporting).
-  - Real-browser gate `scripts/validate-vault-host-login.mjs` (`npm run validate:vault-host-login`):
-    fixture login + 2FA driven THROUGH `buildGatewayRuntime` → capture → strip `cf_clearance`/`__cf_bm`
-    → warm replay lands authenticated.
-  - Tests +12 then +6 (runtime construction/guards, login subprocess glue without Chrome, login
-    marshalling, force-proxy + sticky-suffix regressions).
-  - **Two review rounds resolved on-branch:** P2 force-proxy parity (`047f3b5`), P1 honest R3 binding
-    (`a366886`) — see Decisions.
+- **`df9b984` — U7 four rails.**
+  - **Rail 1 (host-scoped no-exfil):** `cookieBelongsToHost(domain, ownerHost)` in `src/security/url.ts`
+    (dependency-free; exact / subdomain / dotted-parent SSO-apex; single-label + bare-TLD owner rejected;
+    ASCII/punycode-folded). `hostScopeSession` filters a warm jar to its owner. A credentialed session's
+    NAVIGATION is clamped to the owner host via new `PolicyEngine.guardForCredentialHost` (`src/policy/index.ts`)
+    installed by `Gateway.openConsumerSession` (`src/gateway/index.ts`).
+  - **Rail 2 (audit):** new `session-open`/`open` `AuditRecord` (`src/policy/audit.ts`) carrying only
+    consumerId + host (both redaction-safe), emitted at `openConsumerSession`.
+  - **Rail 3 (origination boundary):** `src/policy/origination.ts` — always-on policy deny of
+    account-creation / money-movement navigations by host+path, in `guardFor` after egress / before allowlist,
+    gated on `isNavigationRequest`. Public defaults + `BGW_ORIGINATION_DENY_HOSTS` / `_PATHS` env extension.
+  - **Rail 4 (secret-leak kill-gate):** browserless `runSecretLeakCheck` leg in `scripts/validate-stealth.mjs`
+    (positive control, no real secret) proving stored values never survive the redaction surfaces.
+  - Tests: new `test/vault-safety.test.mjs`; gap doc `docs/solutions/architecture-patterns/vault-observability-redaction-gap.md`.
+- **`a76dc8f` — review round 1 P1s.** Origination matched the RAW `URL.pathname` (so `/sign%75p` evaded
+  `/signup`) → now matches the **decoded + server-normalized** path (`decodedPathVariants` + `serverNormalizedPath`:
+  iterated percent-decode, strip matrix-params `;`, truncate NUL `%00`). Added the credentialed nav clamp.
+- **`b9c1f0c` / `75daced` — docs.** Tracked the server-redirect bypass (below) as a P1 follow-up that **gates U9**.
+- **`df8bc90` — review round 3 P1.** Made `restoreState` an atomic `{ state, ownerHost }` (`RestoreState`);
+  clamp + audit derive from `restoreState.ownerHost` — removed the separate `credentialHost` param.
+- **`c9d97fe` — review round 4 P1 (the load-bearing one).** `buildWarmOverride(vault, secrets, {consumerId, host, …})`
+  now does the vault `get` ITSELF, so the owner **is** the looked-up host (no caller `ownerHost` to mismatch).
+  `RestoreState` is **sealed** (`sealRestoreState`/`isSealedRestore`, non-enumerable brand in `src/browser/types.ts`);
+  `openConsumerSession` REFUSES a restoreState that isn't sealed. Updated `src/browser/index.ts` (exports),
+  the two warm validators, and the unit tests.
 
 ## Decisions Made
 
-- **`vault login` trigger = SSH → on-host process** (operator-chosen via AskUserQuestion). The CLI
-  `docker exec`s a `vault-host` entrypoint that builds its OWN throwaway Gateway in the container.
-  **Zero new network surface; stays on the admin-SSH operator plane** (like keys/connect/status).
-- **Dropped `--apply`/pre-swap-smoke from the vault CLI** (deliberate deviation from the written plan).
-  A vault entry write is **immediately live** — the running gateway re-reads the sealed file per
-  warm-session open under the same KEK, so there's nothing to "activate" via a re-create, and a bad
-  entry fails ONE warm-session open (fail-closed), never the boot. The fresh-process-verify lesson is
-  satisfied instead by a **post-write fresh-instance decrypt** inside the entrypoint.
-- **U8 split into U8a (no-browser) + U8b (login)** for size/risk, matching the U6 split discipline.
-- **`buildGatewayRuntime` extraction** justified by `login` being its second consumer in the same PR
-  (no speculative abstraction). Two seams: **`policyEgress`** is a TEST-ONLY in-process hook (both prod
-  callers omit it → real `isBlockedEgressHost`; the in-process gate passes `()=>false` to reach a
-  loopback fixture); **`secrets`** lets vault-host reuse its one redaction sink so KEK + tokens + creds
-  all scrub through it.
-- **P2 fix (`047f3b5`):** the login-runner now honors `BGW_FORCE_PROXY_HOSTS` — a forced host SKIPS the
-  direct attempt and begins on a pinned exit (mirrors drive's `#firstNavigate`), forced-without-proxy
-  fails loud. The pinned-exit retry loop is now reachable from both the forced-from-start and
-  escalate-after-block paths.
-- **P1 fix (`a366886`):** a proxied capture now REQUIRES a pinnable proxy (proxy creds + onDatacenterIp
-  + `BGW_PROXY_STICKY_SUFFIX`). Without a sticky suffix, `mintStickyProxy` ignores the id → the exit
-  rotates → a stored `stickyExitId` would be a false R3 claim. So forced-without-suffix AND
-  block-without-suffix both fail loud; the pinned-exit loop is reachable only when the suffix is set,
-  so **every recorded `stickyExitId` genuinely pins**.
+- **U7 is RAILS-ONLY (operator-approved via AskUserQuestion).** The consumer warm-open path is NOT wired here
+  — that's U9. Rails are correct-by-construction; tests/validators exercise the seams directly.
+- **Origination boundary = honest guardrail, not airtight.** The policy guard can't see POST bodies or
+  form-field types (`NavigationRequest` is url/host only), so money-movement is host-only and account-creation
+  is path-only. Deny by **host+path, never "has a password field"** — so it never blocks the sanctioned logins
+  the vault exists for. Documented as such in `origination.ts`.
+- **Rail 4 covers log + audit surfaces only;** the observability-output (rendered HTML/screenshots) + egress-payload
+  redaction gap is documented (`vault-observability-redaction-gap.md`), not closed.
+- **Warm-restore owner binding (the 4-round arc):** owner must come from the vault LOOKUP and be SEALED into the
+  restore value, so it can be neither omitted, set as a separate param, nor passed to a builder as a free input.
+  `buildWarmOverride` does the lookup; the gateway rejects unsealed restores.
+- **Accepted residual (reviewer signed off):** `sealRestoreState` is exported across the browser→mcp layer, so it's
+  technically callable with a forged owner. `buildWarmOverride` is the sole sanctioned producer that binds owner to
+  the lookup; the browser layer can't depend on the vault to enforce more. Reviewer: "an in-process API trust
+  boundary, not a remotely reachable bypass… not a blocker."
 
-## What Didn't Work / Ruled Out
+## What Didn't Work
 
-- **In-process operator endpoint on the running gateway** (the "fold into http-main" idea the prior
-  handoff floated for the login trigger) — RULED OUT. It expands the consumer-facing service's surface
-  with an operator control plane, cutting against the admin-SSH-only / KTD-5 doctrine. The SSH →
-  on-host-process model was chosen instead.
-- **A subprocess real-browser gate for `vault login`** — not feasible. The egress filter blocks ALL
-  local IPs (loopback + RFC1918) as anti-SSRF, so a real subprocess (prod egress on) can't reach a
-  local fixture without an env bypass = a prod footgun. Hence the gate runs IN-PROCESS via the
-  test-only `policyEgress` hook; the subprocess arg/stdin/token-lookup glue is unit-tested without Chrome.
-- **P1 option-b (store the capture as honestly-unbound when no suffix)** — rejected. `buildWarmOverride`
-  only proxies via a bound `stickyExitId`, so an unbound forced entry would replay DIRECT — wrong for a
-  force-proxy host. Requiring a pinnable proxy (option-a) is the coherent fix.
+- **Re-filtering a warm jar by a caller-supplied clamp host (the round-3 "validate it matches" idea) — RULED OUT.**
+  A `.example.com` parent cookie legitimately *belongs to* `evil.example.com` (a subdomain), so re-filtering an
+  `accounts` jar against `ownerHost: evil` KEEPS the parent cookie → still leaks. The owner had to be lookup-bound,
+  not validated.
+- **Colocating owner with state but keeping a `buildWarmOverride` `ownerHost` param (round-3 fix) — INSUFFICIENT.**
+  It just moved the mismatch into `buildWarmOverride`'s input (reviewer reproduced it). Fixed in round 4 by doing
+  the lookup inside `buildWarmOverride`.
+- **Folding the server-redirect fix into U7 — declined (operator-approved).** It's high-blast-radius core-surgery
+  (`route.fetch({maxRedirects:0})` + per-hop guard) that must clear the container stealth/proxy/drive gates, so it's
+  its own unit, not a blind drive-by in this PR.
 
 ## What's Next
 
-1. **Phase 3 / U7 — safety rails** (the only vault work left). Prioritized:
-   - **Host-scoped no-exfil:** a stored host-A cookie must only ever be injected into a host-A-guarded
-     session (the warm-replay path must enforce the same host-scoping the capture had).
-   - **Audit every credentialed session** (which consumer, which host, when).
-   - **Hard financial/origination deny-rule** (a policy deny, below the verb layer).
-   - **Secret-leak kill-gate probe:** prove no stored value ever appears in logs/observability/egress —
-     model it on the WebRTC probe leg in `validate-stealth.mjs`.
-   - Plan: `docs/plans/2026-06-22-002-credential-vault-plan.local.md` (U7 section).
-2. **Activation** (separate, deploy-side): set `BGW_VAULT_DIR` (on a persistent volume — see Gotchas)
-   + a `0600` `BGW_VAULT_KEY_FILE`, re-create the container, confirm `vault: ready` in the boot log.
-   Until then the entire vault is dormant.
-3. **Parked, unrelated:** the PerimeterX-defeat spike (`docs/plans/2026-06-22-001-*.local.md`) and the
-   durability/external-users brainstorm (D1+D4). Neither blocks the vault.
+1. **Merge PR #35** (your call — review is clean, 467 green, typecheck clean). Then it's on `main` as the last
+   piece of the vault before U9.
+2. **Paste the round-4 reviewer reply** (it was pbcopy'd to your clipboard; also at
+   `…/scratchpad/u7-reply-round4.md`) into the PR thread, if not already done.
+3. **U9 — wire the consumer warm-open path**, BUT it is **GATED on the server-redirect fix** below. When wiring,
+   `openConsumerSession` derives clamp+audit from the sealed `restoreState.ownerHost` automatically — use
+   `buildWarmOverride(vault, secrets, {consumerId, host, …})` (it does the lookup; returns null if absent).
+4. **CRITICAL FOLLOW-UP — close the nav-guard server-3xx-redirect bypass**
+   (`docs/solutions/architecture-patterns/nav-guard-redirect-bypass.md`). `route.continue()` follows a server
+   redirect chain inside Chrome WITHOUT re-invoking the route handler, so a redirected hop bypasses the credential
+   clamp AND the base allowlist/egress guards (pre-existing, gateway-wide). Fix = `route.fetch({maxRedirects:0})` +
+   per-hop guard check in `setNavigationGuard` (`src/browser/patchright-core.ts`). Needs the container kill-gate +
+   stealth + proxy + drive validation (can't run on the Mac).
+5. **Close the observability-output / egress-payload redaction gap** (`vault-observability-redaction-gap.md`).
+6. **Activate the vault** (separate, deploy-side): `BGW_VAULT_DIR` (PERSISTENT VOLUME) + `0600` `BGW_VAULT_KEY_FILE`,
+   re-create container, confirm `vault: ready` in the boot log.
 
 ## Gotchas & Watch-outs
 
-- **Vault is fully DORMANT in prod** — nothing the vault does is live until `BGW_VAULT_DIR` + a `0600`
-  `BGW_VAULT_KEY_FILE` are set. The CLI reports "vault is not enabled" until then.
-- **ACTIVATION GOTCHA: `BGW_VAULT_DIR` MUST be a persistent volume.** Otherwise every imported/captured
-  entry vanishes on the next container re-create (deploy). Pin this down before activating.
-- **`vault login` launches a SECOND headful Chrome** in the container (transient). Proven safe:
-  `userDataDir` defaults to `""` → a fresh ephemeral profile per launch (no singleton-lock clash with
-  the live gateway), and `DISPLAY=:99` is an image `ENV` so `docker exec` inherits the running Xvfb.
-  Run it at low gateway load (the CLI prints a note); the throwaway Gateway is shut down in `finally`.
-- **`buildGatewayRuntime`'s `policyEgress` is TEST-ONLY.** Both prod callers (http-main, vault-host)
-  must pass NO override → real egress. If you add a third caller, do NOT pass `policyEgress`.
-- **Force-proxy + sticky-suffix coupling:** a proxied vault capture is refused unless
-  `BGW_PROXY_STICKY_SUFFIX` is set (so the bound exit can be re-pinned on warm replay, R3). If `vault
-  login` for a forced host fails with "BGW_PROXY_STICKY_SUFFIX is unset", that's the guard, not a bug.
-- **Branch BEFORE committing when on `main` after a merge** (bit twice in the prior session). This
-  session branched cleanly for both PRs.
-- **Resolve the reviewer-reply commit hash (`git rev-parse`) BEFORE composing the reply** — no
-  `<this commit>` placeholders. Every reviewer-facing reply was pbcopy'd in the same step (operator
-  relays rounds manually); I did NOT auto-post `gh pr comment`.
-- **Public repo** — codenames only (atlas/vault/argus); no real ids/hosts/paths in source/commits/PRs.
-  Both PRs' diffs were scanned clean of fleet identifiers and control/separator bytes.
-- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing).
-- **This HANDOFF commit is on local `main` but NOT pushed** — per the standing main-push gate, the
-  operator pushes `main`. `git push origin main` when ready.
+- **U9 MUST NOT activate before the redirect-bypass fix lands** — a live warm session makes the redirect hop a live
+  cookie-exfil vector against a real stored credential.
+- **`openConsumerSession` now THROWS on an unsealed `restoreState`** ("must be produced by the vault layer"). Any
+  warm session must build its override via `buildWarmOverride` / `sealRestoreState`. Direct `createBrowserCore`
+  callers (the roundtrip/assisted validators) pass `restoreState` to the CORE, which is seal-agnostic — that's fine.
+- **`buildWarmOverride` signature changed** to `(vault, secrets, {consumerId, host, onDatacenterIp, stickySuffix})`
+  and returns `BrowserCoreOptions | null`. The old `(entry, secrets, {ownerHost})` form is gone.
+- **The sealed `RestoreState` brand is non-enumerable** — survives object-spread but is invisible to
+  `deepEqual`/`JSON.stringify` (so existing deepEqual tests still pass). Don't deep-clone a restoreState or the brand
+  is lost; the gateway checks the seal at entry, before any merge.
+- **Vault still FULLY DORMANT in prod.** Activation gotcha stands: `BGW_VAULT_DIR` must be a persistent volume or
+  entries vanish on the next container re-create.
+- **Public repo** — codenames only (atlas/vault/argus); the whole U7 diff was scanned clean of fleet identifiers
+  (origination's payment-processor hosts are generic/public, intentional).
+- **Untracked `.claude/` + `AGENTS.md`** left as-is (pre-existing, every U7 commit explicitly excluded them).
+- **PR #35 is on a feature branch, already pushed.** `main` is unchanged this session (no main-push needed).
