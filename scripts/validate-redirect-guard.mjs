@@ -50,8 +50,10 @@ const server = http.createServer((req, res) => {
     // a page on the owner host that embeds an OFF-HOST subresource (page renders, subresource blocked)
     case "/with-img": return html(`owner page<img src="${otherBase}/img.png">`);
     case "/img.png": served.img++; res.writeHead(200, { "Content-Type": "image/png" }); return res.end("x");
-    // a page that opens a cross-host popup (auto-attach must guard the popup's navigation)
-    case "/popup-opener": return html(`<script>window.open(${JSON.stringify(`${otherBase}/popup-target`)});</script>opener`);
+    // a page that opens a cross-host popup ON CLICK (auto-attach must guard the popup's navigation).
+    // Headful Chrome popup-BLOCKS a script-driven window.open with no user gesture, so the open is
+    // wired to a click the validator performs — otherwise the popup never opens and the check is vacuous.
+    case "/popup-opener": return html(`<button id="openpop" onclick="window.open('${otherBase}/popup-target')">open</button>`);
     case "/popup-target": served.popup++; return html("POPUP LANDED (should never happen)");
     // a page that spawns a dedicated Worker (a separate auto-attached target) which fetches off-host:
     // proves the worker's request is guarded AND that Fetch interception does not deadlock the worker.
@@ -132,6 +134,7 @@ try {
   // opened or simply hadn't navigated yet within the wait.
   const popupAt = guardLog.length;
   await core.navigate(owner("/popup-opener"));
+  await core.click({ target: "#openpop" }); // a real gesture so headful Chrome actually opens the popup
   await sleep(1500); // give the popup time to open + attempt its blocked navigation
   const sawPopupNav = guardLog.slice(popupAt).some((n) => n.host === OTHER && n.isNavigationRequest);
   check("cross-host popup NOT served (auto-attach guards new pages)", served.popup === 0);

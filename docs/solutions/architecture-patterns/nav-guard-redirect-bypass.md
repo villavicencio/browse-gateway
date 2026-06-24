@@ -126,7 +126,10 @@ Surfaced by the multi-lens review of the fix; none is a regression vs the old `c
 - **`validate:stealth` is now guard-on.** It previously ran the *unguarded* `render()` path and so could
   not prove the CDP-Fetch backend's fingerprint effect; it now installs an allow-all guard on every leg
   (prod parity), with `BGW_STEALTH_NO_GUARD=1` for a guard-off A/B baseline. This is the load-bearing
-  Q2 fingerprint check.
+  Q2 fingerprint check. **Q2 RESULT (2026-06-23, local colima — amd64 via Rosetta, headful under Xvfb):
+  guard-on `validate:stealth` PASS** (CF 2/2, DataDome 2/2; webrtc/webgl/secret-leak/negative-control
+  all PASS) → the CDP-Fetch interception does not regress the fingerprint. A final pass on the prod box
+  (deployed image, real residential egress) is the pre-U9-activation check.
 
 ## Why it is its own unit (not folded into U7)
 

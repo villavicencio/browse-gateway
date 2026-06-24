@@ -426,10 +426,13 @@ export class PatchrightBrowserCore implements BrowserCore {
         await cdp.send("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" });
       }
     } catch (err) {
-      // Usually benign: the target detached or a redirect superseded the request, so the
-      // InterceptionId is already invalid. But a genuine send failure can leave the request paused
-      // until navigationTimeoutMs, so surface it (typed code only, no URL/secret) rather than swallow.
-      process.stderr.write(`[browse-gateway] fetch ${decision} send failed (${errCode(err)})\n`);
+      // During teardown (close() detaches the session) a send naturally fails — expected and benign,
+      // so stay quiet. Outside teardown, the target detached or a redirect superseded the request
+      // (invalid InterceptionId) is usually benign too, but a genuine send failure can leave a request
+      // paused until navigationTimeoutMs, so surface it (typed code only, no URL/secret).
+      if (!this.#closing) {
+        process.stderr.write(`[browse-gateway] fetch ${decision} send failed (${errCode(err)})\n`);
+      }
     }
   }
 
@@ -745,13 +748,13 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   async close(): Promise<void> {
-    // Flip fail-closed FIRST: from here #onRequestPaused fails any still-paused request, because the
-    // Fetch.disable below would otherwise release it by CONTINUING (a redirect hop paused at the close
-    // instant must not be auto-allowed past the guard). Tear the session down before the context so no
+    // Flip fail-closed FIRST so #onRequestPaused stops allowing during teardown. Then DETACH the
+    // session (not Fetch.disable): Fetch.disable releases every still-paused request by CONTINUING it
+    // (auto-allow — a redirect hop paused at the close instant must not slip the guard), whereas detach
+    // drops the interception and the paused requests die with the context.close() that follows. No
     // Fetch consumer outlives Chrome.
     this.#closing = true;
     if (this.#cdpGuardSession) {
-      await this.#cdpGuardSession.send("Fetch.disable").catch(() => {});
       await this.#cdpGuardSession.detach().catch(() => {});
       this.#cdpGuardSession = undefined;
     }
