@@ -12,6 +12,11 @@
 #   BGW_CONSUMERS_HOST_PATH host path to consumers.json (mounted read-only at the container path
 #                           the env file's BGW_CONSUMERS_MANIFEST points to).
 # Optional env (sensible defaults; override per host):
+#   BGW_VAULT_HOST_PATH     host path to the persistent vault dir (entries + the 0600 master key),
+#                           bind-mounted READ-WRITE at /run/vault. Set this to activate the credential
+#                           vault (U9 warm-open); the env file's BGW_VAULT_DIR + BGW_VAULT_KEY_FILE must
+#                           then point UNDER /run/vault (e.g. /run/vault/entries, /run/vault/kek).
+#                           Unset → no mount, vault stays dormant (a no-op for non-vault hosts).
 #   BGW_DOCKER_HOST         DOCKER_HOST for the rootless daemon (default: unix:///run/user/$(id -u)/docker.sock)
 #   BGW_CONTAINER           container name (default: browse-gateway-http)
 #   BGW_BIND_ADDR           host bind address (default: 127.0.0.1 — loopback only; never 0.0.0.0)
@@ -34,6 +39,16 @@ HOST_PORT="${BGW_HOST_PORT:-8080}"
 [ -r "$BGW_ENV_FILE" ] || { echo "launch-http: env file not readable: $BGW_ENV_FILE" >&2; exit 1; }
 [ -r "$BGW_CONSUMERS_HOST_PATH" ] || { echo "launch-http: consumers.json not readable: $BGW_CONSUMERS_HOST_PATH" >&2; exit 1; }
 
+# Optional credential-vault mount (U9). When BGW_VAULT_HOST_PATH is set, bind-mount the persistent
+# vault dir (entries + the 0600 master key) READ-WRITE at /run/vault — the gateway writes entries on
+# capture, and the key file's owner-only perms are preserved from the host (loadVaultKey refuses a
+# group/world-readable key). Unset → no mount; the vault stays dormant (openVault returns null).
+vault_args=()
+if [ -n "${BGW_VAULT_HOST_PATH:-}" ]; then
+  [ -d "$BGW_VAULT_HOST_PATH" ] || { echo "launch-http: BGW_VAULT_HOST_PATH is not a directory: $BGW_VAULT_HOST_PATH" >&2; exit 1; }
+  vault_args+=(-v "${BGW_VAULT_HOST_PATH}:/run/vault")
+fi
+
 # Load the secrets/config, then forward EVERY BGW_* var by name (pass-by-name picks up the
 # sourced values). Listing names — not values — keeps secrets out of argv and the process table,
 # and avoids hardcoding consumer IDs in this committed file (new consumers are forwarded automatically).
@@ -55,5 +70,6 @@ docker run -d --name "$CONTAINER" \
   --pids-limit="${BGW_PIDS_LIMIT:-512}" --shm-size="${BGW_SHM_SIZE:-1g}" \
   -p "${BIND_ADDR}:${HOST_PORT}:8080" \
   -v "${BGW_CONSUMERS_HOST_PATH}:/run/consumers.json:ro" \
+  ${vault_args[@]+"${vault_args[@]}"} \
   "${env_args[@]}" \
   "$BGW_DEPLOY_IMAGE" node dist/mcp/http-main.js
