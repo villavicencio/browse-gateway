@@ -1,91 +1,97 @@
-# HANDOFF — 2026-06-24 (morning, PST)
+# HANDOFF — 2026-06-24 (afternoon, PST)
 
-This session **built, review-hardened, and MERGED U9 — consumer warm-open** (vault-restored
-logged-in drive sessions), the headline credential-vault feature. It was driven end-to-end through
-the **first live run of the Codex review-loop SOP**: a 6-round autonomous Claude↔Codex
-adversarial-review loop that caught **four real security bugs** my own self-review missed, converging
-to **Codex `approve`, 0 findings**. U9 is on `main`; the credential vault is still **DORMANT in prod**
-(no behavior change until activated — steps below).
+This session took **U9 — consumer warm-open** from a fresh build all the way to **live + validated in
+prod**: built it, hardened it through a 6-round autonomous Claude↔Codex review loop, merged it,
+activated the credential vault on the prod host, and proved an end-to-end warm-open with a real
+credential (atlas @ www.totalwine.com). The one thing that *didn't* clear is **PerimeterX** on Total
+Wine — which is a known separate problem, not a vault gap. **Next session's explicit goal: kill the
+PerimeterX press-&-hold once and for all.**
 
-## What We Shipped (all on `main`)
+## What We Built / Shipped (all on `main`, synced at `58537ed`)
 
-- **U9 — consumer warm-open** (squash `f8df7cd`, from a 7-commit branch). Implicit auto-warm at
-  `GatewayDriveController.#firstNavigate`: when a consumer navigates to a host that's on its allowlist
-  AND has a vault entry, it opens a **logged-in** session instead of a cold one; otherwise it falls
-  through to the existing cold/escalation path. No new MCP param. Warm takes precedence over
-  force-proxy/direct-first (R3 — must replay on the exact captured exit). Single-host nav-clamp (cross-host
-  is blocked). Policy stays below the verb layer — the trigger only SELECTS a sealed override; all
-  enforcement (seal refusal, owner-host nav clamp, origination boundary, host-scoped jar, credentialed
-  audit) is unchanged. Both entrypoints (`http-main` prod, `main.ts` stdio rollback) wire
-  vault + consumerId + allowlist; `main.ts` gained a lockstep `openVault` so the rollback launcher
-  doesn't diverge (cold while prod is warm).
-- **Deploy mount** (`b9628de`): `scripts/deploy/launch-http.sh` gained an optional
-  `BGW_VAULT_HOST_PATH` bind-mount → `/run/vault` (rw). Unset → no mount, vault dormant — a no-op for
-  non-vault hosts, safe to land ahead of activation.
-- **Runtime gate** `scripts/validate-vault-warm-open.mjs` (`npm run validate:vault-warm-open`): drives
-  the REAL consumer trigger (`controller.navigate`, never `buildWarmOverride`) through a real gateway +
-  headful Chrome. **In-container 14/14, full coverage.** **499 unit tests green.**
-
-## The Codex Loop Earned Its Keep — 4 real bugs, each fixed + re-gated
-
-My self-review (a 3-lens workflow) was clean. Codex found these:
-
-1. **R1 (high) — parent-domain SSO cookie → sibling-subresource exfil.** The nav-clamp clamps only
-   NAVIGATION; subresources keep the consumer allowlist. A retained `.example.com` cookie for owner
-   `accounts.example.com` could ride an allowed sibling subresource (`static.example.com`) off-host.
-   **Fix:** re-scope a retained parent-domain cookie to the owner host at restore
-   (`hostScopeSession`/`clampCookieToOwner`) — server-transparent, breaks nothing.
-2. **R2 (med) — revoked credential silently downgraded a logged-in session to cold.** On
-   reopen-after-reap, a revoked entry silently reopened cold (anonymous) with no consumer-visible error.
-   **Fix:** loud terminal error; never a silent cold fallback.
-3. **R3 (high, three rounds) — bound credential replayed from the WRONG exit.** A bound (residential-exit)
-   credential could replay from (a) the direct/datacenter exit when no proxy, (b) a ROTATING exit when a
-   proxy was configured but no sticky suffix, or (c) an exit "verified" only by an incidental substring in
-   the base password. **Fix:** `proxyOverrideForPinned` verifies the pin **STRUCTURALLY** (datacenter + a
-   `{id}`-bearing sticky suffix + base password; minted password == `base + suffix-with-id`).
-   `buildWarmOverride` **fails closed** otherwise.
-4. **Round 6 → `approve`, 0 findings.**
+- **U9 consumer warm-open** — `f8df7cd` (squash of a 7-commit branch). Implicit auto-warm at
+  `GatewayDriveController.#firstNavigate`; warm > force-proxy/direct-first; single-host nav-clamp; both
+  entrypoints wire vault+consumerId+allowlist. Hardened via 6 Codex rounds (4 real bugs caught: parent-
+  cookie sibling-subresource exfil, revoked-entry silent-cold-downgrade, and the R3 bound-exit fail-open
+  in 3 layers → `proxyOverrideForPinned` structural check). 499 unit tests; runtime gate
+  `scripts/validate-vault-warm-open.mjs` 14/14 in-container. (Full build detail in the prior handoff /
+  git log.)
+- **Deploy mount** — `b9628de`: `scripts/deploy/launch-http.sh` gained optional `BGW_VAULT_HOST_PATH`
+  bind-mount → `/run/vault`.
+- **Deploy fix** — `58537ed`: the vault-mount block read `BGW_VAULT_HOST_PATH` **before** sourcing the
+  env file → mounted a stale/empty path (entries but no key) → `vault: /run/vault/kek ENOENT` → pre-swap
+  smoke aborted **twice** (prod never broke — the gate/smoke/abort safety chain worked). Moved the block
+  to **after** `. "$BGW_ENV_FILE"`. This was the only real prod-activation blocker.
+- **Vault ACTIVATED in prod** — `vault: ready`, live on image `d91f2b1e`, consumers `[atlas, vault,
+  argus]`, `datacenter=true sticky=true` (bound creds re-pin). Host vault at `/home/node/vault/{entries,
+  kek}` (kek 0600 base64-of-32B, node-owned); env file
+  `/home/node/.hermes/.openclaw-shim/.browse-gateway-env` got `BGW_VAULT_DIR=/run/vault/entries`,
+  `BGW_VAULT_KEY_FILE=/run/vault/kek`, `BGW_VAULT_HOST_PATH=/home/node/vault`.
+- **Warm-open VALIDATED LIVE** — imported a real Total Wine credential for atlas
+  (`obscura vault import`, 118 cookies, bound exit `3e7662d5`) and drove `atlas → navigate
+  www.totalwine.com/account`. The gateway opened a **bound warm session** (re-pinned exit, restored
+  cookies, routed residential; navigate returned a page, **not** the R3 fail-closed error → warm fired).
+  Vault→warm-open→consumer pipeline confirmed in prod.
+- **Onboarding helpers** (local, `~/totalwine-onboarding/`): `capture.sh`, `creds.json`, `RUNBOOK.md`.
 
 ## Decisions Made
 
-- **Trigger style: implicit auto-warm** (operator-confirmed). Navigate to a warm host → logged-in
-  session, no flag/verb. The credentialed-session audit makes it traceable.
-- **Cross-host: single-host warm** (operator-confirmed). The nav-clamp blocks an off-owner navigate;
-  use a new drive session for another host.
-- **Owner-subtree cookie residual: ACCEPTED** (operator-ratified). A domain-scoped owner cookie can
-  still reach the owner's OWN subdomains on a subresource — within the owner subtree, never a
-  sibling/parent/third party (those are closed). Accepted under the trusted-owner model (Option B;
-  egress sidecar is the boundary), same class as the WS residual. Documented at `hostScopeSession`.
-  Mitigation: scope a warm host's consumer allowlist to the owner host (avoid `*.parent`). Full
-  exact-host cookie lockdown is tracked as optional hardening (it breaks legitimate cross-subdomain XHR).
+- **Total Wine warm-open is blocked by PerimeterX at the EDGE, not by the vault.** PX throws the
+  Press & Hold *before* the page renders, independent of the login cookie. The replay had a new
+  residential IP (exit `3e7662d5` ≠ capture IP) and no PX token (we strip the IP-bound ones), so it got a
+  fresh challenge. → It's the deferred press-&-hold spike, not a U9 problem.
+- **Capture-through-same-exit is only marginal** for PX (the clearance token is IP-bound + seconds-lived
+  → nothing useful to replay; same-IP buys a little trust, no guarantee). The real fix is defeating the
+  press-&-hold.
+- **Owner-subtree cookie residual: accepted** (operator-ratified, earlier this session) — documented at
+  `hostScopeSession`; full exact-host lockdown is optional hardening.
 
-## What's Next
+## What Didn't Work
 
-1. **Activate the vault in prod** (U9 is inert until then). Short version: provision a persistent
-   `~/vault/entries` dir + a `0600` base64 KEK (`openssl rand -base64 32`); add
-   `BGW_VAULT_DIR=/run/vault/entries`, `BGW_VAULT_KEY_FILE=/run/vault/kek`,
-   `BGW_VAULT_HOST_PATH=~/vault` to the on-host env file; re-scp `launch-http.sh`; deploy
-   (`gh workflow run deploy-http.yml`); confirm the boot log shows `vault: ready`; then
-   `obscura vault login` to capture a credential; verify a consumer warm-opens.
-2. **Pre-activation gates** (in-container, as `node`): `validate:vault-warm-open` (14/14),
-   `validate:stealth` with `BGW_PROXY_*`, `validate:redirect-guard`, `validate:drive`.
-3. **Hardening follow-ups (none blocking):** WS exfil close via `Network.webSocketCreated` (Option B);
-   full exact-host cookie lockdown; narrow-allowlist `retrieve` redirect hard-fail; cross-origin OOPIF
-   container fixture; one in-prod `validate-stealth` `BGW_PROXY_*` run.
+- **Playwright-launched browsers can't clear PX** — `playwright open/codegen` (even `--channel=chrome`)
+  sets automation flags (`navigator.webdriver`, `--enable-automation`) → PX fails the Press & Hold
+  *forever* ("Please try again"), even for a human. Fix: capture with a **plain** Chrome (no automation
+  flags) via `~/totalwine-onboarding/capture.sh` (manual login + `playwright-core connectOverCDP`
+  read-only storageState dump), then `obscura vault import`.
+- **Running the capture on the prod host** — headless, no `$DISPLAY` → the capture must run on the Mac.
+- **`BGW_VAULT_HOST_PATH` read before env-file sourcing** — see `58537ed` above.
+
+## What's Next  → KILL PERIMETERX (the explicit next-session goal)
+
+Plan: `docs/plans/2026-06-22-001-spike-defeat-perimeterx-press-hold.local.md`. First, cheapest experiments:
+
+1. **Stop over-stripping `_pxvid`.** `stripIpBoundTokens` (`src/mcp/vault-login.ts`,
+   `IP_BOUND_COOKIE_PATTERNS` → `/^_px/i`) strips **all** `_px*`, including `_pxvid` — PX's *long-lived
+   visitor/device id*, not the short IP-bound clearance. That makes every replay look like a brand-new
+   visitor. **Keep `_pxvid`; strip only the clearance (`_px3`/`_pxhd`/`pxcts`/`_px`/`_px2`).** Cheapest
+   thing to try; may meaningfully cut re-challenges. (Re-verify the exact PX cookie taxonomy first.)
+2. **Capture-through-the-same-residential-exit** so capture-IP == replay-IP (route the `capture.sh`
+   Chrome through the IPRoyal sticky exit you'll bind, import with that same `--exit`). Test whether PX
+   then waves the residential session through.
+3. **Programmatic press-&-hold defeat** (the hard core of the spike): solve/replay the PX human-challenge
+   on the drive path. Note: CapSolver tier today does reCAPTCHA/hCaptcha/Turnstile, **not** PX
+   press-&-hold. PX iframe markers + the 200-OK false-negative are already documented
+   (`docs/solutions/.../perimeterx-200-iframe-challenge-false-negative.md`).
+4. **(Optional clean proof of U9, deferred this session):** import + warm-open on a **non-PX** login site
+   to *see* warm-open hand back a logged-in page with nothing masking it.
 
 ## Gotchas & Watch-outs
 
-- **BOUND credentials need the sticky suffix.** If a capture escalated to a residential exit, the entry
-  is bound; warm-open **fails closed** (loud) unless `BGW_PROXY_STICKY_SUFFIX` (with `{id}`) +
-  `BGW_ON_DATACENTER_IP=1` + proxy are set. That's the R3 guard working — don't "fix" it by dropping the
-  binding. Direct captures don't need it.
-- **Vault dir MUST persist** and the **key file MUST be `0600`.** Entries-on-disk + missing key fails
-  boot closed by design; a container re-create without the bind-mount loses entries.
-- **Codex loop mechanics:** run `codex-companion.mjs adversarial-review --wait` inside a **detached
-  harness bg task** — plain `--background` got killed by the 2-minute shell timeout mid-handshake and
-  orphaned the worker in a frozen "running" state. Verify a job is alive by its **pid + log mtime**, not
-  just the status field (which can go stale).
-- **Pool floor:** a held warm session consumes a session slot — re-verify `BGW_MAX_SESSIONS` /
-  `perConsumerMax` cover every consumer after adding warm load.
-- **Public repo** — codenames/placeholders only; the deploy script is fleet-clean (host paths via env).
-- Local `main` == `origin/main` (tip `b9628de`); nothing unpushed.
+- **Rootless Docker on prod:** gateway runs as host **`node`** (container-root → node via userns). Vault
+  files MUST be node-owned (run host steps as node, **no sudo**, or the container can't read the key).
+  `docker`/paths are per-user → use absolute `/home/node/...` and `sudo -iu node`.
+- **`obscura` CLI** drops off PATH after an nvm node-version switch (global bin lost). Re-`npm link` in
+  the repo. Capture/import run on the **Mac**; `obscura` docker-execs into the prod container.
+- **Manifest reload:** `consumers.json` is read at boot — an allowlist change needs a container
+  **re-create** (redeploy), not a restart (bind-mount inode + frozen env). atlas is already `allow=["*"]`
+  (allow-all), so adding a host there is a no-op.
+- **Pool floor is exact:** `maxSessions=7 = 3 consumers × perConsumerMax=2 + 1`; no headroom. Warm
+  sessions are held longer → bump `BGW_MAX_SESSIONS` before a 4th consumer or on `SESSION_LIMIT`.
+- **Deploy safety chain is real and load-bearing:** gate → pre-swap smoke → swap → verify → auto-rollback
+  aborted both bad deploys without touching prod. Trust it; read the `--log-failed` `fatal:`/`smoke:` line.
+- **IPRoyal sticky suffix** (verified vs live docs): `_country-us_session-{id}_lifetime-30m` (params in
+  the PASSWORD; session = 8 alphanumeric; lifetime 1s–7d). Bound warm creds need
+  `BGW_PROXY_STICKY_SUFFIX`(with `{id}`)+`BGW_ON_DATACENTER_IP=1`+proxy or warm-open **fails closed** (R3).
+- **Public repo** — codenames/placeholders only; the prod host paths above stay out of committed source.
+- Local `main` == `origin/main` (`58537ed`); nothing unpushed. Untracked `.claude/` + `AGENTS.md`
+  pre-existing, left as-is.
