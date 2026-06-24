@@ -128,8 +128,15 @@ Surfaced by the multi-lens review of the fix; none is a regression vs the old `c
   (prod parity), with `BGW_STEALTH_NO_GUARD=1` for a guard-off A/B baseline. This is the load-bearing
   Q2 fingerprint check. **Q2 RESULT (2026-06-23, local colima — amd64 via Rosetta, headful under Xvfb):
   guard-on `validate:stealth` PASS** (CF 2/2, DataDome 2/2; webrtc/webgl/secret-leak/negative-control
-  all PASS) → the CDP-Fetch interception does not regress the fingerprint. A final pass on the prod box
-  (deployed image, real residential egress) is the pre-U9-activation check.
+  all PASS) → the CDP-Fetch interception does not regress the fingerprint.
+  **PROD-DIRECT GOTCHA:** running `validate:stealth` *direct* on the prod box (`node@`, deployed image)
+  FAILS the CF leg (udemy/glassdoor 403) — this is **datacenter-IP reputation, NOT a fingerprint
+  regression**. Proof: a controlled, interleaved guard-on vs guard-off A/B on a clean residential IP
+  cleared CF **12/12 = 12/12** (incl. udemy, which 403'd direct on prod), and DataDome cleared guard-on
+  on the prod IP. Production never serves CF from the bare datacenter IP — it egresses through a
+  residential proxy. So a meaningful prod fingerprint check must route the CF leg through a residential
+  exit (`validate:stealth` wires no proxy today — an optional `BGW_PROXY_*` path would make it
+  representative).
 
 ## Why it is its own unit (not folded into U7)
 
