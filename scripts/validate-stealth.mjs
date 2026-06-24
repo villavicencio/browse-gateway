@@ -19,6 +19,7 @@
  *   BGW_SKIP_NEGATIVE_CONTROL=0  "1" to skip the headless negative control
  */
 import { createBrowserCore, assess } from "../dist/browser/index.js";
+import { proxyFromSecrets } from "../dist/verbs/index.js";
 import { SecretStore, redactSecrets } from "../dist/security/index.js";
 import { RedactingAuditSink, InMemoryAuditSink } from "../dist/policy/index.js";
 
@@ -49,6 +50,16 @@ const NEGATIVE_URL =
 
 const coreOpts = { channel: CHANNEL, noSandbox: NO_SANDBOX };
 
+// Optional: route the anti-bot legs (CF/DataDome) through the configured residential proxy when
+// BGW_PROXY_* is set. Production serves CF via a residential exit, NEVER the bare host IP — so a
+// direct run on a datacenter host fails CF on IP reputation alone (not a fingerprint signal), making
+// a prod-direct gate a false negative. With the proxy set this becomes a REPRESENTATIVE fingerprint
+// check; unset, it stays direct (the default — local/CI runs on a clean residential IP need no proxy).
+// The webrtc/webgl/negative-control legs stay DIRECT by design: they are IP-independent fingerprint
+// checks, a proxy could perturb ICE gathering, and the negative control must not be helped by a clean
+// exit IP. proxyFromSecrets reads BGW_PROXY_URL/_USERNAME/_PASSWORD; never printed (secret).
+const PROXY = proxyFromSecrets(new SecretStore());
+
 // Production installs a navigation guard on every session BEFORE navigating, so all real anti-bot
 // traffic egresses THROUGH the CDP-Fetch interception (setNavigationGuard). Engage that same path
 // here (an allow-all guard changes nothing about which requests go out — it only turns on the
@@ -63,8 +74,8 @@ async function guardedCore(opts) {
 }
 
 /** One cold attempt: fresh context → render → classify. Returns the assessment + result. */
-async function attempt(url, { headless = false } = {}) {
-  const core = await guardedCore({ ...coreOpts, headless });
+async function attempt(url, { headless = false, proxy } = {}) {
+  const core = await guardedCore({ ...coreOpts, headless, ...(proxy ? { proxy } : {}) });
   try {
     const result = await core.render(url, {
       clearanceTimeoutMs: CLEARANCE_TIMEOUT_MS,
@@ -92,7 +103,7 @@ async function runGroup(category, urls) {
   let passes = 0;
   for (let i = 0; i < ATTEMPTS; i++) {
     const url = urls[i % urls.length];
-    const { result, assessment } = await attempt(url);
+    const { result, assessment } = await attempt(url, { proxy: PROXY });
     const ok = assessment.verdict === "GO";
     if (ok) passes++;
     logAttempt(`${i + 1}/${ATTEMPTS} ${ok ? "PASS" : "FAIL"}`, url, result, assessment);
@@ -280,6 +291,9 @@ async function main() {
   console.log(
     `channel=${CHANNEL || "patched-chromium"} noSandbox=${NO_SANDBOX} ` +
       `attempts=${ATTEMPTS} required=${REQUIRED} clearanceTimeout=${CLEARANCE_TIMEOUT_MS}ms`,
+  );
+  console.log(
+    `anti-bot legs: ${PROXY ? "via configured proxy (representative)" : "DIRECT — set BGW_PROXY_* to route CF/DataDome through a residential exit (a datacenter-direct CF fail is IP reputation, not a fingerprint signal)"}`,
   );
 
   const cloudflare = await runGroup("cloudflare", GROUPS.cloudflare);
