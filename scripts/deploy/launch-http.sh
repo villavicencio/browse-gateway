@@ -39,16 +39,6 @@ HOST_PORT="${BGW_HOST_PORT:-8080}"
 [ -r "$BGW_ENV_FILE" ] || { echo "launch-http: env file not readable: $BGW_ENV_FILE" >&2; exit 1; }
 [ -r "$BGW_CONSUMERS_HOST_PATH" ] || { echo "launch-http: consumers.json not readable: $BGW_CONSUMERS_HOST_PATH" >&2; exit 1; }
 
-# Optional credential-vault mount (U9). When BGW_VAULT_HOST_PATH is set, bind-mount the persistent
-# vault dir (entries + the 0600 master key) READ-WRITE at /run/vault — the gateway writes entries on
-# capture, and the key file's owner-only perms are preserved from the host (loadVaultKey refuses a
-# group/world-readable key). Unset → no mount; the vault stays dormant (openVault returns null).
-vault_args=()
-if [ -n "${BGW_VAULT_HOST_PATH:-}" ]; then
-  [ -d "$BGW_VAULT_HOST_PATH" ] || { echo "launch-http: BGW_VAULT_HOST_PATH is not a directory: $BGW_VAULT_HOST_PATH" >&2; exit 1; }
-  vault_args+=(-v "${BGW_VAULT_HOST_PATH}:/run/vault")
-fi
-
 # Load the secrets/config, then forward EVERY BGW_* var by name (pass-by-name picks up the
 # sourced values). Listing names — not values — keeps secrets out of argv and the process table,
 # and avoids hardcoding consumer IDs in this committed file (new consumers are forwarded automatically).
@@ -60,6 +50,18 @@ env_args=()
 while IFS='=' read -r name; do
   case "$name" in BGW_*) env_args+=(-e "$name") ;; esac
 done < <(compgen -v)
+
+# Optional credential-vault mount (U9). MUST come AFTER sourcing BGW_ENV_FILE above — that file is where
+# BGW_VAULT_HOST_PATH is defined; reading it earlier mounts a stale/empty value (or nothing) and the key
+# file ends up missing inside the container (the smoke would fail with /run/vault/kek ENOENT). When set,
+# bind-mount the persistent vault dir (entries + the 0600 master key) READ-WRITE at /run/vault — the
+# gateway writes entries on capture, and the key file's owner-only perms are preserved from the host
+# (loadVaultKey refuses a group/world-readable key). Unset → no mount; the vault stays dormant.
+vault_args=()
+if [ -n "${BGW_VAULT_HOST_PATH:-}" ]; then
+  [ -d "$BGW_VAULT_HOST_PATH" ] || { echo "launch-http: BGW_VAULT_HOST_PATH is not a directory: $BGW_VAULT_HOST_PATH" >&2; exit 1; }
+  vault_args+=(-v "${BGW_VAULT_HOST_PATH}:/run/vault")
+fi
 
 echo "launch-http: (re)creating ${CONTAINER} on ${BIND_ADDR}:${HOST_PORT} from ${BGW_DEPLOY_IMAGE}"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
