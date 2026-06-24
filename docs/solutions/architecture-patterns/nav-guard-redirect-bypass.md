@@ -65,6 +65,13 @@ while (res is 3xx with Location) {
 return route.fulfill({ response: res });
 ```
 
+## Gating
+
+**This fix must land before U9 activation.** Once the consumer warm-open path is wired (U9), a
+credentialed session is live, and the server-redirect hop becomes a live cookie-exfil vector against a
+real stored credential. U9 must not be activated in prod until this redirect bypass is closed (and
+validated against the container gates). The U7 credential clamp narrows but does not remove the vector.
+
 ## Why it is its own unit (not folded into U7)
 
 - **High blast radius:** it changes how *every* request in the gateway is fulfilled
