@@ -108,39 +108,44 @@ export class Gateway {
   async openConsumerSession(
     token: string,
     coreOverrides?: BrowserCoreOptions,
-    opts?: { diagnostics?: boolean; credentialHost?: string },
+    opts?: { diagnostics?: boolean },
   ): Promise<string> {
     const policy = this.#requirePolicy();
     const consumer = policy.authenticate(token);
     const session = await this.#sessions.acquire(coreOverrides, { consumerId: consumer.id });
     try {
+      // The credential owner host travels WITH the restored state (`restoreState.ownerHost`), so a
+      // credentialed (warm-replay) session is DEFINED by its restored state — there is no separate,
+      // omittable/mismatchable `credentialHost` parameter. If a credential is restored, its nav clamp
+      // is derived from the exact host the cookies were scoped to.
+      const credentialHost = coreOverrides?.restoreState?.ownerHost;
       // A diagnostics probe (the opt-in egress check) is guarded to the policy-owned approved host
       // set ONLY — never the consumer's allowlist — so a restrictive allowlist can't block a
       // service-internal probe and the probe can reach nothing else. The host set lives in the policy
       // (the caller only flips this flag), so a caller can't widen what "diagnostics" may reach.
-      // A credentialed (warm-replay) session clamps NAVIGATION to the credential's owner host (R4
-      // no-exfil) — so a retained parent-domain cookie can't ride a navigation to a sibling host the
-      // consumer's allowlist would otherwise permit. Both extra guards are strictly narrower than the
-      // consumer's; a cold session keeps the plain consumer guard.
+      // A credentialed session clamps NAVIGATION to the credential's owner host (R4 no-exfil) — so a
+      // retained parent-domain cookie can't ride a navigation to a sibling host the consumer's
+      // allowlist would otherwise permit. Both extra guards are strictly narrower than the consumer's;
+      // a cold session keeps the plain consumer guard.
       const guard = opts?.diagnostics
         ? policy.guardForDiagnostics(consumer)
-        : opts?.credentialHost
-          ? policy.guardForCredentialHost(consumer, opts.credentialHost)
+        : credentialHost
+          ? policy.guardForCredentialHost(consumer, credentialHost)
           : policy.guardFor(consumer);
       await session.core.setNavigationGuard(guard);
       // R4/R18: a credentialed (warm-replay) session opens with a stored credential RESTORED into the
       // jar — audit it attributably the moment it is guarded and ready. Only the consumer id + owning
       // host are recorded (both non-secret; host is scrubbed by the redacting sink anyway); the stored
       // credential/cookie values are never touched. A cold drive session (and the cold login-capture
-      // session, which mints rather than restores auth) passes no `credentialHost` and emits nothing
-      // here, keeping the trail signal-dense.
-      if (opts?.credentialHost) {
+      // session, which mints rather than restores auth) carries no restoreState and emits nothing here,
+      // keeping the trail signal-dense.
+      if (credentialHost) {
         policy.audit.record({
           ts: Date.now(),
           consumerId: consumer.id,
           action: "session-open",
           decision: "open",
-          host: opts.credentialHost,
+          host: credentialHost,
           reason: "credentialed session",
         });
       }

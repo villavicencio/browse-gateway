@@ -184,10 +184,13 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
  * already token-filtered at write time ({@link stripIpBoundTokens}), so no IP-bound clearance is
  * replayed here.
  *
- * `ownerHost` is the host the entry is keyed on (the lookup key the caller resolved it by). The restored
- * state is {@link hostScopeSession}-filtered to it (R4 no-exfil): only owner-host cookies/origins are
- * ever injected, so a third-party or smuggled off-host cookie in the blob can never ride into the
- * session. It is REQUIRED, not optional — every warm-open must be host-scoped, enforced by the type.
+ * `ownerHost` is the host the entry is keyed on (the lookup key the caller resolved it by). It does
+ * double duty, ATOMICALLY: the restored state is {@link hostScopeSession}-filtered to it (R4 no-exfil —
+ * only owner-host cookies/origins are ever injected) AND it is carried on the returned
+ * {@link RestoreState} as `ownerHost`, which the gateway clamps the session's navigation to. Because
+ * the same value both filters the jar and bounds navigation — and travels WITH the state, not as a
+ * separate `openConsumerSession` parameter — a caller cannot omit the clamp or point it at a different
+ * (sibling) host than the cookies were scoped to. It is REQUIRED, enforced by the type.
  */
 export function buildWarmOverride(
   entry: VaultEntry,
@@ -197,5 +200,8 @@ export function buildWarmOverride(
   const proxyOverride = entry.stickyExitId
     ? proxyOverrideFor(secrets, opts.onDatacenterIp, opts.stickySuffix, entry.stickyExitId)
     : undefined;
-  return { restoreState: hostScopeSession(entry.session, opts.ownerHost), ...(proxyOverride ?? {}) };
+  return {
+    restoreState: { state: hostScopeSession(entry.session, opts.ownerHost), ownerHost: opts.ownerHost },
+    ...(proxyOverride ?? {}),
+  };
 }

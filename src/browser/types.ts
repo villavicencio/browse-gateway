@@ -57,6 +57,20 @@ export interface StorageState {
   origins: StorageStateOrigin[];
 }
 
+/**
+ * A warm-restore value bound atomically to its OWNER HOST — the single authoritative host the restored
+ * `state` belongs to. Carrying the owner WITH the state (rather than as a separate parameter alongside
+ * it) is a safety invariant: the gateway clamps the credentialed session's navigation to exactly this
+ * `ownerHost` (R4 no-exfil), so the host the cookies were scoped to and the host the session may
+ * navigate can never diverge or be omitted by a caller. Build it via the vault's `buildWarmOverride`,
+ * which sets `ownerHost` to the entry's host and filters `state` to it.
+ */
+export interface RestoreState {
+  state: StorageState;
+  /** The authoritative owner host the `state` belongs to; the gateway clamps navigation to it. */
+  ownerHost: string;
+}
+
 export interface BrowserCoreOptions {
   /**
    * Strict headless. Defaults to `false` (headful) because the spike proved strict
@@ -85,11 +99,12 @@ export interface BrowserCoreOptions {
    * `addCookies` and per-origin localStorage via an origin-guarded init script, so the first
    * navigation is already logged-in. Applied AFTER `launchPersistentContext`, like the runtime
    * `solver` (it is not a launch arg). A vault session pairs this with a clean ephemeral
-   * `userDataDir` (`""`) so the throwaway profile can't shadow the seeded state. Concept-agnostic
-   * at this layer — the "vault" meaning lives above the browser core; here it is just state to
-   * restore. Absent = a cold, stateless session (the default).
+   * `userDataDir` (`""`) so the throwaway profile can't shadow the seeded state. The core injects
+   * the `.state`; the bound `.ownerHost` is the authoritative host the gateway clamps the session's
+   * navigation to (R4 no-exfil — owner travels with the state, never a separate caller param).
+   * Absent = a cold, stateless session (the default).
    */
-  restoreState?: StorageState;
+  restoreState?: RestoreState;
   /**
    * Injected CAPTCHA solver for the interactive drive path: when set, the core auto-solves a
    * detected, blocking interactive CAPTCHA (reCAPTCHA/Turnstile/hCaptcha) during its post-action

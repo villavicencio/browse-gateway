@@ -110,7 +110,7 @@ try {
 
   // --- Warm replay through a FRESH gateway session built from the stored entry.
   const override = buildWarmOverride(entry, secrets, { onDatacenterIp: false, ownerHost: "127.0.0.1" });
-  const handle = await gateway.openConsumerSession(TOKEN, override, { credentialHost: "127.0.0.1" });
+  const handle = await gateway.openConsumerSession(TOKEN, override); // clamp derives from override.restoreState.ownerHost
   try {
     const snap = await gateway.useConsumerSession(TOKEN, handle, (s) => s.core.navigate(`http://127.0.0.1:${srv.port}/dashboard`, { clearanceTimeoutMs: 3000 }));
     check("warm replay through the gateway lands authenticated (durable cookie restored)", /AUTHENTICATED DASHBOARD/.test(`${snap.title}\n${snap.tree}`));

@@ -18,6 +18,7 @@ export type {
   ProxyConfig,
   RenderOptions,
   RenderResult,
+  RestoreState,
   StorageState,
   StorageStateCookie,
   StorageStateOrigin,

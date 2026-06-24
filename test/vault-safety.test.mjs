@@ -89,10 +89,11 @@ test("buildWarmOverride: a smuggled off-host cookie can NEVER reach the restored
   };
   const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: false, ownerHost: "ex.com" });
   assert.deepEqual(
-    override.restoreState.cookies.map((c) => c.name),
+    override.restoreState.state.cookies.map((c) => c.name),
     ["sid"],
     "only the owning-host cookie is injected; the off-host cookie is filtered out before it can reach the jar",
   );
+  assert.equal(override.restoreState.ownerHost, "ex.com", "the restored state carries its authoritative owner host");
 });
 
 test("cross-consumer: an entry stored for one consumer is never readable as another (injection-layer ownership)", () => {
@@ -138,7 +139,7 @@ test("Rail 2: a credentialed open emits a session-open audit record (consumer + 
   const { factory } = makeFactory();
   const gw = Gateway.create(config(3), factory, policy);
 
-  const handle = await gw.openConsumerSession("tok", { restoreState: SESSION }, { credentialHost: "ex.com" });
+  const handle = await gw.openConsumerSession("tok", { restoreState: { state: SESSION, ownerHost: "ex.com" } });
   const rec = audit.records.find((r) => r.action === "session-open");
   assert.ok(rec, "a session-open record was emitted");
   assert.equal(rec.decision, "open");
@@ -151,7 +152,7 @@ test("Rail 2: a credentialed open emits a session-open audit record (consumer + 
   await gw.closeConsumerSession("tok", handle);
 });
 
-test("Rail 2: a COLD open (no credentialHost) emits NO session-open record — only credentialed sessions are on the trail", async () => {
+test("Rail 2: a COLD open (no restored state) emits NO session-open record — only credentialed sessions are on the trail", async () => {
   const audit = new InMemoryAuditSink();
   const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["ex.com"] }]), audit });
   const { factory } = makeFactory();
@@ -281,13 +282,15 @@ test("Rail 1: guardForCredentialHost is never WIDER than the consumer allowlist 
   assert.equal(guard(navReq("other.com", "/")), "block", "an owner host outside the consumer allowlist is still blocked");
 });
 
-test("Rail 1+2: openConsumerSession with credentialHost installs the owner-host-clamped guard AND audits the open", async () => {
+test("Rail 1+2: a restored session DERIVES its clamp + audit from restoreState.ownerHost (no separate, omittable param)", async () => {
   const audit = new InMemoryAuditSink();
   const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["*.example.com"] }]), audit });
   const { factory, cores } = makeFactory();
   const gw = Gateway.create(config(3), factory, policy);
 
-  const handle = await gw.openConsumerSession("tok", { restoreState: SESSION }, { credentialHost: "accounts.example.com" });
+  // The ONLY way to open a warm session is to pass restoreState, which carries its ownerHost — there is
+  // no separate credentialHost arg to omit or point elsewhere. Clamp + audit both derive from it.
+  const handle = await gw.openConsumerSession("tok", { restoreState: { state: SESSION, ownerHost: "accounts.example.com" } });
   const guard = cores[0].guard; // the guard installed on the session's core
   assert.equal(guard(navReq("accounts.example.com", "/")), "allow");
   assert.equal(guard(navReq("evil.example.com", "/")), "block", "sibling blocked by the credential clamp, not just the consumer allowlist");
@@ -296,6 +299,31 @@ test("Rail 1+2: openConsumerSession with credentialHost installs the owner-host-
     "the credentialed open is on the audit trail",
   );
   await gw.closeConsumerSession("tok", handle);
+});
+
+test("Rail 1: the clamp host can NEVER diverge from the restored jar's owner (omitted/mismatched-host regression)", async () => {
+  const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "atlas", token: "tok", allow: ["*.example.com"] }]) });
+  const { factory, cores } = makeFactory();
+  const gw = Gateway.create(config(3), factory, policy);
+
+  // buildWarmOverride binds the filtered jar AND the ownerHost to the SAME value, atomically — a caller
+  // resolving an entry for accounts.example.com cannot produce a warm override that clamps to a sibling.
+  const entry = { session: { cookies: [ck("apex", ".example.com")], origins: [] }, creds: CREDS, updatedAt: 1 };
+  const override = buildWarmOverride(entry, new SecretStore(() => ({})), { onDatacenterIp: false, ownerHost: "accounts.example.com" });
+  assert.equal(override.restoreState.ownerHost, "accounts.example.com");
+
+  // Opening it: there is no second host parameter. The retained `.example.com` parent cookie is in the
+  // jar, but the clamp (derived from ownerHost) blocks navigating to the sibling it would otherwise ride to.
+  const handle = await gw.openConsumerSession("tok", override);
+  const guard = cores[0].guard;
+  assert.equal(guard(navReq("evil.example.com", "/")), "block", "the parent cookie cannot ride to a sibling — clamp is bound to the jar's owner");
+  assert.equal(guard(navReq("accounts.example.com", "/")), "allow");
+  await gw.closeConsumerSession("tok", handle); // free the per-consumer slot before the next open
+
+  // A COLD open (no restoreState) is the only way to get the plain consumer guard — and it carries no jar.
+  const cold = await gw.openConsumerSession("tok");
+  assert.equal(cores[1].guard(navReq("evil.example.com", "/")), "allow", "a cold session has no credential to protect, so the consumer allowlist applies");
+  await gw.closeConsumerSession("tok", cold);
 });
 
 // ─────────────────── Rail 4: secret-leak (deterministic unit half) ───────────────────
