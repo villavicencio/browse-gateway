@@ -13,7 +13,7 @@
 import type { BrowserCoreOptions, StorageState } from "../browser/index.js";
 import { sealRestoreState } from "../browser/index.js";
 import type { LoginCredentials, LoginRecipe } from "../verbs/index.js";
-import { proxyOverrideForPinned, isValidTotpSeed } from "../verbs/index.js";
+import { proxyOverrideForPinned, proxyOverrideForFresh, isValidTotpSeed } from "../verbs/index.js";
 import { cookieBelongsToHost, hostFromUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 
@@ -237,13 +237,33 @@ export function revokeVaultEntry(vault: VaultEntryStore, consumerId: string, hos
 export function buildWarmOverride(
   vault: VaultEntryStore,
   secrets: SecretStore,
-  args: { consumerId: string; host: string; onDatacenterIp: boolean; stickySuffix?: string },
+  args: { consumerId: string; host: string; onDatacenterIp: boolean; stickySuffix?: string; freshExit?: boolean },
 ): BrowserCoreOptions | null {
   const ownerHost = canonicalizeHost(args.host);
   const entry = vault.get<VaultEntry>(args.consumerId, ownerHost);
   if (!entry) return null;
   let proxyOverride: BrowserCoreOptions | undefined;
-  if (entry.stickyExitId) {
+  if (args.freshExit) {
+    // FRESH-EXIT mode (durable fix for exit-reputation-gated hosts, e.g. PerimeterX retail). Restore the
+    // login but route it through a FRESH clean residential exit instead of re-pinning the captured one
+    // (an IPRoyal sticky decays/burns past its lifetime → re-pinning a stale exit lands a 403). Safe
+    // because the IP-bound clearance tokens were stripped at write time ({@link stripIpBoundTokens}), so
+    // the restored auth is not IP-bound and a fresh exit presents no stale-clearance tell. The captured
+    // `entry.stickyExitId` is deliberately IGNORED (the bound exit being stale is the whole point). This
+    // is the OUTERMOST branch so a bound entry on an opted-in host takes the fresh path, never the re-pin.
+    // FAIL CLOSED exactly like the re-pin: a fresh exit that cannot be VERIFIABLY held (no residential
+    // proxy, not on a datacenter IP, or a suffix that can't mint a held exit) → undefined → throw. NEVER
+    // downgrade a logged-in replay to a direct (datacenter) exit.
+    proxyOverride = proxyOverrideForFresh(secrets, args.onDatacenterIp, args.stickySuffix);
+    if (!proxyOverride) {
+      throw new Error(
+        "warm-open (fresh-exit): this host is configured for a fresh residential exit but one cannot be " +
+          "minted here (needs a residential proxy + BGW_ON_DATACENTER_IP + a BGW_PROXY_STICKY_SUFFIX that " +
+          "pins an exit) — refusing to replay a logged-in session from the wrong network posture; fix the " +
+          "proxy config, or remove the host from BGW_WARM_FRESH_EXIT_HOSTS",
+      );
+    }
+  } else if (entry.stickyExitId) {
     // R3 FAIL-CLOSED: a BOUND entry was captured on a specific residential sticky exit and MUST be
     // re-pinned to exactly it. proxyOverrideForPinned returns undefined unless the exit is VERIFIABLY
     // pinned — covering not just "no proxy / not on a datacenter IP" but also "proxy configured yet no

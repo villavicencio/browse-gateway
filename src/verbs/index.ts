@@ -8,7 +8,7 @@ export { extractMarkdown } from "./extract.js";
 export type { Extraction } from "./extract.js";
 export { isCloudflareBlock, shouldEscalateToProxy, parseForceProxyHosts, hostForcesProxy } from "./escalation.js";
 export type { EscalationContext } from "./escalation.js";
-export { proxyOverrideFor, proxyOverrideForPinned, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "./drive.js";
+export { proxyOverrideFor, proxyOverrideForPinned, proxyOverrideForFresh, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "./drive.js";
 export { generateTotp, verifyTotp, isValidTotpSeed, normalizeTotpSeed, MIN_TOTP_SEED_BYTES } from "./totp.js";
 export { assistedLogin, coreLoginDriver, DEFAULT_FIELD_TIMEOUT_MS, DEFAULT_FIELD_POLL_MS } from "./assisted-login.js";
 export type { LoginRecipe, LoginCredentials, LoginDriver, AssistedLoginOptions, AssistedLoginResult } from "./assisted-login.js";

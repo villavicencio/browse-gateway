@@ -48,6 +48,9 @@ export interface GatewayRuntime {
   onDatacenterIp: boolean;
   stickySuffix?: string;
   forceProxyHosts: ReturnType<typeof parseForceProxyHosts>;
+  /** Hosts whose warm-open replays through a FRESH residential exit instead of re-pinning the captured
+   *  one (BGW_WARM_FRESH_EXIT_HOSTS) — the durable fix for exit-reputation-gated hosts. */
+  freshExitHosts: ReturnType<typeof parseForceProxyHosts>;
   verifyEgress: boolean;
 }
 
@@ -120,9 +123,12 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // config, NOT a secret. Absent = rotating exits (which cannot clear an IP-bound CF interstitial).
   const stickySuffix = env.BGW_PROXY_STICKY_SUFFIX || undefined;
   const forceProxyHosts = parseForceProxyHosts(env.BGW_FORCE_PROXY_HOSTS);
+  // Hosts whose warm-open uses a FRESH residential exit instead of re-pinning the captured one (durable
+  // fix for exit-reputation-gated hosts). Same flat-CSV host-suffix shape as force-proxy.
+  const freshExitHosts = parseForceProxyHosts(env.BGW_WARM_FRESH_EXIT_HOSTS);
   const verifyEgress = env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
 
-  return { config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts, verifyEgress };
+  return { config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, verifyEgress };
 }

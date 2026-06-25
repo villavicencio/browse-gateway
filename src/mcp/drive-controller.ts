@@ -61,6 +61,10 @@ export class GatewayDriveController implements DriveController {
   readonly #stickySuffix?: string;
   /** Host suffixes that force residential from the first request (BGW_FORCE_PROXY_HOSTS). */
   readonly #forceProxyHosts: readonly string[];
+  /** Host suffixes whose warm-open uses a FRESH residential exit instead of re-pinning the captured one
+   *  (BGW_WARM_FRESH_EXIT_HOSTS) — the durable fix for exit-reputation-gated hosts whose bound sticky
+   *  exit decays/burns. The captured stickyExitId is ignored for these; a fresh held exit is minted. */
+  readonly #freshExitHosts: readonly string[];
   /** Opt-in: on an escalation failure, probe the proxy's exit and classify residential vs datacenter. */
   readonly #verifyEgressEnabled: boolean;
   /**
@@ -83,6 +87,7 @@ export class GatewayDriveController implements DriveController {
       onDatacenterIp?: boolean;
       stickySuffix?: string;
       forceProxyHosts?: readonly string[];
+      freshExitHosts?: readonly string[];
       verifyEgress?: boolean;
       /** Warm-open (U9): the encrypted vault, this consumer's id, and its allowlist. All three are
        *  required for warm-open to activate; any omitted keeps every session cold (the default). */
@@ -97,6 +102,7 @@ export class GatewayDriveController implements DriveController {
     this.#onDatacenterIp = opts.onDatacenterIp ?? false;
     this.#stickySuffix = opts.stickySuffix;
     this.#forceProxyHosts = opts.forceProxyHosts ?? [];
+    this.#freshExitHosts = opts.freshExitHosts ?? [];
     this.#verifyEgressEnabled = opts.verifyEgress ?? false;
     this.#vault = opts.vault;
     this.#consumerId = opts.consumerId;
@@ -231,7 +237,7 @@ export class GatewayDriveController implements DriveController {
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      if (warm) throw this.#warmStaleError(url, snap.status ?? null);
+      if (warm) throw this.#warmError(url, snap.status ?? null);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
       throw new Error(
         `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
@@ -389,12 +395,18 @@ export class GatewayDriveController implements DriveController {
     // mismatch yields a cold open (no entry) or a correctly-clamped warm open — never a credential on
     // an off-owner-navigable session. Do not "fix" this into a divergent stricter form.
     if (!this.#allowlist.allows(host)) return undefined;
+    // Fresh-exit policy: a host on BGW_WARM_FRESH_EXIT_HOSTS replays its login through a FRESH clean
+    // residential exit instead of re-pinning the captured (decaying) one. Resolved from the host-set on
+    // the SAME host string used for the vault lookup (subdomain-inclusive suffix match, like force-proxy),
+    // so first-open and reopen-after-reap agree and the captured stickyExitId is bypassed for these.
+    const freshExit = hostForcesProxy(host, this.#freshExitHosts);
     return (
       buildWarmOverride(this.#vault, this.#secrets, {
         consumerId: this.#consumerId,
         host,
         onDatacenterIp: this.#onDatacenterIp,
         ...(this.#stickySuffix !== undefined ? { stickySuffix: this.#stickySuffix } : {}),
+        ...(freshExit ? { freshExit: true } : {}),
       }) ?? undefined
     );
   }
@@ -428,7 +440,7 @@ export class GatewayDriveController implements DriveController {
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      throw this.#warmStaleError(url, snap.status ?? null);
+      throw this.#warmError(url, snap.status ?? null);
     }
     this.#pinned = true;
     return snap;
@@ -444,6 +456,27 @@ export class GatewayDriveController implements DriveController {
       `warm (logged-in) navigation to ${url} failed (status=${status ?? "n/a"}): the stored session ` +
         `is likely expired or blocked — ask the operator to re-capture this credential`,
     );
+  }
+
+  /** A FRESH-EXIT warm session that landed blocked means the freshly-minted residential exit was a dud
+   *  (a burned/dead pool IP), NOT a stale credential — the stored login is fine and the next navigate
+   *  re-warms with a DIFFERENT fresh exit. So tell the consumer to retry, not to re-capture (the wrong,
+   *  alarming signal here). The pinned path keeps {@link #warmStaleError} (a re-pin retry is pointless). */
+  #warmFreshError(url: string, status: number | null): Error {
+    return new Error(
+      `warm (logged-in) navigation to ${url} was blocked (status=${status ?? "n/a"}): the fresh ` +
+        `residential exit was likely burned or unreachable — retry navigate to draw a clean exit`,
+    );
+  }
+
+  /** Pick the warm-failure error by the host's exit policy: a fresh-exit host (BGW_WARM_FRESH_EXIT_HOSTS)
+   *  failed because the exit was a dud (retry); any other warm host failed because the captured exit /
+   *  stored session is stale (re-capture). Derived from the URL host so it holds on BOTH the first-navigate
+   *  and the reopen-after-reap path without a separate per-session flag (the host-set is the source of truth). */
+  #warmError(url: string, status: number | null): Error {
+    return hostForcesProxy(new URL(url).hostname, this.#freshExitHosts)
+      ? this.#warmFreshError(url, status)
+      : this.#warmStaleError(url, status);
   }
 
   /**

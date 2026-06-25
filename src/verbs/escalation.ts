@@ -7,6 +7,7 @@
  */
 import { assess, isHardBlock, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
+import { canonicalizeHost } from "../security/index.js";
 
 /**
  * True when the page is blocked AND the block is specifically a Cloudflare challenge
@@ -53,13 +54,17 @@ export function parseForceProxyHosts(value: string | undefined): string[] {
   if (!value) return [];
   return value
     .split(",")
-    .map((h) => h.trim().toLowerCase())
-    .filter(Boolean);
+    .map((h) => h.trim())
+    .filter(Boolean)
+    .map((h) => canonicalizeHost(h)); // canonical (lowercase + no trailing dot) so matching is exact
 }
 
 /** True when `host` matches a force-proxy suffix — an exact match or a dotted subdomain of it
- *  (`totalwine.com` covers `www.totalwine.com` but NOT `nottotalwine.com`). */
+ *  (`totalwine.com` covers `www.totalwine.com` but NOT `nottotalwine.com`). Both sides are
+ *  {@link canonicalizeHost}-normalized so a trailing-dot FQDN (`www.totalwine.com.`) cannot slip past
+ *  the match — the same canonical host the vault lookup / nav clamp use, so a force-proxy / fresh-exit
+ *  policy decision can't be bypassed by caller URL spelling. */
 export function hostForcesProxy(host: string, suffixes: readonly string[]): boolean {
-  const h = host.toLowerCase();
+  const h = canonicalizeHost(host);
   return suffixes.some((s) => h === s || h.endsWith(`.${s}`));
 }

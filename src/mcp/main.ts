@@ -58,6 +58,8 @@ async function main(): Promise<void> {
   // Sticky-session suffix template for proxied escalation (parity with http-main; see there).
   const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
   const forceProxyHosts = parseForceProxyHosts(process.env.BGW_FORCE_PROXY_HOSTS);
+  // Parsed standalone here (the stdio launcher does not use buildGatewayRuntime), mirroring forceProxyHosts.
+  const freshExitHosts = parseForceProxyHosts(process.env.BGW_WARM_FRESH_EXIT_HOSTS);
   const verifyEgress = process.env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
@@ -69,6 +71,7 @@ async function main(): Promise<void> {
     onDatacenterIp,
     stickySuffix,
     forceProxyHosts,
+    freshExitHosts,
     verifyEgress,
     // U9 warm-open: a navigate to an approved host with a stored login opens a logged-in session
     // (vault dormant → null → cold-only). The allowlist here is the same scope the gateway guard clamps to.

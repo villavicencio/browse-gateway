@@ -14,6 +14,7 @@ import type { SecretStore } from "../security/index.js";
 import {
   proxyFromSecrets,
   mintStickyProxy,
+  newStickyExitId,
   PROXY_MAX_ATTEMPTS,
   PROXY_NAV_TIMEOUT_MS,
 } from "./retrieve.js";
@@ -53,18 +54,36 @@ export function proxyOverrideFor(
 }
 
 /**
+ * Shared STRUCTURAL gate for a HELD residential exit, consumed by BOTH the bound-entry re-pin
+ * ({@link proxyOverrideForPinned}) and the fresh-exit warm-open ({@link proxyOverrideForFresh}) so the
+ * two fail-closed paths can NEVER drift. Returns the override ONLY when the exit is VERIFIABLY held: on a
+ * datacenter IP, the sticky suffix is present AND carries the `{id}` placeholder, a base proxy password
+ * exists, and the minted password equals EXACTLY `basePassword + suffix-with-id`. A bare `includes(exitId)`
+ * could be fooled by a base password (or static suffix) that incidentally contains the id — NOT a real
+ * pin — so the check is structural. `proxyOverrideFor` ALONE is not enough: via `mintStickyProxy` it
+ * returns the BASE proxy UNCHANGED (a rotating, unverified exit) when the suffix is absent / has no
+ * `{id}` / has no password, so a caller that only checked for `undefined` would FAIL OPEN — replaying a
+ * logged-in session through an uncontrolled exit, the exact wrong-network-posture replay R3 forbids.
+ */
+function verifiedHeldExit(
+  secrets: SecretStore,
+  onDatacenterIp: boolean,
+  stickySuffix: string | undefined,
+  exitId: string,
+): BrowserCoreOptions | undefined {
+  if (!onDatacenterIp) return undefined;
+  if (!stickySuffix || !stickySuffix.includes("{id}")) return undefined;
+  const base = proxyFromSecrets(secrets);
+  if (!base?.password) return undefined;
+  const expected = base.password + stickySuffix.replaceAll("{id}", exitId);
+  const override = proxyOverrideFor(secrets, onDatacenterIp, stickySuffix, exitId);
+  return override?.proxy?.password === expected ? override : undefined;
+}
+
+/**
  * Like {@link proxyOverrideFor}, but for a BOUND vault entry that MUST re-pin a SPECIFIC captured exit
- * (R3 warm replay): returns the override ONLY when the exit is VERIFIABLY pinned, else `undefined`.
- * `proxyOverrideFor` (via `mintStickyProxy`) returns the BASE proxy UNCHANGED when the sticky suffix is
- * absent (or has no `{id}`, or the proxy has no password) — a rotating/unpinned exit. Restoring a
- * logged-in session through that is the exact wrong-network-posture replay R3 forbids.
- *
- * Verification is STRUCTURAL, not a substring match: the pin is real iff we are on a datacenter IP, the
- * sticky suffix is present AND carries the `{id}` placeholder, a base proxy password exists, and the
- * minted password equals EXACTLY `basePassword + suffix-with-id`. A bare `includes(stickyExitId)` could
- * be fooled by a base password (or static suffix) that incidentally contains the 8-hex id — reachable
- * for operator-imported entries whose `stickyExitId` is supplied — and that is NOT a real pin. The caller
- * ({@link buildWarmOverride}) fails closed on `undefined`.
+ * (R3 warm replay): returns the override ONLY when the exit is VERIFIABLY pinned (see
+ * {@link verifiedHeldExit}), else `undefined`. The caller ({@link buildWarmOverride}) fails closed.
  */
 export function proxyOverrideForPinned(
   secrets: SecretStore,
@@ -72,13 +91,28 @@ export function proxyOverrideForPinned(
   stickySuffix: string | undefined,
   stickyExitId: string,
 ): BrowserCoreOptions | undefined {
-  if (!onDatacenterIp) return undefined;
-  if (!stickySuffix || !stickySuffix.includes("{id}")) return undefined;
-  const base = proxyFromSecrets(secrets);
-  if (!base?.password) return undefined;
-  const expected = base.password + stickySuffix.replaceAll("{id}", stickyExitId);
-  const override = proxyOverrideFor(secrets, onDatacenterIp, stickySuffix, stickyExitId);
-  return override?.proxy?.password === expected ? override : undefined;
+  return verifiedHeldExit(secrets, onDatacenterIp, stickySuffix, stickyExitId);
+}
+
+/**
+ * For a FRESH-EXIT warm-open (the durable fix for exit-reputation-gated hosts, e.g. a PerimeterX retail
+ * site): restore a stored login but route it through a FRESH, server-minted held residential exit
+ * instead of re-pinning the captured one (an IPRoyal sticky decays/burns past its lifetime → 403).
+ * Mints a fresh {@link newStickyExitId} and runs it through the SAME structural gate as the re-pin
+ * ({@link verifiedHeldExit}), so it FAILS CLOSED (returns `undefined`) on exactly the cases the re-pin
+ * does — no residential proxy, not on a datacenter IP, or a sticky suffix that can't mint a held exit.
+ * It NEVER returns a rotating/unverified exit; the caller fails closed and never downgrades a logged-in
+ * replay to a direct (datacenter) exit. The captured `stickyExitId` is deliberately NOT consulted — the
+ * bound exit being stale is the whole reason this mode exists. Safe to not re-pin because the IP-bound
+ * clearance tokens were stripped at capture ({@link import("../mcp/vault-login.js").stripIpBoundTokens}),
+ * so the restored auth is not IP-bound and a fresh exit presents no stale-clearance tell.
+ */
+export function proxyOverrideForFresh(
+  secrets: SecretStore,
+  onDatacenterIp: boolean,
+  stickySuffix: string | undefined,
+): BrowserCoreOptions | undefined {
+  return verifiedHeldExit(secrets, onDatacenterIp, stickySuffix, newStickyExitId());
 }
 
 /**
