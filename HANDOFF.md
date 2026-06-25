@@ -24,8 +24,8 @@ PerimeterX press-&-hold once and for all.**
   to **after** `. "$BGW_ENV_FILE"`. This was the only real prod-activation blocker.
 - **Vault ACTIVATED in prod** — `vault: ready`, live on image `d91f2b1e`, consumers `[atlas, vault,
   argus]`, `datacenter=true sticky=true` (bound creds re-pin). Host vault at `/home/node/vault/{entries,
-  kek}` (kek 0600 base64-of-32B, node-owned); env file
-  `/home/node/.hermes/.openclaw-shim/.browse-gateway-env` got `BGW_VAULT_DIR=/run/vault/entries`,
+  kek}` (kek 0600 base64-of-32B, node-owned); the prod env file
+  `<prod-env-file>` got `BGW_VAULT_DIR=/run/vault/entries`,
   `BGW_VAULT_KEY_FILE=/run/vault/kek`, `BGW_VAULT_HOST_PATH=/home/node/vault`.
 - **Warm-open VALIDATED LIVE** — imported a real Total Wine credential for atlas
   (`obscura vault import`, 118 cookies, bound exit `3e7662d5`) and drove `atlas → navigate
