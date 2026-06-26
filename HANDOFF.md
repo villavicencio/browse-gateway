@@ -1,106 +1,98 @@
-# HANDOFF — 2026-06-26 (morning, PST)
+# HANDOFF — 2026-06-26 (afternoon, PST)
 
-This session was a deep **PerimeterX kill** arc on Total Wine: we tested every lever (cookie `_pxvid`,
-IP coherence, warm-up nav, gesture automation), **root-caused PX to exit-IP reputation** (not behavior),
-then **designed → reviewed → shipped → activated a durable fix** (fresh-exit warm-open mode, merged to
-main + live in prod). The fix is correct and active, but the live validation surfaced the **remaining
-blocker: the prod (VPS) browser fingerprint** — PX 403s the gateway's Patchright-under-Xvfb where a Mac
-Patchright clears the same exit + cookies. Next session = **Mac↔VPS fingerprint parity**.
+This session **killed the PerimeterX blocker on Total Wine** — the open item from the morning handoff
+("VPS fingerprint parity"). We root-caused it (NOT WebGL/Xvfb as long assumed — it's the **OS
+identity**), shipped an opt-in fix through the full pipeline (3-lens design → 4-round Codex review →
+PR #37 → deploy), **activated it in prod, and confirmed PX clears end-to-end**. The one piece left —
+warm-open landing *logged-in* (vs just clearing PX) — is **parked** on a localStorage capture gap,
+fully documented for the next session.
 
-## What We Built (all on `main`, synced; nothing unpushed)
+## What We Built
 
-- **`50e10a5` — feat: fresh-exit warm-open mode** (the durable fix). New `BGW_WARM_FRESH_EXIT_HOSTS`
-  (flat CSV host-suffixes, mirrors `BGW_FORCE_PROXY_HOSTS`): a host on the list replays its stored login
-  through a **fresh clean residential exit** instead of re-pinning the captured (decaying/burned) one.
-  Files: `src/verbs/drive.ts` (shared `verifiedHeldExit` gate + new `proxyOverrideForFresh`; both
-  FAIL-CLOSED, no rotating/unverified exit, never a direct downgrade), `src/mcp/vault-login.ts`
-  (`buildWarmOverride` gains `freshExit`, OUTERMOST branch, ignores the captured `stickyExitId`),
-  `src/mcp/drive-controller.ts` (`#freshExitHosts`; `#warmError` dispatches fresh-block→"retry for clean
-  exit" vs pinned-block→"re-capture", host-derived so it holds on first-nav AND reopen-after-reap),
-  `runtime.ts`/`http-main.ts`/`main.ts` (3 wiring points), `test/fresh-exit-warm.test.mjs` (8 tests).
-  Also: `hostForcesProxy`/`parseForceProxyHosts` now `canonicalizeHost` both sides (Codex R1 fix —
-  trailing-dot FQDN bypass). **507/507 tests pass.**
-- **`e290421` — docs: scrubbed a leaked prod env-file path from HANDOFF.md** (the prior handoff tripped
-  the `cli-brand` fleet-hygiene guard). CI is green again.
-- **Plan + critique**: `docs/plans/2026-06-24-002-fresh-exit-warm-open-plan.local.md` (design + 3-lens
-  critique outcome + folded changes). Updated `docs/plans/2026-06-22-001-spike-defeat-perimeterx-press-hold.local.md`
-  with two addenda (isTrusted-is-not-a-wall; root-cause=exit-reputation). `docs/plans/2026-06-24-001-warmup-navigation-plan.local.md`
-  marked KILLED.
-- **Local PX tooling** (in `~/totalwine-onboarding/`, OUTSIDE the repo — names the real host): `capture-proxied.sh`
-  + `px-proxy.mjs` (proxied capture through a fixed exit), `warmup-falsify.mjs` + RUNBOOK (the zero-code
-  Track-A falsifier), `px-challenge-recon.mjs` + `px-recon-batch.mjs` (PX-structure recon, both DIRECT/proxied),
-  `validate-warm.mjs` (prod warm-open validator), `px-cookie-arms.mjs` (the cookies-vs-fingerprint test).
-  `totalwine.json` = the 2026-06-24 capture (has `_pxvid` + `__pxvid`, no localStorage).
-- **Foreman (side task)**: cloned the Codex review-loop SOP into the Foreman project's memory
-  (`~/.claude/projects/-Users-dvillavicencio-Projects-ibmcconstruction-com/memory/codex-review-loop-sop.md`
-  + index), adapted to its Next.js/Sanity/Vercel domain.
+- **`PR #37` (`2663171`) — opt-in per-host Windows OS-presentation.** New env `BGW_WINDOWS_UA_HOSTS`
+  (CSV host-suffixes, mirrors `BGW_FORCE_PROXY_HOSTS`; default OFF = native Linux everywhere). A listed
+  host presents as **Windows** Chrome via CDP `Emulation.setUserAgentOverride` (UA + `navigator.platform`
+  + `userAgentData`/client-hints). Files: `src/browser/os-presentation.ts` (NEW — `buildWindowsUaOverride`/
+  `buildNativeUaOverride` from the LIVE UA-CH, preserves real brands/fullVersionList, version-derived,
+  `READ_LIVE_UA_JS`), `src/browser/patchright-core.ts` (per-active-page OS-mode machine: eager clean
+  about:blank baseline, active **restore-to-native** on listed→non-listed (no opt-in bleed), **fail-closed**
+  on any read/CDP failure — recreate fresh page + retry, else fail loud), `src/browser/types.ts`
+  (`windowsUaHosts`), `src/gateway/config.ts` (`BGW_WINDOWS_UA_HOSTS` → `config.core`, one wiring point,
+  covers warm/cold/retrieve), `src/security/url.ts` (shared `parseHostSuffixList` + `hostMatchesAnySuffix`;
+  `escalation.ts` force-proxy/fresh-exit now delegate), `src/browser/launch-options.ts` (comment fix —
+  SwiftShader-spoof follow-up retracted, exonerated). Runtime gate `scripts/validate-os-presentation.mjs`
+  (flip/restore/clean-baseline/opt-out). `.gitignore` += `.claude/`. **516 unit tests pass.**
+- **Activated in prod (2026-06-26).** Appended `export BGW_WINDOWS_UA_HOSTS=totalwine.com` to the prod
+  env file (backup saved on-host as `…-env.bak-prewinua`; `launch-http.sh` forwards every `BGW_*` by name,
+  so no script change needed), built `latest`, deployed via `gh workflow run deploy-http.yml` (gate→swap→
+  verify green). Confirmed `BGW_WINDOWS_UA_HOSTS=totalwine.com` live in the running container.
+- **Solution docs (`2cfc771`, on main):** `docs/solutions/runtime-errors/perimeterx-blocks-linux-chrome-os-identity-windows-ua-fix.md`
+  (root cause + fix + "Validated in prod" note) and `docs/solutions/integration-issues/perimeterx-login-capture-needs-plain-chrome-not-automation-launch.md`
+  (the capture-path learning + the open localStorage gap).
+- **Re-imported atlas's Total Wine credential** to the prod vault (fresh sign-in, 122 durable cookies,
+  decrypt-verified) via `obscura vault import`. Durable tunnel re-bootstrapped (LaunchAgent).
+- **Local PX tooling** (in `~/totalwine-onboarding/`, OUTSIDE the repo): `px-probe.mjs` (the same-exit A/B
+  + extended-fingerprint + core-navigate probe harness that root-caused this), `validate-warm.mjs` patched
+  (default target → `/my-account`; always `browser_close` so it stops leaking sessions).
 
 ## Decisions Made
 
-- **PerimeterX on Total Wine is EXIT-IP-REPUTATION-gated, not behavioral.** A clean residential IP clears
-  it **0/5** under Patchright automation (Mac direct AND a fresh IPRoyal exit; recon 2026-06-24/25). The
-  gateway's 10/10 warm-open failures were **atlas's BOUND exit being stale/burned** (an IPRoyal `lifetime-30m`
-  sticky decays past its window). This retired warm-up-nav and gesture automation as unnecessary.
-- **Durable fix = fresh-exit warm-open, NOT a press-&-hold solver.** Relaxing R3's re-pin is safe for
-  opted-in hosts because IP-bound clearance tokens are stripped at capture (`stripIpBoundTokens`), so the
-  restored auth isn't IP-bound. **Opt-in per host; dormant by default** (every non-listed host keeps R3
-  re-pin exactly). The fail-closed-never-direct invariant is preserved via the shared `verifiedHeldExit`.
-- **Shipped via the full pipeline**: 3-lens plan critique (proceed-with-changes) → Codex adversarial-review
-  loop (R1 caught a real trailing-dot fail-open → fixed; R2 approved 0 findings) → squash-merge to main →
-  deploy. Per [[codex-review-loop-sop]].
-- **Activated in prod**: `BGW_WARM_FRESH_EXIT_HOSTS=totalwine.com` is set (confirmed: warm-open returns the
-  FRESH-exit error, not the stale one). Image `e290421` built to `latest` (CI 15:34Z), deployed via
-  `gh workflow run deploy-http.yml` (run 28185511595, success).
+- **Root cause = OS identity, NOT WebGL/Xvfb.** Proven by same-exit A/B (4/4 fresh exits) + a local Docker
+  repro + end-to-end `core.navigate`: on a *fixed* residential exit IP the container 403'd as `Linux x86_64`
+  and CLEARED (200) when ONLY the OS string flipped to Windows. This **overturns** the morning handoff's
+  WebGL/Xvfb framing.
+- **Opt-in per host, default OFF** (operator chose this over global). A Windows UA over the container's Linux
+  fonts/canvas is internally incoherent, so only hosts that demonstrably need it are flipped; every other
+  target keeps its coherent Linux identity. Windows chosen over macOS (dominant desktop OS = lowest suspicion).
+- **Hardened via a 4-round Codex adversarial-review loop** (each round caught a real bug): R1 opt-in bleed +
+  fabricated UA-CH → R2 fail-open restore + `.claude` push-grant in tree → R3 silent read-fallback + poisoned
+  (loaded-page) baseline → **R4 approve**. The fail-closed + clean-baseline design is the result.
+- **Capture path: plain Chrome, not automation.** `playwright codegen`/any automation-launched browser fails
+  the PX press-&-hold; capture in a plain Chrome (`capture.sh`) + read-only `connectOverCDP`.
 
-## What Didn't Work (don't relitigate)
+## What Didn't Work
 
-- **Track A — warm-up navigation: KILLED.** Zero-code falsifier: baseline 10/10 PX-fired, warm-up 10/10
-  fired, **homepage itself fired 10/10**. A no-human warm-up can't clear a behavioral challenge — but that
-  was on atlas's *burned* exit; the real story is exit reputation (above).
-- **Experiment #1 — keep `_pxvid`: NOT the blocker.** The cookie-arms test proved it: the gateway-equivalent
-  stripped cookie set (which DROPS `_pxvid`) **clears PX on the Mac**; keeping `_pxvid` also clears. So
-  `_pxvid` is not what's 403ing the gateway. (Note: `/^_px/i` strips `_pxvid` but KEEPS `__pxvid` — a
-  partial device identity — yet it clears anyway on a good fingerprint.)
-- **Experiment #2 — IP coherence (capture==replay exit): confounded** (sticky lifetime + Mac/VPS fingerprint
-  + behavioral void). Tooling built, not pursued.
-- **`isTrusted` is NOT a wall (myth refuted).** The gateway's Patchright produces `isTrusted=true` on
-  synthesized holds (page.mouse AND raw CDP Input). The "CDP input is isTrusted=false" belief conflates
-  CDP injection with in-page JS dispatchEvent. So Track B gesture automation was never blocked on isTrusted
-  — but it's moot given the exit-reputation root cause.
+- **WebGL/SwiftShader, mediaDevices, screen size, window geometry, WebRTC, timezone — all EXONERATED.** Each
+  was fixed in isolation on a proven-good same-exit and the container still 403'd; only the OS flip cleared it.
+  Don't relitigate these.
+- **`playwright codegen --save-storage` for capture** — automation fingerprint loops the press-&-hold forever.
+- **Cookie-only capture for warm-open-login** — `connectOverCDP storageState` dumped 125 cookies but
+  `origins:0` (no localStorage), and Total Wine has no httpOnly session cookie → warm-open clears PX but lands
+  **logged-out**. This is the parked item (see Next).
+- **Probing login state on `/account`** — it 404s (not a route); the real authed slug is `/my-account`. The
+  `validate-warm.mjs` ✅ was a false positive (heuristic matched "My Account" in the title "Login My Account").
 
 ## What's Next
 
-1. **Mac↔VPS fingerprint parity (THE blocker).** Decisive evidence: same fresh residential exit + same
-   stripped cookies → **Mac Patchright clears PX, VPS gateway 403s**. Classic "clears locally / blocks in
-   prod" — exactly what the **fingerprint-parity harness** solves (`scripts/fingerprint-snapshot` +
-   `-diff`; how Indexxx's WebGL-absent tell was found). Diff the Mac (clears) vs the VPS gateway (403s),
-   find + close the PX-tripping tell (WebGL/canvas/UA/fonts/screen under Xvfb are prime suspects).
-2. **Re-capture atlas's Total Wine credential** — the 2026-06-24 session cookies have expired (warm-open
-   would land logged-OUT even once PX clears). Now easy: a clean exit clears PX with no challenge, so the
-   gateway could even auto-login through a fresh exit (no human plain-Chrome capture needed) — a tracked
-   follow-up.
-3. **Re-validate** once fingerprint parity closes: `~/totalwine-onboarding/validate-warm.mjs` (drives atlas
-   → totalwine.com/account, retries across fresh exits, classifies logged-in/out/blocked).
+1. **Warm-open *logged-in* for Total Wine (the parked item).** Root cause: capture missed localStorage. Fix:
+   extend the capture to evaluate `localStorage` on the live logged-in page and fold it into the imported
+   `storageState.origins` (don't rely on `connectOverCDP storageState` to enumerate it). **Verify first** that
+   a logged-in TW page actually has an auth-looking `localStorage` key (re-launch plain Chrome, log in, inspect
+   before dumping). Then re-import + re-run `~/totalwine-onboarding/validate-warm.mjs` (now targets `/my-account`).
+   Full writeup: the integration-issues capture doc ("Still open: localStorage auth not captured").
+2. **Confirm store 1111 = Folsom.** The capture's `twm-userStoreInformation` cookie pins store **1111 / US-CA /
+   in-store-pickup** (90-day, vault-restored, overrides IP-geo) — so pricing/location is cookie-tied, not
+   IP-geolocated. Just confirm 1111 is the right store.
+3. **Untracked `AGENTS.md`** is sitting in the tree (pre-existing, public-safe copy of the project instructions).
+   Decide whether to commit it or leave it untracked — left alone this session.
 
 ## Gotchas & Watch-outs
 
-- **The fresh-exit 403 is the VPS FINGERPRINT, structurally proven NOT a datacenter fallback.** Fail-closed-
-  never-direct means a warm-open that *navigated* (and 403'd) used a verified residential exit — a datacenter
-  fallback would have THROWN, not 403'd. So don't chase the exit/proxy; it's the browser fingerprint.
-- **`BGW_DIAG_VERIFY_EGRESS` won't help diagnose warm-open egress** — `#verifyEgress()` is called ONLY in
-  the COLD escalation path (`#openHealthyAndNavigate`, drive-controller.ts:519), never the warm path. It's
-  diagnostic-only and off by default; its absence is normal. For a direct residential-egress readout you'd
-  need a *cold* proxied probe.
-- **cli-brand fleet-hygiene guard**: never commit the prod adminSsh / tunnel host / remote manifest / remote
-  env-file literals to any committed file (HANDOFF, docs, source). Consumer codenames (`atlas`) and
-  `totalwine.com` ARE public-safe and allowed. This handoff is clean; keep it that way.
-- **Cookie-arms 404 reading**: `status=404 "Not Found | Total Wine & More"` with no challenge = PX CLEARED +
-  logged-out (the TW app 404s `/account` when not authed), NOT a block. Only a PX challenge page / 403-with-
-  PX-markers is a block.
-- **Validation needs atlas's token** (prod secret, harness won't let the agent read it) — operator pulls it
-  via ssh into `BGW_TOKEN`, then runs `validate-warm.mjs` with `BGW_URL=http://127.0.0.1:8080/mcp` (the
-  durable tunnel must be up; LaunchAgent).
-- **Don't bundle the `_pxvid` strip change** — it was disproven as the blocker this session; the critique's
-  predicted dependency did not bind. Leave `stripIpBoundTokens` as-is unless fingerprint parity reopens it.
-- Local `main` == `origin/main` (`e290421`); 507/507 tests pass; no open PRs. Untracked `.claude/` + `AGENTS.md`
-  pre-existing, left as-is.
+- **`validate-warm.mjs` login-state heuristic is fragile** — it false-matched "My Account" in "Login My Account"
+  and reported ✅ LOGGED-IN when the page was actually `/login`. Read the actual `url`/`title`, don't trust the ✅.
+- **Same-exit A/B is mandatory** for any PX fingerprint test (PX is exit-reputation gated). Pin one IPRoyal
+  sticky id across the configs you compare + add a positive control (Mac clears → exit is good), or noise swamps
+  the signal. `px-probe.mjs` does this.
+- **Local container = amd64-via-Rosetta**, prod = native x86 — faithful for OS/flags/fonts but not 100% for
+  arch-derived axes (SwiftShader backend string differs LLVM vs Subzero). Final confirmation was on real prod.
+- **Capture must be a FRESH sign-in.** A reused `chrome-profile` auto-logs-in from a stale session → captures a
+  dead session shell → warm-open logged-out. Sign out, then sign in, before capturing.
+- **Per-consumer session cap = 2**, 5-min idle reaper (60s tick). Leaked test sessions exhaust atlas's slots
+  ("per-consumer session limit reached (2)"); wait for the reaper. (validate-warm now always `browser_close`s.)
+- **Fleet hygiene (public repo):** never commit the prod host / env-file path / deploy-config path / consumer
+  tokens. The prod env file got `BGW_WINDOWS_UA_HOSTS=totalwine.com` appended this session (path NOT recorded
+  here on purpose). atlas + totalwine.com + BGW_* names are public-safe.
+- **Prod access this session** worked via the `openclaw-prod` ssh alias (operator's explicit approval cleared
+  the auto-mode classifier). The durable Mac→prod `:8080` tunnel LaunchAgent was DOWN at session start — I
+  re-bootstrapped it; it may need re-bootstrapping next session (`launchctl bootstrap gui/$(id -u) <plist>`).
+- Local `main` == `origin/main` (`2cfc771`); no open PRs; 516 tests pass.
