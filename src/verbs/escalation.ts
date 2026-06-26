@@ -7,7 +7,7 @@
  */
 import { assess, isHardBlock, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
-import { canonicalizeHost } from "../security/index.js";
+import { parseHostSuffixList, hostMatchesAnySuffix } from "../security/index.js";
 
 /**
  * True when the page is blocked AND the block is specifically a Cloudflare challenge
@@ -51,12 +51,9 @@ export function shouldEscalateToProxy(
  * known-hostile WAF (PerimeterX et al.) the direct attempt only burns time and trips reputation.
  */
 export function parseForceProxyHosts(value: string | undefined): string[] {
-  if (!value) return [];
-  return value
-    .split(",")
-    .map((h) => h.trim())
-    .filter(Boolean)
-    .map((h) => canonicalizeHost(h)); // canonical (lowercase + no trailing dot) so matching is exact
+  // Delegates to the shared parser (security/url) so force-proxy, fresh-exit, and windows-UA host
+  // lists parse identically and can never drift.
+  return parseHostSuffixList(value);
 }
 
 /** True when `host` matches a force-proxy suffix — an exact match or a dotted subdomain of it
@@ -65,6 +62,7 @@ export function parseForceProxyHosts(value: string | undefined): string[] {
  *  the match — the same canonical host the vault lookup / nav clamp use, so a force-proxy / fresh-exit
  *  policy decision can't be bypassed by caller URL spelling. */
 export function hostForcesProxy(host: string, suffixes: readonly string[]): boolean {
-  const h = canonicalizeHost(host);
-  return suffixes.some((s) => h === s || h.endsWith(`.${s}`));
+  // Delegates to the shared matcher (security/url) — one suffix-match implementation across the
+  // force-proxy / fresh-exit / windows-UA per-host policies.
+  return hostMatchesAnySuffix(host, suffixes);
 }

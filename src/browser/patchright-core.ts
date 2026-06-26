@@ -4,7 +4,8 @@
  */
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
-import { hostFromUrl } from "../security/url.js";
+import { hostFromUrl, hostMatchesAnySuffix } from "../security/url.js";
+import { buildWindowsUaOverride, buildNativeUaOverride, READ_LIVE_UA_JS, type LiveUserAgent } from "./os-presentation.js";
 import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
@@ -224,6 +225,26 @@ export class PatchrightBrowserCore implements BrowserCore {
   /** Injected solver for the drive path; absent = a detected CAPTCHA is left to fail. */
   readonly #solver?: CaptchaSolver;
   /**
+   * Canonical host-suffixes whose navigations present as Windows Chrome instead of Linux (the
+   * opt-in OS-presentation fix for PerimeterX-class scorers that 403 Linux Chrome — see
+   * os-presentation.ts). Empty = every navigation keeps the native Linux identity.
+   */
+  readonly #windowsUaHosts: readonly string[];
+  /**
+   * The drive active page's current OS-presentation mode. Tracked so a REUSED active page actively
+   * RESTORES the native identity when it navigates from a listed host to a non-listed one — the
+   * Windows override must never bleed past the opt-in boundary onto an unrelated host (it is a CDP
+   * target-scoped override that otherwise persists). Reset to "native" whenever a fresh active page opens.
+   */
+  #osMode: "native" | "windows" = "native";
+  /** Live UA/client-hint values read once from the active page before its first OS override, so the
+   *  Windows override preserves the real brands/fullVersionList and a restore re-applies the true native
+   *  identity. Reset with the active page. */
+  #liveUach?: LiveUserAgent;
+  /** The active page's reusable CDP session for the OS-presentation override (apply + restore go through
+   *  the SAME live session, so the override is unambiguous). Detached + reset with the active page. */
+  #osCdpSession?: CDPSession;
+  /**
    * The currently-installed navigation guard. The single persistent CDP `Fetch.requestPaused`
    * listener reads this on every request, so swapping guards is an atomic reassignment — no
    * unguarded window, no Fetch re-enable. Absent until the first setNavigationGuard().
@@ -263,10 +284,12 @@ export class PatchrightBrowserCore implements BrowserCore {
     context: PatchrightContext,
     resolved: ResolvedCoreOptions,
     solver?: CaptchaSolver,
+    windowsUaHosts: readonly string[] = [],
   ) {
     this.#context = context;
     this.#resolved = resolved;
     this.#solver = solver;
+    this.#windowsUaHosts = windowsUaHosts;
   }
 
   static async launch(
@@ -287,8 +310,8 @@ export class PatchrightBrowserCore implements BrowserCore {
     // independent of the navigation guard the gateway installs next. restoreOrClose owns the
     // close-on-failure invariant so a bad blob can't orphan the just-launched Chrome.
     await restoreOrClose(context, opts.restoreState);
-    // The solver is a runtime dependency (not a launch arg) — pass it through to the instance.
-    return new PatchrightBrowserCore(context, resolved, opts.solver);
+    // The solver + windowsUaHosts are runtime dependencies (not launch args) — pass through to the instance.
+    return new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? []);
   }
 
   /**
@@ -302,12 +325,77 @@ export class PatchrightBrowserCore implements BrowserCore {
     return { cookies, origins };
   }
 
+  /** True when `url`'s host is on the opt-in Windows-UA list (so the page should present as Windows). */
+  #shouldPresentWindows(url: string): boolean {
+    if (this.#windowsUaHosts.length === 0) return false;
+    return hostMatchesAnySuffix(hostFromUrl(url), this.#windowsUaHosts);
+  }
+
+  /**
+   * Read the live UA / high-entropy client-hint values from `page` (for an OS override that preserves the
+   * real brands/fullVersionList and a faithful native restore). MUST be read from a FRESH page (about:blank)
+   * before any site script runs — a loaded page can redefine `navigator` getters on the shared host object
+   * and poison the baseline. THROWS on an evaluate/transport failure (fail-closed): the caller must NOT
+   * fall back to a fabricated identity. `READ_LIVE_UA_JS` itself already degrades gracefully for an absent
+   * `userAgentData` / blocked high-entropy (returns at least `{userAgent, platform}`), so a throw here is a
+   * genuine transport failure, not a missing-field case.
+   */
+  async #readLiveUa(page: PatchrightPage): Promise<LiveUserAgent> {
+    return (await page.evaluate(READ_LIVE_UA_JS)) as LiveUserAgent;
+  }
+
+  /**
+   * Apply the Windows OS-presentation to a FRESH (stateless render) page — read the live UA-CH, build a
+   * Windows override that preserves the non-OS fields, and set it via a page CDP session BEFORE the first
+   * navigation so the first request carries the spoofed UA + Sec-CH-UA-Platform headers. No restore is
+   * needed (the page is per-call). FAIL-CLOSED: THROWS on failure rather than rendering a Windows-required
+   * host as Linux — the caller (render) runs this inside its try so the page is still closed, and the
+   * error surfaces to the consumer instead of a silent OS downgrade.
+   */
+  async #applyWindowsToFreshPage(page: PatchrightPage): Promise<void> {
+    const override = buildWindowsUaOverride(await this.#readLiveUa(page));
+    const cdp = await this.#context.newCDPSession(page);
+    await cdp.send("Emulation.setUserAgentOverride", override);
+  }
+
+  /**
+   * Drive the active page's OS-presentation mode to `target`, applying or RESTORING via one reusable
+   * CDP session. A no-op when already in `target` (so repeated navigations to the same listed host don't
+   * re-send, and a never-listed session never touches the UA). The restore leg (windows → native) is the
+   * opt-in-boundary guarantee: a reused drive page that leaves a listed host stops presenting Windows on
+   * its next navigation, so the override can't bleed onto an unrelated host.
+   *
+   * FAIL-CLOSED: THROWS on any read/session/send failure WITHOUT mutating `#osMode`, so navigate() can
+   * recover by recreating a fresh (native) page rather than proceeding to goto() with the wrong/uncertain
+   * identity — a swallowed restore failure would otherwise leave the Windows override live on a non-listed
+   * host (the exact bleed this guards), and a swallowed apply failure would silently downgrade a
+   * Windows-required host to Linux.
+   */
+  async #applyOsMode(page: PatchrightPage, target: "native" | "windows"): Promise<void> {
+    if (target === this.#osMode) return; // already in this mode (native start ⇒ a non-listed session is untouched)
+    // Use ONLY the clean baseline captured from the fresh page in #ensureActivePage — never lazily read it
+    // from the now-loaded page (which could have poisoned navigator). Absent ⇒ the eager capture failed;
+    // fail closed (navigate() recovers by recreating a fresh page, which re-captures, then retries).
+    if (!this.#liveUach) throw new Error("os-presentation: no clean UA baseline captured for this page");
+    if (!this.#osCdpSession) this.#osCdpSession = await this.#context.newCDPSession(page);
+    const override =
+      target === "windows"
+        ? buildWindowsUaOverride(this.#liveUach)
+        : buildNativeUaOverride(this.#liveUach);
+    await this.#osCdpSession.send("Emulation.setUserAgentOverride", override);
+    this.#osMode = target;
+  }
+
   async render(url: string, opts: RenderOptions = {}): Promise<RenderResult> {
     const clearanceTimeoutMs =
       opts.clearanceTimeoutMs ?? DEFAULT_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const page = await this.#context.newPage();
     try {
+      // Present as Windows for opt-in hosts BEFORE the first navigation (fresh per-call page). Inside the
+      // try so the finally still closes the page if it throws; fail-closed — a listed host that can't get
+      // the Windows identity errors out rather than rendering as Linux. Non-listed host = no-op (native).
+      if (this.#shouldPresentWindows(url)) await this.#applyWindowsToFreshPage(page);
       let status: number | null = null;
       try {
         const resp = await page.goto(url, {
@@ -445,7 +533,25 @@ export class PatchrightBrowserCore implements BrowserCore {
   async navigate(url: string, opts: RenderOptions = {}): Promise<PageSnapshot> {
     const clearanceTimeoutMs = opts.clearanceTimeoutMs ?? DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    const page = await this.#ensureActivePage();
+    let page = await this.#ensureActivePage();
+    // Drive the active page's OS presentation to match THIS host BEFORE the goto: Windows for a listed
+    // host, native otherwise — actively restoring native on a listed→non-listed transition so the Windows
+    // override never bleeds onto an unrelated host (opt-in boundary). No-op when already in mode.
+    const wantWindows = this.#shouldPresentWindows(url);
+    try {
+      await this.#applyOsMode(page, wantWindows ? "windows" : "native");
+    } catch (err) {
+      // FAIL-CLOSED: never goto() with an uncertain OS identity. A failed windows→native restore would
+      // otherwise leave the Windows override live on this non-listed host (the bleed), and a failed
+      // native→windows apply would silently downgrade a Windows-required host. Drop the active page (kills
+      // its possibly-overridden CDP session) and open a FRESH one — which starts native — then re-establish
+      // the wanted mode on it; if THAT still fails it propagates, so the navigation fails loudly rather
+      // than landing with the wrong identity.
+      process.stderr.write(`[browse-gateway] OS-presentation (${wantWindows ? "windows" : "native"}) failed; recreating page fail-closed (${errCode(err)})\n`);
+      await this.closeActivePage();
+      page = await this.#ensureActivePage(); // fresh page ⇒ native identity, #osMode reset
+      if (wantWindows) await this.#applyOsMode(page, "windows"); // a non-listed host is already correct (native)
+    }
     // Reset the tracked status; the active-page response listener (#ensureActivePage) repopulates it
     // from THIS nav's main-frame responses — INCLUDING a post-clearance reload. We deliberately do
     // NOT freeze status at the goto's first response: a CF interstitial answers 403 then reloads to
@@ -551,6 +657,17 @@ export class PatchrightBrowserCore implements BrowserCore {
     await this.#activePage?.close().catch(() => {});
     this.#activePage = undefined;
     this.#lastDocStatus = undefined;
+    this.#resetOsPresentation(); // next active page starts native again
+  }
+
+  /** Reset the active page's OS-presentation state (mode + cached live UA + CDP session). Detaches the
+   *  old session best-effort; the page close also tears it down, so this just avoids carrying a stale
+   *  reference onto the next active page. */
+  #resetOsPresentation(): void {
+    void this.#osCdpSession?.detach().catch(() => {});
+    this.#osCdpSession = undefined;
+    this.#liveUach = undefined;
+    this.#osMode = "native";
   }
 
   /**
@@ -562,6 +679,20 @@ export class PatchrightBrowserCore implements BrowserCore {
     if (!this.#activePage) {
       const page = await this.#context.newPage();
       this.#lastDocStatus = undefined;
+      this.#resetOsPresentation(); // a fresh page starts native; its OS mode is decided on the first nav
+      // Capture a CLEAN UA baseline from the fresh (about:blank) page BEFORE any site loads, so a later
+      // listed-host override is built from the REAL browser identity — not from values a previously-loaded
+      // (untrusted) page could have redefined on the shared navigator. Only when the feature is enabled.
+      // Best-effort here (a non-listed-only session never needs it); the apply path (#applyOsMode) fails
+      // closed if a listed host is later reached without a baseline.
+      if (this.#windowsUaHosts.length > 0) {
+        try {
+          this.#liveUach = await this.#readLiveUa(page);
+        } catch (err) {
+          process.stderr.write(`[browse-gateway] OS-presentation baseline read failed (${errCode(err)})\n`);
+        }
+      }
+
       page.on("response", (resp) => {
         try {
           if (resp.request().isNavigationRequest() && resp.frame() === page.mainFrame()) {

@@ -85,3 +85,12 @@ export {
   type FingerprintDiff,
   type AxisSeverity,
 } from "./fingerprint.js";
+export {
+  buildWindowsUaOverride,
+  buildNativeUaOverride,
+  chromeMajorFrom,
+  READ_LIVE_UA_JS,
+  DEFAULT_CHROME_MAJOR,
+  type UserAgentOverride,
+  type LiveUserAgent,
+} from "./os-presentation.js";
