@@ -94,3 +94,18 @@ green on Mac and in-container.
   a hardening follow-up if the host set grows.
 - The `core` option flows from `config.core` (one wiring point in `loadConfig`) to *every* session —
   warm-drive, cold-drive, and retrieve — so the warm-open prod flow is covered by the same env var.
+
+## Validated in prod (2026-06-26)
+
+`BGW_WINDOWS_UA_HOSTS=totalwine.com` was activated in prod (env file + deploy, stealth gate green) and
+exercised end-to-end: **atlas warm-opened `www.totalwine.com` through the real gateway and PerimeterX
+cleared** — the page rendered with no press-&-hold and no "Access denied", through the live
+residential-exit path. This confirms the OS-identity override works through the production warm-open
+pipeline, not just the in-container same-exit A/B harness.
+
+> Probe note: check login state on the **authenticated** slug (`/my-account`), not `/account` — the
+> latter is not a route and 404s, which reads as "logged-out" but is not. Capturing the warm-open
+> session for a press-&-hold host has its own automation-surface gotcha — see
+> `docs/solutions/integration-issues/perimeterx-login-capture-needs-plain-chrome-not-automation-launch.md`.
+> (Note: warm-open replay clears PX in prod but currently lands logged-out for Total Wine — a
+> capture-completeness/localStorage gap tracked in that doc, not a PX failure.)
