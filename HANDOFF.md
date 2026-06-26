@@ -1,97 +1,106 @@
-# HANDOFF — 2026-06-24 (afternoon, PST)
+# HANDOFF — 2026-06-26 (morning, PST)
 
-This session took **U9 — consumer warm-open** from a fresh build all the way to **live + validated in
-prod**: built it, hardened it through a 6-round autonomous Claude↔Codex review loop, merged it,
-activated the credential vault on the prod host, and proved an end-to-end warm-open with a real
-credential (atlas @ www.totalwine.com). The one thing that *didn't* clear is **PerimeterX** on Total
-Wine — which is a known separate problem, not a vault gap. **Next session's explicit goal: kill the
-PerimeterX press-&-hold once and for all.**
+This session was a deep **PerimeterX kill** arc on Total Wine: we tested every lever (cookie `_pxvid`,
+IP coherence, warm-up nav, gesture automation), **root-caused PX to exit-IP reputation** (not behavior),
+then **designed → reviewed → shipped → activated a durable fix** (fresh-exit warm-open mode, merged to
+main + live in prod). The fix is correct and active, but the live validation surfaced the **remaining
+blocker: the prod (VPS) browser fingerprint** — PX 403s the gateway's Patchright-under-Xvfb where a Mac
+Patchright clears the same exit + cookies. Next session = **Mac↔VPS fingerprint parity**.
 
-## What We Built / Shipped (all on `main`, synced at `58537ed`)
+## What We Built (all on `main`, synced; nothing unpushed)
 
-- **U9 consumer warm-open** — `f8df7cd` (squash of a 7-commit branch). Implicit auto-warm at
-  `GatewayDriveController.#firstNavigate`; warm > force-proxy/direct-first; single-host nav-clamp; both
-  entrypoints wire vault+consumerId+allowlist. Hardened via 6 Codex rounds (4 real bugs caught: parent-
-  cookie sibling-subresource exfil, revoked-entry silent-cold-downgrade, and the R3 bound-exit fail-open
-  in 3 layers → `proxyOverrideForPinned` structural check). 499 unit tests; runtime gate
-  `scripts/validate-vault-warm-open.mjs` 14/14 in-container. (Full build detail in the prior handoff /
-  git log.)
-- **Deploy mount** — `b9628de`: `scripts/deploy/launch-http.sh` gained optional `BGW_VAULT_HOST_PATH`
-  bind-mount → `/run/vault`.
-- **Deploy fix** — `58537ed`: the vault-mount block read `BGW_VAULT_HOST_PATH` **before** sourcing the
-  env file → mounted a stale/empty path (entries but no key) → `vault: /run/vault/kek ENOENT` → pre-swap
-  smoke aborted **twice** (prod never broke — the gate/smoke/abort safety chain worked). Moved the block
-  to **after** `. "$BGW_ENV_FILE"`. This was the only real prod-activation blocker.
-- **Vault ACTIVATED in prod** — `vault: ready`, live on image `d91f2b1e`, consumers `[atlas, vault,
-  argus]`, `datacenter=true sticky=true` (bound creds re-pin). Host vault at `/home/node/vault/{entries,
-  kek}` (kek 0600 base64-of-32B, node-owned); the prod env file
-  `<prod-env-file>` got `BGW_VAULT_DIR=/run/vault/entries`,
-  `BGW_VAULT_KEY_FILE=/run/vault/kek`, `BGW_VAULT_HOST_PATH=/home/node/vault`.
-- **Warm-open VALIDATED LIVE** — imported a real Total Wine credential for atlas
-  (`obscura vault import`, 118 cookies, bound exit `3e7662d5`) and drove `atlas → navigate
-  www.totalwine.com/account`. The gateway opened a **bound warm session** (re-pinned exit, restored
-  cookies, routed residential; navigate returned a page, **not** the R3 fail-closed error → warm fired).
-  Vault→warm-open→consumer pipeline confirmed in prod.
-- **Onboarding helpers** (local, `~/totalwine-onboarding/`): `capture.sh`, `creds.json`, `RUNBOOK.md`.
+- **`50e10a5` — feat: fresh-exit warm-open mode** (the durable fix). New `BGW_WARM_FRESH_EXIT_HOSTS`
+  (flat CSV host-suffixes, mirrors `BGW_FORCE_PROXY_HOSTS`): a host on the list replays its stored login
+  through a **fresh clean residential exit** instead of re-pinning the captured (decaying/burned) one.
+  Files: `src/verbs/drive.ts` (shared `verifiedHeldExit` gate + new `proxyOverrideForFresh`; both
+  FAIL-CLOSED, no rotating/unverified exit, never a direct downgrade), `src/mcp/vault-login.ts`
+  (`buildWarmOverride` gains `freshExit`, OUTERMOST branch, ignores the captured `stickyExitId`),
+  `src/mcp/drive-controller.ts` (`#freshExitHosts`; `#warmError` dispatches fresh-block→"retry for clean
+  exit" vs pinned-block→"re-capture", host-derived so it holds on first-nav AND reopen-after-reap),
+  `runtime.ts`/`http-main.ts`/`main.ts` (3 wiring points), `test/fresh-exit-warm.test.mjs` (8 tests).
+  Also: `hostForcesProxy`/`parseForceProxyHosts` now `canonicalizeHost` both sides (Codex R1 fix —
+  trailing-dot FQDN bypass). **507/507 tests pass.**
+- **`e290421` — docs: scrubbed a leaked prod env-file path from HANDOFF.md** (the prior handoff tripped
+  the `cli-brand` fleet-hygiene guard). CI is green again.
+- **Plan + critique**: `docs/plans/2026-06-24-002-fresh-exit-warm-open-plan.local.md` (design + 3-lens
+  critique outcome + folded changes). Updated `docs/plans/2026-06-22-001-spike-defeat-perimeterx-press-hold.local.md`
+  with two addenda (isTrusted-is-not-a-wall; root-cause=exit-reputation). `docs/plans/2026-06-24-001-warmup-navigation-plan.local.md`
+  marked KILLED.
+- **Local PX tooling** (in `~/totalwine-onboarding/`, OUTSIDE the repo — names the real host): `capture-proxied.sh`
+  + `px-proxy.mjs` (proxied capture through a fixed exit), `warmup-falsify.mjs` + RUNBOOK (the zero-code
+  Track-A falsifier), `px-challenge-recon.mjs` + `px-recon-batch.mjs` (PX-structure recon, both DIRECT/proxied),
+  `validate-warm.mjs` (prod warm-open validator), `px-cookie-arms.mjs` (the cookies-vs-fingerprint test).
+  `totalwine.json` = the 2026-06-24 capture (has `_pxvid` + `__pxvid`, no localStorage).
+- **Foreman (side task)**: cloned the Codex review-loop SOP into the Foreman project's memory
+  (`~/.claude/projects/-Users-dvillavicencio-Projects-ibmcconstruction-com/memory/codex-review-loop-sop.md`
+  + index), adapted to its Next.js/Sanity/Vercel domain.
 
 ## Decisions Made
 
-- **Total Wine warm-open is blocked by PerimeterX at the EDGE, not by the vault.** PX throws the
-  Press & Hold *before* the page renders, independent of the login cookie. The replay had a new
-  residential IP (exit `3e7662d5` ≠ capture IP) and no PX token (we strip the IP-bound ones), so it got a
-  fresh challenge. → It's the deferred press-&-hold spike, not a U9 problem.
-- **Capture-through-same-exit is only marginal** for PX (the clearance token is IP-bound + seconds-lived
-  → nothing useful to replay; same-IP buys a little trust, no guarantee). The real fix is defeating the
-  press-&-hold.
-- **Owner-subtree cookie residual: accepted** (operator-ratified, earlier this session) — documented at
-  `hostScopeSession`; full exact-host lockdown is optional hardening.
+- **PerimeterX on Total Wine is EXIT-IP-REPUTATION-gated, not behavioral.** A clean residential IP clears
+  it **0/5** under Patchright automation (Mac direct AND a fresh IPRoyal exit; recon 2026-06-24/25). The
+  gateway's 10/10 warm-open failures were **atlas's BOUND exit being stale/burned** (an IPRoyal `lifetime-30m`
+  sticky decays past its window). This retired warm-up-nav and gesture automation as unnecessary.
+- **Durable fix = fresh-exit warm-open, NOT a press-&-hold solver.** Relaxing R3's re-pin is safe for
+  opted-in hosts because IP-bound clearance tokens are stripped at capture (`stripIpBoundTokens`), so the
+  restored auth isn't IP-bound. **Opt-in per host; dormant by default** (every non-listed host keeps R3
+  re-pin exactly). The fail-closed-never-direct invariant is preserved via the shared `verifiedHeldExit`.
+- **Shipped via the full pipeline**: 3-lens plan critique (proceed-with-changes) → Codex adversarial-review
+  loop (R1 caught a real trailing-dot fail-open → fixed; R2 approved 0 findings) → squash-merge to main →
+  deploy. Per [[codex-review-loop-sop]].
+- **Activated in prod**: `BGW_WARM_FRESH_EXIT_HOSTS=totalwine.com` is set (confirmed: warm-open returns the
+  FRESH-exit error, not the stale one). Image `e290421` built to `latest` (CI 15:34Z), deployed via
+  `gh workflow run deploy-http.yml` (run 28185511595, success).
 
-## What Didn't Work
+## What Didn't Work (don't relitigate)
 
-- **Playwright-launched browsers can't clear PX** — `playwright open/codegen` (even `--channel=chrome`)
-  sets automation flags (`navigator.webdriver`, `--enable-automation`) → PX fails the Press & Hold
-  *forever* ("Please try again"), even for a human. Fix: capture with a **plain** Chrome (no automation
-  flags) via `~/totalwine-onboarding/capture.sh` (manual login + `playwright-core connectOverCDP`
-  read-only storageState dump), then `obscura vault import`.
-- **Running the capture on the prod host** — headless, no `$DISPLAY` → the capture must run on the Mac.
-- **`BGW_VAULT_HOST_PATH` read before env-file sourcing** — see `58537ed` above.
+- **Track A — warm-up navigation: KILLED.** Zero-code falsifier: baseline 10/10 PX-fired, warm-up 10/10
+  fired, **homepage itself fired 10/10**. A no-human warm-up can't clear a behavioral challenge — but that
+  was on atlas's *burned* exit; the real story is exit reputation (above).
+- **Experiment #1 — keep `_pxvid`: NOT the blocker.** The cookie-arms test proved it: the gateway-equivalent
+  stripped cookie set (which DROPS `_pxvid`) **clears PX on the Mac**; keeping `_pxvid` also clears. So
+  `_pxvid` is not what's 403ing the gateway. (Note: `/^_px/i` strips `_pxvid` but KEEPS `__pxvid` — a
+  partial device identity — yet it clears anyway on a good fingerprint.)
+- **Experiment #2 — IP coherence (capture==replay exit): confounded** (sticky lifetime + Mac/VPS fingerprint
+  + behavioral void). Tooling built, not pursued.
+- **`isTrusted` is NOT a wall (myth refuted).** The gateway's Patchright produces `isTrusted=true` on
+  synthesized holds (page.mouse AND raw CDP Input). The "CDP input is isTrusted=false" belief conflates
+  CDP injection with in-page JS dispatchEvent. So Track B gesture automation was never blocked on isTrusted
+  — but it's moot given the exit-reputation root cause.
 
-## What's Next  → KILL PERIMETERX (the explicit next-session goal)
+## What's Next
 
-Plan: `docs/plans/2026-06-22-001-spike-defeat-perimeterx-press-hold.local.md`. First, cheapest experiments:
-
-1. **Stop over-stripping `_pxvid`.** `stripIpBoundTokens` (`src/mcp/vault-login.ts`,
-   `IP_BOUND_COOKIE_PATTERNS` → `/^_px/i`) strips **all** `_px*`, including `_pxvid` — PX's *long-lived
-   visitor/device id*, not the short IP-bound clearance. That makes every replay look like a brand-new
-   visitor. **Keep `_pxvid`; strip only the clearance (`_px3`/`_pxhd`/`pxcts`/`_px`/`_px2`).** Cheapest
-   thing to try; may meaningfully cut re-challenges. (Re-verify the exact PX cookie taxonomy first.)
-2. **Capture-through-the-same-residential-exit** so capture-IP == replay-IP (route the `capture.sh`
-   Chrome through the IPRoyal sticky exit you'll bind, import with that same `--exit`). Test whether PX
-   then waves the residential session through.
-3. **Programmatic press-&-hold defeat** (the hard core of the spike): solve/replay the PX human-challenge
-   on the drive path. Note: CapSolver tier today does reCAPTCHA/hCaptcha/Turnstile, **not** PX
-   press-&-hold. PX iframe markers + the 200-OK false-negative are already documented
-   (`docs/solutions/.../perimeterx-200-iframe-challenge-false-negative.md`).
-4. **(Optional clean proof of U9, deferred this session):** import + warm-open on a **non-PX** login site
-   to *see* warm-open hand back a logged-in page with nothing masking it.
+1. **Mac↔VPS fingerprint parity (THE blocker).** Decisive evidence: same fresh residential exit + same
+   stripped cookies → **Mac Patchright clears PX, VPS gateway 403s**. Classic "clears locally / blocks in
+   prod" — exactly what the **fingerprint-parity harness** solves (`scripts/fingerprint-snapshot` +
+   `-diff`; how Indexxx's WebGL-absent tell was found). Diff the Mac (clears) vs the VPS gateway (403s),
+   find + close the PX-tripping tell (WebGL/canvas/UA/fonts/screen under Xvfb are prime suspects).
+2. **Re-capture atlas's Total Wine credential** — the 2026-06-24 session cookies have expired (warm-open
+   would land logged-OUT even once PX clears). Now easy: a clean exit clears PX with no challenge, so the
+   gateway could even auto-login through a fresh exit (no human plain-Chrome capture needed) — a tracked
+   follow-up.
+3. **Re-validate** once fingerprint parity closes: `~/totalwine-onboarding/validate-warm.mjs` (drives atlas
+   → totalwine.com/account, retries across fresh exits, classifies logged-in/out/blocked).
 
 ## Gotchas & Watch-outs
 
-- **Rootless Docker on prod:** gateway runs as host **`node`** (container-root → node via userns). Vault
-  files MUST be node-owned (run host steps as node, **no sudo**, or the container can't read the key).
-  `docker`/paths are per-user → use absolute `/home/node/...` and `sudo -iu node`.
-- **`obscura` CLI** drops off PATH after an nvm node-version switch (global bin lost). Re-`npm link` in
-  the repo. Capture/import run on the **Mac**; `obscura` docker-execs into the prod container.
-- **Manifest reload:** `consumers.json` is read at boot — an allowlist change needs a container
-  **re-create** (redeploy), not a restart (bind-mount inode + frozen env). atlas is already `allow=["*"]`
-  (allow-all), so adding a host there is a no-op.
-- **Pool floor is exact:** `maxSessions=7 = 3 consumers × perConsumerMax=2 + 1`; no headroom. Warm
-  sessions are held longer → bump `BGW_MAX_SESSIONS` before a 4th consumer or on `SESSION_LIMIT`.
-- **Deploy safety chain is real and load-bearing:** gate → pre-swap smoke → swap → verify → auto-rollback
-  aborted both bad deploys without touching prod. Trust it; read the `--log-failed` `fatal:`/`smoke:` line.
-- **IPRoyal sticky suffix** (verified vs live docs): `_country-us_session-{id}_lifetime-30m` (params in
-  the PASSWORD; session = 8 alphanumeric; lifetime 1s–7d). Bound warm creds need
-  `BGW_PROXY_STICKY_SUFFIX`(with `{id}`)+`BGW_ON_DATACENTER_IP=1`+proxy or warm-open **fails closed** (R3).
-- **Public repo** — codenames/placeholders only; the prod host paths above stay out of committed source.
-- Local `main` == `origin/main` (`58537ed`); nothing unpushed. Untracked `.claude/` + `AGENTS.md`
+- **The fresh-exit 403 is the VPS FINGERPRINT, structurally proven NOT a datacenter fallback.** Fail-closed-
+  never-direct means a warm-open that *navigated* (and 403'd) used a verified residential exit — a datacenter
+  fallback would have THROWN, not 403'd. So don't chase the exit/proxy; it's the browser fingerprint.
+- **`BGW_DIAG_VERIFY_EGRESS` won't help diagnose warm-open egress** — `#verifyEgress()` is called ONLY in
+  the COLD escalation path (`#openHealthyAndNavigate`, drive-controller.ts:519), never the warm path. It's
+  diagnostic-only and off by default; its absence is normal. For a direct residential-egress readout you'd
+  need a *cold* proxied probe.
+- **cli-brand fleet-hygiene guard**: never commit the prod adminSsh / tunnel host / remote manifest / remote
+  env-file literals to any committed file (HANDOFF, docs, source). Consumer codenames (`atlas`) and
+  `totalwine.com` ARE public-safe and allowed. This handoff is clean; keep it that way.
+- **Cookie-arms 404 reading**: `status=404 "Not Found | Total Wine & More"` with no challenge = PX CLEARED +
+  logged-out (the TW app 404s `/account` when not authed), NOT a block. Only a PX challenge page / 403-with-
+  PX-markers is a block.
+- **Validation needs atlas's token** (prod secret, harness won't let the agent read it) — operator pulls it
+  via ssh into `BGW_TOKEN`, then runs `validate-warm.mjs` with `BGW_URL=http://127.0.0.1:8080/mcp` (the
+  durable tunnel must be up; LaunchAgent).
+- **Don't bundle the `_pxvid` strip change** — it was disproven as the blocker this session; the critique's
+  predicted dependency did not bind. Leave `stripIpBoundTokens` as-is unless fingerprint parity reopens it.
+- Local `main` == `origin/main` (`e290421`); 507/507 tests pass; no open PRs. Untracked `.claude/` + `AGENTS.md`
   pre-existing, left as-is.
