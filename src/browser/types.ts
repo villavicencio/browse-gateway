@@ -138,6 +138,17 @@ export interface BrowserCoreOptions {
    * (CF managed challenges are cleared by residential escalation, not a solver).
    */
   solver?: CaptchaSolver;
+  /**
+   * Per-host OS-presentation opt-in (BGW_WINDOWS_UA_HOSTS): canonical host-suffixes whose navigations
+   * should present as **Windows** Chrome instead of `Linux x86_64`, via a CDP UA/platform/client-hints
+   * override applied before the first navigation (see {@link import("./os-presentation.js")}). A runtime
+   * behavior, NOT a launch arg — like {@link solver}/{@link restoreState}, it is read from `opts`, not
+   * mapped into Chrome's argv. Empty/absent = every navigation keeps the native (Linux) identity. Opt-in
+   * because a Windows UA over the container's Linux fonts/canvas is internally incoherent, so we present
+   * Windows only for hosts that demonstrably need it (PerimeterX 403s Linux Chrome — measured on Total
+   * Wine 2026-06-26) and leave all other targets on the coherent Linux identity.
+   */
+  windowsUaHosts?: readonly string[];
 }
 
 /** A point-in-time snapshot of a rendered page. */

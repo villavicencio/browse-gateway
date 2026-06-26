@@ -36,6 +36,10 @@ yarn-error.log*
 .vscode/
 *.swp
 
+# Local agent config — machine-local Claude Code settings (e.g. operator-scoped permission grants);
+# never commit to this public repo.
+.claude/
+
 # Browser / runtime artifacts
 .cache/
 playwright-report/

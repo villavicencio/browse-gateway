@@ -67,7 +67,12 @@ export const WEBRTC_IP_HANDLING_ARG =
  * Applied unconditionally (like the WebRTC policy) — the production surface is the GPU-less
  * Xvfb container, and forcing it everywhere keeps local dev a faithful fingerprint mirror of
  * prod. A host with a REAL GPU should drop these (real hardware WebGL is the better signal).
- * Spoofing the SwiftShader renderer string to a plausible consumer GPU is a possible follow-up.
+ *
+ * NOTE: the SwiftShader renderer string was once suspected as the prime PerimeterX tell and a
+ * renderer-spoof was floated here as a follow-up — but a 2026-06-26 same-exit A/B EXONERATED it
+ * (Mac with these exact SwiftShader args clears PX; a renderer-string spoof did not change the
+ * container's verdict). The actual PX-403 tell on Total Wine was the OS identity (`Linux x86_64`),
+ * fixed by the opt-in Windows OS-presentation override — see `os-presentation.ts`. Leave WebGL as-is.
  */
 export const WEBGL_SWIFTSHADER_ARGS = [
   "--use-gl=angle",

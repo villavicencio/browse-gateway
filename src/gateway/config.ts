@@ -4,6 +4,7 @@
  * gate and the service launch browsers identically.
  */
 import type { BrowserCoreOptions } from "../browser/index.js";
+import { parseHostSuffixList } from "../security/index.js";
 
 export interface GatewayConfig {
   /** Max concurrent browser sessions. Kept low by default — headful Chrome is heavy. */
@@ -59,6 +60,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
   if (env.BGW_CHANNEL !== undefined) core.channel = env.BGW_CHANNEL;
   if (env.BGW_NO_SANDBOX === "1") core.noSandbox = true;
   if (env.BGW_HEADLESS === "1") core.headless = true;
+  // Opt-in per-host OS presentation: hosts on BGW_WINDOWS_UA_HOSTS present as Windows Chrome instead of
+  // Linux (PerimeterX-class scorers 403 Linux Chrome — measured on Total Wine). Empty list = no-op.
+  const windowsUaHosts = parseHostSuffixList(env.BGW_WINDOWS_UA_HOSTS);
+  if (windowsUaHosts.length) core.windowsUaHosts = windowsUaHosts;
 
   return {
     maxSessions: positiveIntOr(env.BGW_MAX_SESSIONS, DEFAULT_GATEWAY_CONFIG.maxSessions),

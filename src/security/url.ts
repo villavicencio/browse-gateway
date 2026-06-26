@@ -43,6 +43,32 @@ export function hostFromUrl(url: string): string {
 }
 
 /**
+ * Parse a comma-separated host-suffix list (e.g. `"totalwine.com, www.example.com"`) into a
+ * normalized, canonical lowercase list. One source of truth for the env-driven per-host policy lists
+ * (force-proxy, fresh-exit, windows-UA) so they all parse identically. Empty/blank → `[]`.
+ */
+export function parseHostSuffixList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean)
+    .map((h) => canonicalizeHost(h)); // canonical (lowercase + no trailing dot) so matching is exact
+}
+
+/**
+ * True when `host` matches one of `suffixes` — an exact match OR a dotted subdomain of it
+ * (`totalwine.com` covers `www.totalwine.com` but NOT `nottotalwine.com`). Both sides are
+ * {@link canonicalizeHost}-normalized so a trailing-dot FQDN can't slip past the match. Shared by the
+ * force-proxy / fresh-exit / windows-UA per-host policies so a decision can't be bypassed by URL
+ * spelling and the surfaces can't drift.
+ */
+export function hostMatchesAnySuffix(host: string, suffixes: readonly string[]): boolean {
+  const h = canonicalizeHost(host);
+  return suffixes.some((s) => h === s || h.endsWith(`.${s}`));
+}
+
+/**
  * Canonicalize a host AND fold it to ASCII/punycode, so a Unicode IDN host (`bücher.example`) and its
  * punycode form (`xn--bcher-kva.example`, which is what Chrome emits in a cookie `domain`) compare
  * equal. Falls back to the plain canonical form when the host can't be parsed as a URL authority (an
