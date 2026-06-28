@@ -56,12 +56,16 @@ host.
 - **Reusing a previously-created isolated profile to skip re-login.** A reused `--user-data-dir` can
   **auto-log-in from a prior run**, so the capture grabs a stale/expired session shell, not a live
   token → warm-open later lands logged-out (see Prevention #1).
-- **Cookie-only capture for a localStorage-auth site (still open).** `connectOverCDP` +
-  `storageState` reliably dumps cookies (including httpOnly), but the dump captured **`origins: 0` —
-  no localStorage**. Total Wine has no httpOnly session cookie (only `twm-cart`/`SERVERID`) and
-  appears to hold its auth token client-side, so the cookie-only capture warm-opens **logged-out**
-  even after a fresh, live sign-in. The plain-Chrome capture defeats PX *for the capture step*; it is
-  not yet a complete-session capture for a client-side-auth site. See "Still open" below.
+- **Relying on `connectOverCDP` + `storageState()` to enumerate localStorage.** It reliably dumps
+  cookies (including httpOnly), but returned **`origins: 0` — no localStorage**. Root cause is precise:
+  Playwright only serializes localStorage for origins in `this._origins`, which is populated *solely*
+  by `addVisitedOrigin` ← `frameNavigatedToNewDocument`. A `connectOverCDP`-attached page that had
+  **already navigated before Playwright attached** never fired that event, so `_origins` is empty and
+  the localStorage-collection loop is skipped → `origins: []`. It is **not** an empty store and **not**
+  a CDP read limit (`frame.evaluate` reads localStorage fine over the same attach). Total Wine has no
+  httpOnly session cookie (only `twm-cart`/`SERVERID`) and holds its auth token client-side, so the
+  cookie-only dump warm-opened **logged-out** even after a fresh, live sign-in. Fixed by enumerating
+  localStorage ourselves per live frame — see Solution step 3 and "Capture fix" below.
 
 ## Solution
 
@@ -81,18 +85,31 @@ Separate the two phases that the naive recipe fused: **log in as a human in a cl
    a real Chrome, the gesture clears. Confirm login on the **authenticated** slug (e.g. `/my-account`),
    not `/account` (see Prevention #2).
 
-3. **Attach READ-ONLY and dump the session** with `playwright-core`:
+3. **Attach READ-ONLY and dump the session** with `playwright-core` — collecting cookies via
+   `storageState()` **and enumerating localStorage ourselves per live frame** (do NOT rely on
+   `storageState()` to enumerate origins; see "Capture fix" below):
 
    ```js
    const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
    const ctx = browser.contexts()[0];
-   await ctx.storageState({ path: 'out.json' });
+   const state = await ctx.storageState();        // cookies (incl. httpOnly) — fine over CDP
+   const byOrigin = new Map();                     // localStorage — enumerate per frame ourselves
+   for (const page of ctx.pages()) for (const frame of page.frames()) {
+     const origin = await frame.evaluate(() => location.origin);
+     if (!/^https?:/.test(origin)) continue;
+     const kv = await frame.evaluate(() =>
+       Object.fromEntries(Object.entries(localStorage)));
+     // …fold kv into byOrigin, then state.origins = [...] of {origin, localStorage:[{name,value}]}
+   }
    await browser.close(); // disconnects only — does NOT close the human Chrome
    ```
 
    `connectOverCDP` attaches to the already-running human browser; it does not relaunch and does not
    add automation flags. `browser.close()` on a `connectOverCDP` handle only **disconnects** — it does
-   not close or disturb the human Chrome.
+   not close or disturb the human Chrome. Iterating `page.frames()` (not just the main frame) captures
+   auth that lives on an account/SSO subdomain iframe too. Do **not** `page.reload()` to prime
+   `_origins` — a reload risks a fresh PX press-&-hold or a logout; the `frame.evaluate` read is
+   strictly read-only.
 
 4. **Import into the vault** (the import strips the IP-bound `_px*` clearance tokens and keeps the
    durable cookies):
@@ -109,20 +126,47 @@ browser without relaunching it or flipping any automation flag, and disconnectin
 the surface. So the captured cookies come from a genuinely clean human session — exactly what PX
 would have minted for a real visitor.
 
-This solves the *capture-past-PX* problem. It does **not** by itself guarantee a *complete* session —
-`storageState` over `connectOverCDP` captured only cookies here, not localStorage (see below).
+This solves the *capture-past-PX* problem. On its own it captured only cookies, not localStorage; the
+capture fix below closes that gap.
 
-## Still open: localStorage auth not captured
+## Capture fix: enumerate localStorage per frame (mechanism verified)
 
-The plain-Chrome capture clears PX and the warm-open *replay also clears PX* (confirmed in prod — the
-page renders, no challenge), but the replay still lands **logged-out**. The captured `out.json` had
-**125 cookies but `origins: 0`** (no localStorage), and Total Wine exposes **no httpOnly session
-cookie** — the auth token is almost certainly held in `localStorage`, which the cookie-oriented dump
-did not grab. Next step for full warm-open-login on a client-side-auth host: extend the capture to
-**evaluate `localStorage` on the live logged-in page** (`page.evaluate(() => ({...localStorage}))`)
-and fold it into the imported `storageState.origins`, rather than relying on `connectOverCDP`'s
-`storageState` to enumerate it. (Verify first that the live logged-in page actually has an auth-looking
-`localStorage` key.)
+The capture tooling now enumerates localStorage itself instead of trusting `storageState()`'s empty
+`_origins`. Two reusable helpers, plus a pre-capture gate:
+
+- **`dump-storagestate.mjs`** — `storageState()` for cookies, then `frame.evaluate` over every live
+  frame to read `localStorage`, folded into `state.origins` as
+  `[{ origin, localStorage: [{name,value}] }]`.
+- **`inspect-localstorage.mjs`** — a **read-only pre-capture gate** that prints, per origin, the
+  localStorage key *names* (never values) and flags auth-looking keys, then exits 0 (auth key found) /
+  3 (none) / 2 (couldn't attach). `capture.sh` runs it before dumping so the operator sees, *before*
+  spending a capture, whether TW's auth is in localStorage and **on which origin**.
+
+Verified on a control origin (seed `authToken` on a live page → inspect flags it, dump yields
+`origins:1` with the value round-tripped). The whole downstream chain was also audited and is correct:
+import carries `origins` intact, `stripIpBoundTokens` leaves them untouched, `hostScopeSession` **keeps**
+a `https://www.totalwine.com` origin under both `www.totalwine.com` and `totalwine.com` owner spellings,
+and warm replay re-injects per-origin localStorage via an origin-guarded `addInitScript` that fires
+before the first navigation. So the only code gap was capture — now fixed.
+
+## Still open: pending a live re-capture + 3 risks the inspect gate de-risks
+
+The mechanism is proven, but **logged-in warm-open for Total Wine is not yet confirmed end-to-end** —
+it needs one live human re-capture (clear PX, fresh sign-in, run `capture.sh`). Three risks remain, and
+the new inspect step is designed to surface the first two immediately:
+
+1. **Origin alignment.** Warm replay's localStorage seed guard is an **exact** `location.origin` match,
+   and the nav-clamp pins the first navigation to the entry's owner host. If TW's auth localStorage
+   lives on apex `https://totalwine.com` while the owner/clamp is `https://www.totalwine.com` (or vice
+   versa), the origin is *kept* through host-scoping but **never injected** → still logged-out. The
+   inspect gate prints the real origin, so a mismatch is caught up front (import must use that exact
+   host). **This is the most likely remaining failure.**
+2. **Auth not in localStorage at all.** If the session lives in `sessionStorage` (which `storageState`
+   **never** captures) or an httpOnly/IP-bound cookie that the strip removed, restoring localStorage
+   won't help. The inspect gate's "no auth-looking key found" warning is the early signal.
+3. **PX re-challenge on replay.** Import strips all `_px*` tokens, so a fresh-exit replay can re-hit the
+   press-&-hold before the page regardless of a correct localStorage restore — the known PX edge-gate,
+   tracked separately (OS-identity + iframe-detection docs), not a capture issue.
 
 ## Prevention
 
@@ -134,7 +178,9 @@ and fold it into the imported `storageState.origins`, rather than relying on `co
    but is not — always verify against the actual authenticated path.
 3. **Capture localStorage too for client-side-auth sites.** A cookie-only `storageState` (`origins:0`)
    silently drops localStorage; if the site has no httpOnly session cookie, the warm-open will be
-   logged-out. Evaluate and include localStorage at capture time.
+   logged-out. Enumerate it per frame with `frame.evaluate` (the tooling now does this) — and run the
+   read-only inspect gate first to confirm an auth-looking key exists *and on which origin*, since warm
+   replay injects per-origin by exact-origin match.
 4. **Validation harness must close consumer-bound sessions on the success path too.** The warm-open
    validation script only called `browser_close` on the error path, so successful runs leaked
    consumer-bound drive sessions and repeated runs hit "per-consumer session limit reached (2)". The
@@ -146,6 +192,7 @@ and fold it into the imported `storageState.origins`, rather than relying on `co
 > Once captured and imported, the *replay* must (a) clear PX through the gateway and (b) carry a
 > complete session. PX-clearance on the gateway side is solved by the OS-identity presentation fix
 > (related OS-identity doc) and the 200/iframe challenge-detection work (related PerimeterX-iframe
-> doc) — both confirmed clearing in prod. The remaining logged-out symptom is the localStorage gap
-> above, a *capture-completeness* issue, not a PX issue. Vault material on the observability/egress
-> surface and redirect-boundary handling are tracked in the redaction-gap and nav-guard-redirect docs.
+> doc) — both confirmed clearing in prod. The logged-out symptom was a *capture-completeness* issue
+> (localStorage), not a PX issue; the capture fix above closes the mechanism, pending one live
+> re-capture to confirm Total Wine end-to-end. Vault material on the observability/egress surface and
+> redirect-boundary handling are tracked in the redaction-gap and nav-guard-redirect docs.
