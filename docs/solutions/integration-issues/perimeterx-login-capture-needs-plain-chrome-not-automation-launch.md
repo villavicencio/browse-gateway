@@ -149,11 +149,18 @@ a `https://www.totalwine.com` origin under both `www.totalwine.com` and `totalwi
 and warm replay re-injects per-origin localStorage via an origin-guarded `addInitScript` that fires
 before the first navigation. So the only code gap was capture — now fixed.
 
-## Still open: pending a live re-capture + 3 risks the inspect gate de-risks
+## RESOLVED 2026-06-28: warm-open lands logged-in end-to-end
 
-The mechanism is proven, but **logged-in warm-open for Total Wine is not yet confirmed end-to-end** —
-it needs one live human re-capture (clear PX, fresh sign-in, run `capture.sh`). Three risks remain, and
-the new inspect step is designed to surface the first two immediately:
+The full pipeline was confirmed logged-in on Total Wine: capture(+localStorage) → strip PX → import →
+fresh residential exit + Windows-UA → **warmup-nav** → `/my-account` "Account Home" (authenticated
+dashboard). The localStorage capture fix here was necessary but **not sufficient** — the deep authed
+URL also needed a **warmup navigation** (clear PX on the homepage first); see
+`docs/solutions/runtime-errors/perimeterx-warm-open-deep-url-403-needs-warmup-navigation.md`. That doc
+also records the durability constraint: TW sessions are short-lived (~hours, no refresh token), so a
+capture must be replayed within its window — the first attempt landed logged-out purely because the
+captured session had already expired.
+
+### The 3 risks that were tracked here (now retired)
 
 1. **Origin alignment.** Warm replay's localStorage seed guard is an **exact** `location.origin` match,
    and the nav-clamp pins the first navigation to the entry's owner host. If TW's auth localStorage
