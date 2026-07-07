@@ -282,6 +282,58 @@ test("warm-up: a LIVE (non-reaped) pinned navigate does NOT re-warm (token alrea
   assert.deepEqual(navs.slice(before), ["https://example.com/deep/more"], "live pinned navigate goes straight to the target, no extra warm-up");
 });
 
+test("warm-up: a handle loss DURING warm-up reopens AND re-warms the fresh session before the target", async () => {
+  // Codex round 2 (medium): if a warm-up hop itself loses the session to a reap, the fresh reopened
+  // session has NO clearance token — so it must be warmed up too, not driven deep-URL-first. The first
+  // warm-up hop drops its session and throws (mid-warm-up reap); the reopened session must receive its
+  // OWN warm-up "/" before the deep target.
+  let nextId = 1;
+  const open = new Map();
+  const opens = [];
+  const navs = []; // [handle, url] per core.navigate
+  let reapNext = true; // the first #run drops its session and throws (reap during warm-up)
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession(_t, override) {
+      opens.push(override);
+      const id = "h" + nextId++;
+      open.set(id, {
+        core: {
+          async navigate(url) {
+            navs.push([id, url]);
+            return { url, title: "ok", tree: "real content ".repeat(12), status: 200 };
+          },
+        },
+      });
+      return id;
+    },
+    async useConsumerSession(_t, handle, fn) {
+      if (reapNext) {
+        reapNext = false;
+        open.delete(handle); // session gone from the pool BEFORE the core runs → #run clears #handle
+        throw new Error("session reaped mid-warm-up");
+      }
+      const s = open.get(handle);
+      if (!s) throw new Error(`no open session for handle ${handle}`);
+      return fn(s);
+    },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll, warmupHosts: ["example.com"],
+  });
+  const snap = await c.navigate("https://example.com/deep/account");
+  assert.equal(snap.status, 200, "the target still landed after the mid-warm-up reap");
+  assert.equal(opens.length, 2, "session 1 (lost mid-warm-up) + session 2 (reopened)");
+  const s2navs = navs.filter(([h]) => h === "h2").map(([, u]) => u);
+  assert.deepEqual(
+    s2navs,
+    ["https://example.com/", "https://example.com/deep/account"],
+    "the reopened session was warmed up (shallow root) BEFORE the deep target — no deep-URL-first on the fresh session",
+  );
+});
+
 test("warm-up: a BOUND (proxied) warm session warms up through the SAME re-pinned exit, then the target", async () => {
   // The proven PX case is a bound/fresh residential exit. Warm-up must run through the SAME sealed
   // proxied session (never an unpinned one), so the warm-up + target share the re-pinned exit (R3).

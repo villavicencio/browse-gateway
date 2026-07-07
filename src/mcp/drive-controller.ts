@@ -253,8 +253,7 @@ export class GatewayDriveController implements DriveController {
     // a LIVE pinned session already carries the token from its first warm-up, so re-warming every navigate
     // would be wrong (and wasteful). A revoked entry already failed LOUD inside #ensureOpen above.
     if (reopening && this.#warmHost !== undefined) {
-      await this.#runWarmup(url);
-      if (!this.#handle) await this.#ensureOpen(); // B2: a warm-up hop that lost the handle re-warms (R3) first
+      await this.#warmUpForTarget(url);
     }
     // Capture warmth AFTER #ensureOpen (which may have RE-WARMED a reaped session): a stale warm replay
     // must fail LOUD with the operator-recapture signal on the reopen path too — not the generic "retry
@@ -469,13 +468,8 @@ export class GatewayDriveController implements DriveController {
     // Warm-up navigation (PerimeterX deep-URL-first fix): on an opted-in owner host, navigate a shallow
     // same-owner page FIRST so the edge WAF issues a clearance token into this live session — then the
     // target navigate carries it instead of hard-403'ing a logged-in-looking request to a deep page with
-    // no clearance. Best-effort and NEVER discards the warm session; the target navigate below stays the
-    // authoritative gate. Runs on the SAME sealed, exit-pinned session (R3) opened just above.
-    await this.#runWarmup(url);
-    // A warm-up hop that lost the session to a mid-flow reap resets #handle (via #run's catch). Re-warm
-    // (re-pinning the SAME captured exit, R3; a revoked entry still fails LOUD) before the target so it
-    // can never surface the raw "no active drive session" string. Usually a no-op — the handle survives.
-    if (!this.#handle) await this.#ensureOpen();
+    // no clearance. Runs on the SAME sealed, exit-pinned session (R3) opened just above.
+    await this.#warmUpForTarget(url);
     const snap = await this.#run((s) =>
       s.core.navigate(url, override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}),
     );
@@ -485,6 +479,30 @@ export class GatewayDriveController implements DriveController {
     }
     this.#pinned = true;
     return snap;
+  }
+
+  /**
+   * Prepare an open, exit-pinned, warmed-up warm session for the target navigate — the SINGLE warm-up
+   * entry point, shared by first warm-open and reopen-after-reap so the two paths can't diverge. Runs
+   * {@link #runWarmup}; if a warm-up hop lost the session to a reap ({@link #run} cleared #handle),
+   * REOPEN (re-pin the captured exit, R3, via {@link #ensureOpen}) and warm the FRESH session ONCE more —
+   * a reopened session has no clearance token, so skipping its warm-up would regress to deep-URL-first
+   * (the PX 403 this feature fixes) and surface a misleading stale-login error. Bounded to a single
+   * re-warm retry, then a final {@link #ensureOpen} guarantees a live re-pinned handle for the target
+   * (never the raw "no active drive session"); a revoked entry still fails LOUD inside #ensureOpen. The
+   * bound means a pathologically-reaping session can't loop — at most two reopens, two warm-ups.
+   */
+  async #warmUpForTarget(url: string): Promise<void> {
+    await this.#runWarmup(url);
+    if (this.#handle === undefined) {
+      // A warm-up hop lost the session to a reap: reopen (re-pin R3) and warm the FRESH session once, so
+      // it carries a clearance token before the deep target rather than regressing to deep-URL-first.
+      await this.#ensureOpen();
+      await this.#runWarmup(url);
+    }
+    // Pathological double-loss: guarantee a live re-pinned handle for the target navigate (best-effort
+    // warm-up is already done; the target navigate stays the authoritative gate).
+    if (this.#handle === undefined) await this.#ensureOpen();
   }
 
   /**
