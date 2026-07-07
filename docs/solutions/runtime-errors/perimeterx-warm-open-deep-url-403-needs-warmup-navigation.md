@@ -55,12 +55,28 @@ Validated 2026-06-28 via a client-side two-step (`~/totalwine-onboarding/validat
 warmup `https://www.totalwine.com/` → target `https://www.totalwine.com/my-account` → **Account Home,
 logged in**.
 
-### Still TODO: move warmup-nav into the gateway
+### DONE (2026-07-07): warmup-nav is now server-side in the gateway
 
-Today the warmup is **client-side** (two `browser_navigate` calls). The durable fix is to make the
-gateway's warm-open do it internally — when warm-opening a host, first navigate the host root (or a
-configured shallow path) to clear PX, then the requested target — so a single consumer `navigate` to a
-deep authed URL just works. See the warmup-navigation plan. Until then, consumers must warm up manually.
+The client-side two-step is now a durable server-side capability. When a warm (vault-backed) session
+opens on an owner host listed in `BGW_WARMUP_HOSTS`, the gateway navigates a shallow same-owner page
+(`BGW_WARMUP_PATHS`, default `/`) FIRST — clearing the edge WAF into the live session — then the
+consumer's real (possibly deep) target, which now carries the token. A single consumer `navigate` to a
+deep authed URL just works; consumers no longer warm up manually.
+
+Where it lives: `GatewayDriveController.#warmUpForTarget` → `#runWarmup` (`src/mcp/drive-controller.ts`),
+run inside `#openWarmAndNavigate` AND the reopen-after-reap path (symmetric — a reaped warm session that
+reopens is warmed up too, so long-lived sessions don't regress to deep-URL-first). Load-bearing invariants
+held (verified in a 3-round Codex adversarial-review loop): runs AFTER the exit is pinned on the SAME
+sealed bound session (R3 fail-closed unchanged); every hop targets only the SEALED owner host and passes
+the credential-owner nav-clamp; it reuses the existing clearance detection/poll (a second call through the
+same `core.navigate`); best-effort — a blocked hop never discards the session, and the target navigate
+stays the authoritative gate (a stale login still fails LOUD). Config is flat env (`BGW_WARMUP_HOSTS`
+reuses the force-proxy host-suffix parser; `BGW_WARMUP_PATHS` is fail-closed at boot on a non-relative
+path). Runtime gate: `scripts/validate-vault-warm-open.mjs` gained a real-browser warm-up leg (shallow
+root fetched before the deep target on one credentialed session).
+
+**Deployment:** set `BGW_WARMUP_HOSTS=totalwine.com` (and optionally `BGW_WARMUP_PATHS`) in the prod env
+file to activate for Total Wine. Unset = warm-up off everywhere (exact prior behavior).
 
 ## A hard durability constraint (Total Wine)
 
