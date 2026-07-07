@@ -1,64 +1,91 @@
-# HANDOFF — 2026-06-28 (Sunday)
+# HANDOFF — 2026-07-07 (Tuesday)
 
-> Operator traveling (overseas), low bandwidth until home Friday 2026-07-03. Nothing here is
-> time-pressured.
+Continuation of the Total Wine warm-open arc. The headline win (warm-open lands LOGGED-IN end-to-end)
+was proven 2026-06-28; since then this session was operational: two "is the gateway down?" checks
+(06-30, 07-06) that were really a dropped local tunnel, then a proper root-cause + fix of the tunnel
+keeper so it stops masquerading as gateway outages, and a `/ce-compound` capturing that fix. Repo is
+docs-only changes; `main == origin/main` at `11cfc65`; no open PRs.
 
-**WIN: warm-open lands LOGGED-IN end-to-end on Total Wine — the parked task is DONE.** Proven live this
-session: capture(+localStorage) → strip PX → import → fresh residential exit + Windows-UA → **warmup-nav**
-→ `/my-account` "Account Home" (authenticated dashboard: Rewards, Profile & Settings, My Rewards). Two
-new findings cracked it — a warmup-navigation requirement and a session-expiry constraint (below).
+## What We Built
 
-## What We Did
+- **Tunnel keeper made self-healing (`11cfc65` documents it; the keeper itself is Mac-local, not in the
+  repo).** Root cause: `~/Library/Application Support/browse-gateway-tunnel/tunnel-keeper.sh` had a
+  self-DISABLE valve — after 10 consecutive fast-fails (<30s) it ran `launchctl bootout` on itself, then
+  stayed fully unloaded until a manual `bootstrap`. The log showed **7 self-disables in 3 weeks (5 in the
+  last 10 days of travel)**, all from transient offline (`Could not resolve hostname …` / `… port 22:
+  Operation timed out` on plane/hotel/captive-portal/VPN-down). Fixed: rewrote the keeper to **never boot
+  out** — classifies `offline` (cap 60s) vs `config` (cap 300s + loud log) vs `unknown` (cap 120s), quick
+  retries for the first 3 fast-fails then escalating capped backoff, KeepAlive keeps retrying so it
+  self-heals when prod is reachable. Backup at `tunnel-keeper.sh.bak-selfdisable` (revert = cp it back).
+  Verified: `sh -n` clean, classifier dry-run maps both real log strings → `offline`, live tunnel
+  undisturbed (new logic applies next cycle).
+- **Solution doc (`11cfc65`, on main):**
+  `docs/solutions/integration-issues/ssh-tunnel-keeper-self-disable-never-recovers.md` — via `/ce-compound`
+  (Full mode, 3 parallel subagents, LOW overlap, frontmatter-validated, fleet-hygiene-clean placeholders).
+- **Updated `TUNNEL.local.md`** (gitignored) + the `durable-tunnel-launchagent` memory to the new
+  self-healing behavior (both previously said "self-disables").
+- **Gateway health confirmed twice** (06-30, 07-06): container `Up 9 days, 0 restarts`, serving HTTP 401
+  in ~3ms on the prod loopback, actively handling `vault` + `atlas` sessions. Each "down?" was the local
+  `:8080` tunnel, not the gateway — bootstrapped it both times.
 
-- **Shipped the localStorage capture fix** (last session's work): `dump-storagestate.mjs` enumerates
-  localStorage per live frame; `inspect-localstorage.mjs` pre-capture gate. Captures now produce
-  populated `origins` (was `origins:0`). Both wired into `capture.sh` / `capture-proxied.sh`.
-- **Diagnosed the warm-open 403 → found it's NOT capture/localStorage.** Cookie-only (origins:0, the
-  exact prior state) ALSO 403'd, ruling out localStorage. Prod logs showed ZERO OS-presentation
-  failures (Windows-UA applies fine on warm), and the code fails-closed (throws) if it can't mint a
-  residential exit — but we got a 403 *snapshot*, so the fresh residential exit + Windows-UA WERE
-  engaged. The gateway was doing everything right.
-- **Found the real cause: deep-URL-first.** A warm-open's first navigation to the deep authed URL
-  (`/my-account`) carries login state but no PX clearance token (stripped) → PX hard-blocks 403.
-  Proven by isolation on the same exit: `/my-account` first → 403; homepage `/` first → 200; homepage
-  THEN `/my-account` in the same session → 200. **Fix = warmup navigation** (clear PX on a shallow page
-  first, then the target). New solution doc:
+### From earlier this arc (still the headline, context for What's Next)
+
+- **Warm-open lands LOGGED-IN end-to-end on Total Wine** (`72dc68b`, proven 2026-06-28): `/my-account`
+  "Account Home" dashboard. Cracked by (1) the **localStorage capture fix** (`dump-storagestate.mjs`
+  per-frame enumeration + `inspect-localstorage.mjs` gate — captures now have populated `origins`), and
+  (2) **warmup navigation** — a warm-open's first nav to a deep authed URL carries login but no PX
+  clearance token → hard 403; hit the homepage first (PX issues a token), then the deep URL in the same
+  session. Full writeup:
   `docs/solutions/runtime-errors/perimeterx-warm-open-deep-url-403-needs-warmup-navigation.md`.
-- **First logged-in attempt landed logged-OUT — because the captured session had EXPIRED**
-  (`twSessionExpiration` 108 min in the past). TW login lives entirely in a short-lived `twSessionId`
-  (localStorage, ~hours); NO durable refresh/remember-me token (every long-expiry cookie is
-  analytics/consent; only httpOnly are `twm-cart` + `SERVERID`). A **fresh capture replayed fast**
-  (28 min window) landed **logged-in** → full pipeline confirmed.
-- **Closed loose end #2: store 1111 = Folsom, CA confirmed** — the account page renders "Pickup at
-  Folsom, CA" from the restored store cookie.
-- **Hardened the validate heuristic** — `validate-warmup.mjs` (and `validate-warm.mjs`) now classify
-  login state on the **landing URL/title** (logged-out REDIRECTS to `/login` "Login My Account";
-  logged-in STAYS on `/my-account` "Account Home"), not a body regex that false-matched 3×.
-- **Tooling added** (in `~/totalwine-onboarding/`, OUTSIDE the repo): `validate-warmup.mjs` (two-step
-  warmup-nav validation), `confirm-login.mjs` (full-page logged-in markers).
+
+## Decisions Made
+
+- **Tunnel: capped backoff over terminal disable.** The self-disable's intent (don't reconnect-storm a
+  dead VPS) is preserved by a capped retry (≤60s offline / ≤300s config) — not a storm — while staying
+  loaded so it self-heals. A terminal `bootout` with only manual recovery is a silent outage on the next
+  transient failure; that trade was wrong for a laptop that travels.
+- **Solution doc = `integration-issues`, not a new `developer-experience` category** (would require a new
+  dir; the repo has only architecture-patterns/integration-issues/runtime-errors).
+- **Deferred a repo-wide `CONCEPTS.md` bootstrap.** `/ce-compound` correctly found no qualifying domain
+  nouns in the tunnel/ops area to seed; the rich vocab (consumer, gateway, warm-open, vault, fresh-exit,
+  drive verbs) is a deliberate `ce-compound-refresh` bootstrap job, not a scoped-run side effect.
+
+## What Didn't Work
+
+- **Hand-bootstrapping the tunnel each time** — a treadmill; it re-disabled on the next offline stretch.
+- **Suspecting the gateway/container on a "down" report** — a red herring every time (container healthy).
+  The dead-tunnel-misread-as-dead-gateway confusion has now recurred 3×; the solution doc's Prevention
+  says verify the server (container + loopback probe) before touching the client.
 
 ## What's Next
 
-1. **Build warmup-nav INTO the gateway (durable fix).** Today the warmup is client-side (two
-   `browser_navigate` calls). The gateway's warm-open should, on opening a warm session for a host,
-   first navigate the host root (or a configured shallow path) to clear PX, THEN the requested target —
-   so a single consumer `navigate` to a deep authed URL just works. See the warmup-navigation plan
-   (`docs/plans/2026-06-24-001-warmup-navigation-plan.local.md`). This is a reviewed code change — fits
-   the codex-review-loop SOP, best done with bandwidth (not mid-flight).
-2. **Decide if TW warm-open is worth more investment** given the durability constraint: a capture is
-   only good for a few hours (no refresh token), so this supports "capture now → automate for a few
-   hours," not persistent login. Fine for short bursts; not a set-and-forget credential.
+1. **Build warmup-nav INTO the gateway (the durable fix for warm-open-login).** Today warmup-nav is
+   CLIENT-side (two `browser_navigate` calls in `~/totalwine-onboarding/validate-warmup.mjs`). The
+   gateway's warm-open should, on opening a warm session, first navigate the host root (or a configured
+   shallow path) to clear PX, THEN the requested target — so a single consumer `navigate` to a deep authed
+   URL just works. Plan: `docs/plans/2026-06-24-001-warmup-navigation-plan.local.md`. This is a reviewed
+   code change (codex-review-loop SOP) — needs real bandwidth, not a mobile/travel session.
+2. **Weigh whether TW warm-open is worth that build** given the durability constraint: TW login is a
+   short-lived `twSessionId` (localStorage, ~hours) with NO durable refresh/remember-me token, so a
+   capture is only good for a few hours ("capture now → automate a few hours," not persistent).
+3. **Decide on untracked `AGENTS.md`** — a public-safe near-duplicate of the CLAUDE.md project
+   instructions, sitting untracked in the tree across several sessions. Commit it or remove it.
 
 ## Gotchas & Watch-outs
 
-- **Replay FAST after capture** — check `twSessionExpiration`; a logged-out replay may just be an
-  expired session, not a restore bug.
-- **A PX-site 403 is ambiguous at the gateway** (can't tell burned exit from PX block). If fresh-exit
-  retries all 403 but the homepage 200s → it's deep-URL-first, not the exits.
-- **Login-state heuristics lie** — trust the landing URL/title, not body text.
-- **Prod reads are operator-run or operator-authorized** — the token fetch + `docker logs` this session
-  were explicitly authorized; the auto-mode classifier gates them otherwise.
-- **Mac→prod `:8080` tunnel** must be up for the validate scripts; bootstrap:
+- **"Is the gateway down?" is almost always the local `:8080` tunnel.** Verify the container +
+  `curl 127.0.0.1:8080/mcp` (401 = healthy) before touching anything. Bootstrap the tunnel:
   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dvillavicencio.browse-gateway-tunnel.plist`.
-- Untracked `AGENTS.md` still parked (decide commit-or-leave when home).
-- Local `main` ahead of origin by the doc commits this session; no open PRs.
+  With the self-healing keeper, it should now recover on its own within ~1–2 min of a network return.
+- **Prod reads (SSH, `docker logs`, env-file greps) are gated by the auto-mode classifier** — operator
+  runs them, or explicitly authorizes the agent per-session (both happened this session).
+- **Replay a TW capture FAST** — check `twSessionExpiration` before concluding a logged-out warm-open is a
+  bug; it may just be an expired session.
+- **`validate-warm*.mjs` classify login on the landing URL/title** (logged-out redirects to `/login`
+  "Login My Account"; logged-in stays on `/my-account` "Account Home") — the old body-text heuristic
+  false-matched 3×.
+- **Fleet hygiene (public repo):** never commit the prod host/alias/env-path/consumer tokens. The tunnel
+  solution doc uses `<prod-host>` placeholders on purpose.
+- Local `main == origin/main` (`11cfc65`); no open PRs; only untracked `AGENTS.md`.
+- **Memory note:** `operator-traveling-low-bandwidth-2026-06-28` is stale (return date 2026-07-03 has
+  passed) — safe to delete on the next memory pass.
