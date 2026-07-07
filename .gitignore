@@ -24,6 +24,9 @@ coverage/
 *.local.md
 *.local.*
 
+# Security audit reports — map the gateway's security surfaces; keep local, never commit (public repo)
+audit/
+
 # Logs
 *.log
 npm-debug.log*
