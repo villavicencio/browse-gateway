@@ -61,6 +61,14 @@ export class GatewayDriveController implements DriveController {
   readonly #stickySuffix?: string;
   /** Host suffixes that force residential from the first request (BGW_FORCE_PROXY_HOSTS). */
   readonly #forceProxyHosts: readonly string[];
+  /** Owner-host suffixes whose warm-open navigates a shallow page FIRST (BGW_WARMUP_HOSTS) so a
+   *  behavioral WAF (PerimeterX) issues a clearance token before the consumer's deep target. */
+  readonly #warmupHosts: readonly string[];
+  /** Shallow same-owner relative paths the warm-up navigates before the target (BGW_WARMUP_PATHS;
+   *  default `["/"]`). Every path is a boot-validated same-host absolute path (see parseWarmupPaths). */
+  readonly #warmupPaths: readonly string[];
+  /** Optional progress log (stderr in prod, omitted in tests) for warm-up hop outcomes. */
+  readonly #log?: (msg: string) => void;
   /** Host suffixes whose warm-open uses a FRESH residential exit instead of re-pinning the captured one
    *  (BGW_WARM_FRESH_EXIT_HOSTS) — the durable fix for exit-reputation-gated hosts whose bound sticky
    *  exit decays/burns. The captured stickyExitId is ignored for these; a fresh held exit is minted. */
@@ -88,6 +96,13 @@ export class GatewayDriveController implements DriveController {
       stickySuffix?: string;
       forceProxyHosts?: readonly string[];
       freshExitHosts?: readonly string[];
+      /** Warm-up navigation (BGW_WARMUP_HOSTS / BGW_WARMUP_PATHS): on warm-open to a matching owner
+       *  host, navigate the shallow path(s) first so the edge WAF issues a clearance token before the
+       *  deep target. Absent/empty hosts → no warm-up (the default; non-regression). */
+      warmupHosts?: readonly string[];
+      warmupPaths?: readonly string[];
+      /** Optional progress log for warm-up hop outcomes (prod entrypoints pass their stderr logger). */
+      log?: (msg: string) => void;
       verifyEgress?: boolean;
       /** Warm-open (U9): the encrypted vault, this consumer's id, and its allowlist. All three are
        *  required for warm-open to activate; any omitted keeps every session cold (the default). */
@@ -103,6 +118,9 @@ export class GatewayDriveController implements DriveController {
     this.#stickySuffix = opts.stickySuffix;
     this.#forceProxyHosts = opts.forceProxyHosts ?? [];
     this.#freshExitHosts = opts.freshExitHosts ?? [];
+    this.#warmupHosts = opts.warmupHosts ?? [];
+    this.#warmupPaths = opts.warmupPaths ?? ["/"];
+    this.#log = opts.log;
     this.#verifyEgressEnabled = opts.verifyEgress ?? false;
     this.#vault = opts.vault;
     this.#consumerId = opts.consumerId;
@@ -435,6 +453,16 @@ export class GatewayDriveController implements DriveController {
    */
   async #openWarmAndNavigate(url: string, override: BrowserCoreOptions): Promise<PageSnapshot> {
     await this.#openSessionWarm(override);
+    // Warm-up navigation (PerimeterX deep-URL-first fix): on an opted-in owner host, navigate a shallow
+    // same-owner page FIRST so the edge WAF issues a clearance token into this live session — then the
+    // target navigate carries it instead of hard-403'ing a logged-in-looking request to a deep page with
+    // no clearance. Best-effort and NEVER discards the warm session; the target navigate below stays the
+    // authoritative gate. Runs on the SAME sealed, exit-pinned session (R3) opened just above.
+    await this.#runWarmup(override, url);
+    // A warm-up hop that lost the session to a mid-flow reap resets #handle (via #run's catch). Re-warm
+    // (re-pinning the SAME captured exit, R3; a revoked entry still fails LOUD) before the target so it
+    // can never surface the raw "no active drive session" string. Usually a no-op — the handle survives.
+    if (!this.#handle) await this.#ensureOpen();
     const snap = await this.#run((s) =>
       s.core.navigate(url, override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}),
     );
@@ -444,6 +472,57 @@ export class GatewayDriveController implements DriveController {
     }
     this.#pinned = true;
     return snap;
+  }
+
+  /**
+   * Warm-up navigation: before the consumer's real (possibly deep, authed) target, navigate one or more
+   * SHALLOW same-owner-host paths on the SAME already-open warm session, so a behavioral/edge WAF issues
+   * a clearance token into the live session. Only fires for owner hosts on {@link #warmupHosts}; a
+   * no-match owner runs ZERO warm-up navigations (non-regression). Called only from
+   * {@link #openWarmAndNavigate}, after {@link #openSessionWarm} — i.e. AFTER the exit is pinned (R3).
+   *
+   * Invariants (load-bearing, from the warm-open security audit):
+   *  - Every hop targets the OWNER host from the SEAL (`override.restoreState.ownerHost`) + a
+   *    boot-validated relative path, so it passes the credential-owner-host nav-clamp: no off-owner hop,
+   *    no clamp widening. A defensive host re-check skips any hop whose built URL isn't the owner (the
+   *    live clamp would block it regardless — this just never attempts it).
+   *  - Each hop is a second call through the SAME {@link #run}/`core.navigate` path with the SAME
+   *    clearance budget as the target — it reuses the existing clearance detection/poll, adding none.
+   *  - BEST-EFFORT: a blocked/failed hop is logged and aborts the remaining hops (so a bad exit isn't
+   *    hammered), and NEVER discards the warm session. The target navigate stays the real gate, so a
+   *    stale/blocked login still fails LOUD there — warm-up can only ever help, never mask staleness.
+   */
+  async #runWarmup(override: BrowserCoreOptions, targetUrl: string): Promise<void> {
+    const ownerHost = override.restoreState?.ownerHost;
+    if (!ownerHost || !hostForcesProxy(ownerHost, this.#warmupHosts)) return; // feature off / host not opted in
+    // Warm-up shares the target's ORIGIN — its scheme and port — so it hits the same server, but pins the
+    // HOST to the SEALED owner (never the caller's URL host), which the nav-clamp then agrees with. The
+    // target host equals ownerHost canonically (the seal derived it from the vault lookup keyed on the
+    // navigated host), so this is the same site at a shallow path, defense-in-depth on top of that.
+    const target = new URL(targetUrl);
+    const portPart = target.port ? `:${target.port}` : "";
+    // Same clearance posture the target uses — a proxied (bound/fresh-exit) warm session needs the
+    // escalated budget to clear an interstitial; a direct one keeps the default.
+    const clearance = override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {};
+    for (const path of this.#warmupPaths) {
+      const warmupUrl: string = `${target.protocol}//${ownerHost}${portPart}${path}`;
+      // Defense in depth on top of the boot-time path validation (parseWarmupPaths): never navigate a
+      // warm-up URL whose HOST isn't the sealed owner — the credential nav-clamp would block it anyway.
+      // Compare hostname (not host) so a non-default port on the origin doesn't false-trip this skip.
+      if (new URL(warmupUrl).hostname !== ownerHost) continue;
+      if (warmupUrl === targetUrl) continue; // the target IS this shallow page — its own navigate clears it
+      let blocked: boolean;
+      try {
+        const snap = await this.#run((s) => s.core.navigate(warmupUrl, clearance));
+        blocked = navFailed(snap);
+      } catch {
+        // A warm-up hop that threw (a transient core error, or a mid-warm-up reap that reset #handle).
+        // Best-effort: stop warming up and let the target navigate below be the authoritative gate.
+        blocked = true;
+      }
+      this.#log?.(`warm-up: ${warmupUrl} → ${blocked ? "blocked" : "ok"}`);
+      if (blocked) break; // abort the remaining hops; don't hammer the exit's reputation
+    }
   }
 
   /** The loud, actionable error for a warm replay that landed stale/blocked: the stored login is

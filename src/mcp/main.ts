@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Gateway, loadConfig } from "../gateway/index.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary, Allowlist } from "../policy/index.js";
 import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
-import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, parseWarmupPaths, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 
@@ -60,6 +60,10 @@ async function main(): Promise<void> {
   const forceProxyHosts = parseForceProxyHosts(process.env.BGW_FORCE_PROXY_HOSTS);
   // Parsed standalone here (the stdio launcher does not use buildGatewayRuntime), mirroring forceProxyHosts.
   const freshExitHosts = parseForceProxyHosts(process.env.BGW_WARM_FRESH_EXIT_HOSTS);
+  // Warm-up navigation (PX deep-URL-first fix): mirror runtime.ts so the stdio rollback launcher doesn't
+  // diverge (cold-deep-first while prod warms up). parseWarmupPaths fails closed on a non-relative path.
+  const warmupHosts = parseForceProxyHosts(process.env.BGW_WARMUP_HOSTS);
+  const warmupPaths = parseWarmupPaths(process.env.BGW_WARMUP_PATHS);
   const verifyEgress = process.env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
@@ -75,6 +79,9 @@ async function main(): Promise<void> {
     stickySuffix,
     forceProxyHosts,
     freshExitHosts,
+    warmupHosts,
+    warmupPaths,
+    log,
     verifyEgress,
     // U9 warm-open: a navigate to an approved host with a stored login opens a logged-in session
     // (vault dormant → null → cold-only). The allowlist here is the same scope the gateway guard clamps to.

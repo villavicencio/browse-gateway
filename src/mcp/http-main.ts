@@ -40,7 +40,7 @@ async function main(): Promise<void> {
   // Build the shared gateway runtime (config, secrets, vault, consumers, policy, gateway, escalation
   // posture) with every fail-closed boot guard. Identical construction is used by the on-host
   // `obscura vault login` capture (cli/vault-host.ts) so the two never drift.
-  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, verifyEgress } =
+  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress } =
     buildGatewayRuntime(process.env, { log });
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
@@ -65,6 +65,9 @@ async function main(): Promise<void> {
         stickySuffix,
         forceProxyHosts,
         freshExitHosts,
+        warmupHosts,
+        warmupPaths,
+        log,
         verifyEgress,
         vault,
         consumerId: consumer.id,

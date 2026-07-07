@@ -63,6 +63,38 @@ export function parseForceProxyHosts(value: string | undefined): string[] {
  *  policy decision can't be bypassed by caller URL spelling. */
 export function hostForcesProxy(host: string, suffixes: readonly string[]): boolean {
   // Delegates to the shared matcher (security/url) — one suffix-match implementation across the
-  // force-proxy / fresh-exit / windows-UA per-host policies.
+  // force-proxy / fresh-exit / windows-UA / warm-up per-host policies.
   return hostMatchesAnySuffix(host, suffixes);
+}
+
+/**
+ * Parse `BGW_WARMUP_PATHS` — the shallow same-origin path(s) a warm-open navigates FIRST so a
+ * behavioral/edge WAF (PerimeterX) issues a clearance token into the live session, before the
+ * consumer's real (possibly deep, authed) target. A logged-in-looking first request straight to a
+ * deep page carries no clearance and is hard-403'd; landing a shallow page first mints the token, and
+ * the target navigate then carries it (solution 2026-06-28). Comma-separated; empty/unset → the host
+ * root (`["/"]`), the proven default.
+ *
+ * FAIL-CLOSED at boot: a value that is not a same-host ABSOLUTE PATH — it must start with a single
+ * `/` and carry no scheme or authority — THROWS, so a config typo can't silently point a warm-up hop
+ * off the credential's owner host. (The owner host is always supplied by the sealed vault override at
+ * nav time, never from here, and the warm session's nav-clamp would block an off-owner request anyway;
+ * this parser just refuses to even express one.) A protocol-relative `//host` or a full `scheme://…`
+ * is rejected precisely because those are the two shapes that could re-introduce an authority.
+ */
+export function parseWarmupPaths(value: string | undefined): string[] {
+  const paths = (value ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (paths.length === 0) return ["/"]; // proven default: warm up on the host root
+  for (const p of paths) {
+    if (!p.startsWith("/") || p.startsWith("//") || p.includes("://")) {
+      throw new Error(
+        `BGW_WARMUP_PATHS: "${p}" is not a same-host absolute path — each warm-up path must start with ` +
+          `a single "/" and carry no scheme or host (the owner host comes from the sealed vault entry)`,
+      );
+    }
+  }
+  return paths;
 }

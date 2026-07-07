@@ -29,6 +29,7 @@ import {
   stickySuffixBootError,
   stickySuffixRedactables,
   parseForceProxyHosts,
+  parseWarmupPaths,
   httpCaptchaSolverFromSecrets,
   DEFAULT_CAPTCHA_BUDGET,
 } from "../verbs/index.js";
@@ -52,6 +53,10 @@ export interface GatewayRuntime {
   /** Hosts whose warm-open replays through a FRESH residential exit instead of re-pinning the captured
    *  one (BGW_WARM_FRESH_EXIT_HOSTS) — the durable fix for exit-reputation-gated hosts. */
   freshExitHosts: ReturnType<typeof parseForceProxyHosts>;
+  /** Owner-host suffixes whose warm-open navigates a shallow page first to clear a behavioral WAF
+   *  (BGW_WARMUP_HOSTS), and the shallow path(s) to warm up on (BGW_WARMUP_PATHS; default `["/"]`). */
+  warmupHosts: ReturnType<typeof parseForceProxyHosts>;
+  warmupPaths: ReturnType<typeof parseWarmupPaths>;
   verifyEgress: boolean;
 }
 
@@ -127,6 +132,11 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // Hosts whose warm-open uses a FRESH residential exit instead of re-pinning the captured one (durable
   // fix for exit-reputation-gated hosts). Same flat-CSV host-suffix shape as force-proxy.
   const freshExitHosts = parseForceProxyHosts(env.BGW_WARM_FRESH_EXIT_HOSTS);
+  // Warm-up navigation (PerimeterX deep-URL-first fix): owner hosts that navigate a shallow page first
+  // to clear the edge WAF, and the shallow path(s). Same flat-CSV host-suffix shape as force-proxy;
+  // parseWarmupPaths fails CLOSED here on a non-relative path so a typo can't misconfigure warm-up.
+  const warmupHosts = parseForceProxyHosts(env.BGW_WARMUP_HOSTS);
+  const warmupPaths = parseWarmupPaths(env.BGW_WARMUP_PATHS);
   const verifyEgress = env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
@@ -134,5 +144,5 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // minted sticky password can't leak the exit's geo/session/lifetime structure past redactSecrets (R9).
   secrets.addRedactable(stickySuffixRedactables(stickySuffix));
 
-  return { config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, verifyEgress };
+  return { config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress };
 }

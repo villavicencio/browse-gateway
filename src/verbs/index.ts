@@ -6,7 +6,7 @@ export { retrieve, classifyBlock, escalationDiagnostics, EscalationError, classi
 export type { RetrieveOptions, RetrieveResult, BlockReason, BlockSignal, EscalationDiagnostics, EgressCheck } from "./retrieve.js";
 export { extractMarkdown } from "./extract.js";
 export type { Extraction } from "./extract.js";
-export { isCloudflareBlock, shouldEscalateToProxy, parseForceProxyHosts, hostForcesProxy } from "./escalation.js";
+export { isCloudflareBlock, shouldEscalateToProxy, parseForceProxyHosts, hostForcesProxy, parseWarmupPaths } from "./escalation.js";
 export type { EscalationContext } from "./escalation.js";
 export { proxyOverrideFor, proxyOverrideForPinned, proxyOverrideForFresh, navFailed, shouldEscalateDrive, PROXY_OPEN_ATTEMPTS } from "./drive.js";
 export { generateTotp, verifyTotp, isValidTotpSeed, normalizeTotpSeed, MIN_TOTP_SEED_BYTES } from "./totp.js";

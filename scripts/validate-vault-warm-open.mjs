@@ -47,8 +47,18 @@ const COOKIE = "sid=warm-open-3d9f1a72"; // durable session cookie (not IP-bound
 const page = (b) => `<!doctype html><html><body>${b}</body></html>`;
 const hasSid = (req) => (req.headers.cookie ?? "").includes(COOKIE);
 
+// Ordered log of served navigation paths, so the warm-up leg can assert the shallow root was fetched
+// BEFORE the deep target on the same session (proving server-side warm-up sequencing through real Chrome).
+const requestLog = [];
+
 function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  requestLog.push(url.pathname);
+  if (url.pathname === "/") {
+    // The shallow "warm-up" landing (a real user's homepage) — a behavioral WAF would issue clearance here.
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    return res.end(page("<h1>HOME</h1><p>welcome to the shop</p>"));
+  }
   if (url.pathname === "/login") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Set-Cookie": `${COOKIE}; Path=/; SameSite=Lax` });
     return res.end(page("<h1>LOGIN OK</h1>"));
@@ -168,6 +178,33 @@ try {
     }
   } finally {
     await c1.close();
+  }
+
+  // --- Leg 1w: SERVER-SIDE WARM-UP navigation (PerimeterX deep-URL-first fix). A controller wired with
+  // warmupHosts=[aHost] and navigating a DEEP path must first navigate the shallow root on the SAME warm
+  // session (so an edge WAF would issue a clearance token), THEN the deep target — carrying the restored
+  // login. Asserts the real Chrome fetched "/" BEFORE "/dashboard" (server-side sequencing, no client
+  // two-step), the deep page landed AUTHENTICATED, and it all rode ONE credentialed warm session.
+  {
+    const before = requestLog.length;
+    const credBefore = credOpens(aHost).length;
+    const cw = new GatewayDriveController(gateway, secrets, TOKEN, {
+      onDatacenterIp: false,
+      vault,
+      consumerId: "atlas",
+      allowlist: new Allowlist(allow),
+      warmupHosts: [aHost],
+      warmupPaths: ["/"],
+    });
+    try {
+      const snap = await cw.navigate(`${a.origin}/dashboard`);
+      const served = requestLog.slice(before).filter((p) => p === "/" || p === "/dashboard");
+      check("warm-up: the shallow root was fetched BEFORE the deep target (server-side sequencing)", served[0] === "/" && served.includes("/dashboard"));
+      check("warm-up: the deep target still lands AUTHENTICATED (restored login carried through)", /AUTHENTICATED DASHBOARD/.test(text(snap)));
+      check("warm-up: warm-up + target rode ONE credentialed warm session (no extra session)", credOpens(aHost).length - credBefore === 1);
+    } finally {
+      await cw.close();
+    }
   }
 
   // --- Leg 3: selectivity + off-host reachability control. A fresh controller navigating to the
