@@ -27,6 +27,7 @@ import { SecretStore, openVault, canonicalizeHost } from "../security/index.js";
 import type { VaultStore } from "../security/index.js";
 import {
   stickySuffixBootError,
+  stickySuffixRedactables,
   parseForceProxyHosts,
   httpCaptchaSolverFromSecrets,
   DEFAULT_CAPTCHA_BUDGET,
@@ -129,6 +130,9 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   const verifyEgress = env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
+  // Fold the suffix's provider-param fragments into the redaction set so a driver error that echoes a
+  // minted sticky password can't leak the exit's geo/session/lifetime structure past redactSecrets (R9).
+  secrets.addRedactable(stickySuffixRedactables(stickySuffix));
 
   return { config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, verifyEgress };
 }

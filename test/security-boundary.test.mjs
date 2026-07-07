@@ -17,6 +17,7 @@ import {
   InMemoryAuditSink,
   RedactingAuditSink,
 } from "../dist/policy/index.js";
+import { mintStickyProxy, stickySuffixRedactables } from "../dist/verbs/index.js";
 
 const nav = (host, url = `http://${host}/`) => ({
   url,
@@ -126,6 +127,29 @@ test("redactSecrets: still scrubs a credential rotated OUT of the store (rotatio
   assert.ok(!out.includes("old-rotated-password"), "a retired-but-in-flight credential must still be redacted");
   assert.ok(!out.includes("new-current-password"), "current credential redacted");
   assert.equal(out, "err old=[REDACTED] new=[REDACTED]");
+});
+
+test("stickySuffixRedactables + redactSecrets: a minted sticky proxy password never leaks the provider param structure", () => {
+  const suffix = "_country-us_session-{id}_lifetime-30m";
+  const store = new SecretStore(() => ({ BGW_PROXY_PASSWORD: "hunter2-long-password" }));
+  // Boot-time fold of the suffix's literal fragments (mirrors runtime.ts / main.ts).
+  store.addRedactable(stickySuffixRedactables(suffix));
+  // What mintStickyProxy produces for one escalation attempt (fresh 8-hex id), if a driver echoed it.
+  const minted = mintStickyProxy({ server: "http://p.example:1", password: "hunter2-long-password" }, suffix, "abc12345");
+  const out = redactSecrets(`ERR_PROXY_CONNECTION_FAILED pass=${minted.password}`, store);
+  assert.ok(!out.includes("hunter2-long-password"), "base proxy password leaked");
+  assert.ok(!out.includes("_country-us_session-"), "provider session/geo structure leaked");
+  assert.ok(!out.includes("_lifetime-30m"), "provider lifetime structure leaked");
+  // Only the ephemeral, opaque per-attempt exit id remains — non-credential, not knowable ahead of time.
+  assert.ok(out.includes("abc12345"), "the ephemeral exit id is the expected residual");
+});
+
+test("stickySuffixRedactables: degenerate suffixes never blanket-redact ordinary output", () => {
+  assert.deepEqual(stickySuffixRedactables(undefined), []);
+  assert.deepEqual(stickySuffixRedactables("{id}"), []); // pure placeholder -> nothing to fold
+  const store = new SecretStore(() => ({}));
+  store.addRedactable(stickySuffixRedactables("_s{id}")); // "_s" is 2 chars -> redactSecrets skips it
+  assert.equal(redactSecrets("path_saved ok", store), "path_saved ok");
 });
 
 test("InMemoryAuditSink: maxRecords keeps only the most recent N (ring buffer)", () => {

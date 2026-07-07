@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Gateway, loadConfig } from "../gateway/index.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary, Allowlist } from "../policy/index.js";
 import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
-import { retrieve, stickySuffixBootError, parseForceProxyHosts, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 
@@ -63,6 +63,9 @@ async function main(): Promise<void> {
   const verifyEgress = process.env.BGW_DIAG_VERIFY_EGRESS === "1";
   const stickyErr = stickySuffixBootError(stickySuffix);
   if (stickyErr) throw new Error(stickyErr); // fail closed: a no-{id} suffix silently kills rotation
+  // Fold the suffix's provider-param fragments into the redaction set (parity with runtime.ts; R9) so a
+  // driver error echoing a minted sticky password can't leak the exit geo/session/lifetime structure.
+  secrets.addRedactable(stickySuffixRedactables(stickySuffix));
   // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
   // The interactive `drive` surface: a persistent, consumer-bound session driven via browser_* tools.

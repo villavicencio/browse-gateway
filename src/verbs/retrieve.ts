@@ -308,6 +308,25 @@ export function stickySuffixBootError(suffix: string | undefined): string | null
 }
 
 /**
+ * The literal, non-`{id}` fragments of a sticky-suffix template, for folding into the SecretStore's
+ * redaction set at boot (R9 defense-in-depth). {@link mintStickyProxy} appends
+ * `suffix.replaceAll("{id}", <8hex>)` to the BASE proxy password: the base is already redactable
+ * (loaded from `BGW_PROXY_PASSWORD`), but the appended suffix — the residential provider's param
+ * structure (geo/session/lifetime) — is not, so a driver error that echoed the full minted password
+ * would leak it past `redactSecrets` (`[REDACTED]_country-us_session-<id>_lifetime-30m`). Registering
+ * the fragments around `{id}` scrubs that structure; only the ephemeral per-attempt 8-hex id remains
+ * (opaque, non-credential). BOUNDED on purpose: fixed config split ONCE at boot, never per-request —
+ * folding every minted password would grow the redaction set for the process lifetime AND is not
+ * R3-safe, since {@link import("./drive.js").proxyOverrideForPinned} byte-compares the minted password
+ * to re-pin a held exit. Fragments < 3 chars are harmless: `redactSecrets` skips them, so a short
+ * fragment can never blanket-redact ordinary output.
+ */
+export function stickySuffixRedactables(suffix: string | undefined): string[] {
+  if (!suffix) return [];
+  return suffix.split("{id}").filter((fragment) => fragment.length > 0);
+}
+
+/**
  * PerimeterX press-&-hold copy present in the rendered page — the top-document HTML OR a child
  * frame's HTML. The challenge renders in a cross-origin `px-captcha-modal` iframe, which
  * `page.content()` (top frame only) never serializes; the core captures the child frames as
