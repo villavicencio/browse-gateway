@@ -226,6 +226,62 @@ test("warm-up: R3 fail-closed still trips BEFORE any warm-up (a bound entry with
   assert.deepEqual(navs, [], "no warm-up navigation fired");
 });
 
+test("warm-up: a reaped DIRECT warm session RE-WARMS the shallow page before the deep target on reopen", async () => {
+  // The gap Codex caught: after an idle reap, the reopen-after-reap path re-warms a fresh warm session
+  // with NO clearance token and would go deep-URL-first. It must run the SAME warm-up before the target,
+  // symmetric with the first warm-open — else a warm-up host regresses to the PX 403 this feature fixes.
+  const { gateway, navs, open, opens } = makeNavRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com")); // direct capture (no exit)
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll, warmupHosts: ["example.com"],
+  });
+  await c.navigate("https://example.com/deep/account"); // first warm-open: warm-up "/" then target, pinned
+  open.delete([...open.keys()][0]); // idle reap closes the held session out from under us
+  await assert.rejects(c.navigate("https://example.com/deep/account"), /no open session/); // reap detected, handle reset
+  const before = navs.length;
+  await c.navigate("https://example.com/deep/again"); // reopen-after-reap path
+  assert.deepEqual(
+    navs.slice(before),
+    ["https://example.com/", "https://example.com/deep/again"],
+    "reopen re-warmed the shallow root BEFORE the deep target — no deep-URL-first regression",
+  );
+  assert.equal(opens[opens.length - 1]?.restoreState?.ownerHost, "example.com", "reopen re-warmed (sealed), not cold");
+});
+
+test("warm-up: a reaped BOUND warm session re-warms through the SAME re-pinned exit before the target on reopen", async () => {
+  const { gateway, navs, open, opens } = makeNavRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com", { stickyExitId: "abcd1234" }));
+  const c = new GatewayDriveController(gateway, proxySecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+    warmupHosts: ["example.com"], onDatacenterIp: true, stickySuffix: "_s-{id}",
+  });
+  await c.navigate("https://example.com/deep/account");
+  open.delete([...open.keys()][0]);
+  await assert.rejects(c.navigate("https://example.com/deep/account"), /no open session/);
+  const before = navs.length;
+  await c.navigate("https://example.com/deep/again");
+  assert.deepEqual(
+    navs.slice(before),
+    ["https://example.com/", "https://example.com/deep/again"],
+    "bound reopen re-warmed the shallow root before the deep target",
+  );
+  assert.equal(opens[opens.length - 1]?.proxy?.password, "pw_s-abcd1234", "reopen re-pinned the SAME captured exit (R3); warm-up rode it");
+});
+
+test("warm-up: a LIVE (non-reaped) pinned navigate does NOT re-warm (token already held)", async () => {
+  // Only an actual reopen re-warms. A second navigate on a still-live warm session must NOT re-run
+  // warm-up (the live session already carries the clearance token; re-warming every navigate is wrong).
+  const { gateway, navs } = makeNavRecordingGateway();
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    vault, consumerId: "vault", allowlist: allowAll, warmupHosts: ["example.com"],
+  });
+  await c.navigate("https://example.com/deep/account"); // warm-up "/" + target
+  const before = navs.length;
+  await c.navigate("https://example.com/deep/more"); // live pinned navigate — no reap, no re-warm
+  assert.deepEqual(navs.slice(before), ["https://example.com/deep/more"], "live pinned navigate goes straight to the target, no extra warm-up");
+});
+
 test("warm-up: a BOUND (proxied) warm session warms up through the SAME re-pinned exit, then the target", async () => {
   // The proven PX case is a bound/fresh residential exit. Warm-up must run through the SAME sealed
   // proxied session (never an unpinned one), so the warm-up + target share the re-pinned exit (R3).

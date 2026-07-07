@@ -242,7 +242,20 @@ export class GatewayDriveController implements DriveController {
     // mode). A failed nav means the committed exit/IP went bad, so discard it — the next navigate
     // re-runs the direct-first escalation rather than stranding the caller on a known-bad exit. We
     // surface the failure rather than swap the exit live under the page (that would lose state, KTD-5).
+    // A prior navigate that hit the idle reap reset #handle (via #run's catch) while leaving #pinned set —
+    // so an undefined handle HERE means #ensureOpen is about to RE-OPEN, not reuse, the session.
+    const reopening = this.#handle === undefined;
     await this.#ensureOpen();
+    // A warm session re-opened after an idle reap is a fresh session with NO edge-WAF clearance token —
+    // exactly like a first warm-open — so on a warm-up host it would otherwise regress to deep-URL-first
+    // and 403 (then surface a misleading "re-capture"/"retry" error whose real cause is the missing
+    // warm-up). Warm it up before the target, symmetric with #openWarmAndNavigate. Gated on `reopening`:
+    // a LIVE pinned session already carries the token from its first warm-up, so re-warming every navigate
+    // would be wrong (and wasteful). A revoked entry already failed LOUD inside #ensureOpen above.
+    if (reopening && this.#warmHost !== undefined) {
+      await this.#runWarmup(url);
+      if (!this.#handle) await this.#ensureOpen(); // B2: a warm-up hop that lost the handle re-warms (R3) first
+    }
     // Capture warmth AFTER #ensureOpen (which may have RE-WARMED a reaped session): a stale warm replay
     // must fail LOUD with the operator-recapture signal on the reopen path too — not the generic "retry
     // for a fresh exit", which is actively wrong for a bound entry whose retry re-pins the SAME exit.
@@ -458,7 +471,7 @@ export class GatewayDriveController implements DriveController {
     // target navigate carries it instead of hard-403'ing a logged-in-looking request to a deep page with
     // no clearance. Best-effort and NEVER discards the warm session; the target navigate below stays the
     // authoritative gate. Runs on the SAME sealed, exit-pinned session (R3) opened just above.
-    await this.#runWarmup(override, url);
+    await this.#runWarmup(url);
     // A warm-up hop that lost the session to a mid-flow reap resets #handle (via #run's catch). Re-warm
     // (re-pinning the SAME captured exit, R3; a revoked entry still fails LOUD) before the target so it
     // can never surface the raw "no active drive session" string. Usually a no-op — the handle survives.
@@ -478,22 +491,24 @@ export class GatewayDriveController implements DriveController {
    * Warm-up navigation: before the consumer's real (possibly deep, authed) target, navigate one or more
    * SHALLOW same-owner-host paths on the SAME already-open warm session, so a behavioral/edge WAF issues
    * a clearance token into the live session. Only fires for owner hosts on {@link #warmupHosts}; a
-   * no-match owner runs ZERO warm-up navigations (non-regression). Called only from
-   * {@link #openWarmAndNavigate}, after {@link #openSessionWarm} — i.e. AFTER the exit is pinned (R3).
+   * no-match owner runs ZERO warm-up navigations (non-regression). Reads the warm session's owner host
+   * and proxy posture from instance state ({@link #warmHost} / {@link #proxiedSession}), both set by
+   * {@link #openSessionWarm}, so BOTH the first warm-open ({@link #openWarmAndNavigate}) and the
+   * reopen-after-reap path can share it. Always runs AFTER the exit is pinned (R3) on the warm session.
    *
    * Invariants (load-bearing, from the warm-open security audit):
-   *  - Every hop targets the OWNER host from the SEAL (`override.restoreState.ownerHost`) + a
-   *    boot-validated relative path, so it passes the credential-owner-host nav-clamp: no off-owner hop,
-   *    no clamp widening. A defensive host re-check skips any hop whose built URL isn't the owner (the
-   *    live clamp would block it regardless — this just never attempts it).
+   *  - Every hop targets the OWNER host from the SEAL (`#warmHost`, set from `restoreState.ownerHost`) +
+   *    a boot-validated relative path, so it passes the credential-owner-host nav-clamp: no off-owner
+   *    hop, no clamp widening. A defensive host re-check skips any hop whose built URL isn't the owner
+   *    (the live clamp would block it regardless — this just never attempts it).
    *  - Each hop is a second call through the SAME {@link #run}/`core.navigate` path with the SAME
    *    clearance budget as the target — it reuses the existing clearance detection/poll, adding none.
    *  - BEST-EFFORT: a blocked/failed hop is logged and aborts the remaining hops (so a bad exit isn't
    *    hammered), and NEVER discards the warm session. The target navigate stays the real gate, so a
    *    stale/blocked login still fails LOUD there — warm-up can only ever help, never mask staleness.
    */
-  async #runWarmup(override: BrowserCoreOptions, targetUrl: string): Promise<void> {
-    const ownerHost = override.restoreState?.ownerHost;
+  async #runWarmup(targetUrl: string): Promise<void> {
+    const ownerHost = this.#warmHost;
     if (!ownerHost || !hostForcesProxy(ownerHost, this.#warmupHosts)) return; // feature off / host not opted in
     // Warm-up shares the target's ORIGIN — its scheme and port — so it hits the same server, but pins the
     // HOST to the SEALED owner (never the caller's URL host), which the nav-clamp then agrees with. The
@@ -503,7 +518,7 @@ export class GatewayDriveController implements DriveController {
     const portPart = target.port ? `:${target.port}` : "";
     // Same clearance posture the target uses — a proxied (bound/fresh-exit) warm session needs the
     // escalated budget to clear an interstitial; a direct one keeps the default.
-    const clearance = override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {};
+    const clearance = this.#proxiedSession ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {};
     for (const path of this.#warmupPaths) {
       const warmupUrl: string = `${target.protocol}//${ownerHost}${portPart}${path}`;
       // Defense in depth on top of the boot-time path validation (parseWarmupPaths): never navigate a
