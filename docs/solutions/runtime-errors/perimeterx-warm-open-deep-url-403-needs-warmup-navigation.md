@@ -78,6 +78,15 @@ root fetched before the deep target on one credentialed session).
 **Deployment:** set `BGW_WARMUP_HOSTS=totalwine.com` (and optionally `BGW_WARMUP_PATHS`) in the prod env
 file to activate for Total Wine. Unset = warm-up off everywhere (exact prior behavior).
 
+**VALIDATED LIVE IN PROD (2026-07-08).** Activated (`BGW_WARMUP_HOSTS=totalwine.com`) + deployed, and the
+real consumer (atlas) did a deep authed look-up in ONE `navigate`: `https://www.totalwine.com/p/91181175`
+returned logged-in, location-scoped data (Folsom pickup store, aisle 07 / bay 23 / shelf 05, live price,
+in-stock) — no client-side two-step. The account+location-scoped store/aisle detail confirms genuine
+logged-in state, not an anonymous page. The deep-URL-first PX 403 is defeated end-to-end. TW is a
+force-proxy host, so warm-open re-pinned the exit and the warm-up `/` cleared PX on it (atlas noted "worked
+with forced proxy"). The green deploy also confirmed the fail-closed `parseWarmupPaths` boot guard passed
+with the live config.
+
 ## A hard durability constraint (Total Wine)
 
 Total Wine's logged-in state lives **entirely in a short-lived `twSessionId`** (localStorage, ~a couple
