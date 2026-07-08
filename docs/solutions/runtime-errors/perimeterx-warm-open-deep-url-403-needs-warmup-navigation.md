@@ -87,16 +87,27 @@ force-proxy host, so warm-open re-pinned the exit and the warm-up `/` cleared PX
 with forced proxy"). The green deploy also confirmed the fail-closed `parseWarmupPaths` boot guard passed
 with the live config.
 
-## A hard durability constraint (Total Wine)
+## Total Wine capture durability — CORRECTED 2026-07-08: lasts days+, NOT ~a couple hours
 
-Total Wine's logged-in state lives **entirely in a short-lived `twSessionId`** (localStorage, ~a couple
-hours) with **no durable refresh/remember-me token** — every long-expiry cookie is analytics/consent
-(`OptanonConsent`, Adobe `mbox`/`AMCV`, `_cs_id`); the only httpOnly cookies are `twm-cart` and
-`SERVERID`. Consequence: a captured session is only replayable for a few hours. The first warm-open
-attempt this session landed **logged-out for exactly this reason** — `twSessionExpiration` was 108 min
-in the past by replay time. A fresh capture replayed within its window (28 min left) landed logged-in.
-So warm-open-login for TW is "capture now, automate for the next few hours," not "capture once, persist
-for weeks." Weigh this before investing further in TW-specific warm-open.
+**The earlier "~a couple hours" claim was WRONG.** Corrected by a direct operator observation
+(2026-07-08): a TW capture left **untouched for 7+ days** (across a work trip) warm-opened and landed
+logged-in **first try**. So a captured session is durable for **at least ~7 days** (proven lower bound;
+true upper bound unknown), and "capture once, automate for a week+" is the right model — which removes
+the main reason-to-not-invest in TW warm-open.
+
+Why the earlier claim was off (do not re-inherit it):
+- It rested on ONE reading — `twSessionExpiration` was 108 min past on an old capture that landed
+  logged-out (2026-06-28), plus one fresh capture that worked. n=2, and measured **before warmup-nav
+  existed**, when a warm-open went deep-URL-first straight into a PX 403. So that "logged-out" verdict
+  was plausibly the **deep-URL PX block misread as expiry**, not a truly dead session. Now that the
+  homepage warm-up clears PX first, a week-old capture works.
+- `twSessionExpiration` (localStorage) therefore does **not** govern the real login lifetime — don't
+  gate replay decisions on it. The doc's old claim that TW has "no durable refresh/remember-me token"
+  is also suspect: something keeps the session alive for a week+ (unidentified — a longer-lived cookie
+  or a server-side session revived on the first cleared navigate). Re-inspect if it ever matters.
+- Practical rule: if a warm-open lands logged-OUT, don't assume expiry — first confirm warm-up actually
+  cleared PX (page loaded, not a 403), then check whether it's a genuinely different/older account
+  state before re-capturing.
 
 ## Prevention / gotchas
 
