@@ -78,10 +78,10 @@ clean; no open PRs.
 
 ## What's Next
 
-1. **Deploy `main` to prod so the audit hardening goes live.** The 10 fixes are on `main` but prod runs a
-   built image — verify the running container's image vs HEAD and, if stale, `gh workflow run deploy-http.yml`
-   (gate/smoke/abort will protect the swap). This is defensive hardening; nothing forces urgency, but until a
-   deploy the prod process is unhardened. **Confirm before assuming prod is patched.**
+1. ~~**Deploy `main` to prod so the audit hardening goes live.**~~ **DONE 2026-07-14** — deploy-http run
+   `29373029387` (success, no rollback) swapped prod from `069eb4d` (pre-audit) to the `latest` image built
+   from **`e8e3e35` = HEAD** (confirmed via the image's `org.opencontainers.image.revision` label). Post-swap
+   verify passed → the Fable hardening is LIVE. Warm-up config in the prod env file was untouched (still active).
 2. **#11 stays TRACKED — do not fix** unless a deliberate `SecretStore` redesign is being scoped (see
    Decisions). It's logged in `audit/FABLE-AUDIT-REPORT.md` (LOCAL) and the `fable-audit-resolved` memory.
 3. **Carry-over optionals from the prior (warm-up) session, still open:** a TW liveness-probe tool; naming
@@ -92,8 +92,8 @@ clean; no open PRs.
 
 - **`audit/FABLE-AUDIT-REPORT.md` is LOCAL ONLY (gitignored)** — not on origin, won't survive a fresh clone.
   All 10 items are marked FIXED with commits inside it; #11 is the only open item there (tracked, not a bug).
-- **The audit hardening is on `main`, not necessarily in prod** — see What's Next #1. Env vars still read at
-  container LAUNCH (`launch-http.sh`), so any config also needs a redeploy/restart.
+- **The audit hardening is now LIVE in prod** (deployed 2026-07-14, image = HEAD `e8e3e35`; see What's Next #1).
+  Env vars still read at container LAUNCH (`launch-http.sh`), so any future config change needs a redeploy/restart.
 - **Redaction is a redact-BEFORE-serialize discipline now** — if you touch `src/security/secrets.ts`,
   `src/browser/patchright-core.ts`, or any secret-adjacent sink, read
   `docs/solutions/best-practices/redact-before-serialize.md` first. Pass the SecretStore
