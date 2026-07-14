@@ -66,6 +66,23 @@ test("slot fields reject NUL / control characters and empties", () => {
   assert.throws(() => seal("x", { kek: KEK, consumerId: "", host: "a.com" }), /non-empty/);
 });
 
+test("AAD injectivity: ill-formed Unicode (lone surrogates) is REJECTED, not collapsed to one AAD", () => {
+  // Buffer.from(x, "utf8") maps EVERY lone surrogate to the same replacement bytes (EF BF BD), so
+  // without a guard consumerId "\uD800" and "\uD801" would share an AAD — a record sealed under one
+  // could open under the other (a cross-slot transplant). Both must fail closed at seal AND open time.
+  const HI = "\uD800"; // lone high surrogate
+  const HI2 = "\uD801"; // a DIFFERENT lone high surrogate — same UTF-8 replacement bytes as HI
+  const LO = "\uDC00"; // lone low surrogate
+  assert.throws(() => seal("x", { kek: KEK, consumerId: HI, host: "a.com" }), /ill-formed Unicode/);
+  assert.throws(() => seal("x", { kek: KEK, consumerId: HI2, host: "a.com" }), /ill-formed Unicode/);
+  assert.throws(() => seal("x", { kek: KEK, consumerId: "atlas", host: "a" + LO + ".com" }), /ill-formed Unicode/);
+  assert.throws(() => open(seal("x", CTX), { kek: KEK, consumerId: HI, host: "example.com" }), /ill-formed Unicode/);
+  // A well-formed astral scalar (a PROPER surrogate pair, U+1F600 😀) round-trips losslessly → accepted.
+  const pair = "😀.example";
+  const rec = seal("emoji-ok", { kek: KEK, consumerId: "atlas", host: pair });
+  assert.equal(open(rec, { kek: KEK, consumerId: "atlas", host: pair }).toString("utf8"), "emoji-ok");
+});
+
 test("wrong master key fails open()", () => {
   const rec = seal("secret", CTX);
   assert.throws(() => open(rec, { kek: randomBytes(32), consumerId: "atlas", host: "example.com" }));

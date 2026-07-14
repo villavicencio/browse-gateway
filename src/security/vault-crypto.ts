@@ -3,8 +3,11 @@
  * repo's FIRST encryption-at-rest surface. Dependency-free: `node:crypto` AES-256-GCM only.
  *
  * Envelope scheme: a master key (KEK) wraps a fresh random 32-byte data key (DEK) per entry; the DEK
- * encrypts the payload. Why envelope on a single host: rotation is a cheap DEK re-wrap (no payload
- * re-encryption), and per-entry crypto-shredding = drop the wrapped DEK. The KEK is never used as a
+ * encrypts the payload. Why envelope on a single host: the format ENABLES cheap key rotation (re-wrap
+ * the DEK only) and per-entry crypto-shredding (drop the wrapped DEK). Note the current
+ * `rotateVaultKey` takes the simpler full-reseal path — decrypt each entry under the old KEK and
+ * re-seal it afresh (new DEK, payload re-encrypted) under the new — NOT a DEK-only re-wrap; the
+ * envelope still permits the cheaper form if a future rotation needs it. The KEK is never used as a
  * cipher key directly — an HKDF step derives a domain-separated wrapping key from it.
  *
  * AAD binds every ciphertext to its (version, consumerId, host) slot via an INJECTIVE encoding: a
@@ -19,7 +22,8 @@ import { randomBytes, createCipheriv, createDecipheriv, hkdfSync, timingSafeEqua
 export const VAULT_SCHEMA_VERSION = 1;
 /** AES-256 key length. */
 const KEY_LEN = 32;
-/** GCM nonce length — 12 bytes is the standard/efficient choice; random per encryption, never reused. */
+/** GCM nonce length — 12 bytes is the standard/efficient choice; drawn at random per encryption, so
+ *  its collision risk is probabilistically bounded (per-layer analysis on `seal()`), not zero. */
 const NONCE_LEN = 12;
 /** GCM auth tag length. */
 const TAG_LEN = 16;
@@ -64,6 +68,16 @@ function assertKek(kek: Buffer): void {
 export function assertSlotField(name: string, value: string): void {
   if (typeof value !== "string" || value.length === 0) throw new Error(`vault: ${name} must be a non-empty string`);
   if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`vault: ${name} contains control characters`);
+  // Reject ill-formed UTF-16 (a lone/unpaired surrogate). `aad()` binds the slot via
+  // `Buffer.from(value, "utf8")`, and UTF-8 encoding collapses EVERY lone surrogate to the SAME
+  // replacement bytes (EF BF BD) — so distinct fields (e.g. consumerId U+D800 vs U+D801) would produce
+  // an IDENTICAL AAD, breaking the injective (consumer, host) binding the no-transplant guarantee rests
+  // on (a record sealed under one could open under the other). A UTF-8 round-trip is lossless iff the
+  // string is well-formed, so it detects exactly this — equivalent to String.prototype.isWellFormed(),
+  // which is ES2024, beyond this project's ES2022 lib.
+  if (Buffer.from(value, "utf8").toString("utf8") !== value) {
+    throw new Error(`vault: ${name} contains ill-formed Unicode (a lone surrogate)`);
+  }
 }
 
 /**
@@ -71,7 +85,10 @@ export function assertSlotField(name: string, value: string): void {
  * concatenation, so two distinct slots can never share an authenticated context. A naive separator
  * (a space, or even NUL) is NOT injective when a field can contain that separator, and the whole
  * slot-binding (a record can't be transplanted to another consumer/host) rests on injectivity.
- * Authenticated, not encrypted.
+ * Injectivity holds over the ACCEPTED field domain: `assertSlotField` rejects control chars AND
+ * ill-formed Unicode (lone surrogates), so each field's UTF-8 encoding is itself lossless/injective and
+ * the byte-length prefixes let the concatenation be split back apart unambiguously. Authenticated, not
+ * encrypted.
  */
 function aad(v: number, consumerId: string, host: string): Buffer {
   assertSlotField("consumerId", consumerId);
@@ -113,8 +130,17 @@ function gcmOpen(key: Buffer, box: GcmBox, ad: Buffer): Buffer {
 
 /**
  * Encrypt `plaintext` into a sealed record bound to `ctx`'s (consumer, host). A fresh random DEK is
- * generated per call (so nonce reuse across entries is impossible) and wrapped under the KEK-derived
- * key; both layers carry the same AAD binding.
+ * generated per call and wrapped under the KEK-derived key; both layers carry the same AAD binding.
+ *
+ * Nonce safety is probabilistic, not absolute, and differs by layer. The BLOB layer draws a fresh
+ * random 256-bit DEK and a random 96-bit nonce per call, so a repeated (key, nonce) pair is
+ * negligible: only a DEK collision — astronomically unlikely across the 256-bit space — could put two
+ * nonces under one blob key. The DEK-WRAP layer reuses ONE key (the KEK-derived wrapping key,
+ * deterministic in the KEK) across every seal with a random 96-bit nonce, so its nonce uniqueness is
+ * birthday-bounded on that 96-bit space — NIST SP 800-38D caps random-IV GCM at 2^32 invocations per
+ * key. That budget is spent by CUMULATIVE seals (every put / overwrite / rotation re-seal counts), not
+ * by entry count; re-keying under a distinct KEK resets it. The gateway does not itself count
+ * invocations or auto-rotate, so 2^32 is design headroom, not an enforced ceiling.
  */
 export function seal(plaintext: Buffer | string, ctx: VaultContext): SealedRecord {
   assertKek(ctx.kek);
