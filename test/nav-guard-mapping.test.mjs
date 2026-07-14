@@ -216,3 +216,18 @@ test("CAPTCHA_SOLVE_ERROR_CODES: the solve-failure sink allowlist covers known c
   assert.ok(set.has("timeout") && set.has("vendor-error") && set.has("budget-exhausted"), "known codes are allowlisted");
   assert.ok(!set.has("a-custom-solver-code-with-a-secret"), "an arbitrary/custom code is NOT allowlisted (logged as generic 'error')");
 });
+
+// --- OOPIF: the guard is frame-agnostic — a cross-origin iframe request is decided by host (audit #7)
+
+test("decideRequest: a cross-origin OOPIF request is decided by host — the guard is frame-agnostic (audit #7)", () => {
+  // Fetch.requestPaused carries no frame origin: a cross-origin iframe's request is just a paused
+  // request with the iframe's host, so the guard's decision covers an OOPIF's navigation + subresource
+  // EXACTLY as a top-frame request. The interception WIRING (setAutoAttach flatten delivering a child
+  // target's Fetch to the guard session) is proven in-container by scripts/validate-redirect-guard.mjs
+  // (popup + worker + OOPIF-iframe legs).
+  const allowOwner = (nav) => (nav.host === "owner.com" ? "allow" : "block");
+  assert.equal(decideRequest(allowOwner, evt("Document", "https://evil.example/oopif")), "block", "OOPIF top navigation to an off-host is blocked");
+  assert.equal(decideRequest(allowOwner, evt("XHR", "https://evil.example/x")), "block", "OOPIF subresource to an off-host is blocked");
+  assert.equal(decideRequest(allowOwner, evt("Document", "https://owner.com/child")), "allow", "an owner-host child frame is allowed (same as the top frame)");
+  assert.equal(decideRequest(allowOwner, evt("Image", "https://owner.com/logo.png")), "allow");
+});

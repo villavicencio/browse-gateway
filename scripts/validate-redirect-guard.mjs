@@ -23,9 +23,10 @@ import { createBrowserCore } from "../dist/browser/index.js";
 
 const OWNER = "127.0.0.1"; // the credential/owner host the guard clamps to
 const OTHER = "localhost"; // a different hostname on the same loopback — the "sibling"/off-host
+const OOPIF_BLOCKED = "oopif-blocked.invalid"; // a UNIQUE host only a committed OOPIF child ever requests
 
-// --- loopback fixtures: a redirect chain, an allowed chain, a subresource, a popup, a control ----
-const served = { exfil: 0, ownerC: 0, img: 0, popup: 0, ok: 0, workerFetch: 0 };
+// --- loopback fixtures: redirect chains, a subresource, a popup, a worker, an OOPIF iframe, a control -
+const served = { exfil: 0, ownerC: 0, img: 0, popup: 0, ok: 0, workerFetch: 0, oopifChild: 0, oopifSub: 0 };
 const server = http.createServer((req, res) => {
   const port = server.address().port;
   const ownerBase = `http://${OWNER}:${port}`;
@@ -62,6 +63,16 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/javascript" });
       return res.end(`fetch(${JSON.stringify(`${otherBase}/worker-fetch`)}).catch(()=>{});`);
     case "/worker-fetch": served.workerFetch++; res.writeHead(200); return res.end("worker-fetch");
+    // OOPIF proof (audit #7): the owner parent embeds a CROSS-SITE iframe on the OTHER host, which the
+    // OOPIF-leg guard ALLOWS so it COMMITS → a separate out-of-process iframe target under site
+    // isolation. The committed child then subrequests a UNIQUE blocked host; the guard must intercept
+    // THAT request (setAutoAttach flatten routing the committed child target's Fetch), proving OOPIF
+    // interception rather than merely blocking the iframe's initial navigation at the parent.
+    case "/oopif-parent": return html(`owner page<iframe src="${otherBase}/oopif-child"></iframe>`);
+    case "/oopif-child":
+      served.oopifChild++;
+      return html(`<script>fetch("http://${OOPIF_BLOCKED}:${port}/oopif-sub").catch(()=>{})</script>committed OOPIF child`);
+    case "/oopif-sub": served.oopifSub++; res.writeHead(200); return res.end("oopif-sub"); // never reached (host blocked)
     // owner-host control: a plain allowed page
     case "/ok": served.ok++; return html("OK");
     default: res.writeHead(404); return res.end("nope");
@@ -143,10 +154,38 @@ try {
 
   // 5b) a dedicated Worker (separate auto-attached target) — its off-host fetch is guarded AND the
   // page/worker do not deadlock under Fetch interception.
+  const workerAt = guardLog.length;
   await core.navigate(owner("/worker-opener"));
   await sleep(1500);
-  check("worker off-host fetch NOT served (worker target guarded, no deadlock)", served.workerFetch === 0);
+  // Non-vacuous: require the guard to have SEEN the worker's exact off-host `/worker-fetch` request —
+  // proving the worker target actually started, auto-attached, and issued the fetch (a bare
+  // served.workerFetch===0 would false-pass if worker creation failed or auto-attach deadlocked first).
+  const sawWorkerFetch = guardLog.slice(workerAt).some((n) => n.url.includes("/worker-fetch"));
+  check("the worker's off-host fetch was intercepted by the guard (worker started + auto-attach, no deadlock)", sawWorkerFetch);
+  check("worker off-host fetch NOT served (worker target guarded)", served.workerFetch === 0);
   await core.closeActivePage();
+
+  // 5c) OOPIF (audit #7): a cross-site iframe on OTHER is ALLOWED so it COMMITS (a separate
+  // out-of-process iframe target under site isolation); the committed child then subrequests a UNIQUE
+  // blocked host. The guard must intercept THAT request — proving setAutoAttach flatten routes a
+  // COMMITTED OOPIF child target's Fetch to the guard, not merely blocking the iframe's initial
+  // navigation at the parent. The unique host makes the positive signal NON-VACUOUS (only the committed
+  // child requests it), and served.oopifChild proves the child actually committed first. (Raw-CDP
+  // target-type correlation isn't available through the core's public API; the popup + worker legs above
+  // separately prove the same flatten auto-attach delivers a non-frame child target's Fetch.)
+  await core.setNavigationGuard((nav) => {
+    guardLog.push(nav);
+    return nav.host === OWNER || nav.host === OTHER ? "allow" : "block"; // allow parent + committed child; block the unique host
+  });
+  const oopifAt = guardLog.length;
+  await core.navigate(owner("/oopif-parent"));
+  await sleep(1500); // let the OOPIF commit + run its blocked subrequest
+  const sawOopifSub = guardLog.slice(oopifAt).some((n) => n.host === OOPIF_BLOCKED);
+  check("cross-site OOPIF child committed (the allowed iframe loaded)", served.oopifChild >= 1);
+  check("the committed OOPIF's unique-host subrequest was intercepted (flatten routes the child target's Fetch)", sawOopifSub);
+  check("the OOPIF's blocked subrequest was NOT served", served.oopifSub === 0);
+  await core.closeActivePage();
+  await core.setNavigationGuard(allowOwner); // restore owner-only for the fail-closed leg
 
   // 6) fail-closed: a throwing guard blocks even an owner-host request.
   await core.setNavigationGuard(throwingGuard);
