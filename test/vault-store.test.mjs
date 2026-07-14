@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, mkdirSync, rmSync, renameSync, symlinkSync, linkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -20,6 +20,7 @@ import {
   SecretStore,
   redactSecrets,
   sealJson,
+  slotFileName,
 } from "../dist/security/index.js";
 
 function tmp() {
@@ -344,5 +345,117 @@ test("rotateVaultKey: a LEGACY oversized entry rotates atomically (put's audit-#
   assert.equal(next.get("atlas", "b.com").creds.token, big, "legacy oversized entry rotated to the new key");
   assert.throws(() => store(dir, oldKek).get("atlas", "a.com"), /authenticate|decrypt/i, "old key opens nothing after rotation");
   assert.throws(() => store(dir, oldKek).get("atlas", "b.com"), /authenticate|decrypt/i);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: RESUMES a crash-interrupted rotation (mixed old/new key files, audit #8)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  store(dir, oldKek).put("atlas", "a.com", { a: 1 });
+  store(dir, oldKek).put("vault", "b.com", { b: 2 });
+  // Simulate a rotation that CRASHED after flipping a.com to the new key but before b.com (same slot →
+  // same file, so this overwrites a.com's record with a newKek-sealed one). The vault is now split.
+  store(dir, newKek).put("atlas", "a.com", { a: 1 });
+  // Re-running with the SAME (old,new) pair must RESUME — NOT fail Phase 1 on the already-flipped file.
+  const n = rotateVaultKey(dir, oldKek, newKek, canonicalizeHost);
+  assert.equal(n, 2, "both entries rotated — the already-flipped one resumed, not errored");
+  const next = store(dir, newKek);
+  assert.deepEqual(next.get("atlas", "a.com"), { a: 1 }, "the already-flipped entry opens under the new key");
+  assert.deepEqual(next.get("vault", "b.com"), { b: 2 }, "the remaining entry was rotated to the new key");
+  assert.throws(() => store(dir, oldKek).get("vault", "b.com"), /authenticate|decrypt/i, "the old key opens nothing after resume");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: REJECTS an identical old/new master key (a rotation must change the key)", () => {
+  const dir = tmp();
+  const kek = randomBytes(32);
+  store(dir, kek).put("atlas", "a.com", { a: 1 });
+  assert.throws(() => rotateVaultKey(dir, kek, Buffer.from(kek), canonicalizeHost), /identical|DIFFERENT/);
+  // A corrupt file that opens under NEITHER key still fails closed (no partial write).
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: a file that opens under NEITHER key fails closed (no partial write)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  const foreignKek = randomBytes(32);
+  store(dir, oldKek).put("atlas", "a.com", { a: 1 });
+  // A file sealed under a THIRD (foreign) key — opens under neither old nor new.
+  const rec = sealJson({ x: 1 }, { kek: foreignKek, consumerId: "atlas", host: "foreign.com" });
+  store(dir, oldKek).put("atlas", "foreign.com", { placeholder: 1 });
+  const f = readdirSync(dir).filter((n) => n.endsWith(".vault.json")).find((n) => {
+    try { return JSON.parse(readFileSync(join(dir, n), "utf8")).host === "foreign.com"; } catch { return false; }
+  });
+  writeFileSync(join(dir, f), JSON.stringify({ consumerId: "atlas", host: "foreign.com", record: rec }) + "\n");
+  assert.throws(() => rotateVaultKey(dir, oldKek, newKek, canonicalizeHost), /authenticate|decrypt/i);
+  // Phase 1 aborted before any write: the good entry still opens under the OLD key.
+  assert.deepEqual(store(dir, oldKek).get("atlas", "a.com"), { a: 1 }, "no entry was rotated (fail closed)");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: REJECTS a valid entry copied to a NON-canonical filename (no old-key ciphertext survives, audit #8)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  store(dir, oldKek).put("atlas", "a.com", { a: 1 }); // the canonical file for the slot
+  // Copy that entry's record to a NON-canonical filename (a manual copy / duplicate slot). Both decrypt,
+  // but put() only rewrites the canonical path, so the copy would otherwise survive under the OLD key.
+  const [canonical] = readdirSync(dir).filter((n) => n.endsWith(".vault.json"));
+  writeFileSync(join(dir, "copy-not-a-canonical-hash.vault.json"), readFileSync(join(dir, canonical)));
+  assert.throws(() => rotateVaultKey(dir, oldKek, newKek, canonicalizeHost), /canonical slot path/);
+  // Fail closed BEFORE any write: the canonical entry still opens under the OLD key (nothing rotated).
+  assert.deepEqual(store(dir, oldKek).get("atlas", "a.com"), { a: 1 }, "no partial rotation");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: REJECTS a NON-CANONICAL stored host (raw host would leave an old-key file, audit #8)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  store(dir, oldKek).put("atlas", "a.com", { a: 1 }); // a good canonical entry
+  // A record sealed for a RAW (non-canonical) host, stored at that raw host's slot path. Phase 2's put()
+  // would canonicalize "A.COM." → "a.com" and write a DIFFERENT slot, leaving this file under the old key.
+  const rec = sealJson({ x: 1 }, { kek: oldKek, consumerId: "atlas", host: "A.COM." });
+  writeFileSync(slotFileName(dir, "atlas", "A.COM."), JSON.stringify({ consumerId: "atlas", host: "A.COM.", record: rec }) + "\n");
+  assert.throws(() => rotateVaultKey(dir, oldKek, newKek, canonicalizeHost), /non-canonical host/);
+  assert.deepEqual(store(dir, oldKek).get("atlas", "a.com"), { a: 1 }, "fail closed — nothing rotated");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: REJECTS a symlinked or hard-linked entry file (an alias would keep old ciphertext, audit #8)", () => {
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  // Symlink: a canonical-named symlink to the real entry — Phase 2's rename replaces the LINK, not the target.
+  const d1 = tmp();
+  store(d1, oldKek).put("atlas", "a.com", { a: 1 });
+  const [f1] = readdirSync(d1).filter((n) => n.endsWith(".vault.json"));
+  renameSync(join(d1, f1), join(d1, "real-target")); // move the real file off the *.vault.json set
+  symlinkSync(join(d1, "real-target"), join(d1, f1)); // canonical-named symlink → the real target
+  assert.throws(() => rotateVaultKey(d1, oldKek, newKek, canonicalizeHost), /plain single-linked|symlink|hard link|non-regular/);
+  rmSync(d1, { recursive: true, force: true });
+
+  // Hard link: a second name for the same inode — rename leaves the other name on the old ciphertext.
+  const d2 = tmp();
+  store(d2, oldKek).put("atlas", "a.com", { a: 1 });
+  const [f2] = readdirSync(d2).filter((n) => n.endsWith(".vault.json"));
+  linkSync(join(d2, f2), join(d2, "hardlink-copy")); // f2 now has nlink=2
+  assert.throws(() => rotateVaultKey(d2, oldKek, newKek, canonicalizeHost), /plain single-linked|symlink|hard link|non-regular/);
+  rmSync(d2, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: REJECTS an orphaned atomic-write temp (crashed write left old-key ciphertext, audit #8)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  store(dir, oldKek).put("atlas", "a.com", { a: 1 });
+  const [f] = readdirSync(dir).filter((n) => n.endsWith(".vault.json"));
+  // Simulate a crash between put's temp-write and rename: an orphaned <slot>.vault.json.<hex>.tmp with
+  // OLD-key ciphertext. Rotation enumerates only *.vault.json, so it would ignore this and "succeed".
+  writeFileSync(join(dir, `${f}.abcdef012345.tmp`), readFileSync(join(dir, f)));
+  assert.throws(() => rotateVaultKey(dir, oldKek, newKek, canonicalizeHost), /orphaned atomic-write temp|\.tmp/);
+  // Fail closed: nothing rotated (the published entry still opens under the OLD key).
+  assert.deepEqual(store(dir, oldKek).get("atlas", "a.com"), { a: 1 }, "no partial rotation while an orphan temp exists");
   rmSync(dir, { recursive: true, force: true });
 });

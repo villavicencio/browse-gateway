@@ -32,6 +32,7 @@ export {
   countVaultEntries,
   vaultKeyBootError,
   rotateVaultKey,
+  slotFileName,
   type VaultStoreOptions,
   type VaultEntryMeta,
   type OpenVaultDeps,

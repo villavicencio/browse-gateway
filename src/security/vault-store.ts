@@ -27,6 +27,7 @@ import {
   renameSync,
   unlinkSync,
   statSync,
+  lstatSync,
 } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -122,6 +123,25 @@ function scanLeaves(value: unknown): LeafScan {
   return { redactable, oversized };
 }
 
+/**
+ * The canonical on-disk filename for a `(consumerId, canonicalHost)` slot. Rejects control chars (so the
+ * same slot-validity rule governs the filename and the AAD), then hashes an INJECTIVE length-prefixed
+ * encoding — a plain `host \0 consumer` join would collide if a field contained a NUL, silently
+ * overwriting another slot. Shared by the store's writes AND {@link rotateVaultKey}'s every-file
+ * canonical-path check (so a copied/duplicate entry can't survive rotation under the old key).
+ */
+export function slotFileName(dir: string, consumerId: string, canonicalHost: string): string {
+  assertSlotField("consumerId", consumerId);
+  assertSlotField("host", canonicalHost);
+  const c = Buffer.from(consumerId, "utf8");
+  const h = Buffer.from(canonicalHost, "utf8");
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(h.length, 0);
+  head.writeUInt32BE(c.length, 4);
+  const name = createHash("sha256").update(Buffer.concat([head, h, c])).digest("hex");
+  return join(dir, `${name}${ENTRY_SUFFIX}`);
+}
+
 export class VaultStore {
   readonly #kek: Buffer;
   readonly #dir: string;
@@ -136,18 +156,7 @@ export class VaultStore {
   }
 
   #fileFor(consumerId: string, canonicalHost: string): string {
-    // Reject control chars (so the same slot validity rule governs the filename and the AAD), then
-    // hash an INJECTIVE length-prefixed encoding — a plain `host \0 consumer` join would collide if a
-    // field itself contained a NUL, silently overwriting another slot's entry.
-    assertSlotField("consumerId", consumerId);
-    assertSlotField("host", canonicalHost);
-    const c = Buffer.from(consumerId, "utf8");
-    const h = Buffer.from(canonicalHost, "utf8");
-    const head = Buffer.alloc(8);
-    head.writeUInt32BE(h.length, 0);
-    head.writeUInt32BE(c.length, 4);
-    const name = createHash("sha256").update(Buffer.concat([head, h, c])).digest("hex");
-    return join(this.#dir, `${name}${ENTRY_SUFFIX}`);
+    return slotFileName(this.#dir, consumerId, canonicalHost);
   }
 
   /** Fold a payload's foldable leaf values into the redaction set (best-effort; no-op without a hook). */
@@ -245,17 +254,34 @@ export function listVaultEntries(dir: string): VaultEntryMeta[] {
 }
 
 /**
- * Rotate the master key: re-seal every entry under `newKek` (decrypt with `oldKek`, encrypt afresh —
- * a new DEK + nonces per entry). After this returns, point BGW_VAULT_KEY_FILE at the new key; the old
- * key no longer opens anything. Returns the number of entries rotated.
+ * Rotate the master key: re-seal every entry under `newKek` (decrypt, encrypt afresh — a new DEK +
+ * nonces per entry). After this returns, point BGW_VAULT_KEY_FILE at the new key. Returns the number of
+ * entries rotated.
+ *
+ * OFFLINE OPERATION: run this with the gateway STOPPED. It takes no lock and is not safe against a live
+ * `put`/`get` racing it — the caller must guarantee exclusive access to `dir` for the rotation's
+ * duration (the gateway process is the only writer, so stopping it is the exclusivity boundary).
+ *
+ * INVENTORY BOUNDARY: the entry set is the TOP-LEVEL, plain, single-linked `*.vault.json` files the
+ * store itself writes, each at its canonical slot path. Rotation rejects (fail closed) any that isn't —
+ * a symlink/hard link, a non-regular file, a non-canonical host, a file at a non-canonical name, or an
+ * ORPHANED atomic-write temp (`*.vault.json.<hex>.tmp` from a crashed write, which holds old-key
+ * ciphertext) — so no copy/alias/temp can survive under the old key. Entry ciphertext the operator has
+ * copied OUT of this set (renamed off the `.vault.json` suffix, or into a subdirectory) is out of the
+ * store's scope; the caller must not leave such copies in `dir`.
  *
  * Two phases so a single bad entry can't leave a half-rotated split-brain vault: STRICTLY enumerate +
- * decrypt EVERY `*.vault.json` under `oldKek` FIRST — any file that won't parse or decrypt throws
- * before a single file is rewritten, so the old key still opens everything. This does NOT use `list()`
- * (which SKIPS malformed files for the lenient `vault status` path — rotation must not, or a corrupt
- * entry would be left behind under the old key while the rest flips). Only once the whole set is
- * verified do we re-seal in place. (Residual: a process crash during the write phase can leave a
- * partial rotation; re-run with the old key — already-flipped entries fail phase 1, surfacing it.)
+ * decrypt EVERY `*.vault.json` FIRST — any file that won't parse or decrypt throws before a single file
+ * is rewritten. This does NOT use `list()` (which SKIPS malformed files for the lenient `vault status`
+ * path — rotation must not, or a corrupt entry would be left behind under the old key while the rest
+ * flips). Only once the whole set is verified do we re-seal in place.
+ *
+ * RESUMABLE: Phase 1 decrypts each file under `newKek` OR `oldKek` (new first). So a rotation interrupted
+ * mid-write (some files already flipped to `newKek`, the rest still `oldKek`) is completed simply by
+ * re-running with the same (old, new) pair — already-flipped entries open under `newKek`, the rest under
+ * `oldKek`, and all are re-sealed under `newKek`. A file that opens under NEITHER key is corrupt/foreign
+ * → throw (fail closed, no partial write). `newKek` must differ from `oldKek` (a no-op "rotation" that
+ * doesn't change the key is rejected).
  */
 export function rotateVaultKey(
   dir: string,
@@ -263,7 +289,22 @@ export function rotateVaultKey(
   newKek: Buffer,
   canonicalizeHost: (host: string) => string,
 ): number {
-  const files = existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(ENTRY_SUFFIX)) : [];
+  if (oldKek.equals(newKek)) {
+    throw new Error("vault: rotateVaultKey requires a DIFFERENT new key — old and new master keys are identical");
+  }
+  const allNames = existsSync(dir) ? readdirSync(dir) : [];
+  // A crashed atomic write (put writes `<slot>.vault.json.<hex>.tmp` then renames) can orphan a `.tmp`
+  // holding OLD-key ciphertext. It is not a `*.vault.json` entry, so Phase 1 would not rotate it — a
+  // "successful" rotation would then leave old-key ciphertext behind, defeating key-compromise recovery.
+  // Fail CLOSED: the operator must remove orphaned temps (incomplete writes, safe to delete) first.
+  const orphanTemp = allNames.find((n) => /\.vault\.json\.[0-9a-f]+\.tmp$/.test(n));
+  if (orphanTemp) {
+    throw new Error(
+      `vault: an orphaned atomic-write temp exists (${orphanTemp}) — a crashed write left old-key ` +
+        `ciphertext; remove the *.vault.json.*.tmp file(s) from the vault dir before rotating`,
+    );
+  }
+  const files = allNames.filter((n) => n.endsWith(ENTRY_SUFFIX));
   // Phase 1 — strict: parse + decrypt the specific file (via its stored tuple's AAD), no skipping.
   const decrypted = files.map((name) => {
     const raw = readFileSync(join(dir, name), "utf8");
@@ -276,9 +317,44 @@ export function rotateVaultKey(
     if (typeof file.consumerId !== "string" || typeof file.host !== "string" || file.record == null) {
       throw new Error(`vault: ${name} is not a valid entry (missing consumerId/host/record) — refusing to rotate`);
     }
-    // openJson throws on a malformed record, a wrong key, or an AAD mismatch — fail closed, no write yet.
-    const value = openJson(file.record as SealedRecord, { kek: oldKek, consumerId: file.consumerId, host: file.host });
-    return { consumerId: file.consumerId, host: file.host, value };
+    const consumerId = file.consumerId;
+    const host = file.host;
+    const record = file.record as SealedRecord;
+    // Reject a filesystem ALIAS before any write: `readFileSync` follows a symlink and Phase 2's rename
+    // replaces the LINK (leaving the target's old-key ciphertext), and a hard-linked file keeps the old
+    // inode reachable under its other name. `lstat` (not `stat`) sees the symlink itself; a subdir named
+    // `*.vault.json` also fails `isFile()`.
+    const st = lstatSync(join(dir, name));
+    if (!st.isFile() || st.nlink > 1) {
+      throw new Error(`vault: ${name} is not a plain single-linked file (symlink / hard link / non-regular) — refusing to rotate`);
+    }
+    // The stored host must ALREADY be canonical: Phase 1 derives the expected path from the stored host,
+    // but Phase 2's put() canonicalizes it — a raw host (e.g. "A.COM.") would pass here yet be rewritten
+    // to the "a.com" slot, leaving the raw-host file decryptable under the OLD key. Reject the mismatch.
+    if (canonicalizeHost(host) !== host) {
+      throw new Error(`vault: ${name} has a non-canonical host — refusing to rotate (would leave an old-key file behind)`);
+    }
+    // Every enumerated file MUST be at its canonical slot path. A valid entry COPIED to a different
+    // *.vault.json name (or a duplicate slot) would otherwise be decrypted + counted but NOT rewritten
+    // by Phase 2's put() (which writes the CANONICAL path) — leaving an old-key-decryptable copy behind.
+    // Reject BEFORE any write so the every-file rotation guarantee (key-compromise recovery) holds.
+    if (slotFileName(dir, consumerId, host) !== join(dir, name)) {
+      throw new Error(
+        `vault: ${name} is not at its canonical slot path — refusing to rotate (a copied or duplicate ` +
+          `entry would leave old-key ciphertext decryptable after rotation)`,
+      );
+    }
+    // Decrypt under EITHER key so an interrupted rotation resumes: try newKek first (a file already
+    // flipped by a crashed prior run), then oldKek (a not-yet-rotated file). openJson fails closed (GCM
+    // tag) on a wrong key, so the fallback is safe — a file is sealed under exactly one key. If NEITHER
+    // opens it, the file is corrupt/foreign and oldKek's throw propagates → Phase 1 aborts, no writes.
+    let value: unknown;
+    try {
+      value = openJson(record, { kek: newKek, consumerId, host });
+    } catch {
+      value = openJson(record, { kek: oldKek, consumerId, host });
+    }
+    return { consumerId, host, value };
   });
   // Phase 2 — re-seal under the new key (pure) and write each in place (atomic temp + rename per file).
   // allowOversize: rotation re-seals EXISTING entries, so a legacy oversized credential (written before
