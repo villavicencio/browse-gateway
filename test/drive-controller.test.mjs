@@ -304,6 +304,59 @@ test("controller: a driver error carrying proxy credentials is redacted before r
   });
 });
 
+test("controller: a session-OPEN error carrying proxy credentials is redacted too (audit #2)", async () => {
+  // The open path (launch + warm-cookie restore + proxy connect) throws OUTSIDE #run's scrub. It must
+  // redact at the open boundary too, not lean on the session-manager's static CORE_LAUNCH re-wrap.
+  const proxyUrl = "http://user:sup3r-secret-proxy-pass@proxy.example:8080";
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: proxyUrl }));
+  const gateway = {
+    sessions: { get: () => undefined },
+    // Simulate a launch/proxy failure AT OPEN whose message embeds the BYO proxy credentials.
+    async openConsumerSession() {
+      throw new Error(`net::ERR_PROXY_CONNECTION_FAILED launching via ${proxyUrl}`);
+    },
+    async useConsumerSession() {
+      throw new Error("unreached: open failed first");
+    },
+    async closeConsumerSession() {},
+  };
+  const c = new GatewayDriveController(gateway, secrets, "tok");
+  const assertRedacted = (label) => (e) => {
+    assert.ok(!e.message.includes("sup3r-secret-proxy-pass"), `raw secret must not survive ${label}`);
+    assert.ok(!e.message.includes(proxyUrl), `the proxy URL must be redacted from ${label}`);
+    return true;
+  };
+  // Both entries into the open path: the explicit open(), and the lazy open on the first navigate.
+  await assert.rejects(c.open(), assertRedacted("open()"));
+  await assert.rejects(c.navigate("https://example.com/"), assertRedacted("the navigate open path"));
+});
+
+test("controller: a WARM session-open error carrying a secret is redacted (audit #2 warm-restore vector)", async () => {
+  // The warm open path (vault-restored cookies + proxy connect) is the audit's named vector. It routes
+  // through the SAME redaction helper as the cold open, so a secret in a warm-open throw is scrubbed too.
+  const proxyUrl = "http://user:sup3r-secret-proxy-pass@proxy.example:8080";
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: proxyUrl }));
+  const gateway = {
+    sessions: { get: () => undefined },
+    async openConsumerSession() {
+      throw new Error(`net::ERR_TUNNEL_CONNECTION_FAILED restoring warm session via ${proxyUrl}`);
+    },
+    async useConsumerSession() {
+      throw new Error("unreached: warm open failed first");
+    },
+    async closeConsumerSession() {},
+  };
+  const vault = makeVault("vault", "example.com", warmEntry("example.com"));
+  const c = new GatewayDriveController(gateway, secrets, "tok", {
+    vault, consumerId: "vault", allowlist: allowAll,
+  });
+  await assert.rejects(c.navigate("https://example.com/dashboard"), (e) => {
+    assert.ok(!e.message.includes("sup3r-secret-proxy-pass"), "raw secret must not survive warm open");
+    assert.ok(!e.message.includes(proxyUrl), "the proxy URL must be redacted from the warm open path");
+    return true;
+  });
+});
+
 // --- U9 warm-open (consumer-facing trigger) --------------------------------------------------------
 
 /** A recording gateway that captures every open's coreOverrides + navigate opts + closed handles, and

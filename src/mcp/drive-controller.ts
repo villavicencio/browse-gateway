@@ -401,10 +401,29 @@ export class GatewayDriveController implements DriveController {
     await this.#openSession(this.#proxiedSession ? this.#resolveProxyOverride() : undefined);
   }
 
+  /**
+   * Open a consumer session, scrubbing any secret material from a launch/restore/proxy error before it
+   * propagates — the open-path analogue of {@link #run} (which already redacts the drive/use path). The
+   * open path (browser launch + warm-cookie restore + proxy connect) can surface a secret in a raw
+   * throw; redacting HERE means coverage no longer hangs on the session-manager's static CORE_LAUNCH
+   * re-wrap holding (audit #2). A plain re-wrap matches #run — no caller branches on the open error's
+   * type/code (SessionManagerError is only produced, never inspected; EscalationError is thrown at the
+   * navigate/escalation layer, never by openConsumerSession). The `#verifyEgress` probe opens directly:
+   * it already swallows every error to `{ kind: "unknown" }`, so it has no surface to redact.
+   */
+  async #openConsumerSession(override: BrowserCoreOptions | undefined): Promise<string> {
+    try {
+      return await this.#gateway.openConsumerSession(this.#token, override);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(redactSecrets(message, this.#secrets));
+    }
+  }
+
   /** Open a consumer session with the given core override (a proxied exit, or undefined for direct),
    *  recording whether it is proxied for reopen-after-reap and failure messaging. */
   async #openSession(override: BrowserCoreOptions | undefined): Promise<void> {
-    this.#handle = await this.#gateway.openConsumerSession(this.#token, override);
+    this.#handle = await this.#openConsumerSession(override);
     this.#proxiedSession = override !== undefined;
   }
 
@@ -450,7 +469,7 @@ export class GatewayDriveController implements DriveController {
    * sealed `restoreState.ownerHost` (the authoritative, vault-derived value), never a caller input.
    */
   async #openSessionWarm(override: BrowserCoreOptions): Promise<void> {
-    this.#handle = await this.#gateway.openConsumerSession(this.#token, override);
+    this.#handle = await this.#openConsumerSession(override);
     this.#proxiedSession = override.proxy !== undefined;
     this.#warmHost = override.restoreState?.ownerHost;
   }
