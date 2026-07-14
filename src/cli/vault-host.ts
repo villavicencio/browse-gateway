@@ -163,7 +163,11 @@ async function doImport(env: NodeJS.ProcessEnv, argv: string[], vault: VaultStor
     throw new Error("vault-host: import payload missing valid `creds` (username + password strings)");
   }
   // Fold the secret material into the redaction set BEFORE anything below can throw with it in scope.
-  secrets.addRedactable([creds.username, creds.password, ...(creds.totpSeed ? [creds.totpSeed] : [])]);
+  // Password + TOTP seed are CREDENTIALS — register them through the guarded API so an unredactable
+  // (<3 / marker) one is rejected at import rather than persisted and later leaked (audit #3). The
+  // username may legitimately be short, so it uses the permissive API.
+  secrets.addRedactable([creds.username]);
+  secrets.addRedactableCredential([creds.password, ...(creds.totpSeed ? [creds.totpSeed] : [])]);
 
   assertConsumerKnown(env, consumerId);
   const before = (session.cookies ?? []).length;
@@ -231,7 +235,10 @@ async function doLogin(env: NodeJS.ProcessEnv, argv: string[]): Promise<void> {
     throw new Error("vault-host: login payload missing valid `creds` (username + password strings)");
   }
   // Fold the secret material in BEFORE building the runtime / capturing — so any later throw scrubs it.
-  secrets.addRedactable([creds.username, creds.password, ...(creds.totpSeed ? [creds.totpSeed] : [])]);
+  // Password + TOTP through the guarded API (reject an unredactable one at ingress, audit #3); username
+  // may be short → permissive.
+  secrets.addRedactable([creds.username]);
+  secrets.addRedactableCredential([creds.password, ...(creds.totpSeed ? [creds.totpSeed] : [])]);
 
   // The full runtime launches a browser; reuse the process redaction sink so KEK + tokens fold here too.
   const runtime = buildGatewayRuntime(env, { log, secrets });

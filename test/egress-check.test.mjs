@@ -94,7 +94,7 @@ function makeProxyGateway(sessionNavLists, exitOrgJson) {
 
 test("drive: with verifyEgress on, an exhausted escalation attaches a classified exitCheck", async () => {
   const { gateway, opened } = makeProxyGateway([[THIN_403], [THIN_403]], '{"ip":"5.78.127.182","org":"AS24940 Hetzner Online GmbH"}');
-  const drive = new GatewayDriveController(gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pw" })), "tok", {
+  const drive = new GatewayDriveController(gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" })), "tok", {
     onDatacenterIp: true,
     verifyEgress: true,
   });
@@ -111,7 +111,7 @@ test("drive: with verifyEgress on, an exhausted escalation attaches a classified
 
 test("drive: with verifyEgress OFF (default), no exitCheck is attached (no extra proxied probe)", async () => {
   const { gateway } = makeProxyGateway([[THIN_403], [THIN_403]], '{"org":"AS24940 Hetzner Online GmbH"}');
-  const drive = new GatewayDriveController(gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pw" })), "tok", {
+  const drive = new GatewayDriveController(gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" })), "tok", {
     onDatacenterIp: true,
   });
   await assert.rejects(drive.navigate("https://hostile.example/"), (err) => {

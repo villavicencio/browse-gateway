@@ -9,6 +9,28 @@ import { inspect } from "node:util";
 
 export type SecretSource = () => Record<string, string | undefined>;
 
+/** Shortest value `redactSecrets` will scrub — a 1–2 char value is skipped so it can't blanket-redact
+ *  ordinary output. A credential shorter than this is UNREDACTABLE, so it is rejected at ingress. */
+const MIN_REDACTABLE_LEN = 3;
+/** Reserved output markers redaction emits; a secret equal to one would be re-introduced post-scrub. */
+const RESERVED_REDACTION_MARKERS = new Set(["[REDACTED]", "<url>"]);
+
+/**
+ * Fail CLOSED on a credential that {@link redactSecrets} could not hide: a 1–2 char value it skips (to
+ * avoid blanket-redacting ordinary text), or a value equal to an output marker (re-introduced post-scrub).
+ * Enforced at EVERY redaction ingress (typed SECRET_KEYS + {@link SecretStore.addRedactable}) so no
+ * un-redactable credential can enter the set. `label` names the source (a key / "a registered secret") —
+ * the rejected VALUE is NEVER interpolated, so the boot/registration error can't itself leak the secret.
+ */
+function assertRedactableSecret(value: string, label: string): void {
+  if (value.length < MIN_REDACTABLE_LEN) {
+    throw new Error(`${label} is too short (<${MIN_REDACTABLE_LEN} chars) to be redactable — it would leak in logs; use a longer value`);
+  }
+  if (RESERVED_REDACTION_MARKERS.has(value)) {
+    throw new Error(`${label} collides with a reserved redaction marker — use a different value`);
+  }
+}
+
 /** The BYO secret env keys the gateway recognizes. */
 export const SECRET_KEYS = [
   "BGW_PROXY_URL",
@@ -45,6 +67,7 @@ export class SecretStore {
     for (const key of SECRET_KEYS) {
       const value = env[key];
       if (value) {
+        assertRedactableSecret(value, `secret ${key}`); // fail closed on an un-redactable credential (audit #3)
         next.set(key, value);
         this.#redactable.add(value); // never forget a value, so rotation can't un-redact it
       }
@@ -60,8 +83,36 @@ export class SecretStore {
    * values are never forgotten (rotation-safe, like {@link reload}). Keep the set bounded — register
    * only durable consumer tokens, not ephemeral per-request values.
    */
+  /**
+   * Register PERMISSIVE, possibly-short values for redaction — sticky-suffix STRUCTURE fragments and
+   * non-secret usernames, where a <3 value is legitimate and redactSecrets' <3 skip is the intended
+   * behavior. Rejects only a reserved-marker collision (never legitimate, would be re-introduced
+   * post-scrub). For CREDENTIALS that MUST be redactable (tokens, passwords, TOTP seeds, sensitive vault
+   * leaves), use {@link addRedactableCredential}, which additionally rejects an unredactable <3 value.
+   */
   addRedactable(values: Iterable<string>): void {
-    for (const v of values) if (v) this.#redactable.add(v);
+    for (const v of values) {
+      if (!v) continue;
+      if (RESERVED_REDACTION_MARKERS.has(v)) {
+        throw new Error("a registered secret collides with a reserved redaction marker — use a different value");
+      }
+      this.#redactable.add(v);
+    }
+  }
+
+  /**
+   * Register CREDENTIAL-grade values (consumer tokens, vault passwords / TOTP seeds, sensitive vault
+   * leaves) for redaction, enforcing the FULL redactability invariant at this ingress: a value too
+   * short to redact (<3, which redactSecrets skips) or equal to an output marker is REJECTED — fail
+   * closed, so an unredactable credential can never be persisted/used and then leak in a log. The error
+   * names only the source, never the value.
+   */
+  addRedactableCredential(values: Iterable<string>): void {
+    for (const v of values) {
+      if (!v) continue;
+      assertRedactableSecret(v, "a credential");
+      this.#redactable.add(v);
+    }
   }
 
   get(key: SecretKey): string | undefined {
@@ -113,7 +164,7 @@ export function escapeRegExp(s: string): string {
  * redact-BEFORE-serialize: scrub the raw string before any escaping transform (see how the smoke logger
  * `gateway/smoke-log.ts` redacts each raw leaf before it serializes).
  */
-export function redactSecrets(text: string, store: SecretStore): string {
+export function redactSecrets(text: string, store: { redactableValues(): readonly string[] }): string {
   let out = text;
   const variants = new Set<string>();
   for (const value of store.redactableValues()) {

@@ -109,14 +109,49 @@ test("redactSecrets: scrubs secret values, leaves short noise, no secret survive
 test("redactSecrets: also scrubs the URL-encoded form; skips 1-2 char secrets", () => {
   const store = new SecretStore(() => ({
     BGW_PROXY_PASSWORD: "p@ss",   // encodes to p%40ss — the realistic proxy-error leak form
-    BGW_PROXY_USERNAME: "ab",     // 2 chars -> skipped so it can't blanket-redact ordinary text
     BGW_CAPTCHA_API_KEY: "key123",
   }));
   const out = redactSecrets("raw=p@ss enc=p%40ss key=key123", store);
   assert.ok(!out.includes("p@ss"), "verbatim secret leaked");
   assert.ok(!out.includes("p%40ss"), "url-encoded secret leaked");
   assert.ok(!out.includes("key123"));
-  assert.equal(redactSecrets("about the table", store), "about the table", "2-char secret must not blanket-redact");
+  // redactSecrets' own <3 skip (defense-in-depth). The ingress guards now REJECT a <3-char secret, so
+  // exercise the primitive directly via a duck-typed store that surfaces a 2-char value.
+  const shortStore = { redactableValues: () => ["ab"] };
+  assert.equal(redactSecrets("about the table", shortStore), "about the table", "2-char value must not blanket-redact");
+});
+
+test("SecretStore: REJECTS an unredactable secret at BOTH ingresses — too short / marker (audit #3)", () => {
+  // Typed SECRET_KEYS ingress (reload).
+  assert.throws(() => new SecretStore(() => ({ BGW_PROXY_PASSWORD: "ab" })), /too short/, "a 2-char credential can't be redacted → rejected");
+  assert.throws(() => new SecretStore(() => ({ BGW_PROXY_PASSWORD: "<url>" })), /redaction marker/, "a value equal to the <url> marker is rejected");
+  assert.throws(() => new SecretStore(() => ({ BGW_CAPTCHA_API_KEY: "[REDACTED]" })), /redaction marker/, "a value equal to [REDACTED] is rejected");
+  // PERMISSIVE addRedactable (fragments / usernames): rejects a MARKER collision, PERMITS a <3 value.
+  const s = new SecretStore(() => ({}));
+  assert.throws(() => s.addRedactable(["<url>"]), /redaction marker/, "a marker-collision registered value is rejected");
+  assert.throws(() => s.addRedactable(["[REDACTED]"]), /redaction marker/);
+  s.addRedactable(["_s"]); // a 2-char fragment is permitted (the sticky-suffix path relies on this)
+  s.addRedactable(["jo"]); // a short username is permitted
+  // GUARDED addRedactableCredential (tokens / passwords / TOTP): rejects BOTH <3 and marker.
+  assert.throws(() => s.addRedactableCredential(["ab"]), /too short/, "a <3-char CREDENTIAL is rejected at ingress");
+  assert.throws(() => s.addRedactableCredential(["<url>"]), /redaction marker/);
+  s.addRedactableCredential(["a-real-credential-value"]); // a normal credential registers fine
+  // A normal credential still loads / registers.
+  const ok = new SecretStore(() => ({ BGW_PROXY_PASSWORD: "hunter2-long-password" }));
+  assert.equal(ok.get("BGW_PROXY_PASSWORD"), "hunter2-long-password");
+  ok.addRedactable(["a-long-consumer-token"]);
+});
+
+test("SecretStore: the rejection error NEVER interpolates the rejected value (no boot-time leak, audit #3)", () => {
+  // A boot error is written to stderr uncensored, so the message itself must not carry the secret.
+  const marker = "<url>";
+  try {
+    new SecretStore(() => ({ BGW_PROXY_PASSWORD: marker }));
+    assert.fail("should have thrown");
+  } catch (e) {
+    assert.ok(!e.message.includes(marker), "the rejected value is not in the error message");
+    assert.match(e.message, /BGW_PROXY_PASSWORD/, "only the key + category are reported");
+  }
 });
 
 test("redactSecrets: still scrubs a credential rotated OUT of the store (rotation can't un-redact)", () => {

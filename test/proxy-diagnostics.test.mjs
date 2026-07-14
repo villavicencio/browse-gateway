@@ -90,7 +90,7 @@ function makeProxyGateway(sessionNavLists) {
 test("drive: exhausted proxied exits throw EscalationError with structured diagnostics", async () => {
   // Direct blocks (hard 403), then every proxied exit also blocks → exhaustion.
   const { gateway, opened } = makeProxyGateway([[THIN_403], [THIN_403]]);
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
   const drive = new GatewayDriveController(gateway, secrets, "tok", { onDatacenterIp: true });
 
   await assert.rejects(
@@ -146,7 +146,7 @@ function makeRenderGateway(result) {
 
 test("retrieve: a CF block that never clears populates proxyDiagnostic with attempts + reason", async () => {
   const gateway = makeRenderGateway(cfBlockRender);
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
   const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
   assert.equal(r.blocked, true);
   assert.equal(r.proxyUsed, true);

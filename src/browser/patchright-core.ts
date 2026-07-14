@@ -5,12 +5,14 @@
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
 import { hostFromUrl, hostMatchesAnySuffix } from "../security/url.js";
+import { SecretStore, redactSecrets } from "../security/secrets.js";
 import { buildWindowsUaOverride, buildNativeUaOverride, READ_LIVE_UA_JS, type LiveUserAgent } from "./os-presentation.js";
 import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
   awaitSolvableCaptcha,
+  CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
   type LiveCaptcha,
 } from "./captcha.js";
@@ -92,10 +94,53 @@ export function decideRequest(
   }
 }
 
-/** A short, URL-stripped reason for a diagnostic line — never leak a target/secret into logs (R9). */
-function errCode(err: unknown): string {
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.replace(/https?:\/\/\S+/gi, "<url>").slice(0, 80);
+/**
+ * A short, secret-free reason for a diagnostic line (R9). Order matters: scrub KNOWN secrets from the
+ * FULL message first (via the injected redactor — catches a bare proxy password anywhere, incl. past
+ * char 80), THEN strip any residual URL (a target/exit URL is not a stored secret but must not be
+ * logged), THEN truncate. Without a redactor (tests/smoke) it degrades to URL-strip + truncate.
+ */
+export function errCode(err: unknown, redact?: (s: string) => string): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const scrubbed = redact ? redact(raw) : raw;
+  return scrubbed.replace(/https?:\/\/\S+/gi, "<url>").slice(0, 80);
+}
+
+/**
+ * The redactor a launch uses for its own stderr diagnostics ({@link errCode}), built from the UNION of
+ * the caller's secret VALUES (`opts.secrets`) and the launch's own proxy credentials, scrubbed in ONE
+ * longest-first pass — so no secret can fragment another (the flaw of composing two opaque redactors).
+ * For a SECRET-BEARING launch (proxy/solver) that supplied no `opts.secrets`, it CENTRALIZES injection
+ * by defaulting to the process-env {@link SecretStore} (which loads the SAME BGW_PROXY_* / BGW_CAPTCHA_*
+ * the launch's creds come from) — so a proxied/solver core is NEVER launched without a way to scrub its
+ * diagnostics (R9, audit #3; the earlier gap where a validator/tool built a proxied Gateway from bare
+ * `loadConfig()` and leaked a bare password). A plain direct launch with no secrets needs none.
+ * Exported for tests.
+ */
+export function resolveCoreRedactor(opts: BrowserCoreOptions): ((s: string) => string) | undefined {
+  // OPTION-supplied proxy credentials are a first-class credential source that can DIFFER from what the
+  // caller's secret set knows — a per-session proxy override merged in by SessionManager.acquire (a
+  // gateway override, a minted sticky password). Validate them (guarded → an unredactable <3/marker one
+  // fails CLOSED here; real proxy creds are env-derived and ≥3 so this never trips in practice), then
+  // UNION them with the caller's secret VALUES and scrub in ONE redactSecrets pass. A single pass orders
+  // longest-first, so no secret can fragment another (neither a base secret inside a cred, nor a cred
+  // inside a caller-only secret) — the flaw any sequential composition of two opaque redactors has.
+  const optionCreds = [opts.proxy?.username, opts.proxy?.password].filter(
+    (v): v is string => typeof v === "string" && v.length > 0,
+  );
+  let validatedOptionCreds: readonly string[] = [];
+  if (optionCreds.length) {
+    const tmp = new SecretStore(() => ({}));
+    tmp.addRedactableCredential(optionCreds); // validate: fail closed on an unredactable option cred
+    validatedOptionCreds = tmp.redactableValues();
+  }
+  // Caller's secret values, or — for a secret-bearing launch that supplied no store — the process-env
+  // store (the same BGW_PROXY_* / BGW_CAPTCHA_* the launch uses).
+  const callerStore = opts.secrets ?? (opts.proxy || opts.solver ? new SecretStore() : undefined);
+  if (!callerStore && !validatedOptionCreds.length) return undefined;
+  const values = [...(callerStore?.redactableValues() ?? []), ...validatedOptionCreds];
+  if (!values.length) return undefined;
+  return (s: string) => redactSecrets(s, { redactableValues: () => values });
 }
 
 const DEFAULT_CLEARANCE_TIMEOUT_MS = 20_000;
@@ -231,6 +276,13 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   readonly #windowsUaHosts: readonly string[];
   /**
+   * Secret redactor (R9), injected from the gateway's SecretStore. The browser core's own stderr
+   * diagnostics ({@link errCode}) URL-strip by construction, but a bare secret (a proxy password not
+   * in URL form) would otherwise survive — this scrubs the KNOWN secret set from a diagnostic line
+   * before it is written. Absent (tests / smoke) = URL-strip only, the prior behavior.
+   */
+  readonly #redact?: (s: string) => string;
+  /**
    * The drive active page's current OS-presentation mode. Tracked so a REUSED active page actively
    * RESTORES the native identity when it navigates from a listed host to a non-listed one — the
    * Windows override must never bleed past the opt-in boundary onto an unrelated host (it is a CDP
@@ -285,16 +337,22 @@ export class PatchrightBrowserCore implements BrowserCore {
     resolved: ResolvedCoreOptions,
     solver?: CaptchaSolver,
     windowsUaHosts: readonly string[] = [],
+    redact?: (s: string) => string,
   ) {
     this.#context = context;
     this.#resolved = resolved;
     this.#solver = solver;
     this.#windowsUaHosts = windowsUaHosts;
+    this.#redact = redact;
   }
 
   static async launch(
     opts: BrowserCoreOptions = {},
   ): Promise<PatchrightBrowserCore> {
+    // R9 (audit #3): a secret-bearing launch (proxy creds / solver key) always gets a redactor for its
+    // stderr diagnostics — the caller's, or a centralized process-env default — so a bare secret can
+    // never reach deployment/validation logs even if the caller didn't wire one. See resolveCoreRedactor.
+    const redact = resolveCoreRedactor(opts);
     const resolved = resolveCoreOptions(opts);
     const launchOptions = buildLaunchOptions(resolved);
     // R13/R17: never expose CDP off-localhost. Patchright drives Chromium over a pipe, so
@@ -310,8 +368,8 @@ export class PatchrightBrowserCore implements BrowserCore {
     // independent of the navigation guard the gateway installs next. restoreOrClose owns the
     // close-on-failure invariant so a bad blob can't orphan the just-launched Chrome.
     await restoreOrClose(context, opts.restoreState);
-    // The solver + windowsUaHosts are runtime dependencies (not launch args) — pass through to the instance.
-    return new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? []);
+    // The solver + windowsUaHosts + redactor are runtime dependencies (not launch args) — pass through.
+    return new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? [], redact);
   }
 
   /**
@@ -503,7 +561,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     const decision: NavigationDecision = this.#closing
       ? "block"
       : decideRequest(this.#activeGuard, event, (err) => {
-          process.stderr.write(`[browse-gateway] navigation guard threw; request blocked (${errCode(err)})\n`);
+          process.stderr.write(`[browse-gateway] navigation guard threw; request blocked (${errCode(err, this.#redact)})\n`);
         });
     try {
       if (decision === "allow") {
@@ -519,7 +577,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       // (invalid InterceptionId) is usually benign too, but a genuine send failure can leave a request
       // paused until navigationTimeoutMs, so surface it (typed code only, no URL/secret).
       if (!this.#closing) {
-        process.stderr.write(`[browse-gateway] fetch ${decision} send failed (${errCode(err)})\n`);
+        process.stderr.write(`[browse-gateway] fetch ${decision} send failed (${errCode(err, this.#redact)})\n`);
       }
     }
   }
@@ -547,7 +605,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       // its possibly-overridden CDP session) and open a FRESH one — which starts native — then re-establish
       // the wanted mode on it; if THAT still fails it propagates, so the navigation fails loudly rather
       // than landing with the wrong identity.
-      process.stderr.write(`[browse-gateway] OS-presentation (${wantWindows ? "windows" : "native"}) failed; recreating page fail-closed (${errCode(err)})\n`);
+      process.stderr.write(`[browse-gateway] OS-presentation (${wantWindows ? "windows" : "native"}) failed; recreating page fail-closed (${errCode(err, this.#redact)})\n`);
       await this.closeActivePage();
       page = await this.#ensureActivePage(); // fresh page ⇒ native identity, #osMode reset
       if (wantWindows) await this.#applyOsMode(page, "windows"); // a non-listed host is already correct (native)
@@ -689,7 +747,7 @@ export class PatchrightBrowserCore implements BrowserCore {
         try {
           this.#liveUach = await this.#readLiveUa(page);
         } catch (err) {
-          process.stderr.write(`[browse-gateway] OS-presentation baseline read failed (${errCode(err)})\n`);
+          process.stderr.write(`[browse-gateway] OS-presentation baseline read failed (${errCode(err, this.#redact)})\n`);
         }
       }
 
@@ -816,9 +874,13 @@ export class PatchrightBrowserCore implements BrowserCore {
     } catch (err) {
       // Vendor error / timeout / budget: leave the page challenged rather than throw under the verb,
       // but emit a diagnostic so a left-challenged drive page has a WHY (parity with retrieve's
-      // block-reason). Log the typed code only — never the message (vendor strings) or the key (R9).
-      const code = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
-      process.stderr.write(`[browse-gateway] captcha solve failed (${code}); page left challenged\n`);
+      // block-reason). ALLOWLIST the code: the built-in solver uses fixed typed codes, but an
+      // injected/alternate solver places no restriction on `code`, so anything unrecognized becomes a
+      // generic "error" (never echoed) — then still route through errCode (redact + URL-strip +
+      // truncate) as belt-and-suspenders. This fifth stderr sink can't leak a secret/URL (R9, audit #3).
+      const raw = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
+      const code = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw) ? raw : "error";
+      process.stderr.write(`[browse-gateway] captcha solve failed (${errCode(code, this.#redact)}); page left challenged\n`);
       return false;
     }
     if (!token) return false;

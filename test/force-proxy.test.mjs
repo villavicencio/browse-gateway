@@ -10,7 +10,7 @@ import { SecretStore } from "../dist/security/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 
 const REAL = "real accessibility tree ".repeat(60); // not blocked
-const PROXY_SECRETS = () => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" });
+const PROXY_SECRETS = () => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" });
 
 // --- pure helpers ----------------------------------------------------------------------------
 

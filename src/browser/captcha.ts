@@ -28,6 +28,21 @@ export interface CaptchaSolver {
   solve(challenge: CaptchaChallenge): Promise<string>;
 }
 
+/**
+ * The KNOWN, non-secret solver error codes (part of the CaptchaSolver contract; `verbs/captcha-solver`
+ * derives its `CaptchaSolveErrorCode` type from this). An ALLOWLIST: the browser core logs a recognized
+ * code in a solve-failure diagnostic but replaces any UNRECOGNIZED `code` from a custom/injected solver
+ * with a generic marker, so an opaque solver can't smuggle a secret into stderr via `error.code` (R9).
+ */
+export const CAPTCHA_SOLVE_ERROR_CODES = [
+  "not-configured", // no API key/URL — solver shouldn't have been constructed
+  "unsupported-kind", // we don't map this CaptchaKind to a task type
+  "missing-sitekey", // the challenge carried no siteKey (required by the task types)
+  "budget-exhausted", // per-window solve cap hit — refuse rather than spend
+  "vendor-error", // the service returned an error (createTask/getTaskResult errorId)
+  "timeout", // the solve did not complete within the deadline
+] as const;
+
 export class NullCaptchaSolver implements CaptchaSolver {
   async solve(): Promise<string> {
     throw new Error("no CAPTCHA solver configured");

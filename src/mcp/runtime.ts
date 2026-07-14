@@ -83,7 +83,7 @@ function loadConsumers(env: NodeJS.ProcessEnv, secrets: SecretStore): ConsumerSp
   if (!path) throw new Error("BGW_CONSUMERS_MANIFEST is required (path to the consumer manifest JSON)");
   const manifest = parseConsumerManifest(readFileSync(path, "utf8"));
   const { specs, tokens } = buildConsumerSpecs(manifest, env);
-  secrets.addRedactable(tokens); // tokens never surface in logs/audit/errors (R9)
+  secrets.addRedactableCredential(tokens); // tokens are credentials — must be redactable (R9, audit #3)
   return specs;
 }
 
@@ -107,6 +107,10 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   if (vault) log("vault: ready (encrypted credential store enabled)");
   // Interactive-CAPTCHA solver for the drive/capture path, wired when BYO config is present.
   config.core.solver = httpCaptchaSolverFromSecrets(secrets, env.BGW_CAPTCHA_API_URL, { budget: DEFAULT_CAPTCHA_BUDGET });
+  // R9: give the browser core the SecretStore so its own stderr diagnostics (errCode) scrub a bare
+  // secret, not just URL-strip — closes the audit-#3 gap (a proxy password not in URL form). Passing the
+  // store (not a redactor fn) lets the core union these values with a launch's proxy creds in one pass.
+  config.core.secrets = secrets;
 
   const specs = loadConsumers(env, secrets);
   const registry = new ConsumerRegistry(specs);

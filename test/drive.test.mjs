@@ -24,29 +24,29 @@ test("proxyOverrideFor: {proxy} only with a proxy configured AND on a datacenter
 });
 
 test("proxyOverrideFor: with a sticky suffix, EACH CALL mints a fresh held exit", () => {
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pwd" }));
   const a = proxyOverrideFor(secrets, true, "_s-{id}");
   const b = proxyOverrideFor(secrets, true, "_s-{id}");
-  assert.match(a?.proxy?.password, /^pw_s-[0-9a-f]+$/);
+  assert.match(a?.proxy?.password, /^pwd_s-[0-9a-f]+$/);
   assert.notEqual(a?.proxy?.password, b?.proxy?.password, "fresh sticky session per resolve");
   // No suffix → base password untouched (prior rotating behavior).
-  assert.equal(proxyOverrideFor(secrets, true)?.proxy?.password, "pw");
+  assert.equal(proxyOverrideFor(secrets, true)?.proxy?.password, "pwd");
 });
 
 test("proxyOverrideFor: a PINNED stickyExitId re-pins the SAME held exit across calls (vault warm replay, R3)", () => {
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pwd" }));
   const a = proxyOverrideFor(secrets, true, "_s-{id}", "abcd1234");
   const b = proxyOverrideFor(secrets, true, "_s-{id}", "abcd1234");
-  assert.equal(a?.proxy?.password, "pw_s-abcd1234");
+  assert.equal(a?.proxy?.password, "pwd_s-abcd1234");
   assert.equal(a?.proxy?.password, b?.proxy?.password, "same id → same exit, every replay");
   // A pinned id differs from a fresh mint, and 3-arg callers are unchanged (fresh per call).
-  assert.notEqual(proxyOverrideFor(secrets, true, "_s-{id}")?.proxy?.password, "pw_s-abcd1234");
+  assert.notEqual(proxyOverrideFor(secrets, true, "_s-{id}")?.proxy?.password, "pwd_s-abcd1234");
 });
 
 test("proxyOverrideForPinned: returns the override ONLY when the exit is VERIFIABLY pinned (R3 fail-closed)", () => {
-  const full = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+  const full = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pwd" }));
   // Truly pinned: proxy + datacenter + a sticky suffix that applies the id.
-  assert.equal(proxyOverrideForPinned(full, true, "_s-{id}", "abcd1234")?.proxy?.password, "pw_s-abcd1234");
+  assert.equal(proxyOverrideForPinned(full, true, "_s-{id}", "abcd1234")?.proxy?.password, "pwd_s-abcd1234");
   // NOT pinnable → undefined so the caller fails closed (never a wrong/rotating-exit replay):
   assert.equal(proxyOverrideForPinned(full, true, undefined, "abcd1234"), undefined, "no sticky suffix → base (rotating) proxy → undefined");
   assert.equal(proxyOverrideForPinned(full, true, "_s-static", "abcd1234"), undefined, "suffix without {id} → id not applied → undefined");

@@ -95,7 +95,7 @@ function warmEntry(host, opts = {}) {
 }
 
 const noSecrets = () => new SecretStore(() => ({}));
-const proxySecrets = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+const proxySecrets = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
 const allowAll = new Allowlist(["*"]);
 
 test("warm-up: an opted-in owner host warms up the shallow root BEFORE the deep target, on ONE session", async () => {
@@ -265,7 +265,7 @@ test("warm-up: a reaped BOUND warm session re-warms through the SAME re-pinned e
     ["https://example.com/", "https://example.com/deep/again"],
     "bound reopen re-warmed the shallow root before the deep target",
   );
-  assert.equal(opens[opens.length - 1]?.proxy?.password, "pw_s-abcd1234", "reopen re-pinned the SAME captured exit (R3); warm-up rode it");
+  assert.equal(opens[opens.length - 1]?.proxy?.password, "pwd_s-abcd1234", "reopen re-pinned the SAME captured exit (R3); warm-up rode it");
 });
 
 test("warm-up: a LIVE (non-reaped) pinned navigate does NOT re-warm (token already held)", async () => {
@@ -346,5 +346,5 @@ test("warm-up: a BOUND (proxied) warm session warms up through the SAME re-pinne
   await c.navigate("https://example.com/deep/account");
   assert.deepEqual(navs, ["https://example.com/", "https://example.com/deep/account"], "warm-up root, then target");
   assert.equal(opens.length, 1, "one bound proxied session for BOTH the warm-up and the target");
-  assert.equal(opens[0]?.proxy?.password, "pw_s-abcd1234", "the SAME re-pinned captured exit (R3) carried the warm-up");
+  assert.equal(opens[0]?.proxy?.password, "pwd_s-abcd1234", "the SAME re-pinned captured exit (R3) carried the warm-up");
 });

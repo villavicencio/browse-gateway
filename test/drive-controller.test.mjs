@@ -179,14 +179,14 @@ test("controller: sticky escalation mints a FRESH held exit per proxied attempt 
       open.delete(h);
     },
   };
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
   const c = new GatewayDriveController(gateway, secrets, "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
   const snap = await c.navigate("https://hard.example/");
   assert.equal(snap.status, 200, "escalation landed the page");
   assert.equal(opens.length, 3, "1 direct open + 2 proxied attempts");
   assert.equal(opens[0], undefined, "first open is direct (no override)");
   const proxiedPw = opens.slice(1).map((o) => o?.proxy?.password);
-  for (const pw of proxiedPw) assert.match(pw, /^pw_s-[0-9a-f]+$/, "sticky suffix applied per proxied open");
+  for (const pw of proxiedPw) assert.match(pw, /^pwd_s-[0-9a-f]+$/, "sticky suffix applied per proxied open");
   assert.equal(new Set(proxiedPw).size, 2, "each proxied attempt minted its own sticky session");
   assert.equal(navOpts.length, 3, "1 direct + 2 proxied navigates fired (direct proves it ran)");
   assert.equal(navOpts[0], undefined, "direct navigate passes no opts → keeps the default clearance");
@@ -227,7 +227,7 @@ test("controller: a reaped PROXIED session reopens with the escalated clearance 
     },
     async closeConsumerSession(_t, h) { open.delete(h); },
   };
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
   const c = new GatewayDriveController(gateway, secrets, "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
   await c.navigate("https://hard.example/"); // direct CF → escalate → pinned proxied
   const pinned = [...open.keys()][0];
@@ -248,7 +248,7 @@ test("controller: proxy config removed mid-escalation throws a distinct 'unavail
   const secrets = {
     get(key) {
       if (key === "BGW_PROXY_URL") { urlGets++; return urlGets <= 2 ? "http://proxy:8080" : ""; }
-      if (key === "BGW_PROXY_PASSWORD") return "pw";
+      if (key === "BGW_PROXY_PASSWORD") return "pwd";
       return undefined;
     },
   };
@@ -419,7 +419,7 @@ function warmEntry(host, opts = {}) {
 }
 
 const allowAll = new Allowlist(["*"]);
-const proxySecrets = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+const proxySecrets = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
 
 test("warm-open: an approved host with a vault entry opens a SEALED, host-scoped warm session", async () => {
   const { gateway, opens, open } = makeRecordingGateway();

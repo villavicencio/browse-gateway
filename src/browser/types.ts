@@ -149,6 +149,16 @@ export interface BrowserCoreOptions {
    * Wine 2026-06-26) and leave all other targets on the coherent Linux identity.
    */
   windowsUaHosts?: readonly string[];
+  /**
+   * The gateway's secret set (R9), for redacting the browser core's own stderr diagnostics. The core
+   * writes best-effort diagnostics to stderr; those URL-strip by construction, but a bare secret (e.g. a
+   * proxy password not in URL form) would otherwise survive. Passing the STORE (not an opaque redactor
+   * function) lets the core union the caller's secret VALUES with the launch's own proxy credentials and
+   * scrub them in ONE longest-first pass — so no secret can fragment another (see resolveCoreRedactor).
+   * A runtime dependency, NOT a launch arg — like {@link solver}. Absent (tests / smoke) = URL-strip only
+   * for a direct launch; a proxy/solver launch that omits it falls back to a process-env store.
+   */
+  secrets?: { redactableValues(): readonly string[] };
 }
 
 /** A point-in-time snapshot of a rendered page. */

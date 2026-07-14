@@ -115,8 +115,8 @@ test("detectCaptcha: recognizes recaptcha/hcaptcha/turnstile + sitekey, else nul
 
 test("proxyFromSecrets: builds config from secrets, undefined when absent", () => {
   assert.equal(proxyFromSecrets(new SecretStore(() => ({}))), undefined);
-  const p = proxyFromSecrets(new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_USERNAME: "u", BGW_PROXY_PASSWORD: "pw" })));
-  assert.deepEqual(p, { server: "http://p:8080", username: "u", password: "pw" });
+  const p = proxyFromSecrets(new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_USERNAME: "usr", BGW_PROXY_PASSWORD: "pwd" })));
+  assert.deepEqual(p, { server: "http://p:8080", username: "usr", password: "pwd" });
 });
 
 test("retrieve: AE1 happy path returns readable markdown, no proxy, not blocked", async () => {
@@ -140,22 +140,22 @@ test("retrieve: AE2 soft target from datacenter IP does NOT engage the proxy", a
 });
 
 test("mintStickyProxy: appends the suffix template with {id} substituted; base config untouched", () => {
-  const base = { server: "http://proxy:8080", username: "u", password: "pw" };
+  const base = { server: "http://proxy:8080", username: "u", password: "pwd" };
   const minted = mintStickyProxy(base, "_sticky-{id}-hold", "abc123");
-  assert.equal(minted.password, "pw_sticky-abc123-hold");
+  assert.equal(minted.password, "pwd_sticky-abc123-hold");
   assert.equal(minted.server, base.server);
-  assert.equal(base.password, "pw", "base config is not mutated");
+  assert.equal(base.password, "pwd", "base config is not mutated");
 });
 
 test("mintStickyProxy: no template or no password → the base config unchanged (rotating behavior)", () => {
-  const base = { server: "http://proxy:8080", password: "pw" };
+  const base = { server: "http://proxy:8080", password: "pwd" };
   assert.equal(mintStickyProxy(base, undefined), base, "no template → same object, password untouched");
   const noPw = { server: "s", username: "u" };
   assert.equal(mintStickyProxy(noPw, "_sticky-{id}"), noPw, "no password to suffix → same object");
 });
 
 test("mintStickyProxy: a fresh random id per call (distinct exits across attempts)", () => {
-  const base = { server: "s", password: "pw" };
+  const base = { server: "s", password: "pwd" };
   const a = mintStickyProxy(base, "_s-{id}");
   const b = mintStickyProxy(base, "_s-{id}");
   assert.notEqual(a.password, b.password, "two mints must land two different sticky sessions");
@@ -164,7 +164,7 @@ test("mintStickyProxy: a fresh random id per call (distinct exits across attempt
 test("mintStickyProxy: auto-generated {id} is EXACTLY 8 hex chars (IPRoyal _session- spec)", () => {
   // IPRoyal requires the _session- value be precisely 8 alphanumeric chars. The auto-generated id
   // (no explicit id arg) must satisfy that — a 16-char id is out of spec and may be truncated/ignored.
-  const base = { server: "s", password: "pw" };
+  const base = { server: "s", password: "pwd" };
   const minted = mintStickyProxy(base, "_country-us_session-{id}_lifetime-30m");
   const session = minted.password.match(/_session-([0-9a-z]+)_/)?.[1];
   assert.ok(session, "a session token was appended");
@@ -174,10 +174,10 @@ test("mintStickyProxy: auto-generated {id} is EXACTLY 8 hex chars (IPRoyal _sess
 test("mintStickyProxy: a suffix with no {id} is a static no-op append → all attempts pin one exit", () => {
   // The silent rotation-collapse footgun: replaceAll('{id}') matches nothing, so two mints are
   // IDENTICAL. stickySuffixBootError() rejects this config at startup (asserted below).
-  const base = { server: "s", password: "pw" };
+  const base = { server: "s", password: "pwd" };
   const a = mintStickyProxy(base, "_static-hold");
   const b = mintStickyProxy(base, "_static-hold");
-  assert.equal(a.password, "pw_static-hold");
+  assert.equal(a.password, "pwd_static-hold");
   assert.equal(a.password, b.password, "no {id} → same exit every attempt");
 });
 
@@ -198,7 +198,7 @@ test("retrieve: sticky escalation mints a FRESH held exit per proxied attempt + 
     renderOf(cfBlockSignal),
     renderOf({ text: "x".repeat(1000), html: articleHtml }),
   ]);
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
   const r = await retrieve(gateway, secrets, {
     token: "t",
     url: "https://hard.example/",
@@ -208,7 +208,7 @@ test("retrieve: sticky escalation mints a FRESH held exit per proxied attempt + 
   assert.equal(r.proxyUsed, true);
   assert.equal(calls.length, 4); // 1 direct + 3 proxied
   const proxied = calls.slice(1).map((c) => c.coreOverrides?.proxy?.password);
-  for (const pw of proxied) assert.match(pw, /^pw_s-[0-9a-f]+$/, "sticky suffix applied over the base password");
+  for (const pw of proxied) assert.match(pw, /^pwd_s-[0-9a-f]+$/, "sticky suffix applied over the base password");
   assert.equal(new Set(proxied).size, 3, "every proxied attempt minted its own sticky session");
   for (const c of calls.slice(1)) {
     assert.equal(c.renderOpts?.clearanceTimeoutMs, PROXY_CLEARANCE_TIMEOUT_MS, "escalated clearance on proxied attempts");
@@ -222,10 +222,10 @@ test("retrieve: no stickySuffix → proxied attempts keep the base password (pri
     renderOf(cfBlockSignal),
     renderOf({ text: "x".repeat(1000), html: articleHtml }),
   ]);
-  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pw" }));
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
   const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
   assert.equal(r.proxyUsed, true);
-  assert.equal(calls[1].coreOverrides?.proxy?.password, "pw");
+  assert.equal(calls[1].coreOverrides?.proxy?.password, "pwd");
 });
 
 test("retrieve: an explicit clearanceTimeoutMs wins over the escalated default on proxied attempts", async () => {

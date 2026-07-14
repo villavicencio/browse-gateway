@@ -18,7 +18,7 @@ const STATE = {
 };
 const RECIPE = { loginUrl: "https://ex.com/login", usernameField: "#u", passwordField: "#p", submit: "#s", successText: "AUTHENTICATED" };
 const CREDS = { username: "u", password: "p" };
-const PROXY_SECRETS = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pw" }));
+const PROXY_SECRETS = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1", BGW_PROXY_PASSWORD: "pwd" }));
 
 // Navigate snapshots: a cleared page, a Cloudflare managed challenge (escalatable), and a dead/
 // unreachable nav (null status — NOT escalatable, a fresh exit won't fix it).

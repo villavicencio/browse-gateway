@@ -18,6 +18,7 @@
  */
 import type { SecretStore } from "../security/index.js";
 import type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "../browser/captcha.js";
+import { CAPTCHA_SOLVE_ERROR_CODES } from "../browser/captcha.js";
 
 /** Standard task-type vocabulary for the createTask/getTaskResult protocol; proxyless token solves. */
 const TASK_TYPE: Record<CaptchaKind, string | undefined> = {
@@ -27,13 +28,9 @@ const TASK_TYPE: Record<CaptchaKind, string | undefined> = {
   unknown: undefined,
 };
 
-export type CaptchaSolveErrorCode =
-  | "not-configured" // no API key/URL — solver shouldn't have been constructed
-  | "unsupported-kind" // we don't map this CaptchaKind to a task type
-  | "missing-sitekey" // the challenge carried no siteKey (required by the task types)
-  | "budget-exhausted" // per-window solve cap hit — refuse rather than spend
-  | "vendor-error" // the service returned an error (createTask/getTaskResult errorId)
-  | "timeout"; // the solve did not complete within the deadline
+// The known, non-secret solver error codes live with the CaptchaSolver contract (browser/captcha) so the
+// browser core can allowlist them without a verbs->browser->verbs import cycle.
+export type CaptchaSolveErrorCode = (typeof CAPTCHA_SOLVE_ERROR_CODES)[number];
 
 export class CaptchaSolveError extends Error {
   readonly code: CaptchaSolveErrorCode;

@@ -32,6 +32,10 @@ async function main(): Promise<void> {
   if (consumer.allow.length === 0) throw new Error("BGW_MCP_ALLOWLIST is required (no hosts allowed)");
 
   const secrets = new SecretStore();
+  // The bearer token is a credential — register it in the redaction set (guarded, so a too-short/marker
+  // token fails closed) so it can never surface in an audit URL / error (R9, audit #3). runtime.ts folds
+  // manifest tokens the same way; this stdio launcher must not diverge.
+  secrets.addRedactableCredential([consumer.token]);
   // Credential/session-state vault (B1) for U9 warm-open: off unless BGW_VAULT_DIR is set. Mirror the
   // http-main/runtime construction so this stdio rollback launcher doesn't silently diverge (cold-only
   // while prod is warm). Constructing it here runs the fail-closed boot guard (entries on disk but no
@@ -53,6 +57,9 @@ async function main(): Promise<void> {
   config.core.solver = httpCaptchaSolverFromSecrets(secrets, process.env.BGW_CAPTCHA_API_URL, {
     budget: DEFAULT_CAPTCHA_BUDGET,
   });
+  // R9: the browser core's own stderr diagnostics (errCode) scrub the known-secret set via this store —
+  // not just URL-strip — so a bare proxy password can't surface in a core diagnostic line (audit #3).
+  config.core.secrets = secrets;
   const gateway = Gateway.create(config, undefined, policy);
   const onDatacenterIp = process.env.BGW_ON_DATACENTER_IP === "1";
   // Sticky-session suffix template for proxied escalation (parity with http-main; see there).

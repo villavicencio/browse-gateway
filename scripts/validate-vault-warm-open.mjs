@@ -263,7 +263,7 @@ try {
   // audit clamped to the owner — not a fake that discards the override. (Owner host need not be a live
   // server: we assert acceptance + re-pin, not a navigation.)
   {
-    const proxySecrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://127.0.0.1:1", BGW_PROXY_PASSWORD: "pw" }));
+    const proxySecrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://127.0.0.1:1", BGW_PROXY_PASSWORD: "pwd" }));
     importLoginToVault(vault, {
       consumerId: "atlas",
       host: "bound.example",
@@ -272,7 +272,7 @@ try {
       stickyExitId: "abcd1234",
     });
     const boundOv = buildWarmOverride(vault, proxySecrets, { consumerId: "atlas", host: "bound.example", onDatacenterIp: true, stickySuffix: "_s-{id}" });
-    check("bound entry → buildWarmOverride re-pins the SAME captured exit (R3)", boundOv?.proxy?.password === "pw_s-abcd1234");
+    check("bound entry → buildWarmOverride re-pins the SAME captured exit (R3)", boundOv?.proxy?.password === "pwd_s-abcd1234");
     const handle = await gateway.openConsumerSession(TOKEN, boundOv); // launches with the proxy SET (never dialed — no navigate)
     try {
       check("gateway ACCEPTS the proxied sealed bound override (not a fake)", typeof handle === "string" && handle.length > 0);

@@ -106,7 +106,7 @@ const FAST = { fieldTimeoutMs: 200, pollIntervalMs: 10, totpAtSeconds: AT };
 
 test("happy path (no 2FA): fills creds, submits, judges success, captures state", async () => {
   const { driver, log } = makeFakeDriver();
-  const res = await assistedLogin(driver, RECIPE, { username: "me@x.com", password: "pw" }, FAST);
+  const res = await assistedLogin(driver, RECIPE, { username: "me@x.com", password: "pwd" }, FAST);
   assert.deepEqual(res.state, CAPTURED);
   assert.deepEqual(log.fills.map((f) => f.target), [SEL.user, SEL.pass]);
   assert.deepEqual(log.submits, [SEL.submit]);
