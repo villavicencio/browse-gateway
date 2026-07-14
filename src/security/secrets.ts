@@ -115,7 +115,12 @@ export function redactSecrets(text: string, store: SecretStore): string {
   }
   const ordered = [...variants].sort((a, b) => b.length - a.length);
   for (const value of ordered) {
-    out = out.replace(new RegExp(escapeRegExp(value), "g"), "[REDACTED]");
+    // Literal replace (not a compiled RegExp): a secret is matched verbatim, so replaceAll is exactly
+    // equivalent to a global replace of the escaped literal — but it avoids the per-call regex
+    // COMPILATION cost and, critically, never throws V8's "regular expression too large" at execution
+    // on a big folded value (e.g. a long session token / JWT), which `new RegExp(escapeRegExp(value))`
+    // does. (`escapeRegExp` stays exported for callers that build actual patterns, e.g. cli/tunnel.)
+    out = out.replaceAll(value, "[REDACTED]");
   }
   return out;
 }

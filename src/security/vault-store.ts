@@ -36,8 +36,15 @@ const ENTRY_SUFFIX = ".vault.json";
 /** Generic leaf values fold for redaction only inside this length window (skip noise + huge blobs). */
 const REDACT_MIN = 8;
 const REDACT_MAX = 4096;
-/** Values under a sensitive-looking JSON key fold regardless of length (down to redactSecrets' 3-char floor). */
+/** A credential-grade value (under a SENSITIVE_KEY, or a `{name,value}` pair's value) folds across a
+ *  WIDER window than a generic leaf: down to 3 chars (a TOTP/PIN the generic floor would drop) AND up to
+ *  REDACT_SENSITIVE_MAX — covering a long JWT / big session cookie the generic 4KB blob-guard would drop.
+ *  A credential-grade value LARGER than the ceiling is NOT silently dropped from redaction (that would
+ *  leave an unredactable secret in the payload): `put` REFUSES to persist such an entry (audit #4), so a
+ *  stored credential is always redactable. The ceiling both admits every realistic credential and bounds
+ *  each folded value's length, keeping redactSecrets' O(set) per-call cost in check. */
 const REDACT_SENSITIVE_MIN = 3;
+const REDACT_SENSITIVE_MAX = 65536;
 /** JSON keys whose values are credential-grade — fold them even when short (TOTP code, PIN, CVV, short password). */
 const SENSITIVE_KEY = /pass|secret|token|totp|otp|pin|cvv|cvc|key|credential|cookie|auth|bearer/i;
 
@@ -67,29 +74,52 @@ export interface VaultStoreOptions {
   redact?: (values: Iterable<string>) => void;
 }
 
+/** Result of scanning a payload's string leaves for redaction folding. `oversized` counts credential-
+ *  grade values too large to fold (> REDACT_SENSITIVE_MAX); `put` refuses to persist any such entry so
+ *  an unredactable secret is never silently stored (audit #4). */
+interface LeafScan {
+  redactable: Set<string>;
+  oversized: number;
+}
+
 /**
- * Collect string leaf values from a decrypted payload for redaction. Generic values fold within a
- * length window (skip noise + huge blobs); values under a SENSITIVE_KEY (password/totp/pin/cvv/…) fold
- * even when short, since a 6-digit code or 4-char PIN is exactly the kind of credential that must not
- * surface in a log — the plain length floor would silently drop it.
+ * Scan the string leaf values of a decrypted payload for redaction. Generic values fold within a length
+ * window (skip noise + huge blobs). A credential-grade value — under a SENSITIVE_KEY
+ * (password/totp/pin/cvv/…), or the `value` of a `{name,value}` pair (the storageState cookie/localStorage
+ * shape) — folds across a WIDER window: down to 3 chars (a 6-digit code / 4-char PIN the generic floor
+ * would drop) and up to REDACT_SENSITIVE_MAX. A credential-grade value BEYOND that ceiling is NOT added
+ * to the set AND is counted in `oversized` — never silently dropped: the caller (`put`) refuses to
+ * persist it rather than store a secret it cannot guarantee is redactable.
  */
-function leafSecrets(value: unknown, out: Set<string>, sensitiveKey = false): void {
-  if (typeof value === "string") {
-    const min = sensitiveKey ? REDACT_SENSITIVE_MIN : REDACT_MIN;
-    if (value.length >= min && value.length <= REDACT_MAX) out.add(value);
-  } else if (Array.isArray(value)) {
-    // An array inherits its key's sensitivity (e.g. `tokens: ["a","b"]`).
-    for (const v of value) leafSecrets(v, out, sensitiveKey);
-  } else if (value && typeof value === "object") {
-    // Sensitivity RESETS per immediate key (a container key doesn't drag short siblings in). Two
-    // sensitivity sources: a SENSITIVE_KEY name, OR the `value` of a `{name, value}` pair — the
-    // storageState cookie/localStorage shape, whose value is credential-grade even when short (a 4-char
-    // session token) while the sibling `name` ("sid") must NOT fold (it would over-redact ordinary logs).
-    const isNameValuePair = "name" in value && "value" in value;
-    for (const [k, v] of Object.entries(value)) {
-      leafSecrets(v, out, SENSITIVE_KEY.test(k) || (isNameValuePair && k === "value"));
+function scanLeaves(value: unknown): LeafScan {
+  const redactable = new Set<string>();
+  let oversized = 0;
+  const walk = (v: unknown, sensitive: boolean): void => {
+    if (typeof v === "string") {
+      if (sensitive) {
+        if (v.length < REDACT_SENSITIVE_MIN) return; // too short to be a distinguishable secret
+        if (v.length > REDACT_SENSITIVE_MAX) {
+          oversized++; // an unredactable credential-grade leaf → put() will refuse the whole entry
+          return;
+        }
+        redactable.add(v);
+      } else if (v.length >= REDACT_MIN && v.length <= REDACT_MAX) {
+        redactable.add(v);
+      }
+    } else if (Array.isArray(v)) {
+      for (const x of v) walk(x, sensitive); // an array inherits its key's sensitivity (e.g. tokens: [...])
+    } else if (v && typeof v === "object") {
+      // Sensitivity RESETS per immediate key (a container key doesn't drag short siblings in). The
+      // sibling `name` of a `{name,value}` pair must NOT fold (it would over-redact ordinary logs);
+      // only its `value` is credential-grade.
+      const isNameValuePair = "name" in v && "value" in v;
+      for (const [k, val] of Object.entries(v)) {
+        walk(val, SENSITIVE_KEY.test(k) || (isNameValuePair && k === "value"));
+      }
     }
-  }
+  };
+  walk(value, false);
+  return { redactable, oversized };
 }
 
 export class VaultStore {
@@ -120,16 +150,30 @@ export class VaultStore {
     return join(this.#dir, `${name}${ENTRY_SUFFIX}`);
   }
 
-  #foldRedaction(value: unknown): void {
-    if (!this.#redact) return;
-    const secrets = new Set<string>();
-    leafSecrets(value, secrets);
-    if (secrets.size) this.#redact(secrets);
+  /** Fold a payload's foldable leaf values into the redaction set (best-effort; no-op without a hook). */
+  #fold(scan: LeafScan): void {
+    if (this.#redact && scan.redactable.size) this.#redact(scan.redactable);
   }
 
-  /** Seal `value` for `(consumerId, host)` and write it atomically (temp + rename, 0600). */
-  put(consumerId: string, host: string, value: unknown): void {
+  /**
+   * Seal `value` for `(consumerId, host)` and write it atomically (temp + rename, 0600). By default a
+   * NEW capture is REFUSED if it carries a credential-grade value too large to fold — it would be stored
+   * but unredactable (audit #4), and silently dropping it is not an option for a secret. `allowOversize`
+   * (rotation ONLY) skips that refusal: {@link rotateVaultKey} re-seals EXISTING entries — including a
+   * legacy oversized one written before this guard — and must never reject mid-run, which would split a
+   * rotation across the old and new keys. An oversized leaf is not folded on either path; only the
+   * refusal differs.
+   */
+  put(consumerId: string, host: string, value: unknown, opts: { allowOversize?: boolean } = {}): void {
     const ch = this.#canon(host);
+    // Scan BEFORE any write, so a rejected put leaves nothing on disk (atomic refusal).
+    const scan = scanLeaves(value);
+    if (scan.oversized > 0 && !opts.allowOversize) {
+      throw new Error(
+        `vault: refusing to store an entry with a credential-grade value larger than ${REDACT_SENSITIVE_MAX} ` +
+          `bytes — it cannot be guaranteed redactable (audit #4); shrink or omit the oversized field before capture`,
+      );
+    }
     const record = sealJson(value, { kek: this.#kek, consumerId, host: ch });
     const file: EntryFile = { consumerId, host: ch, record };
     mkdirSync(this.#dir, { recursive: true, mode: 0o700 });
@@ -137,7 +181,7 @@ export class VaultStore {
     const tmp = `${target}.${randomBytes(6).toString("hex")}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(file)}\n`, { mode: 0o600 });
     renameSync(tmp, target); // atomic publish — no torn file is ever visible
-    this.#foldRedaction(value);
+    this.#fold(scan);
   }
 
   /** Decrypt the entry for `(consumerId, host)`, or null if absent. Throws (fail closed) on any
@@ -149,7 +193,11 @@ export class VaultStore {
     const file = JSON.parse(readFileSync(target, "utf8")) as EntryFile;
     // AAD binds to the REQUESTED (consumerId, ch) — a swapped file fails here, not on the stored tuple.
     const value = openJson<T>(file.record, { kek: this.#kek, consumerId, host: ch });
-    this.#foldRedaction(value);
+    // Fold LENIENTLY on read: a pre-existing entry with an oversized credential-grade leaf (written
+    // before the put-time guard, or hand-crafted) is still opened — refusing here would break warm-open
+    // for a legitimately stored session. Only NEW writes are rejected (at put); its oversized leaf is
+    // simply not folded. `oversized` is ignored on this path.
+    this.#fold(scanLeaves(value));
     return value;
   }
 
@@ -233,8 +281,11 @@ export function rotateVaultKey(
     return { consumerId: file.consumerId, host: file.host, value };
   });
   // Phase 2 — re-seal under the new key (pure) and write each in place (atomic temp + rename per file).
+  // allowOversize: rotation re-seals EXISTING entries, so a legacy oversized credential (written before
+  // put's audit-#4 guard) must NOT make put throw mid-loop — that would leave earlier files flipped to
+  // the new key while the rest stay on the old (split-brain). Its leaf simply isn't folded, as on get().
   const newStore = new VaultStore({ kek: newKek, dir, canonicalizeHost });
-  for (const e of decrypted) newStore.put(e.consumerId, e.host, e.value);
+  for (const e of decrypted) newStore.put(e.consumerId, e.host, e.value, { allowOversize: true });
   return decrypted.length;
 }
 

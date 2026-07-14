@@ -17,6 +17,9 @@ import {
   vaultKeyBootError,
   rotateVaultKey,
   canonicalizeHost,
+  SecretStore,
+  redactSecrets,
+  sealJson,
 } from "../dist/security/index.js";
 
 function tmp() {
@@ -182,6 +185,61 @@ test("short sensitive values (TOTP code / PIN / short password) fold despite the
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("LARGE credential-grade leaves fold up to the ceiling and are redactable end-to-end (audit #4)", () => {
+  const dir = tmp();
+  const folded = new Set();
+  const s = store(dir, KEK, (vals) => { for (const v of vals) folded.add(v); });
+  const atCap = "j" + "W".repeat(65535); // exactly REDACT_SENSITIVE_MAX = 65536 (> the generic 4KB cap)
+  const bigCookie = "s".repeat(30000); // a big {name,value} cookie value (credential-grade)
+  const bigNote = "n".repeat(30000); // a large value under a NON-sensitive key
+  s.put("atlas", "example.com", {
+    creds: { token: atCap },
+    session: { cookies: [{ name: "SID", value: bigCookie }] },
+    note: bigNote,
+  });
+  assert.ok(folded.has(atCap), "a value AT the 64KB ceiling folds — must be redactable");
+  assert.ok(folded.has(bigCookie), "a big {name,value} cookie value folds (credential-grade)");
+  assert.ok(!folded.has(bigNote), "a large NON-sensitive value stays capped (generic blob-noise guard)");
+  // End-to-end: the folded credential is actually scrubbed by redactSecrets via a SecretStore.
+  const secrets = new SecretStore(() => ({}));
+  secrets.addRedactable(folded);
+  const scrubbed = redactSecrets(`leaked token=${atCap} cookie=${bigCookie}`, secrets);
+  assert.ok(!scrubbed.includes(atCap), "the folded token is scrubbed from a log line (VaultStore→SecretStore→redactSecrets)");
+  assert.ok(!scrubbed.includes(bigCookie), "the folded cookie value is scrubbed");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("put REFUSES a credential-grade value beyond the fold ceiling — no silent unredactable secret (audit #4)", () => {
+  const dir = tmp();
+  const folded = new Set();
+  const s = store(dir, KEK, (vals) => { for (const v of vals) folded.add(v); });
+  const overCap = "j".repeat(65537); // one over REDACT_SENSITIVE_MAX — cannot be guaranteed redactable
+  assert.throws(
+    () => s.put("atlas", "example.com", { creds: { token: overCap } }),
+    /larger than 65536|cannot be guaranteed redactable/,
+  );
+  assert.equal(readdirSync(dir).filter((f) => f.endsWith(".vault.json")).length, 0, "nothing persisted on a rejected put");
+  assert.ok(!folded.has(overCap), "the oversized value was never folded");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("get is LENIENT on a pre-existing oversized entry — reading must not break warm-open (audit #4)", () => {
+  const dir = tmp();
+  const folded = new Set();
+  const s = store(dir, KEK, (vals) => { for (const v of vals) folded.add(v); });
+  // Seed a normal entry to learn the on-disk filename, then overwrite it with a re-sealed OVERSIZED
+  // payload under the SAME slot — simulating an entry written before the put-time guard existed.
+  s.put("atlas", "example.com", { creds: { password: "seed-value" } });
+  const [file] = readdirSync(dir).filter((f) => f.endsWith(".vault.json"));
+  const big = "z".repeat(70000);
+  const record = sealJson({ creds: { token: big } }, { kek: KEK, consumerId: "atlas", host: "example.com" });
+  writeFileSync(join(dir, file), JSON.stringify({ consumerId: "atlas", host: "example.com", record }) + "\n");
+  const got = s.get("atlas", "example.com"); // must NOT throw — legacy entry stays readable
+  assert.equal(got.creds.token, big, "legacy oversized entry remains readable (get is lenient)");
+  assert.ok(!folded.has(big), "the oversized leaf is not folded on read (best-effort)");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("store rejects control characters in consumer/host (slot-field validation)", () => {
   const dir = tmp();
   const NUL = String.fromCharCode(0);
@@ -257,5 +315,34 @@ test("rotateVaultKey: new key opens everything, old key no longer works", () => 
   assert.deepEqual(next.get("atlas", "a.com"), { a: 1 }, "new key opens");
   assert.deepEqual(next.get("vault", "b.com"), { b: 2 });
   assert.throws(() => store(dir, oldKek).get("atlas", "a.com"), /authenticate|decrypt/i, "old key is dead");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("rotateVaultKey: a LEGACY oversized entry rotates atomically (put's audit-#4 reject must not split rotation)", () => {
+  const dir = tmp();
+  const oldKek = randomBytes(32);
+  const newKek = randomBytes(32);
+  const s = store(dir, oldKek);
+  s.put("atlas", "a.com", { a: 1 }); // a normal entry that rotates first
+  // Craft a LEGACY oversized entry directly (put() would now reject it), sealed under the OLD key —
+  // simulating an entry written before the audit-#4 guard existed. It sits alongside the normal one.
+  const big = "z".repeat(70000);
+  const rec = sealJson({ creds: { token: big } }, { kek: oldKek, consumerId: "atlas", host: "b.com" });
+  // Learn the on-disk name by putting a placeholder for the same slot, then overwrite it with the big rec.
+  s.put("atlas", "b.com", { placeholder: "x" });
+  const bFile = readdirSync(dir).filter((f) => f.endsWith(".vault.json")).find((f) => {
+    try { return JSON.parse(readFileSync(join(dir, f), "utf8")).host === "b.com"; } catch { return false; }
+  });
+  writeFileSync(join(dir, bFile), JSON.stringify({ consumerId: "atlas", host: "b.com", record: rec }) + "\n");
+
+  const n = rotateVaultKey(dir, oldKek, newKek, canonicalizeHost);
+  assert.equal(n, 2, "both entries rotated (rotation did not throw on the oversized legacy entry)");
+
+  // Atomic: EVERY entry now opens under the NEW key (no split-brain), none under the old.
+  const next = store(dir, newKek);
+  assert.deepEqual(next.get("atlas", "a.com"), { a: 1 }, "normal entry rotated to the new key");
+  assert.equal(next.get("atlas", "b.com").creds.token, big, "legacy oversized entry rotated to the new key");
+  assert.throws(() => store(dir, oldKek).get("atlas", "a.com"), /authenticate|decrypt/i, "old key opens nothing after rotation");
+  assert.throws(() => store(dir, oldKek).get("atlas", "b.com"), /authenticate|decrypt/i);
   rmSync(dir, { recursive: true, force: true });
 });

@@ -129,6 +129,18 @@ test("redactSecrets: still scrubs a credential rotated OUT of the store (rotatio
   assert.equal(out, "err old=[REDACTED] new=[REDACTED]");
 });
 
+test("redactSecrets: scrubs a LARGE folded value without throwing (regex-too-large regression)", () => {
+  // A big credential (e.g. a long session token) folded into the set used to make redactSecrets throw
+  // V8's "regular expression too large" when it compiled new RegExp(escapeRegExp(value)). The literal
+  // replaceAll path must scrub it cleanly instead.
+  const big = "T" + "k".repeat(70000);
+  const store = new SecretStore(() => ({}));
+  store.addRedactable([big]);
+  let out;
+  assert.doesNotThrow(() => { out = redactSecrets(`log token=${big} tail`, store); });
+  assert.equal(out, "log token=[REDACTED] tail");
+});
+
 test("stickySuffixRedactables + redactSecrets: a minted sticky proxy password never leaks the provider param structure", () => {
   const suffix = "_country-us_session-{id}_lifetime-30m";
   const store = new SecretStore(() => ({ BGW_PROXY_PASSWORD: "hunter2-long-password" }));
