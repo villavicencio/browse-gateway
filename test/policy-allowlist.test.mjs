@@ -73,7 +73,20 @@ test("Allowlist: `*.x` stays a subdomain wildcard, not allow-all", () => {
   const a = new Allowlist(["*.example.com"]);
   assert.equal(a.allows("example.com"), true);
   assert.equal(a.allows("api.example.com"), true);
+  assert.equal(a.allows("www.example.com"), true); // ordinary wildcard still matches the www host
   assert.equal(a.allows("evil.com"), false); // a real wildcard must NOT match everything
+});
+
+test("Allowlist: `*.www.<domain>` stays scoped to the www subtree, not widened to `*.<domain>` (audit #6)", () => {
+  const a = new Allowlist(["*.www.example.com"]);
+  // Honored: the www.example.com apex and its subdomains.
+  assert.equal(a.allows("www.example.com"), true, "matches its own apex");
+  assert.equal(a.allows("api.www.example.com"), true, "matches a subdomain of the www subtree");
+  assert.equal(a.allows("WWW.Example.COM."), true, "case + trailing FQDN dot tolerated on the apex");
+  // Footgun closed: the interior `www` must NOT be stripped into `*.example.com`.
+  assert.equal(a.allows("example.com"), false, "must NOT widen to the bare domain");
+  assert.equal(a.allows("mail.example.com"), false, "must NOT admit a sibling subdomain");
+  assert.equal(a.allows("evil.example.com"), false, "must NOT admit an arbitrary subdomain of the domain");
 });
 
 test("guardFor: egress deny still wins over an allow-all (`*`) consumer", () => {

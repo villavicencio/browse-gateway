@@ -37,7 +37,12 @@ export class Allowlist {
     if (trimmed === "*") {
       this.#allowAll = true;
     } else if (trimmed.startsWith("*.")) {
-      this.#suffixes.add(normalizeHost(trimmed.slice(2)));
+      // A wildcard suffix is canonicalized but kept www-SENSITIVE: `*.www.x.com` must stay scoped to
+      // the www.x.com subtree, NOT be www-stripped into `*.x.com` — which would silently widen an
+      // operator's rule to the entire domain (e.g. admit `mail.x.com`, `evil.x.com`; audit #6). An
+      // ordinary `*.x.com` already matches `www.x.com` via the suffix-endsWith path below, so no
+      // www-insensitivity is lost for the common case; only the interior-`www` footgun is closed.
+      this.#suffixes.add(canonicalizeHost(trimmed.slice(2)));
     } else {
       this.#exact.add(normalizeHost(trimmed));
     }
@@ -49,12 +54,17 @@ export class Allowlist {
    * have no meaningful host) — allow-all does not change that.
    */
   allows(host: string): boolean {
-    const h = normalizeHost(host);
-    if (!h) return false;
+    // Two host forms from one canonicalization: `canon` is www-SENSITIVE (for wildcard-suffix
+    // matching, so an interior `www` in a rule is honored — audit #6); `wwwless` drops a leading
+    // `www.` (for exact rules, which stay www-insensitive as documented). `wwwless` is exactly
+    // `normalizeHost(host)`, so exact matching is byte-for-byte unchanged.
+    const canon = canonicalizeHost(host);
+    if (!canon) return false;
     if (this.#allowAll) return true;
-    if (this.#exact.has(h)) return true;
+    const wwwless = canon.replace(/^www\./, "");
+    if (this.#exact.has(wwwless)) return true;
     for (const suffix of this.#suffixes) {
-      if (h === suffix || h.endsWith(`.${suffix}`)) return true;
+      if (canon === suffix || canon.endsWith(`.${suffix}`)) return true;
     }
     return false;
   }
