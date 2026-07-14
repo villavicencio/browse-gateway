@@ -7,26 +7,32 @@
  * anti-bot (that's the U1 gate's job).
  */
 import { Gateway } from "./index.js";
+import { SecretStore } from "../security/index.js";
+import { smokeLine, smokeErrorLine, safeUrlForLog } from "./smoke-log.js";
 
 const TARGET = process.env.BGW_SMOKE_URL ?? "https://example.com/";
+// Even dev/CI smoke output is not exempt from R9: EVERY line goes through the redacting smoke logger so
+// no BGW_* secret reaches stdout/stderr — in a config dump, the target URL, a page title, or a nested
+// launch-error cause (audit #5). Secrets loaded once from process.env at startup.
+const secrets = new SecretStore();
+const log = (msg: string) => console.log(smokeLine(msg, secrets));
 
 async function main(): Promise<void> {
   const gateway = Gateway.create();
-  console.log(
-    `[gateway] up — maxSessions=${gateway.config.maxSessions} core=${JSON.stringify(gateway.config.core)}`,
-  );
+  log(`[gateway] up — maxSessions=${gateway.config.maxSessions} core=${JSON.stringify(gateway.config.core)}`);
 
   try {
     const result = await gateway.withSession(async (session) => {
-      console.log(`[gateway] session ${session.id} open (active=${gateway.sessions.activeCount})`);
+      log(`[gateway] session ${session.id} open (active=${gateway.sessions.activeCount})`);
       return session.core.render(TARGET, { clearanceTimeoutMs: 15_000 });
     });
 
-    const title = JSON.stringify(result.title).slice(0, 60);
-    console.log(
-      `[gateway] rendered ${TARGET} — status=${result.status} textLen=${result.text.length} title=${title}`,
-    );
-    console.log(`[gateway] active sessions after release: ${gateway.sessions.activeCount}`);
+    // Do NOT log the raw page title — it is arbitrary TARGET-controlled content that can reflect a
+    // token from the smoke URL (not a loaded BGW secret, so redaction can't catch it) and JSON-escaping
+    // + truncating it before redaction would defeat exact-value scrubbing anyway. A length is a safe,
+    // sufficient render signal alongside status/textLen. safeUrlForLog logs the URL as origin only.
+    log(`[gateway] rendered ${safeUrlForLog(TARGET)} — status=${result.status} textLen=${result.text.length} titleLen=${result.title.length}`);
+    log(`[gateway] active sessions after release: ${gateway.sessions.activeCount}`);
 
     if (gateway.sessions.activeCount !== 0) {
       throw new Error("session leaked after withSession returned");
@@ -36,13 +42,15 @@ async function main(): Promise<void> {
     }
   } finally {
     await gateway.shutdown();
-    console.log(`[gateway] shutdown complete — active sessions: ${gateway.sessions.activeCount}`);
+    log(`[gateway] shutdown complete — active sessions: ${gateway.sessions.activeCount}`);
   }
 
-  console.log("[gateway] SMOKE OK ✅");
+  log("[gateway] SMOKE OK ✅");
 }
 
 main().catch((err) => {
-  console.error("[gateway] SMOKE FAILED ❌", err);
+  // smokeErrorLine preserves the FULL error (incl. the wrapped browser-launch `cause` — the actionable
+  // root the smoke gate needs) via util.inspect, then redacts. err.stack alone would hide the cause.
+  console.error(smokeErrorLine("[gateway] SMOKE FAILED ❌", err, secrets));
   process.exit(1);
 });
