@@ -56,3 +56,9 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   output.
 - `.env*` and `*.local.md` are gitignored. Keep deployment-specific and fleet-specific
   detail in those local files, not in committed source.
+
+## Vault lane
+
+Durable cross-session notes for this project live in the shared Obsidian vault:
+`~/Obsidian/hermes/projects/browse-gateway/`. Write durable notes there; read anywhere in
+the vault when helpful, but write only to this lane unless asked.
