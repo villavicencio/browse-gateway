@@ -212,7 +212,7 @@ export class Gateway {
 
 export { loadConfig, DEFAULT_GATEWAY_CONFIG, poolSizingError } from "./config.js";
 export type { GatewayConfig } from "./config.js";
-export { SessionManager, SessionManagerError } from "./session-manager.js";
+export { SessionManager, SessionManagerError, MAX_INFLIGHT_MS } from "./session-manager.js";
 export type {
   CoreFactory,
   SessionManagerOptions,

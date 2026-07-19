@@ -34,6 +34,9 @@ export class Session {
   /** Verbs currently awaiting on this session. Held > 0 for the whole of a long navigate so the
    *  idle reaper can't close the browser mid-flight (mirrors the MCP transport's `inFlight` guard). */
   #inFlight = 0;
+  /** Wall-clock ms when the CURRENT in-flight burst began (undefined when idle). The reaper uses this
+   *  to reclaim a verb that never settles (hung browser/CDP) instead of leaking its slot forever. */
+  #inFlightSince?: number;
 
   constructor(core: BrowserCore, opts: { id?: string; consumerId?: string } = {}) {
     this.#core = core;
@@ -56,6 +59,12 @@ export class Session {
     return this.#inFlight;
   }
 
+  /** How long the CURRENT in-flight burst has been running at `now` (0 when nothing is in flight).
+   *  The reaper reads this to reclaim a verb wedged past the max-in-flight deadline. */
+  inFlightMs(now: number = Date.now()): number {
+    return this.#inFlightSince === undefined ? 0 : now - this.#inFlightSince;
+  }
+
   /** Mark the session as just-used so the idle reaper defers closing it. */
   touch(): void {
     this.#lastActivityAt = Date.now();
@@ -63,17 +72,22 @@ export class Session {
 
   /**
    * Enter a verb: stamp activity and mark the session in-flight so the idle reaper won't close it
-   * while a long navigate is still awaiting. ALWAYS pair with `endActivity()` in a `finally`.
+   * while a long navigate is still awaiting. ALWAYS pair with `endActivity()` in a `finally`. The
+   * first entry of a burst records `#inFlightSince`, so a verb that never settles can still be
+   * reclaimed once it exceeds the max-in-flight deadline (see `reapIdle`).
    */
   beginActivity(): void {
-    this.#lastActivityAt = Date.now();
+    if (this.#inFlight === 0) this.#inFlightSince = Date.now();
     this.#inFlight++;
+    this.#lastActivityAt = Date.now();
   }
 
   /** Leave a verb: drop the in-flight count and re-stamp activity, so a just-finished long call
-   *  isn't reaped on the very next tick for having started before the TTL. */
+   *  isn't reaped on the very next tick for having started before the TTL. The count floors at 0
+   *  (underflow guard), and the in-flight-burst start clears once the last verb leaves. */
   endActivity(): void {
-    this.#inFlight--;
+    this.#inFlight = Math.max(0, this.#inFlight - 1);
+    if (this.#inFlight === 0) this.#inFlightSince = undefined;
     this.#lastActivityAt = Date.now();
   }
 

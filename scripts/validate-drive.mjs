@@ -126,9 +126,12 @@ try {
     if (!sawInFlight) {
       note(`in-flight navigate never observed (${SLOW} likely unreachable) — skipping the in-flight-guard reap check`);
     } else {
-      // Force "everything is idle by the clock" (now = +10min, ttl = 0). Without the guard this reaps
-      // the session and the pending navigate would surface a raw "no open session"; with it, survives.
-      const reapedMid = await gateway.sessions.reapIdle(0, Date.now() + 600_000);
+      // Force "idle by the clock" (ttl = 0) at now = +1s — past the idle TTL but well BELOW the
+      // max-in-flight deadline (MAX_INFLIGHT_MS, 10min), so only the in-flight guard can spare it.
+      // Without the guard this reaps the session and the pending navigate would surface a raw
+      // "no open session"; with it, the session survives. (The wedged-verb reclaim path — an
+      // in-flight burst PAST that deadline — is covered by the unit tests, not this live gate.)
+      const reapedMid = await gateway.sessions.reapIdle(0, Date.now() + 1_000);
       check(
         "an in-flight navigate crossing the idle TTL is NOT reaped (in-flight guard holds)",
         reapedMid.length === 0 && gateway.sessions.activeCount >= 1,
