@@ -129,6 +129,26 @@ test("controller: a navigating action that lands on a dead nav (chrome-error, st
   await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
 });
 
+test("controller: a post-action block preserves the failure envelope across #run's redaction re-wrap (issue #39)", async () => {
+  // #actAndSnap throws attachFailure(...) INSIDE #run, whose catch re-wraps into a fresh redacted Error —
+  // the non-enumerable `.failure` must be carried over, or the drive envelope is lost on this path.
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makePostActionBlockGateway({
+    url: "https://blocked.example/final", title: "403 Forbidden", tree: "Forbidden", status: 403,
+    diagnostics: { finalUrl: "https://blocked.example/final", title: "403 Forbidden", status: 403,
+      consoleErrors: ["error: waf blocked"], redirectChain: ["https://blocked.example/final"] },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (err) { caught = err; }
+  assert.ok(caught, "the action must throw");
+  const env = failureOf(caught);
+  assert.ok(env, "the failure envelope survives #run's redaction re-wrap");
+  assert.equal(env.finalUrl, "https://blocked.example/final");
+  assert.equal(env.status, 403);
+});
+
 test("controller: a reaped session resets the handle so the next navigate reopens", async () => {
   const { gateway, open } = makeFakeGateway();
   const c = new GatewayDriveController(gateway, noSecrets(), "tok");

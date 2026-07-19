@@ -30,6 +30,8 @@ import {
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck } from "../verbs/index.js";
+import { redactFailureDiagnostics, attachFailure, failureOf } from "../observability/index.js";
+import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
 import type { VaultEntryStore } from "./vault-login.js";
 import type { DriveController } from "./server.js";
@@ -164,6 +166,16 @@ export class GatewayDriveController implements DriveController {
   }
 
   /**
+   * Redact and return the failure-evidence envelope (issue #39) carried on a failed drive snapshot, for
+   * attaching to a thrown failure at parity with retrieve. REDACTS at this seam (secret set scrubbed +
+   * cookie/authorization stripped) since the core built the RAW envelope; undefined when the snapshot
+   * carried none. The SINGLE place drive failures pull the envelope, so the redaction can't be skipped.
+   */
+  #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
+    return snap?.diagnostics ? redactFailureDiagnostics(snap.diagnostics, this.#secrets) : undefined;
+  }
+
+  /**
    * Opt-in egress check (U4): open a fresh proxied session, fetch an ip-info endpoint, and classify
    * the exit as residential vs datacenter from its ASN/org. Best-effort and bounded — any failure
    * (blocked endpoint, dead exit, unparseable body) yields { kind: "unknown" } and never masks the
@@ -267,11 +279,15 @@ export class GatewayDriveController implements DriveController {
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      if (warm) throw this.#warmError(url, snap.status ?? null);
+      const failure = this.#failure(snap);
+      if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null), failure);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
-      throw new Error(
-        `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
-          `reached${proxyAvailable ? " — retry navigate for a fresh exit" : ""}`,
+      throw attachFailure(
+        new Error(
+          `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
+            `reached${proxyAvailable ? " — retry navigate for a fresh exit" : ""}`,
+        ),
+        failure,
       );
     }
     return snap;
@@ -331,6 +347,7 @@ export class GatewayDriveController implements DriveController {
         `the page was blocked or could not be reached` +
         (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
       dx,
+      this.#failure(direct),
     );
   }
 
@@ -494,7 +511,7 @@ export class GatewayDriveController implements DriveController {
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      throw this.#warmError(url, snap.status ?? null);
+      throw attachFailure(this.#warmError(url, snap.status ?? null), this.#failure(snap));
     }
     this.#pinned = true;
     return snap;
@@ -655,6 +672,7 @@ export class GatewayDriveController implements DriveController {
         (exitCheck ? `, exit=${exitCheck.kind}` : "") +
         `)`,
       dx,
+      this.#failure(last),
     );
   }
 
@@ -692,9 +710,12 @@ export class GatewayDriveController implements DriveController {
       // reputation block (4xx + thin) reached by the action as well as a visible challenge — neither
       // is handed back as success.
       if (navFailed(snap)) {
-        throw new Error(
-          "the action landed on a blocked/challenge page that did not clear — close and reopen the " +
-            "drive session, then retry the flow",
+        throw attachFailure(
+          new Error(
+            "the action landed on a blocked/challenge page that did not clear — close and reopen the " +
+              "drive session, then retry the flow",
+          ),
+          this.#failure(snap),
         );
       }
       return snap;
@@ -709,7 +730,11 @@ export class GatewayDriveController implements DriveController {
       // Session reaped/closed out from under us -> reset so the next navigate transparently reopens.
       if (!this.#gateway.sessions.get(handle)) this.#handle = undefined;
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(redactSecrets(message, this.#secrets));
+      // Preserve a failure envelope (issue #39) across the redaction re-wrap: an action that landed on a
+      // blocked page throws `attachFailure(...)` INSIDE this #run turn (see #actAndSnap), and the fresh
+      // Error below would otherwise drop the non-enumerable `.failure`. The envelope was already redacted
+      // at #failure(), so re-attaching it is secret-safe.
+      throw attachFailure(new Error(redactSecrets(message, this.#secrets)), failureOf(err));
     }
   }
 }

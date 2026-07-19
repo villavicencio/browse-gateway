@@ -20,6 +20,8 @@ import {
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
+import { redactFailureDiagnostics } from "../observability/index.js";
+import type { FailureDiagnostics } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -99,6 +101,14 @@ export interface RetrieveResult {
   captchaSolved: boolean;
   /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
   proxyDiagnostic?: EscalationDiagnostics;
+  /**
+   * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
+   * bounded console + network / optional screenshot — surfaced ONLY on a blocked/failed retrieve, and
+   * REDACTED (secret set scrubbed + cookie/authorization stripped) before it reaches here. Absent on a
+   * successful retrieve, so the success shape is unchanged. Distinct from {@link proxyDiagnostic} (the
+   * proxy-escalation tally) — this is the page-evidence bundle the site-compat epic (#38) reports through.
+   */
+  diagnostics?: FailureDiagnostics;
 }
 
 /**
@@ -193,10 +203,18 @@ export function escalationDiagnostics(opts: {
  */
 export class EscalationError extends Error {
   readonly diagnostics: EscalationDiagnostics;
-  constructor(message: string, diagnostics: EscalationDiagnostics) {
+  /**
+   * The page-evidence envelope (issue #39) for this failure — a DISTINCT field from {@link diagnostics}
+   * (the proxy-escalation tally), deliberately NOT overloading it. Carries finalUrl / title / status /
+   * redirect chain / console + network / optional screenshot, already REDACTED by the drive layer that
+   * threw. Absent when no snapshot was captured (e.g. a force-proxy request with no proxy available).
+   */
+  readonly failure?: FailureDiagnostics;
+  constructor(message: string, diagnostics: EscalationDiagnostics, failure?: FailureDiagnostics) {
     super(message);
     this.name = "EscalationError";
     this.diagnostics = diagnostics;
+    if (failure) this.failure = failure;
   }
 }
 
@@ -490,6 +508,12 @@ export async function retrieve(
         },
       })
     : undefined;
+  // Failure-evidence envelope (issue #39): surface it ONLY on a block, and REDACT it (secret set scrubbed
+  // + cookie/authorization stripped) before it leaves this seam. The core built the RAW envelope on
+  // `render.diagnostics` (finalUrl = the post-redirect page.url(), the retrieve URL-bug fix). A successful
+  // retrieve carries no envelope, so its shape is unchanged.
+  const diagnostics =
+    blocked && render.diagnostics ? redactFailureDiagnostics(render.diagnostics, secrets) : undefined;
   return {
     url,
     status: render.status,
@@ -501,5 +525,6 @@ export async function retrieve(
     proxyUsed,
     captchaSolved,
     ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
+    ...(diagnostics ? { diagnostics } : {}),
   };
 }

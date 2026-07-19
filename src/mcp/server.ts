@@ -10,6 +10,8 @@ import { MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
 import type { BlockReason, EscalationDiagnostics } from "../verbs/index.js";
 import { EscalationError } from "../verbs/index.js";
+import { summarizeFailureDiagnostics, failureOf } from "../observability/index.js";
+import type { FailureDiagnostics } from "../observability/index.js";
 
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
@@ -25,6 +27,9 @@ export interface RetrieveOutcome {
   captchaSolved: boolean;
   /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
   proxyDiagnostic?: EscalationDiagnostics;
+  /** Failure-evidence envelope (issue #39): finalUrl / title / status / redirect chain / console +
+   *  network / optional screenshot — present ONLY on a blocked/failed retrieve, already redacted. */
+  diagnostics?: FailureDiagnostics;
 }
 
 export type RetrieveFn = (input: { url: string; forceProxy?: boolean }) => Promise<RetrieveOutcome>;
@@ -57,9 +62,23 @@ export interface GatewayMcpDeps {
   version?: string;
 }
 
-/** Render a snapshot for the agent: a url/title header plus the ref-annotated accessibility tree. */
+/** Render a snapshot for the agent: a url/title header plus the ref-annotated accessibility tree. The
+ *  header now surfaces the captured status + CF/PX vendor hints (issue #39 — they were computed on the
+ *  snapshot but dropped here); only non-empty signals are shown, so a clean 2xx page with no hints keeps
+ *  the original two-line header. */
 function formatSnapshot(snap: PageSnapshot): string {
-  return `url: ${snap.url}\ntitle: ${snap.title}\n\n${snap.tree}`;
+  const bits: string[] = [];
+  if (snap.status != null) bits.push(`status: ${snap.status}`);
+  if (snap.cfHint) bits.push("cfHint: true");
+  if (snap.pxHint) bits.push("pxHint: true");
+  const meta = bits.length ? `\n${bits.join("  ")}` : "";
+  return `url: ${snap.url}\ntitle: ${snap.title}${meta}\n\n${snap.tree}`;
+}
+
+/** Serialize a redacted failure envelope for a text tool error, with the base64 screenshot shrunk to a
+ *  size marker so a diagnostics line stays small + readable. */
+function renderFailure(diag: FailureDiagnostics): string {
+  return `\nfailure: ${JSON.stringify(summarizeFailureDiagnostics(diag))}`;
 }
 
 export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
@@ -101,12 +120,15 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           const why = result.reason ?? "empty-content";
           const hint = result.reason === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
           const diag = result.proxyDiagnostic ? `\ndiagnostics: ${JSON.stringify(result.proxyDiagnostic)}` : "";
+          // Surface the failure-evidence envelope (issue #39) — finalUrl / title / status / redirect chain /
+          // console + network — so a retrieve failure is diagnosable instead of opaque. Already redacted.
+          const failure = result.diagnostics ? renderFailure(result.diagnostics) : "";
           return {
             isError: true,
             content: [
               {
                 type: "text",
-                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}${diag}`,
+                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}${diag}${failure}`,
               },
             ],
           };
@@ -129,10 +151,14 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
   const drive = deps.drive;
   if (drive) {
     const fail = (err: unknown) => {
-      const base = `browse-gateway error: ${err instanceof Error ? err.message : String(err)}`;
+      let text = `browse-gateway error: ${err instanceof Error ? err.message : String(err)}`;
       // Attach structured escalation diagnostics when present so the caller sees WHY a proxied
       // navigation failed (proxy applied? which exit? what blocked it?). Secrets-free by construction.
-      const text = err instanceof EscalationError ? `${base}\ndiagnostics: ${JSON.stringify(err.diagnostics)}` : base;
+      if (err instanceof EscalationError) text += `\ndiagnostics: ${JSON.stringify(err.diagnostics)}`;
+      // Surface the failure-evidence envelope (issue #39) at parity with retrieve — from an
+      // EscalationError's `.failure` or a plain drive error decorated by attachFailure. Already redacted.
+      const failure = failureOf(err);
+      if (failure) text += renderFailure(failure);
       return { isError: true as const, content: [{ type: "text" as const, text }] };
     };
     const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
