@@ -43,13 +43,14 @@ test("redaction scrubs a registered secret out of console/network/redirect/url d
   const red = redactFailureDiagnostics(diag, storeOf(SECRET));
   const blob = JSON.stringify(red);
   assert.ok(!blob.includes(SECRET), "the secret must not survive anywhere in the envelope");
-  // The query-borne secret is stripped to the marker (it never even reaches the secret pass).
+  // The query-borne secret is stripped to the marker on a root path (it never reaches the secret pass).
   assert.equal(red.finalUrl, "https://target.example/?<redacted>");
-  // The path-borne secret is caught by the registered-secret pass.
-  assert.match(red.redirectChain[0], /\[REDACTED\]/);
+  // The path-borne secret is collapsed to the depth marker (origin+depth only).
+  assert.equal(red.redirectChain[0], "https://a.example/<redacted>");
+  // Non-URL occurrences are still caught by the registered-secret pass.
   assert.match(red.consoleErrors[0], /\[REDACTED\]/);
   assert.match(red.networkFailures[0], /\[REDACTED\]/);
-  // status + the non-secret hop pass through unchanged.
+  // status + the non-secret ROOT hop pass through unchanged.
   assert.equal(red.status, 403);
   assert.equal(red.redirectChain[1], "https://b.example/");
 });
@@ -97,16 +98,57 @@ test("adversarial redaction (EMPTY secret store): OAuth URLs, JSON cookies, fold
   ]) {
     assert.ok(!blob.includes(leak), `leak survived redaction: ${leak}`);
   }
-  // finalUrl: origin+path preserved (a signal #48 needs), query + fragment stripped to markers.
-  assert.equal(red.finalUrl, "https://idp.example/callback?<redacted>#<redacted>");
-  assert.equal(red.redirectChain[0], "https://start.example/go?<redacted>");
-  assert.equal(red.redirectChain[1], "https://idp.example/callback?<redacted>#<redacted>");
-  // an embedded URL inside a console/network line is sanitized too (params gone, origin+path kept).
-  assert.ok(red.consoleErrors[0].includes("https://idp.example/callback"));
-  assert.ok(!red.consoleErrors[0].includes("code="));
+  // finalUrl: origin + DEPTH only (path collapsed to a marker), query + fragment stripped to markers.
+  assert.equal(red.finalUrl, "https://idp.example/<redacted>?<redacted>#<redacted>");
+  assert.equal(red.redirectChain[0], "https://start.example/<redacted>?<redacted>");
+  assert.equal(red.redirectChain[1], "https://idp.example/<redacted>?<redacted>#<redacted>");
+  // an embedded URL inside a console/network line is sanitized too (origin kept, path+params gone).
+  assert.ok(red.consoleErrors[0].includes("https://idp.example/<redacted>"));
+  assert.ok(!red.consoleErrors[0].includes("callback") && !red.consoleErrors[0].includes("code="));
   assert.match(red.consoleErrors[1], /"Cookie":\[REDACTED\]/);
-  assert.ok(red.networkFailures[0].includes("https://api.example/v1?<redacted>"));
+  assert.ok(red.networkFailures[0].includes("https://api.example/<redacted>?<redacted>"));
   assert.match(red.networkFailures[1], /Authorization:\s*\[REDACTED\]/i);
+});
+
+test("adversarial redaction r2 (EMPTY store): path tokens, basic-auth, escaped URLs, split/unindented headers", () => {
+  const diag = buildFailureDiagnostics({
+    // 1a. path segment token + 1b. basic-auth userinfo — both must be dropped (origin+depth only).
+    finalUrl: "https://user:BASIC_PASS@idp.example/reset/PATH_TOKEN_XYZ?k=QP",
+    status: 401,
+    redirectChain: [
+      "https://user:BASIC_PASS@idp.example/reset/PATH_TOKEN_XYZ",
+      "https://svc.example/magic/MAGIC_LINK_TOK",
+    ],
+    consoleErrors: [
+      // 2. backslash-escaped URL notation (JSON-escaped slashes) — its query must not leak.
+      'blocked {"u":"https:\\/\\/idp.example\\/callback?code=ESCAPED_CODE_TOK"}',
+      // 3. UNINDENTED header continuation — a token split across a raw newline; the tail must go too,
+      //    and a real following field (Content-Type) must still STOP the redaction.
+      "Authorization: Bearer FIRST_HALF_TOK\nSECOND_HALF_TOK\nContent-Type: text/html",
+      // 4. same sensitive header repeated across two entries — each entry redacts independently.
+      "log a -- Set-Cookie: sid=SPLIT_A_TOK",
+    ],
+    networkFailures: [
+      "log b -- Set-Cookie: sid=SPLIT_B_TOK",
+    ],
+  });
+  const red = redactFailureDiagnostics(diag, storeOf()); // EMPTY store — closed by URL/header scrubbers
+  const blob = JSON.stringify(red);
+  for (const leak of [
+    "BASIC_PASS", "PATH_TOKEN_XYZ", "MAGIC_LINK_TOK", "ESCAPED_CODE_TOK",
+    "FIRST_HALF_TOK", "SECOND_HALF_TOK", "SPLIT_A_TOK", "SPLIT_B_TOK",
+  ]) {
+    assert.ok(!blob.includes(leak), `leak survived r2 redaction: ${leak}`);
+  }
+  // origin + depth only; userinfo, path token, and query all gone.
+  assert.equal(red.finalUrl, "https://idp.example/<redacted>?<redacted>");
+  assert.equal(red.redirectChain[0], "https://idp.example/<redacted>");
+  assert.equal(red.redirectChain[1], "https://svc.example/<redacted>");
+  // the escaped URL's query is stripped (origin kept).
+  assert.ok(red.consoleErrors[0].includes("https://idp.example/<redacted>"));
+  // a real next header field still ends the Authorization redaction.
+  assert.match(red.consoleErrors[1], /Authorization:\s*\[REDACTED\]/i);
+  assert.ok(red.consoleErrors[1].includes("Content-Type: text/html"), "a following real field is NOT swallowed");
 });
 
 // --- isRetrieveFailure predicate (shared by retrieve() and the MCP surface) -------------------

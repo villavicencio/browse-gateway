@@ -103,35 +103,51 @@ export function buildFailureDiagnostics(input: FailureDiagnosticsInput): Failure
   return diag;
 }
 
+/** Normalize backslash-escaped slashes (`\/` → `/`), so a JSON/log-escaped URL notation
+ *  (`https:\/\/idp.example\/callback?code=…`) parses and sanitizes like the plain form instead of
+ *  slipping past the URL scrubber with its query intact. */
+function normalizeEscapedUrl(s: string): string {
+  return s.replace(/\\\//g, "/");
+}
+
 /**
- * Strip a URL's query string and fragment entirely, keeping origin + path only — the robust default,
- * because sensitive params can't be enumerated (OAuth `?code=…&access_token=…`, signed URLs, session
- * ids). Appends a `?<redacted>` / `#<redacted>` marker when a query/fragment was present, so the
- * diagnostic still signals that params existed. The PATH is preserved (a home-page vs deep-URL signal
- * #48's home-fallback detection needs). A non-parseable / non-http value is returned unchanged (the
- * secret + header scrubbers still run over it). This is the leak the registered-secret-only scrubber
- * missed: an unregistered access token in a URL is caught here regardless of the secret set.
+ * Reduce a URL to ORIGIN + DEPTH only — the robust default, because sensitive material hides in more
+ * than the query: userinfo (`user:pass@`), a path SEGMENT (a reset / magic-link token), the query, and
+ * the fragment can all carry credentials, and none can be enumerated. For an http(s) URL the surfaced
+ * form is `scheme://host[:port]` + (`/` for root, else `/<redacted>`) + a `?<redacted>` / `#<redacted>`
+ * marker when a query/fragment was present. The ROOT-vs-DEEP distinction is preserved (#48's
+ * home-fallback detection runs on the RAW url internally and surfaces only a boolean slot, so it does
+ * NOT depend on the surfaced literal path — collapsing it is safe). Escaped-slash notation is normalized
+ * first (fix for the JSON-escaped-URL bypass). A non-http scheme keeps its shape minus userinfo/query/
+ * fragment; a non-parseable value is returned unchanged (the secret + header scrubbers still run over it).
  */
 function sanitizeUrl(raw: string): string {
   let u: URL;
   try {
-    u = new URL(raw);
+    u = new URL(normalizeEscapedUrl(raw));
   } catch {
     return raw;
   }
-  const hadQuery = u.search.length > 0;
-  const hadFragment = u.hash.length > 0;
+  const marker = (u.search.length > 0 ? "?<redacted>" : "") + (u.hash.length > 0 ? "#<redacted>" : "");
+  if (u.protocol === "http:" || u.protocol === "https:") {
+    // Build from protocol + host (host is host:port only — never userinfo), so basic-auth creds are
+    // dropped by construction; collapse any non-root path so a token segment can't leak.
+    const deep = u.pathname !== "" && u.pathname !== "/";
+    return `${u.protocol}//${u.host}${deep ? "/<redacted>" : "/"}${marker}`;
+  }
+  // Non-http scheme (about:, chrome-error:, data:, …): strip userinfo/query/fragment, keep the rest.
+  u.username = "";
+  u.password = "";
   u.search = "";
   u.hash = "";
-  let out = u.toString();
-  if (hadQuery) out += "?<redacted>";
-  if (hadFragment) out += "#<redacted>";
-  return out;
+  return u.toString() + marker;
 }
 
 /** Sanitize every http(s) URL embedded in a free-text line (a console error / network line frequently
- *  carries a full URL with its query), so an OAuth/token URL can't leak through a dump field either. */
-const URL_IN_TEXT_RE = /https?:\/\/[^\s"'<>)\]]+/gi;
+ *  carries a full URL with its query), so an OAuth/token URL can't leak through a dump field either.
+ *  Matches the backslash-escaped slash notation too (`https:\/\/…`), which the plain `//` form missed;
+ *  the char class keeps backslashes so the escaped path is consumed and normalized inside sanitizeUrl. */
+const URL_IN_TEXT_RE = /https?:(?:\\?\/){2}[^\s"'<>)\]]+/gi;
 function sanitizeUrlsInText(s: string): string {
   return s.replace(URL_IN_TEXT_RE, (m) => sanitizeUrl(m));
 }
@@ -141,12 +157,14 @@ function sanitizeUrlsInText(s: string): string {
  * line — always sensitive even when the value isn't a registered secret (a session cookie minted by the
  * site, a bearer the caller passed). Broadened past a bare same-line `name: value` to also catch: a
  * quoted / JSON key (`"Cookie":"…"`, `'authorization': '…'`, `Set-Cookie` inside a JSON blob), a `=`
- * separator, a quoted OR bare value, AND folded header continuation lines (RFC-style leading-whitespace
- * continuations), so a multi-line Authorization can't leak its tail. Over-redaction (e.g. swallowing an
- * indented follow-on line) is the safe direction here.
+ * separator, a quoted OR bare value, AND folded continuation lines — BOTH the RFC-style indented form
+ * (`\n[ \t]+…`) AND an UNINDENTED next line that does NOT itself start a new header field (a token split
+ * across a raw `\n`), so the tail can't leak. The continuation STOPS at a real next field (`name:` /
+ * `name=`), so a following `Content-Type: …` still ends the redaction. Over-redaction (swallowing an
+ * unrelated non-field follow-on line) is the safe direction here.
  */
 const SENSITIVE_HEADER_RE =
-  /(["']?)\b(set-cookie|cookie|authorization)\b\1(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S[^\n]*(?:\n[ \t]+\S[^\n]*)*)/gi;
+  /(["']?)\b(set-cookie|cookie|authorization)\b\1(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S[^\n]*(?:\n(?:[ \t]+\S|(?![ \t]*[\w-]+\s*[:=])\S)[^\n]*)*)/gi;
 function stripSensitiveHeaders(s: string): string {
   return s.replace(SENSITIVE_HEADER_RE, (_m, q: string, name: string, sep: string) => `${q}${name}${q}${sep}[REDACTED]`);
 }
@@ -154,10 +172,13 @@ function stripSensitiveHeaders(s: string): string {
 /**
  * Redact an envelope before it is serialized to a caller/log (redact-before-serialize, R9). Applies
  * three scrubbers so a leak does NOT depend on a value being a registered secret:
- *   1. URL sanitization — the query + fragment are stripped from finalUrl, every redirectChain entry,
- *      and any URL embedded in a console/network line (catches unregistered OAuth codes / access tokens);
+ *   1. URL sanitization ({@link sanitizeUrl}) — reduces finalUrl, every redirectChain entry, and any URL
+ *      embedded in a console/network line to ORIGIN + DEPTH: userinfo (`user:pass@`), the path segments,
+ *      the query, and the fragment are all dropped (catches basic-auth creds, reset/magic-link path
+ *      tokens, and unregistered OAuth codes — incl. the backslash-escaped `https:\/\/…` notation);
  *   2. the registered-secret pass (`redactSecrets`) — proxy/vault/consumer credential VALUES;
- *   3. cookie/set-cookie/authorization header stripping (quoted, JSON, `=`, and folded continuations).
+ *   3. cookie/set-cookie/authorization header stripping (quoted, JSON, `=`, and indented OR unindented
+ *      folded continuations).
  * The `screenshotRef` (opaque base64 bytes) and the numeric/boolean slots pass through untouched.
  * `secrets` is a structural store (`{ redactableValues(): readonly string[] }`) — passing the VALUE SET
  * (not an opaque redactor) keeps the secret pass single-pass so a value can't fragment across redactors.

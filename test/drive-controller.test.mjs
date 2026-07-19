@@ -145,7 +145,8 @@ test("controller: a post-action block preserves the failure envelope across #run
   assert.ok(caught, "the action must throw");
   const env = failureOf(caught);
   assert.ok(env, "the failure envelope survives #run's redaction re-wrap");
-  assert.equal(env.finalUrl, "https://blocked.example/final");
+  // #failure() redacts, so a deep path collapses to origin+depth (the r2 URL scrubber).
+  assert.equal(env.finalUrl, "https://blocked.example/<redacted>");
   assert.equal(env.status, 403);
 });
 
