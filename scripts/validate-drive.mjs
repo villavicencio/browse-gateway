@@ -106,6 +106,43 @@ try {
     }
   }
 
+  // 3b) IN-FLIGHT GUARD (issue #46): a navigate still running when the reaper fires — even past the
+  //     TTL — must NOT have its session reaped mid-flight. Hold a real navigate open against a slow
+  //     allowlisted endpoint, force a full-idle reap by the clock, and assert the session survives.
+  //     Only the in-flight guard can spare it here (its lastActivityAt is far past the TTL by clock).
+  //     Best-effort: degrades to a note if the delay endpoint is unreachable (like the form step).
+  {
+    const SLOW = "https://httpbin.org/delay/8"; // allowlisted; ~8s response gives a wide in-flight window
+    const navP = drive.navigate(SLOW).catch((err) => ({ __navErr: err }));
+    // Wait (bounded ≈5s) for the navigate to land in-flight on the consumer-bound session.
+    let sawInFlight = false;
+    for (let i = 0; i < 200; i++) {
+      if (gateway.sessions.list().some((s) => s.consumerId !== undefined && s.inFlight > 0)) {
+        sawInFlight = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    if (!sawInFlight) {
+      note(`in-flight navigate never observed (${SLOW} likely unreachable) — skipping the in-flight-guard reap check`);
+    } else {
+      // Force "everything is idle by the clock" (now = +10min, ttl = 0). Without the guard this reaps
+      // the session and the pending navigate would surface a raw "no open session"; with it, survives.
+      const reapedMid = await gateway.sessions.reapIdle(0, Date.now() + 600_000);
+      check(
+        "an in-flight navigate crossing the idle TTL is NOT reaped (in-flight guard holds)",
+        reapedMid.length === 0 && gateway.sessions.activeCount >= 1,
+      );
+    }
+    const done = await navP; // let the slow navigate settle before the step-4 idle reap
+    if (done && done.__navErr) {
+      note(
+        `slow navigate errored after the guard check (${SLOW}): ` +
+          `${done.__navErr instanceof Error ? done.__navErr.message.split("\n")[0] : String(done.__navErr)}`,
+      );
+    }
+  }
+
   // 4) idle reap -> the next action surfaces a clean "no open session" error.
   const reaped = await gateway.sessions.reapIdle(0, Date.now() + 600_000); // force: everything is "idle"
   check("an idle drive session is reaped", reaped.length >= 1 && gateway.sessions.activeCount === 0);

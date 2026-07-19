@@ -167,9 +167,13 @@ export class Gateway {
   /**
    * Run `fn` against an already-open consumer session. Re-authenticates and verifies the handle
    * belongs to this consumer (so one consumer can't drive another's session — the error is identical
-   * for an unknown handle and a foreign one, leaking nothing), refreshes the idle timer, and keeps
-   * the session open. The guard installed at open persists on the context, so every action stays
-   * policy-checked.
+   * for an unknown handle and a foreign one, leaking nothing), and keeps the session open. The guard
+   * installed at open persists on the context, so every action stays policy-checked.
+   *
+   * The session is marked in-flight for the WHOLE of `fn` (not just at call start) and re-stamped on
+   * completion, so the idle reaper can't close the browser out from under a long navigate — the same
+   * in-flight guard the MCP transport uses one layer up (`http-server.ts`). Activity was previously
+   * stamped only before `fn` ran, so a navigate crossing the idle TTL got reaped mid-flight.
    */
   async useConsumerSession<T>(
     token: string,
@@ -182,8 +186,12 @@ export class Gateway {
     if (!session || session.consumerId !== consumer.id) {
       throw new Error(`no open session for handle ${handle}`);
     }
-    session.touch();
-    return fn(session, consumer);
+    session.beginActivity();
+    try {
+      return await fn(session, consumer);
+    } finally {
+      session.endActivity();
+    }
   }
 
   /** Close an open consumer session. Verifies ownership; a no-op for an unknown/foreign handle. */

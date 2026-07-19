@@ -255,6 +255,54 @@ test("touch() advances lastActivityAt so a freshly-used session survives the rea
   assert.deepEqual(await gw.sessions.reapIdle(1_000, t + 2_000), [handle], "past TTL of last touch -> reaped");
 });
 
+test("reapIdle: an in-flight session (inFlight > 0) is NOT reaped past the TTL; it is reaped once inFlight returns to 0", async () => {
+  const { factory, cores } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  const handle = await gw.openConsumerSession("tok-a");
+  const session = gw.sessions.get(handle);
+
+  session.beginActivity(); // a long navigate is now in flight on this session
+  assert.equal(session.inFlight, 1);
+  // Far past the TTL by wall-clock, but in-flight -> the reaper MUST skip it (mirrors http-server:249).
+  assert.deepEqual(await gw.sessions.reapIdle(1_000, Date.now() + 600_000), [], "in-flight -> not reaped");
+  assert.equal(gw.sessions.activeCount, 1, "in-flight session survived the reaper");
+  assert.equal(cores[0].closed, false, "core stayed open during the in-flight navigate");
+
+  session.endActivity(); // navigate completed; activity re-stamped, inFlight back to 0
+  assert.equal(session.inFlight, 0);
+  // Genuinely idle now: past the TTL of the completion stamp -> reaped (non-regression).
+  assert.deepEqual(await gw.sessions.reapIdle(1_000, Date.now() + 600_000), [handle], "idle -> reaped");
+  assert.equal(gw.sessions.activeCount, 0);
+  assert.equal(cores[0].closed, true, "genuinely-idle session's core closed");
+});
+
+test("useConsumerSession: holds a session in-flight for the whole verb, so a navigate crossing the TTL survives", async () => {
+  const { factory, cores } = makeFactory();
+  const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);
+  const gw = Gateway.create(config(3), factory, policy);
+  const handle = await gw.openConsumerSession("tok-a");
+
+  // Start a long verb and hold it in-flight on a promise we control (a stand-in for a multi-second
+  // navigate). beginActivity() runs synchronously before the first await, so inFlight is already 1.
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const inflight = gw.useConsumerSession("tok-a", handle, async () => {
+    await gate;
+    return "done";
+  });
+  assert.equal(gw.sessions.get(handle).inFlight, 1, "verb marked the session in-flight");
+
+  // The reaper fires while the verb is still awaiting, deep past the TTL — the session must survive.
+  assert.deepEqual(await gw.sessions.reapIdle(1_000, Date.now() + 600_000), [], "in-flight verb not reaped");
+  assert.equal(gw.sessions.activeCount, 1);
+  assert.equal(cores[0].closed, false);
+
+  release();
+  assert.equal(await inflight, "done", "the long verb still resolved to its caller");
+  assert.equal(gw.sessions.get(handle).inFlight, 0, "in-flight count released on completion");
+});
+
 test("per-consumer cap counts only consumer-bound sessions, not transient retrieve sessions", async () => {
   const { factory } = makeFactory();
   const policy = policyFor([{ id: "a", token: "tok-a", allow: ["example.com"] }]);

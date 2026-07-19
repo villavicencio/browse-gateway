@@ -15,6 +15,8 @@ export interface SessionInfo {
   /** Wall-clock ms of the last activity — the idle reaper keys off this. */
   lastActivityAt: number;
   state: SessionState;
+  /** Number of verbs currently executing on this session; the idle reaper never reaps while > 0. */
+  inFlight: number;
   /** The consumer that owns this session, if it is a consumer-bound (drive) session. */
   consumerId?: string;
   /** The owned core's kind, e.g. "patchright". */
@@ -29,6 +31,9 @@ export class Session {
   readonly #core: BrowserCore;
   #state: SessionState = "open";
   #lastActivityAt: number;
+  /** Verbs currently awaiting on this session. Held > 0 for the whole of a long navigate so the
+   *  idle reaper can't close the browser mid-flight (mirrors the MCP transport's `inFlight` guard). */
+  #inFlight = 0;
 
   constructor(core: BrowserCore, opts: { id?: string; consumerId?: string } = {}) {
     this.#core = core;
@@ -46,8 +51,29 @@ export class Session {
     return this.#lastActivityAt;
   }
 
+  /** Verbs currently executing on this session. The idle reaper skips a session while this is > 0. */
+  get inFlight(): number {
+    return this.#inFlight;
+  }
+
   /** Mark the session as just-used so the idle reaper defers closing it. */
   touch(): void {
+    this.#lastActivityAt = Date.now();
+  }
+
+  /**
+   * Enter a verb: stamp activity and mark the session in-flight so the idle reaper won't close it
+   * while a long navigate is still awaiting. ALWAYS pair with `endActivity()` in a `finally`.
+   */
+  beginActivity(): void {
+    this.#lastActivityAt = Date.now();
+    this.#inFlight++;
+  }
+
+  /** Leave a verb: drop the in-flight count and re-stamp activity, so a just-finished long call
+   *  isn't reaped on the very next tick for having started before the TTL. */
+  endActivity(): void {
+    this.#inFlight--;
     this.#lastActivityAt = Date.now();
   }
 
@@ -65,6 +91,7 @@ export class Session {
       createdAt: this.createdAt,
       lastActivityAt: this.#lastActivityAt,
       state: this.#state,
+      inFlight: this.#inFlight,
       ...(this.consumerId ? { consumerId: this.consumerId } : {}),
       core: this.#core.kind,
     };
