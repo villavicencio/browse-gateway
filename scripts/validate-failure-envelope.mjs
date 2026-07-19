@@ -32,7 +32,8 @@ const cfApex = new URL(CF_TARGET).hostname.split(".").slice(-2).join(".");
 const REDIRECT_URL = "https://httpbin.org/redirect-to?url=https%3A%2F%2Fhttpbin.org%2Fhtml&status_code=302";
 const REDIRECT_FINAL = "https://httpbin.org/html";
 const OFF_ALLOWLIST = "https://www.google.com/"; // deliberately NOT in ALLOW → guard-blocked → nav-failed
-const ALLOW = ["httpbin.org", "*.httpbin.org", cfApex, `*.${cfApex}`];
+const LINKED_PAGE = "https://example.com/"; // has an <a> to iana.org (OFF-allowlist) → a click-triggered failing nav
+const ALLOW = ["example.com", "*.example.com", "httpbin.org", "*.httpbin.org", cfApex, `*.${cfApex}`];
 
 const policy = new PolicyEngine({
   registry: new ConsumerRegistry([{ id: "agent-1", token: TOKEN, allow: ALLOW }]),
@@ -116,6 +117,35 @@ try {
       check("a CF block throws with a populated failure envelope", typeof env.finalUrl === "string" && "status" in env);
     } else {
       note(`CF check skipped (${CF_TARGET}): ${err instanceof Error ? err.message.split("\n")[0] : String(err)} — likely IP reputation on a direct session`);
+    }
+  }
+  await drive.close().catch(() => {});
+
+  // 5) evidence is scoped to the FAILING nav, not the prior page (evidence-bleed fix). Load a clean page
+  //    (baseline), then CLICK a link that navigates OFF-allowlist → the guard blocks that nav → the
+  //    action-exception path throws with an envelope whose finalUrl reflects the FAILING nav's landing,
+  //    NOT the initial page. Best-effort (needs a live link) — notes on any hiccup.
+  const base = await drive.navigate(LINKED_PAGE).catch(() => null);
+  if (!base || base.status === null) {
+    note(`linked-page unreachable (${LINKED_PAGE}) — skipping the click-triggered evidence-scoping check`);
+  } else {
+    const linkRef = (base.tree.match(/link[^\n]*\[ref=([^\]]+)\]/) ?? [])[1];
+    if (!linkRef) {
+      note("no link ref found on the baseline page — skipping the evidence-scoping check");
+    } else {
+      let clickEnv;
+      try {
+        await drive.click({ target: linkRef, element: "off-allowlist link" });
+      } catch (err) {
+        clickEnv = failureOf(err);
+      }
+      check("a click-triggered failing navigation throws with a failure envelope", !!clickEnv);
+      if (clickEnv) {
+        console.log(`  click-nav envelope: finalUrl=${clickEnv.finalUrl}`);
+        // The evidence must be from the FAILING nav, not the baseline example.com page it clicked from.
+        check("the envelope evidence is scoped to the failing nav (not the baseline page)",
+          typeof clickEnv.finalUrl === "string" && !/example\.com\/?$/.test(clickEnv.finalUrl));
+      }
     }
   }
   await drive.close().catch(() => {});

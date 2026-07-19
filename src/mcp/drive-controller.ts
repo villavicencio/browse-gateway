@@ -704,7 +704,22 @@ export class GatewayDriveController implements DriveController {
    */
   async #actAndSnap(act: (session: Session) => Promise<unknown>): Promise<PageSnapshot> {
     return this.#run(async (s) => {
-      await act(s);
+      try {
+        await act(s);
+      } catch (err) {
+        // The ACTION itself threw (a locator timeout, a detached element, a failed fill) BEFORE any
+        // snapshot — otherwise the envelope is dropped and a drive action failure is opaque (issue #39).
+        // Best-effort snapshot the current page so the failure still carries evidence; the page may be
+        // wedged, so its OWN try/catch. Attach the redacted envelope and rethrow — #run's catch preserves
+        // `.failure` across its redaction re-wrap.
+        let failure: FailureDiagnostics | undefined;
+        try {
+          failure = this.#failure(await s.core.snapshot());
+        } catch {
+          // the page is unusable — no snapshot evidence; the action error still propagates with none
+        }
+        throw attachFailure(err instanceof Error ? err : new Error(String(err)), failure);
+      }
       const snap = await s.core.snapshot();
       // The snapshot carries the active page's last navigation status, so navFailed catches a bare
       // reputation block (4xx + thin) reached by the action as well as a visible challenge — neither

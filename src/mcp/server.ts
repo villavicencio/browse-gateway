@@ -6,10 +6,9 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { MIN_CONTENT_LENGTH } from "../browser/index.js";
 import type { DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
 import type { BlockReason, EscalationDiagnostics } from "../verbs/index.js";
-import { EscalationError } from "../verbs/index.js";
+import { EscalationError, isRetrieveFailure } from "../verbs/index.js";
 import { summarizeFailureDiagnostics, failureOf } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 
@@ -108,12 +107,11 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
     async ({ url, forceProxy }) => {
       try {
         const result = await deps.retrieve({ url, forceProxy });
-        // A null status means the navigation never completed — an off-allowlist policy block
-        // or an unreachable host — so the browser's own error page (thin content) must not be
-        // handed back as a successful result. A short-but-valid page has a real status, so it
-        // is unaffected.
-        const navFailed = result.status === null && result.markdown.length < MIN_CONTENT_LENGTH;
-        if (result.blocked || !result.markdown || navFailed) {
+        // The SHARED retrieve-failure predicate (retrieve() attaches the evidence envelope on exactly
+        // this condition, #39): blocked, empty/whitespace markdown (empty extraction), or a failed nav
+        // (null status + thin body — an off-allowlist/unreachable target whose thin error page must not
+        // be handed back as content). A short-but-valid page has a real status + content, so it is fine.
+        if (isRetrieveFailure(result)) {
           // Surface WHY, plus whether escalation engaged, so a failure is diagnosable instead of a
           // silent "blocked". `captcha` is the actionable one — it means an interactive challenge
           // with no solver wired (v1), which no proxy can clear.

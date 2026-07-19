@@ -103,34 +103,79 @@ export function buildFailureDiagnostics(input: FailureDiagnosticsInput): Failure
   return diag;
 }
 
-/** Strip the value of any `cookie` / `set-cookie` / `authorization` header that appears in a dump line,
- *  regardless of the secret set — these are always sensitive even when the value isn't a registered
- *  secret (e.g. a session cookie minted by the site). Matches `name: value` to end-of-line. */
-const SENSITIVE_HEADER_RE = /\b(cookie|set-cookie|authorization)(\s*[:=]\s*)\S[^\n]*/gi;
-function stripSensitiveHeaders(s: string): string {
-  return s.replace(SENSITIVE_HEADER_RE, (_m, name: string, sep: string) => `${name}${sep}[REDACTED]`);
+/**
+ * Strip a URL's query string and fragment entirely, keeping origin + path only — the robust default,
+ * because sensitive params can't be enumerated (OAuth `?code=…&access_token=…`, signed URLs, session
+ * ids). Appends a `?<redacted>` / `#<redacted>` marker when a query/fragment was present, so the
+ * diagnostic still signals that params existed. The PATH is preserved (a home-page vs deep-URL signal
+ * #48's home-fallback detection needs). A non-parseable / non-http value is returned unchanged (the
+ * secret + header scrubbers still run over it). This is the leak the registered-secret-only scrubber
+ * missed: an unregistered access token in a URL is caught here regardless of the secret set.
+ */
+function sanitizeUrl(raw: string): string {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return raw;
+  }
+  const hadQuery = u.search.length > 0;
+  const hadFragment = u.hash.length > 0;
+  u.search = "";
+  u.hash = "";
+  let out = u.toString();
+  if (hadQuery) out += "?<redacted>";
+  if (hadFragment) out += "#<redacted>";
+  return out;
+}
+
+/** Sanitize every http(s) URL embedded in a free-text line (a console error / network line frequently
+ *  carries a full URL with its query), so an OAuth/token URL can't leak through a dump field either. */
+const URL_IN_TEXT_RE = /https?:\/\/[^\s"'<>)\]]+/gi;
+function sanitizeUrlsInText(s: string): string {
+  return s.replace(URL_IN_TEXT_RE, (m) => sanitizeUrl(m));
 }
 
 /**
- * Redact an envelope before it is serialized to a caller/log (redact-before-serialize, R9). Every
- * free-text field (finalUrl, title, redirectChain, consoleErrors, networkFailures) is scrubbed of the
- * secret set via `redactSecrets` AND stripped of cookie/set-cookie/authorization header material. The
- * `screenshotRef` (opaque base64 image bytes) and the numeric/boolean slots pass through untouched.
- * `secrets` is a structural store (`{ redactableValues(): readonly string[] }`) — any SecretStore
- * satisfies it, so passing the VALUE SET (not an opaque redactor) keeps this a single-pass scrub that
- * can't fragment a secret straddling two redactors (see the redact-before-serialize best-practice doc).
+ * Strip the value of any `cookie` / `set-cookie` / `authorization` header wherever it appears in a dump
+ * line — always sensitive even when the value isn't a registered secret (a session cookie minted by the
+ * site, a bearer the caller passed). Broadened past a bare same-line `name: value` to also catch: a
+ * quoted / JSON key (`"Cookie":"…"`, `'authorization': '…'`, `Set-Cookie` inside a JSON blob), a `=`
+ * separator, a quoted OR bare value, AND folded header continuation lines (RFC-style leading-whitespace
+ * continuations), so a multi-line Authorization can't leak its tail. Over-redaction (e.g. swallowing an
+ * indented follow-on line) is the safe direction here.
+ */
+const SENSITIVE_HEADER_RE =
+  /(["']?)\b(set-cookie|cookie|authorization)\b\1(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S[^\n]*(?:\n[ \t]+\S[^\n]*)*)/gi;
+function stripSensitiveHeaders(s: string): string {
+  return s.replace(SENSITIVE_HEADER_RE, (_m, q: string, name: string, sep: string) => `${q}${name}${q}${sep}[REDACTED]`);
+}
+
+/**
+ * Redact an envelope before it is serialized to a caller/log (redact-before-serialize, R9). Applies
+ * three scrubbers so a leak does NOT depend on a value being a registered secret:
+ *   1. URL sanitization — the query + fragment are stripped from finalUrl, every redirectChain entry,
+ *      and any URL embedded in a console/network line (catches unregistered OAuth codes / access tokens);
+ *   2. the registered-secret pass (`redactSecrets`) — proxy/vault/consumer credential VALUES;
+ *   3. cookie/set-cookie/authorization header stripping (quoted, JSON, `=`, and folded continuations).
+ * The `screenshotRef` (opaque base64 bytes) and the numeric/boolean slots pass through untouched.
+ * `secrets` is a structural store (`{ redactableValues(): readonly string[] }`) — passing the VALUE SET
+ * (not an opaque redactor) keeps the secret pass single-pass so a value can't fragment across redactors.
  */
 export function redactFailureDiagnostics(
   diag: FailureDiagnostics,
   secrets: { redactableValues(): readonly string[] },
 ): FailureDiagnostics {
-  const scrub = (s: string): string => stripSensitiveHeaders(redactSecrets(s, secrets));
+  // A single URL field (finalUrl, a redirect hop): strip params first, then the secret pass.
+  const scrubUrl = (s: string): string => redactSecrets(sanitizeUrl(s), secrets);
+  // A free-text field (title, console, network): sanitize embedded URLs, secret pass, header strip.
+  const scrubText = (s: string): string => stripSensitiveHeaders(redactSecrets(sanitizeUrlsInText(s), secrets));
   const out: FailureDiagnostics = { ...diag };
-  if (diag.finalUrl !== undefined) out.finalUrl = scrub(diag.finalUrl);
-  if (diag.title !== undefined) out.title = scrub(diag.title);
-  if (diag.redirectChain) out.redirectChain = diag.redirectChain.map(scrub);
-  if (diag.consoleErrors) out.consoleErrors = diag.consoleErrors.map(scrub);
-  if (diag.networkFailures) out.networkFailures = diag.networkFailures.map(scrub);
+  if (diag.finalUrl !== undefined) out.finalUrl = scrubUrl(diag.finalUrl);
+  if (diag.title !== undefined) out.title = scrubText(diag.title);
+  if (diag.redirectChain) out.redirectChain = diag.redirectChain.map(scrubUrl);
+  if (diag.consoleErrors) out.consoleErrors = diag.consoleErrors.map(scrubText);
+  if (diag.networkFailures) out.networkFailures = diag.networkFailures.map(scrubText);
   return out;
 }
 

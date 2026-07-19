@@ -84,6 +84,19 @@ export interface RetrieveOptions {
  */
 export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "perimeterx-challenge" | "hard-block" | "blocked";
 
+/**
+ * The single retrieve-FAILURE predicate, shared by {@link retrieve} (to attach + redact the
+ * failure-diagnostics envelope, #39) and the MCP surface (`server.ts`, to fail the tool call) so the
+ * two can never disagree — a page the MCP layer errors on must always carry evidence. A retrieve failed
+ * when it was `blocked`, produced empty/whitespace `markdown` (empty extraction — the status-200 +
+ * blank-body case that `blocked` alone misses), OR the navigation never landed (null status + thin
+ * body — an off-allowlist/unreachable target whose thin error page must not be handed back as content).
+ */
+export function isRetrieveFailure(r: { blocked: boolean; markdown: string; status: number | null }): boolean {
+  const navFailed = r.status === null && r.markdown.length < MIN_CONTENT_LENGTH;
+  return r.blocked || r.markdown.trim().length === 0 || navFailed;
+}
+
 export interface RetrieveResult {
   url: string;
   status: number | null;
@@ -508,12 +521,15 @@ export async function retrieve(
         },
       })
     : undefined;
-  // Failure-evidence envelope (issue #39): surface it ONLY on a block, and REDACT it (secret set scrubbed
-  // + cookie/authorization stripped) before it leaves this seam. The core built the RAW envelope on
+  // Failure-evidence envelope (issue #39): surface it on ANY retrieve failure (blocked, empty-content,
+  // or a failed nav — the SHARED {@link isRetrieveFailure} predicate the MCP layer also fails on, so an
+  // errored result always carries evidence), and REDACT it (URL params stripped + secret set scrubbed +
+  // cookie/authorization stripped) before it leaves this seam. The core built the RAW envelope on
   // `render.diagnostics` (finalUrl = the post-redirect page.url(), the retrieve URL-bug fix). A successful
   // retrieve carries no envelope, so its shape is unchanged.
+  const failed = isRetrieveFailure({ blocked, markdown: extraction.markdown, status: render.status });
   const diagnostics =
-    blocked && render.diagnostics ? redactFailureDiagnostics(render.diagnostics, secrets) : undefined;
+    failed && render.diagnostics ? redactFailureDiagnostics(render.diagnostics, secrets) : undefined;
   return {
     url,
     status: render.status,

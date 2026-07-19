@@ -149,6 +149,72 @@ test("controller: a post-action block preserves the failure envelope across #run
   assert.equal(env.status, 403);
 });
 
+/** A fake whose first navigate succeeds, then the next ACTION throws; snapshot returns `currentSnap`
+ *  (or throws when `snapshotThrows`) so the best-effort action-exception snapshot can be exercised. */
+function makeActionThrowsGateway(currentSnap, { snapshotThrows = false } = {}) {
+  let nextId = 1;
+  const open = new Map();
+  const core = {
+    async navigate() { return { url: "u", title: "ok", tree: "form [ref=e1]", status: 200 }; },
+    async click() { throw new Error("locator.click: Timeout 10000ms exceeded"); },
+    async type() { throw new Error("locator.fill: Element is not attached to the DOM"); },
+    async snapshot() { if (snapshotThrows) throw new Error("page crashed"); return currentSnap; },
+  };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + nextId++; open.set(id, { core }); return id; },
+    async useConsumerSession(_t, h, fn) {
+      const s = open.get(h);
+      if (!s) throw new Error(`no open session for handle ${h}`);
+      return fn(s);
+    },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  return { gateway };
+}
+
+test("controller: a THROWING click attaches a best-effort failure envelope (issue #39, action-exception)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makeActionThrowsGateway({
+    url: "https://cur.example/", title: "current", tree: "form [ref=e1]", status: 200,
+    diagnostics: { finalUrl: "https://cur.example/", title: "current", status: 200, consoleErrors: ["error: boom"] },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "the throwing action propagates");
+  assert.match(caught.message, /Timeout/, "the original action error is preserved");
+  const env = failureOf(caught);
+  assert.ok(env, "the action-exception path attaches an envelope from a best-effort snapshot");
+  assert.equal(env.finalUrl, "https://cur.example/");
+});
+
+test("controller: a THROWING type also carries the envelope", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makeActionThrowsGateway({
+    url: "https://cur.example/", title: "current", tree: "form [ref=e1]", status: 200,
+    diagnostics: { finalUrl: "https://cur.example/", status: 200 },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.type({ target: "e1" }, "hi"); } catch (e) { caught = e; }
+  assert.ok(caught && failureOf(caught), "the throwing type attaches an envelope");
+});
+
+test("controller: a throwing action whose best-effort snapshot ALSO fails still propagates cleanly (no envelope)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makeActionThrowsGateway(undefined, { snapshotThrows: true });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "the action error still propagates when the recovery snapshot also fails");
+  assert.match(caught.message, /Timeout/);
+  assert.equal(failureOf(caught), undefined, "no envelope when no snapshot could be taken");
+});
+
 test("controller: a reaped session resets the handle so the next navigate reopens", async () => {
   const { gateway, open } = makeFakeGateway();
   const c = new GatewayDriveController(gateway, noSecrets(), "tok");

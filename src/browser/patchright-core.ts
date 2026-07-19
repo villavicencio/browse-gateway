@@ -185,6 +185,21 @@ const REF_PATTERN = /^[a-z]?\d*e\d+$/i;
 /** Visible body text — the post-inject advancement signal (catches same-page/AJAX callback updates). */
 const BODY_TEXT_JS = "document.body ? document.body.innerText : ''";
 
+/**
+ * Whether a captured request marks the START of a NEW top-level navigation, so the per-navigation
+ * evidence buffers (console / network / redirect — issue #39) reset. True only for a main-frame
+ * navigation request that is NOT itself a redirect hop of an in-flight navigation: a redirect hop
+ * CONTINUES the same navigation, so it must append to the redirect chain, not wipe it. Pure + exported
+ * so the reset decision is unit-testable without a browser.
+ */
+export function isTopLevelNavStart(
+  isNavigationRequest: boolean,
+  isMainFrame: boolean,
+  isRedirectHop: boolean,
+): boolean {
+  return isNavigationRequest && isMainFrame && !isRedirectHop;
+}
+
 /** Resolve a {@link DriveTarget}'s `target` to a Playwright selector: a ref -> `aria-ref=`, else passthrough. */
 export function targetToSelector(target: string): string {
   const t = target.trim();
@@ -596,13 +611,8 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   async #onRequestPaused(cdp: CDPSession, event: FetchRequestPaused): Promise<void> {
     const { requestId } = event;
-    // Accumulate each main-document hop into the redirect chain (issue #39): a Document-type request is
-    // the navigation, and CDP re-pauses every server 3xx hop, so this records the ordered hop URLs the
-    // browser walked (a subframe document may also appear — a bounded, acceptable over-capture). The URL
-    // is redacted at the surfacing seam, never here. Skip during teardown so a closing hop isn't logged.
-    if (!this.#closing && event.resourceType === "Document" && event.request?.url) {
-      this.#pushEvidence(this.#redirectChain, event.request.url);
-    }
+    // (Redirect-chain capture moved to the page "request" listener in #attachEvidenceListeners — it is
+    // MAIN-FRAME-scoped and fires the per-navigation evidence reset, which the CDP layer can't see here.)
     // During close() Fetch.disable would auto-CONTINUE a still-paused request (allow); fail it instead.
     const decision: NavigationDecision = this.#closing
       ? "block"
@@ -799,6 +809,23 @@ export class PatchrightBrowserCore implements BrowserCore {
    * BOTH render()'s per-call page and the drive active page, so the two paths capture the same evidence.
    */
   #attachEvidenceListeners(page: PatchrightPage): void {
+    // Scope the evidence to the CURRENT top-level navigation. A main-frame navigation request resets the
+    // buffers at its START (its first hop — `redirectedFrom() === null`) and appends each hop (incl.
+    // server 3xx redirects) to the chain; a redirect hop continues the SAME nav and does NOT reset. This
+    // fires for a click/type-submit/select/key-triggered navigation too — not only the navigate() method —
+    // so a later blocked snapshot never mixes the prior page's console/network evidence (the 50-cap can't
+    // evict the relevant lines with stale ones). A subframe request is ignored (not a top-level nav).
+    page.on("request", (req) => {
+      try {
+        const isNav = req.isNavigationRequest();
+        const isMain = req.frame() === page.mainFrame();
+        if (!isNav || !isMain) return;
+        if (isTopLevelNavStart(isNav, isMain, req.redirectedFrom() !== null)) this.#resetEvidence();
+        this.#pushEvidence(this.#redirectChain, req.url());
+      } catch {
+        // a detached/superseded request can throw on access — ignore
+      }
+    });
     page.on("console", (msg) => {
       try {
         const type = msg.type();
