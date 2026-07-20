@@ -20,6 +20,8 @@ function makeFactory({ failTimes = 0, failGuard = false } = {}) {
     const core = {
       kind: "fake",
       closed: false,
+      killed: false,
+      forceKillAvailable: true,
       renderCalls: [],
       guardCalls: 0,
       async render(url) {
@@ -35,12 +37,111 @@ function makeFactory({ failTimes = 0, failGuard = false } = {}) {
       async close() {
         this.closed = true;
       },
+      async kill() {
+        this.killed = true;
+        this.closed = true;
+      },
     };
     cores.push(core);
     return core;
   };
   return { factory, cores };
 }
+
+/**
+ * A fully controllable fake core for the issue #50 teardown/force-kill tests. `close()` and `kill()`
+ * behaviors are mutable per-core: "resolve" (settles cleanly), "reject" (fails fast), or "hang" (never
+ * settles until `releaseClose()`/`releaseKill()`). Records call counts so a test can assert close was
+ * NOT re-run on the reconfirm path, etc.
+ */
+function makeControllableCore({ closeMode = "resolve", killMode = "resolve", forceKillAvailable = true } = {}) {
+  let closeRelease;
+  let killRelease;
+  const core = {
+    kind: "fake",
+    closed: false,
+    killed: false,
+    forceKillAvailable,
+    closeCalls: 0,
+    killCalls: 0,
+    closeMode,
+    killMode,
+    async render(url) {
+      return { url, status: 200, title: "t", text: "x".repeat(1000), html: "<main/>", clearanceWaitedMs: 0 };
+    },
+    async setNavigationGuard(guard) {
+      this.guard = guard;
+    },
+    async close() {
+      this.closeCalls++;
+      if (this.closeMode === "resolve") {
+        this.closed = true;
+        return;
+      }
+      if (this.closeMode === "reject") throw new Error("close boom");
+      return new Promise((resolve, reject) => {
+        closeRelease = (ok) => {
+          if (ok) {
+            this.closed = true;
+            resolve();
+          } else reject(new Error("close boom (late)"));
+        };
+      });
+    },
+    async kill() {
+      this.killCalls++;
+      if (this.killMode === "resolve") {
+        this.killed = true;
+        this.closed = true;
+        return;
+      }
+      if (this.killMode === "reject") throw new Error("kill unconfirmed");
+      return new Promise((resolve, reject) => {
+        killRelease = (ok) => {
+          if (ok) {
+            this.killed = true;
+            this.closed = true;
+            resolve();
+          } else reject(new Error("kill unconfirmed (late)"));
+        };
+      });
+    },
+    releaseClose(ok = true) {
+      closeRelease?.(ok);
+    },
+    releaseKill(ok = true) {
+      killRelease?.(ok);
+    },
+  };
+  return core;
+}
+
+/** A factory yielding controllable cores; per-acquire config comes from `configs` (array = one per
+ *  acquire, last repeats; object = same for all). `cores` collects each built core for assertions. */
+function makeControllableFactory(configs = {}) {
+  const cores = [];
+  let i = 0;
+  const factory = async () => {
+    const cfg = Array.isArray(configs) ? configs[Math.min(i, configs.length - 1)] : configs;
+    i++;
+    const core = makeControllableCore(cfg);
+    cores.push(core);
+    return core;
+  };
+  return { factory, cores };
+}
+
+/** A promise plus its resolver — a launch gate for the acquire⇄shutdown race test. */
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Yield to the event loop so pending microtasks/timers settle. */
+const tick = () => new Promise((r) => setTimeout(r, 5));
 
 const config = (maxSessions) => ({ maxSessions, core: {} });
 
@@ -363,4 +464,203 @@ test("openConsumerSession: releases the half-open session if guard install fails
   await assert.rejects(gw.openConsumerSession("tok-a"), /guard install boom/);
   assert.equal(gw.sessions.activeCount, 0, "no half-open session left after guard-install failure");
   assert.equal(cores[0].closed, true, "the half-open session's core was closed");
+});
+
+// --- issue #50: confirmable teardown + force-kill -------------------------------------------------
+
+const teardownMgr = (maxSessions, factory, perConsumerMax) =>
+  new SessionManager({
+    maxSessions,
+    coreFactory: factory,
+    closeGraceMs: 30,
+    killConfirmMs: 30,
+    ...(perConsumerMax ? { perConsumerMax } : {}),
+  });
+
+test("teardown: a clean close frees the slot without force-killing (non-regression)", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "resolve" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 0, "slot freed on clean close");
+  assert.equal(cores[0].closed, true);
+  assert.equal(cores[0].killed, false, "a clean close never force-kills");
+  assert.equal(cores[0].killCalls, 0);
+});
+
+test("teardown: a wedged close escalates to force-kill (grace path) and reclaims the slot", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "hang", killMode: "resolve" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  await mgr.release(s.id); // close hangs → grace elapses → kill resolves
+  assert.equal(mgr.activeCount, 0, "slot reclaimed after force-kill");
+  assert.equal(cores[0].killed, true, "the wedged browser was force-killed");
+  assert.equal(cores[0].closeCalls, 1);
+  assert.equal(cores[0].killCalls, 1);
+});
+
+test("teardown: a rejected close escalates to force-kill and reclaims the slot", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "reject", killMode: "resolve" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 0);
+  assert.equal(cores[0].killed, true, "a rejected close is not mistaken for a dead browser — it force-kills");
+  assert.equal(cores[0].killCalls, 1);
+});
+
+test("teardown: a wedged close keeps the slot COUNTED until the kill confirms (cap-safe)", async () => {
+  // A failed close whose force-kill is still in flight must NOT free capacity for a replacement while
+  // the browser may still be alive.
+  const { factory, cores } = makeControllableFactory({ closeMode: "reject", killMode: "hang" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  const relP = mgr.release(s.id); // close rejects → kill called → hangs (unconfirmed so far)
+  await tick();
+  assert.equal(mgr.activeCount, 1, "slot stays counted while the kill is unconfirmed");
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT", "no replacement admitted past the cap");
+  cores[0].releaseKill(true); // kill confirms → dead
+  await relP;
+  assert.equal(mgr.activeCount, 0, "slot reclaimed only after the kill confirms");
+  assert.equal(cores[0].killed, true);
+});
+
+test("teardown: per-consumer cap counts a session mid-teardown too", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "reject", killMode: "hang" });
+  const mgr = teardownMgr(3, factory, 1); // per-consumer cap 1, global headroom
+  const s = await mgr.acquire(undefined, { consumerId: "a" });
+  const relP = mgr.release(s.id);
+  await tick();
+  await assert.rejects(
+    mgr.acquire(undefined, { consumerId: "a" }),
+    (e) => e.code === "SESSION_LIMIT",
+    "a wedged-teardown session still counts against its consumer's cap",
+  );
+  cores[0].releaseKill(true);
+  await relP;
+});
+
+test("teardown: an unconfirmed force-kill stays counted, then self-heals on the next reap (kill-only)", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "reject", killMode: "reject" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  await mgr.release(s.id); // close rejects → kill rejects (unconfirmed) → zombie, still counted
+  assert.equal(mgr.activeCount, 1, "an unconfirmed kill keeps the session counted (cap-safe zombie)");
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT");
+  assert.equal(cores[0].closeCalls, 1, "close was attempted once");
+  // The process is now reapable; the reconfirm loop must retry the KILL only — never re-run close.
+  cores[0].killMode = "resolve";
+  await mgr.reapIdle(60_000, Date.now());
+  assert.equal(mgr.activeCount, 0, "slot reclaimed once the reconfirm confirms death");
+  assert.equal(cores[0].killed, true);
+  assert.equal(cores[0].closeCalls, 1, "reconfirm is KILL-ONLY — core.close() was never re-run");
+  assert.ok(cores[0].killCalls >= 2, "the kill was retried");
+});
+
+test("reapIdle: a never-settling transient (untagged) wedged past the deadline IS reaped (issue #49)", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "resolve" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire(); // untagged transient (no consumerId)
+  s.beginActivity(); // withSession stamps this around a hung render
+  const future = Date.now() + MAX_INFLIGHT_MS + 1_000;
+  const reaped = await mgr.reapIdle(60_000, future, MAX_INFLIGHT_MS);
+  assert.deepEqual(reaped, [s.id], "the wedged untagged transient was reclaimed");
+  assert.equal(mgr.activeCount, 0);
+  assert.equal(cores[0].closed, true);
+});
+
+test("reapIdle: a healthy in-flight transient is NOT reaped (non-regression)", async () => {
+  const { factory } = makeControllableFactory({ closeMode: "resolve" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  s.beginActivity();
+  const reaped = await mgr.reapIdle(60_000, Date.now(), MAX_INFLIGHT_MS);
+  assert.deepEqual(reaped, [], "an in-flight transient within the deadline survives");
+  assert.equal(mgr.activeCount, 1);
+});
+
+test("reapIdle: an idle untagged transient is NOT idle-reaped (idle branch is consumer-only)", async () => {
+  const { factory } = makeControllableFactory({ closeMode: "resolve" });
+  const mgr = teardownMgr(1, factory);
+  await mgr.acquire(); // untagged, inFlight 0
+  const future = Date.now() + 10_000_000;
+  const reaped = await mgr.reapIdle(0, future, MAX_INFLIGHT_MS); // ttl 0 → everything is "idle"
+  assert.deepEqual(reaped, [], "an untagged transient is invisible to the idle-TTL branch");
+  assert.equal(mgr.activeCount, 1);
+});
+
+test("reapIdle: skips a session already tearing down (no double close)", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "reject", killMode: "hang" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire(undefined, { consumerId: "a" });
+  s.beginActivity();
+  const relP = mgr.release(s.id); // teardown in flight (in #closing); kill hangs
+  await tick();
+  const future = Date.now() + MAX_INFLIGHT_MS + 1_000;
+  const reaped = await mgr.reapIdle(60_000, future, MAX_INFLIGHT_MS);
+  assert.equal(reaped.includes(s.id), false, "a session mid-teardown is not re-selected");
+  assert.equal(cores[0].closeCalls, 1, "close was not run a second time");
+  cores[0].releaseKill(true);
+  await relP;
+});
+
+test("shutdown: refuses new acquires and AWAITS a pending teardown", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "reject", killMode: "hang" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  const relP = mgr.release(s.id); // teardown pending on the hanging kill
+  await tick();
+  let shutDone = false;
+  const shutP = mgr.shutdown().then(() => {
+    shutDone = true;
+  });
+  await tick();
+  assert.equal(shutDone, false, "shutdown blocks on the pending teardown");
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT", "acquire refused mid-shutdown");
+  cores[0].releaseKill(true);
+  await relP;
+  await shutP;
+  assert.equal(shutDone, true, "shutdown completes once the teardown confirms");
+  assert.equal(mgr.activeCount, 0);
+  assert.equal(cores[0].killed, true);
+});
+
+test("acquire racing shutdown: the launched core is torn down and never registered", async () => {
+  const gate = deferred();
+  const built = [];
+  const factory = async () => {
+    await gate.promise; // hold the launch open until the test releases it
+    const core = makeControllableCore({ closeMode: "resolve" });
+    built.push(core);
+    return core;
+  };
+  const mgr = teardownMgr(2, factory);
+  const acqP = mgr.acquire(); // enters #launchAndRegister, blocks on the gate
+  await tick();
+  const shutP = mgr.shutdown(); // flips #shuttingDown, awaits #launching (this acquire)
+  await tick();
+  gate.resolve(); // factory resolves → re-check sees shutting down → self-teardown the orphan, throw
+  await assert.rejects(acqP, (e) => e.code === "SESSION_LIMIT");
+  await shutP;
+  assert.equal(built.length, 1, "the core did launch");
+  assert.equal(built[0].closed, true, "the shutdown-racing orphan was torn down");
+  assert.equal(mgr.activeCount, 0, "the orphan was never registered as a session");
+});
+
+test("forceKillAvailable: surfaces false when a core cannot capture its PID (health signal)", async () => {
+  const { factory } = makeControllableFactory({ forceKillAvailable: false });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  assert.equal(mgr.forceKillAvailable, false, "manager reports force-kill degraded");
+  assert.equal(s.info.forceKillAvailable, false, "session info surfaces the degradation");
+});
+
+test("teardown: with force-kill unavailable, a wedged close stays a counted zombie (documented degrade)", async () => {
+  // No PID captured → kill() rejects immediately ("unavailable"). A wedged close then has no recourse and
+  // stays counted (reverts to pre-#50 behavior) rather than false-freeing a slot.
+  const { factory } = makeControllableFactory({ closeMode: "reject", killMode: "reject", forceKillAvailable: false });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 1, "no PID → no confirmed death → slot stays counted (never false-freed)");
 });

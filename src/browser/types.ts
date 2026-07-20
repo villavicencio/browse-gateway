@@ -312,8 +312,31 @@ export interface BrowserCore {
    * gateway's authenticated path, which installs a guard before any navigation.
    */
   setNavigationGuard(guard: NavigationGuard): Promise<void>;
-  /** Tear down the browser and release all processes. */
+  /**
+   * Graceful teardown: close the browser and release all processes. RESOLVES only once the process is
+   * confirmed gone (a resolved close is trusted death — the vehicle's own close either exits cleanly or
+   * force-kills on its internal timeout before resolving). REJECTS if the close fails, so the caller can
+   * escalate to {@link kill} rather than mistaking a wedged/failed close for a dead browser (issue #50).
+   */
   close(): Promise<void>;
+  /**
+   * Force-kill the browser process (issue #50): SIGKILL the process (group + leader) and CONFIRM the OS
+   * process is gone — resolving ONLY on a confirmed exit (child `'exit'` / `kill(pid,0)`→ESRCH) within
+   * `confirmMs`, REJECTING if death cannot be confirmed in that window. Idempotent and re-runnable: a
+   * second call re-sends the signal and re-confirms, so a session-manager reconfirm loop can retry a
+   * previously-unconfirmed kill. REJECTS immediately when force-kill is unavailable (no PID captured at
+   * launch — see {@link forceKillAvailable}); the caller treats that as an unconfirmed, still-counted
+   * teardown. Confirmation NEVER trusts the group-kill's own ESRCH (a wrong/absent group would falsely
+   * read as dead) — only the leader pid's liveness.
+   */
+  kill(confirmMs: number): Promise<void>;
+  /**
+   * Whether {@link kill} can actually force-kill this core — true when the Chromium PID was captured at
+   * launch. False means force-kill degraded to unavailable (a patchright internal changed shape); teardown
+   * falls back to graceful-close-only and a wedged close stays a counted zombie. Surfaced to health so a
+   * degraded process is observable without log-grepping.
+   */
+  readonly forceKillAvailable: boolean;
 
   // --- Interactive `drive` surface (stateful path) -------------------------------------------
   // These act on a single persistent "active page" within the core's guarded context, so every

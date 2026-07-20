@@ -23,6 +23,7 @@ import {
   resolveCoreOptions,
   type ResolvedCoreOptions,
 } from "./launch-options.js";
+import type { ChildProcess } from "node:child_process";
 import type {
   BrowserCore,
   BrowserCoreOptions,
@@ -47,6 +48,38 @@ type PatchrightLocator = ReturnType<PatchrightPage["locator"]>;
 type PatchrightBrowser = NonNullable<ReturnType<PatchrightContext["browser"]>>;
 /** Browser-level CDP session type, derived so we don't depend on a named patchright export. */
 type CDPSession = Awaited<ReturnType<PatchrightBrowser["newBrowserCDPSession"]>>;
+
+/**
+ * Reach the launched Chromium OS process handle ONCE at launch, for the issue #50 force-kill primitive.
+ *
+ * patchright/Playwright expose no public child-process handle for a persistent context, so we cross the
+ * in-process client↔server bridge that patchright itself uses (`_connection.toImpl`, wired because
+ * patchright runs client and server in the same Node process): the client context resolves to the
+ * server-side CRBrowserContext, whose `_browser.options.browserProcess.process` IS the Node
+ * {@link ChildProcess} Chromium was spawned as. That handle gives us the leader PID (for a SIGKILL of
+ * the process group) and an authoritative `'exit'` event (for death confirmation) with no live CDP
+ * dependency, so it works even when the browser is CDP-wedged.
+ *
+ * Every link is feature-detected and the whole reach is try-wrapped: a future patchright that renames an
+ * internal returns `undefined` here (force-kill degrades to unavailable — {@link PatchrightBrowserCore.forceKillAvailable}),
+ * it NEVER throws at launch. The in-container gate asserts this succeeds on the shipping `channel:"chrome"`
+ * build so a patchright bump that breaks it fails CI before deploy, not silently in prod.
+ */
+function captureBrowserProcess(
+  context: PatchrightContext,
+): { pid: number; child: ChildProcess } | undefined {
+  try {
+    const conn = (context as unknown as { _connection?: { toImpl?: (o: unknown) => unknown } })._connection;
+    const impl = conn?.toImpl?.(context) as
+      | { _browser?: { options?: { browserProcess?: { process?: ChildProcess } } } }
+      | undefined;
+    const child = impl?._browser?.options?.browserProcess?.process;
+    if (child && typeof child.pid === "number") return { pid: child.pid, child };
+  } catch {
+    // Any shape change in the internal reach → degrade (return undefined), never throw at launch.
+  }
+  return undefined;
+}
 
 /** The subset of the CDP `Fetch.requestPaused` event the navigation guard reads. */
 interface FetchRequestPaused {
@@ -348,6 +381,14 @@ export class PatchrightBrowserCore implements BrowserCore {
    * paused at the close instant must not be auto-allowed past the guard.
    */
   #closing = false;
+  /**
+   * The launched Chromium's leader PID and Node ChildProcess handle, captured once at launch for the
+   * issue #50 force-kill primitive. `undefined` when capture failed (a patchright internal changed shape)
+   * — then {@link forceKillAvailable} is false and {@link kill} rejects (teardown degrades to
+   * graceful-close-only). Never used for anything but SIGKILL + death-confirmation.
+   */
+  readonly #pid?: number;
+  readonly #child?: ChildProcess;
   /** The single persistent page the interactive `drive` verbs act on (absent until navigate()). */
   #activePage?: PatchrightPage;
   /**
@@ -381,6 +422,18 @@ export class PatchrightBrowserCore implements BrowserCore {
     this.#solver = solver;
     this.#windowsUaHosts = windowsUaHosts;
     this.#redact = redact;
+    const captured = captureBrowserProcess(context);
+    this.#pid = captured?.pid;
+    this.#child = captured?.child;
+    if (!captured) {
+      // Loud, distinctive, non-fatal (issue #50): the gateway is uptime-critical, so a patchright internal
+      // rename must degrade force-kill, not down the whole process. The in-container capture gate is the
+      // real tripwire; `forceKillAvailable` is surfaced to health so a degraded process is observable.
+      process.stderr.write(
+        "[browse-gateway] force-kill UNAVAILABLE: could not capture the Chromium PID at launch " +
+          "(patchright internal shape changed); a wedged close will fall back to graceful-close-only\n",
+      );
+    }
   }
 
   static async launch(
@@ -1102,6 +1155,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     return this.#context;
   }
 
+  /** Whether {@link kill} can force-kill this core — true iff the Chromium PID was captured at launch. */
+  get forceKillAvailable(): boolean {
+    return this.#pid !== undefined;
+  }
+
   async close(): Promise<void> {
     // Flip fail-closed FIRST so #onRequestPaused stops allowing during teardown. Then DETACH the
     // session (not Fetch.disable): Fetch.disable releases every still-paused request by CONTINUING it
@@ -1113,7 +1171,81 @@ export class PatchrightBrowserCore implements BrowserCore {
       await this.#cdpGuardSession.detach().catch(() => {});
       this.#cdpGuardSession = undefined;
     }
-    await this.#context.close().catch(() => {});
+    // Let a context.close() failure PROPAGATE (issue #50): the session manager frees a capacity slot only
+    // on a CONFIRMED close, so a swallowed failure would let it treat a still-alive browser as dead and
+    // admit a replacement past the cap. A failed/wedged close now surfaces so the manager escalates to
+    // kill() instead of mistaking it for a dead browser. The guard-detach above stays best-effort —
+    // detaching an already-gone CDP session is benign and must not block or fail the real teardown.
+    await this.#context.close();
+  }
+
+  /**
+   * Force-kill the browser (issue #50). SIGKILLs the process GROUP (-pid — reaps Chromium's
+   * renderer/GPU/zygote children, since patchright spawns Chrome detached as its own group leader) AND
+   * the leader pid itself as belt-and-braces (in case the group-leader assumption ever fails in a new
+   * env; `--init`/tini then reaps any reparented child). Then CONFIRMS death within `confirmMs` via the
+   * ChildProcess `'exit'` event and/or a `kill(pid,0)` liveness poll on the LEADER pid — never via the
+   * group-kill's own ESRCH (a wrong/absent group would falsely read as dead). Idempotent + re-runnable:
+   * a second call re-signals and re-confirms, so the manager's reconfirm loop can retry an unconfirmed
+   * kill. Rejects immediately when no PID was captured (force-kill unavailable).
+   */
+  async kill(confirmMs: number): Promise<void> {
+    const pid = this.#pid;
+    if (pid === undefined) {
+      throw new Error("force-kill unavailable: no Chromium PID captured at launch");
+    }
+    this.#closing = true; // fail-closed during teardown, same as close()
+    const child = this.#child;
+    // Already reaped? Use exitCode (set on the 'exit' event), NOT child.killed — .killed only means a
+    // signal was successfully SENT, not that the OS reaped the process.
+    if (child && child.exitCode !== null) return;
+    this.#sigkill(-pid); // process group: renderers/GPU/zygote
+    this.#sigkill(pid); // leader, belt-and-braces
+    await this.#confirmProcessDead(pid, child, confirmMs);
+  }
+
+  /** Best-effort SIGKILL. ESRCH (target already gone) is success-shaped input to the confirm step, not an
+   *  error; any other errno is logged and swallowed — the confirm poll is the source of truth for death. */
+  #sigkill(target: number): void {
+    try {
+      process.kill(target, "SIGKILL");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH") {
+        process.stderr.write(`[browse-gateway] SIGKILL ${target} failed (${errCode(err, this.#redact)})\n`);
+      }
+    }
+  }
+
+  /** Resolve once the LEADER pid is confirmed gone (ChildProcess `'exit'` OR `kill(pid,0)`→ESRCH), reject
+   *  if not confirmed within `deadlineMs`. All timers unref'd; listeners cleaned up on settle. */
+  #confirmProcessDead(pid: number, child: ChildProcess | undefined, deadlineMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (dead: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        clearTimeout(deadline);
+        if (child) child.removeListener("exit", onExit);
+        if (dead) resolve();
+        else reject(new Error(`force-kill: pid ${pid} not confirmed dead within ${deadlineMs}ms`));
+      };
+      const onExit = (): void => finish(true);
+      if (child) child.once("exit", onExit);
+      const probe = (): void => {
+        try {
+          process.kill(pid, 0); // signal 0 = liveness probe; throws ESRCH once the pid is gone
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ESRCH") finish(true);
+        }
+      };
+      const poll = setInterval(probe, 100);
+      poll.unref?.();
+      const deadline = setTimeout(() => finish(false), deadlineMs);
+      deadline.unref?.();
+      probe(); // the process may already be gone
+    });
   }
 }
 

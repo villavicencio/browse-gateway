@@ -21,6 +21,9 @@ export interface SessionInfo {
   consumerId?: string;
   /** The owned core's kind, e.g. "patchright". */
   core: string;
+  /** Whether this session's browser can be force-killed (issue #50) — false = force-kill degraded to
+   *  graceful-close-only for it (PID capture failed at launch). Surfaced so a degraded process is visible. */
+  forceKillAvailable: boolean;
 }
 
 export class Session {
@@ -99,6 +102,11 @@ export class Session {
     return this.#core;
   }
 
+  /** Whether this session's browser can be force-killed (issue #50) — proxies the owned core. */
+  get forceKillAvailable(): boolean {
+    return this.#core.forceKillAvailable;
+  }
+
   get info(): SessionInfo {
     return {
       id: this.id,
@@ -108,17 +116,63 @@ export class Session {
       inFlight: this.#inFlight,
       ...(this.consumerId ? { consumerId: this.consumerId } : {}),
       core: this.#core.kind,
+      forceKillAvailable: this.#core.forceKillAvailable,
     };
   }
 
   /**
-   * Close the underlying core and mark the session closed. Idempotent and
-   * concurrency-safe: the state flips before the await, so a second (or racing) call
-   * is a no-op and the core is never double-closed.
+   * Tear the session down with CONFIRMED death (issue #50): attempt a graceful `core.close()` raced
+   * against `closeGraceMs`; a clean close is trusted death (the core resolves close only once the
+   * process has exited). If the close fails fast OR is still pending at the grace deadline, abandon it
+   * and escalate to `core.kill()` (SIGKILL + confirm within `killConfirmMs`). Flips the session to
+   * `closed` and RESOLVES only when death is confirmed by either path; REJECTS if the force-kill can't
+   * confirm the process died in time, leaving the session `open` (the manager keeps it counted and hands
+   * it to the reconfirm loop). Idempotent: an already-closed session is a no-op.
+   *
+   * The session manager dedupes concurrent teardowns (its `#closing` map), so this runs at most once per
+   * session; the core's own close/kill are the only things touching the browser.
    */
-  async close(): Promise<void> {
+  async teardown(closeGraceMs: number, killConfirmMs: number): Promise<void> {
     if (this.#state === "closed") return;
+    const closeP = this.#core.close();
+    const grace = graceTimer(closeGraceMs);
+    // 'closed' fires only on a CLEAN resolve; a rejecting close surfaces as 'close-failed' → escalate.
+    const outcome = await Promise.race([
+      closeP.then(() => "closed" as const, () => "close-failed" as const),
+      grace.promise.then(() => "timeout" as const),
+    ]);
+    grace.clear(); // don't leave a dangling ~10s timer on the common clean-close path
+    if (outcome === "closed") {
+      this.#state = "closed";
+      return;
+    }
+    closeP.catch(() => {}); // abandon a still-pending / rejected close without an unhandled rejection
+    await this.#core.kill(killConfirmMs); // throws if death can't be confirmed → session stays 'open'
     this.#state = "closed";
-    await this.#core.close();
   }
+
+  /**
+   * Kill-only reconfirm (issue #50): re-SIGKILL and re-confirm death, WITHOUT ever calling `core.close()`
+   * again. The manager's reconfirm loop calls this every reaper tick for a session whose {@link teardown}
+   * couldn't confirm the kill. Calling `close()` here would be unsafe — after the earlier SIGKILL tore
+   * down the CDP transport, `core.close()` resolves instantly and would be mistaken for a clean death
+   * while the OS process is still alive. `core.kill()` re-probes the real pid, so it only confirms a
+   * genuine exit. Flips to `closed` on confirm; rejects (stays `open`) if still unconfirmed.
+   */
+  async reconfirm(killConfirmMs: number): Promise<void> {
+    if (this.#state === "closed") return;
+    await this.#core.kill(killConfirmMs);
+    this.#state = "closed";
+  }
+}
+
+/** A cancellable delay: `promise` resolves after `ms`; `clear()` cancels the (unref'd) timer so a
+ *  clean close doesn't leave a dangling grace timer alive. */
+function graceTimer(ms: number): { promise: Promise<void>; clear: () => void } {
+  let handle: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((resolve) => {
+    handle = setTimeout(resolve, ms);
+    handle.unref?.();
+  });
+  return { promise, clear: () => clearTimeout(handle) };
 }
