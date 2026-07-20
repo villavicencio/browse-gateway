@@ -111,22 +111,28 @@ function normalizeEscapedUrl(s: string): string {
 }
 
 /**
- * Reduce a URL to ORIGIN + DEPTH only — the robust default, because sensitive material hides in more
- * than the query: userinfo (`user:pass@`), a path SEGMENT (a reset / magic-link token), the query, and
- * the fragment can all carry credentials, and none can be enumerated. For an http(s) URL the surfaced
- * form is `scheme://host[:port]` + (`/` for root, else `/<redacted>`) + a `?<redacted>` / `#<redacted>`
- * marker when a query/fragment was present. The ROOT-vs-DEEP distinction is preserved (#48's
- * home-fallback detection runs on the RAW url internally and surfaces only a boolean slot, so it does
- * NOT depend on the surfaced literal path — collapsing it is safe). Escaped-slash notation is normalized
- * first (fix for the JSON-escaped-URL bypass). A non-http scheme keeps its shape minus userinfo/query/
- * fragment; a non-parseable value is returned unchanged (the secret + header scrubbers still run over it).
+ * Reduce a URL to a minimal, FAIL-CLOSED form — the robust default, because sensitive material hides in
+ * more than the query: userinfo (`user:pass@`), a path SEGMENT (a reset / magic-link token), the query,
+ * the fragment, and a non-http opaque body (a `data:`/`javascript:` payload) can all carry credentials,
+ * and none can be enumerated.
+ *   - http(s): surfaced as `scheme://host[:port]` + (`/` for root, else `/<redacted>`) + `?<redacted>` /
+ *     `#<redacted>` markers when present. The HOST is KEPT — it is the essential "which site failed"
+ *     diagnostic; a secret encoded in a hostname label (DNS-exfil) is an accepted residual (see the note
+ *     on {@link redactFailureDiagnostics}). The ROOT-vs-DEEP path distinction is preserved (#48 runs on
+ *     the RAW url internally and surfaces only a boolean, so collapsing the surfaced path is safe).
+ *   - ANY non-http scheme (`data:`, `blob:`, `javascript:`, `filesystem:`, `file:`, `about:`,
+ *     `chrome-error:`, …): collapsed to `scheme:<redacted>` — the opaque body is NEVER kept (a
+ *     `data:text/html,<token>` would otherwise leak its payload), only the scheme + presence markers.
+ *   - Un-parseable (e.g. an out-of-range port `:99999`, which `new URL` REJECTS): returns
+ *     `<unparseable-url>` rather than the raw string — fail closed, never leak an unparsed cred/token.
+ * Escaped-slash notation is normalized first (the JSON-escaped-URL bypass fix).
  */
 function sanitizeUrl(raw: string): string {
   let u: URL;
   try {
     u = new URL(normalizeEscapedUrl(raw));
   } catch {
-    return raw;
+    return "<unparseable-url>"; // fail closed: a rejected URL (bad port, malformed) must not leak raw
   }
   const marker = (u.search.length > 0 ? "?<redacted>" : "") + (u.hash.length > 0 ? "#<redacted>" : "");
   if (u.protocol === "http:" || u.protocol === "https:") {
@@ -135,21 +141,19 @@ function sanitizeUrl(raw: string): string {
     const deep = u.pathname !== "" && u.pathname !== "/";
     return `${u.protocol}//${u.host}${deep ? "/<redacted>" : "/"}${marker}`;
   }
-  // Non-http scheme (about:, chrome-error:, data:, …): strip userinfo/query/fragment, keep the rest.
-  u.username = "";
-  u.password = "";
-  u.search = "";
-  u.hash = "";
-  return u.toString() + marker;
+  // Any non-http scheme: collapse the opaque body entirely — keep only the scheme + presence markers.
+  return `${u.protocol}<redacted>${marker}`;
 }
 
-/** Sanitize every http(s) URL embedded in a free-text line (a console error / network line frequently
- *  carries a full URL with its query), so an OAuth/token URL can't leak through a dump field either.
- *  Matches the backslash-escaped slash notation too (`https:\/\/…`), which the plain `//` form missed;
- *  the char class keeps backslashes so the escaped path is consumed and normalized inside sanitizeUrl. */
+/** Sanitize every URL embedded in a free-text line (a console/network line frequently carries a full URL
+ *  with its query/token). Two passes: http(s) — matching the backslash-escaped `https:\/\/…` notation
+ *  too (the char class keeps backslashes so the escaped path is consumed and normalized inside
+ *  sanitizeUrl) — and a scheme-agnostic pass for the RISKY opaque-body schemes (`data:`/`blob:`/
+ *  `javascript:`/…), whose payloads must also be collapsed, not just http(s) URLs. */
 const URL_IN_TEXT_RE = /https?:(?:\\?\/){2}[^\s"'<>)\]]+/gi;
+const RISKY_SCHEME_IN_TEXT_RE = /\b(?:data|blob|javascript|vbscript|filesystem|file|about|chrome-error):[^\s"']+/gi;
 function sanitizeUrlsInText(s: string): string {
-  return s.replace(URL_IN_TEXT_RE, (m) => sanitizeUrl(m));
+  return s.replace(URL_IN_TEXT_RE, (m) => sanitizeUrl(m)).replace(RISKY_SCHEME_IN_TEXT_RE, (m) => sanitizeUrl(m));
 }
 
 /**
@@ -159,29 +163,42 @@ function sanitizeUrlsInText(s: string): string {
  * quoted / JSON key (`"Cookie":"…"`, `'authorization': '…'`, `Set-Cookie` inside a JSON blob), a `=`
  * separator, a quoted OR bare value, AND folded continuation lines — BOTH the RFC-style indented form
  * (`\n[ \t]+…`) AND an UNINDENTED next line that does NOT itself start a new header field (a token split
- * across a raw `\n`), so the tail can't leak. The continuation STOPS at a real next field (`name:` /
- * `name=`), so a following `Content-Type: …` still ends the redaction. Over-redaction (swallowing an
- * unrelated non-field follow-on line) is the safe direction here.
+ * across a raw `\n`), so the tail can't leak. The continuation STOPS ONLY at a real next COLON-form field
+ * (`name:`), NOT at a `key=value` line — so a `Content-Type: …` ends the redaction while an
+ * `access_token=…` continuation tail is swallowed (the `[:=]`→`:`-only boundary fix). Over-redaction
+ * (swallowing an unrelated non-field follow-on line) is the safe direction here.
  */
 const SENSITIVE_HEADER_RE =
-  /(["']?)\b(set-cookie|cookie|authorization)\b\1(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S[^\n]*(?:\n(?:[ \t]+\S|(?![ \t]*[\w-]+\s*[:=])\S)[^\n]*)*)/gi;
+  /(["']?)\b(set-cookie|cookie|authorization)\b\1(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S[^\n]*(?:\n(?:[ \t]+\S|(?![ \t]*[\w-]+\s*:)\S)[^\n]*)*)/gi;
 function stripSensitiveHeaders(s: string): string {
   return s.replace(SENSITIVE_HEADER_RE, (_m, q: string, name: string, sep: string) => `${q}${name}${q}${sep}[REDACTED]`);
 }
 
 /**
- * Redact an envelope before it is serialized to a caller/log (redact-before-serialize, R9). Applies
- * three scrubbers so a leak does NOT depend on a value being a registered secret:
- *   1. URL sanitization ({@link sanitizeUrl}) — reduces finalUrl, every redirectChain entry, and any URL
- *      embedded in a console/network line to ORIGIN + DEPTH: userinfo (`user:pass@`), the path segments,
- *      the query, and the fragment are all dropped (catches basic-auth creds, reset/magic-link path
- *      tokens, and unregistered OAuth codes — incl. the backslash-escaped `https:\/\/…` notation);
+ * Redact an envelope before it is serialized to a caller/log (redact-before-serialize, R9). A
+ * FAIL-CLOSED posture: a leak does NOT depend on a value being a registered secret. Applies —
+ *   1. URL sanitization ({@link sanitizeUrl}) — finalUrl, every redirectChain entry, and any URL embedded
+ *      in a console/network line: http(s) → origin + depth (userinfo, path segments, query, fragment all
+ *      dropped); any non-http scheme → `scheme:<redacted>` (opaque body dropped); un-parseable →
+ *      `<unparseable-url>`;
  *   2. the registered-secret pass (`redactSecrets`) — proxy/vault/consumer credential VALUES;
  *   3. cookie/set-cookie/authorization header stripping (quoted, JSON, `=`, and indented OR unindented
- *      folded continuations).
+ *      folded continuations WITHIN an entry; a `key=value` continuation tail is swallowed — the boundary
+ *      is a COLON-form next field only).
  * The `screenshotRef` (opaque base64 bytes) and the numeric/boolean slots pass through untouched.
  * `secrets` is a structural store (`{ redactableValues(): readonly string[] }`) — passing the VALUE SET
  * (not an opaque redactor) keeps the secret pass single-pass so a value can't fragment across redactors.
+ *
+ * ACCEPTED RESIDUALS (documented, deliberately not closed):
+ *   - the http(s) HOST is KEPT — it is the essential "which site failed" diagnostic for internal
+ *     consumers, and destroying it to defend a secret encoded in a DNS label (exotic hostname-exfil) is
+ *     not worth the diagnostic loss;
+ *   - a sensitive-header value SPLIT ACROSS TWO ARRAY ENTRIES is not carried. Each entry is scrubbed
+ *     independently. This is UNREACHABLE in the capture model — a console entry is one atomic `msg.text()`
+ *     and a networkFailures entry is `METHOD url errText` with NO header material — and a cross-entry
+ *     "continuation" carry cannot be distinguished from two independent complete entries, so it would
+ *     redact whole unrelated diagnostic entries (a `set-cookie:` ending one line would wipe the next).
+ *     Per the redaction-vs-diagnostic-value trade-off, the carry is intentionally NOT implemented.
  */
 export function redactFailureDiagnostics(
   diag: FailureDiagnostics,
@@ -198,6 +215,22 @@ export function redactFailureDiagnostics(
   if (diag.consoleErrors) out.consoleErrors = diag.consoleErrors.map(scrubText);
   if (diag.networkFailures) out.networkFailures = diag.networkFailures.map(scrubText);
   return out;
+}
+
+/**
+ * Sanitize a URL for a caller-facing ERROR STRING (not an envelope field) — e.g. the retrieve failure
+ * message that interpolates the requested URL, or a drive error carrying a raw target URL. Same
+ * fail-closed reduction as the envelope's URL fields (origin+depth for http(s), `scheme:<redacted>` for
+ * non-http, `<unparseable-url>` on a parse failure), so no error surface echoes an unsanitized URL.
+ */
+export function sanitizeUrlForError(raw: string): string {
+  return sanitizeUrl(raw);
+}
+
+/** Sanitize every URL embedded in a free-text error MESSAGE (a drive error interpolates a raw target
+ *  URL). Reuses the envelope's in-text URL scrubber so an error surface can't echo an unsanitized URL. */
+export function sanitizeUrlsInErrorText(s: string): string {
+  return sanitizeUrlsInText(s);
 }
 
 /**

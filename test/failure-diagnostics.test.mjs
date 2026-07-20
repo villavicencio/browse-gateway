@@ -151,6 +151,35 @@ test("adversarial redaction r2 (EMPTY store): path tokens, basic-auth, escaped U
   assert.ok(red.consoleErrors[1].includes("Content-Type: text/html"), "a following real field is NOT swallowed");
 });
 
+test("fail-closed URL sanitize r3 (EMPTY store): unusual port, basic-auth, data: URL, key=value continuation", () => {
+  const diag = buildFailureDiagnostics({
+    // out-of-range port → new URL() REJECTS → fail closed (must NOT leak the raw creds/token).
+    finalUrl: "https://user:BASICPASS_TOK@idp.example:99999/reset/PATH_TOK?code=CODE_TOK",
+    redirectChain: [
+      "https://user:BASICPASS2_TOK@svc.example/magic/MAGIC_TOK", // basic-auth userinfo + path token
+      "data:text/html,<DATA_TOK>",                              // non-http opaque body
+    ],
+    consoleErrors: [
+      "loaded data:text/html,<DATACON_TOK> then failed",        // data: URL embedded in free text
+      "Authorization: Bearer FIRST_TOK\naccess_token=SECOND_TOK\nContent-Type: text/html", // key=value tail
+    ],
+  });
+  const red = redactFailureDiagnostics(diag, storeOf()); // EMPTY store
+  const blob = JSON.stringify(red);
+  for (const leak of [
+    "BASICPASS_TOK", "PATH_TOK", "CODE_TOK", "BASICPASS2_TOK", "MAGIC_TOK",
+    "DATA_TOK", "DATACON_TOK", "FIRST_TOK", "SECOND_TOK",
+  ]) {
+    assert.ok(!blob.includes(leak), `leak survived r3 redaction: ${leak}`);
+  }
+  assert.equal(red.finalUrl, "<unparseable-url>", "an out-of-range port fails closed");
+  assert.equal(red.redirectChain[0], "https://svc.example/<redacted>", "userinfo dropped, path collapsed, host kept");
+  assert.equal(red.redirectChain[1], "data:<redacted>", "non-http opaque body dropped");
+  assert.ok(red.consoleErrors[0].includes("data:<redacted>"), "embedded data: URL collapsed");
+  assert.match(red.consoleErrors[1], /Authorization:\s*\[REDACTED\]/i);
+  assert.ok(red.consoleErrors[1].includes("Content-Type: text/html"), "a real next COLON field survives");
+});
+
 // --- isRetrieveFailure predicate (shared by retrieve() and the MCP surface) -------------------
 
 test("isRetrieveFailure: blocked / empty / whitespace / failed-nav are failures; short-valid is not", () => {
@@ -285,6 +314,48 @@ test("an empty-content retrieve (status 200, blank markdown, NOT blocked) still 
   assert.match(res.content[0].text, /reason=empty-content/);
   assert.match(res.content[0].text, /failure:/, "the empty-content failure carries an evidence envelope");
   assert.match(res.content[0].text, /empty\.example\/article/);
+});
+
+test("the MCP retrieve error surface sanitizes the interpolated request URL (r3, no raw creds/token echoed)", async () => {
+  const raw = "https://user:PASS_LEAK@idp.example/reset/PATH_LEAK?code=CODE_LEAK";
+  const client = await connect({
+    retrieve: async () => outcome({ blocked: true, markdown: "", reason: "hard-block", status: 403 }),
+  });
+  const res = await client.callTool({ name: "retrieve", arguments: { url: raw } });
+  assert.equal(res.isError, true);
+  const text = res.content[0].text;
+  for (const leak of ["PASS_LEAK", "PATH_LEAK", "CODE_LEAK"]) {
+    assert.ok(!text.includes(leak), `the error surface echoed a raw ${leak}`);
+  }
+  assert.ok(text.includes("https://idp.example/"), "the origin is preserved for diagnostics");
+});
+
+test("the MCP retrieve CATCH surface sanitizes a raw URL in a thrown error message (r3)", async () => {
+  const client = await connect({
+    retrieve: async () => { throw new Error("unsupported URL scheme (https://user:CATCHPASS@x.example/p/CATCHTOK?c=CQ)"); },
+  });
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://x.example/" } });
+  assert.equal(res.isError, true);
+  for (const leak of ["CATCHPASS", "CATCHTOK", "CQ"]) {
+    assert.ok(!res.content[0].text.includes(leak), `the catch surface echoed a raw ${leak}`);
+  }
+});
+
+test("the drive fail() surface sanitizes a raw URL in the error message (r3)", async () => {
+  const drive = {
+    async open() {},
+    async navigate() { throw new Error("navigation failed for https://user:DRIVEPASS@site.example/deep/DRIVETOK?x=DQ"); },
+    async snapshot() { return { url: "u", title: "t", tree: "x", status: 200 }; },
+    async click() {}, async type() {}, async selectOption() {}, async pressKey() {},
+    async waitFor() {}, async screenshot() { return "QUJD"; }, async close() {},
+  };
+  const client = await connect({ drive });
+  const res = await client.callTool({ name: "browser_navigate", arguments: { url: "https://site.example/" } });
+  assert.equal(res.isError, true);
+  for (const leak of ["DRIVEPASS", "DRIVETOK", "DQ"]) {
+    assert.ok(!res.content[0].text.includes(leak), `the drive fail() surface echoed a raw ${leak}`);
+  }
+  assert.ok(res.content[0].text.includes("https://site.example/"), "the origin is preserved");
 });
 
 test("a successful retrieve carries NO failure envelope (success shape unchanged)", async () => {

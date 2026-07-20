@@ -9,6 +9,8 @@ export {
   buildFailureDiagnostics,
   redactFailureDiagnostics,
   summarizeFailureDiagnostics,
+  sanitizeUrlForError,
+  sanitizeUrlsInErrorText,
   attachFailure,
   failureOf,
   FAILURE_DIAGNOSTICS_CAP,

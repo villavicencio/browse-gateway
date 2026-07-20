@@ -9,7 +9,7 @@ import { z } from "zod";
 import type { DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
 import type { BlockReason, EscalationDiagnostics } from "../verbs/index.js";
 import { EscalationError, isRetrieveFailure } from "../verbs/index.js";
-import { summarizeFailureDiagnostics, failureOf } from "../observability/index.js";
+import { summarizeFailureDiagnostics, failureOf, sanitizeUrlForError, sanitizeUrlsInErrorText } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 
 /** The slice of a RetrieveResult the MCP tool reports. */
@@ -126,18 +126,21 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
             content: [
               {
                 type: "text",
-                text: `Could not retrieve readable content for ${url} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}${diag}${failure}`,
+                // Sanitize the interpolated REQUEST url — the raw input can carry userinfo/reset-token/
+                // OAuth-code (issue #39 r3: an error surface must not echo an unsanitized URL).
+                text: `Could not retrieve readable content for ${sanitizeUrlForError(url)} (reason=${why}, status=${result.status ?? "n/a"}, proxyUsed=${result.proxyUsed}, captchaSolved=${result.captchaSolved}).${hint}${diag}${failure}`,
               },
             ],
           };
         }
         return { content: [{ type: "text", text: result.markdown }] };
       } catch (err) {
-        // Gateway down / browser crash: a clean tool error, never a hang or a leaked secret.
+        // Gateway down / browser crash: a clean tool error, never a hang or a leaked secret. The message
+        // may carry a raw target URL (e.g. "unsupported URL scheme: … (<url>)"), so sanitize any URL in it.
         const message = err instanceof Error ? err.message : String(err);
         return {
           isError: true,
-          content: [{ type: "text", text: `browse-gateway error: ${message}` }],
+          content: [{ type: "text", text: `browse-gateway error: ${sanitizeUrlsInErrorText(message)}` }],
         };
       }
     },
@@ -149,7 +152,10 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
   const drive = deps.drive;
   if (drive) {
     const fail = (err: unknown) => {
-      let text = `browse-gateway error: ${err instanceof Error ? err.message : String(err)}`;
+      // Drive errors interpolate a raw target URL (`navigation failed … for <url>`, warm errors, etc.),
+      // so sanitize any URL in the message before it becomes tool text/logs (issue #39 r3).
+      const message = sanitizeUrlsInErrorText(err instanceof Error ? err.message : String(err));
+      let text = `browse-gateway error: ${message}`;
       // Attach structured escalation diagnostics when present so the caller sees WHY a proxied
       // navigation failed (proxy applied? which exit? what blocked it?). Secrets-free by construction.
       if (err instanceof EscalationError) text += `\ndiagnostics: ${JSON.stringify(err.diagnostics)}`;
