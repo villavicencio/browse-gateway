@@ -183,6 +183,26 @@ try {
   const chromeAfter = chromeCount();
   console.log(`     chrome procs: before=${chromeBefore} after=${chromeAfter}`);
   check("Db. the restore-failed browser was reaped (no orphaned Chrome)", chromeAfter <= chromeBefore);
+
+  // --- Section E: the process-GENERATION marker distinguishes a recycled pid (issue #50 r5) -----------
+  // The reuse-safe force-kill relies on /proc start-time telling OUR leader from a later process that
+  // reused the pid (real under pids_limit=512). Prove the primitive: a detached leader is its own group
+  // leader with a readable start-time, and a fresh process gets a DIFFERENT start-time.
+  const readStartTime = (pid) => {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return s.slice(s.lastIndexOf(")") + 2).split(" ")[19];
+  };
+  const g1 = spawn("bash", ["-c", "sleep 300"], { detached: true, stdio: "ignore" });
+  await new Promise((r) => setTimeout(r, 200));
+  const st1 = readStartTime(g1.pid);
+  check("E. a detached process is its own group leader with a readable start-time generation", pgidOf(g1.pid) === g1.pid && !!st1);
+  process.kill(-g1.pid, "SIGKILL");
+  await new Promise((r) => setTimeout(r, 200));
+  const g2 = spawn("bash", ["-c", "sleep 300"], { detached: true, stdio: "ignore" });
+  await new Promise((r) => setTimeout(r, 200));
+  const st2 = readStartTime(g2.pid);
+  check("Eb. a fresh process has a DIFFERENT start-time (a recycled pid would be told apart)", st1 !== st2);
+  process.kill(-g2.pid, "SIGKILL");
 } catch (err) {
   console.log(`  FAIL  threw: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
   failures++;

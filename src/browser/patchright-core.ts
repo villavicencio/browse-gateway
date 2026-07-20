@@ -24,6 +24,7 @@ import {
   type ResolvedCoreOptions,
 } from "./launch-options.js";
 import type { ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import type {
   BrowserCore,
   BrowserCoreOptions,
@@ -75,6 +76,27 @@ const LAUNCH_CLEANUP_KILL_CONFIRM_MS = 5_000;
  *  terminated (there's nothing to gate on). Never uses `child.killed` (that means "signal sent", not reaped). */
 function childTerminated(child: ChildProcess | undefined): boolean {
   return child !== undefined && (child.exitCode !== null || child.signalCode !== null);
+}
+
+/**
+ * Read `pid`'s process-group id and start-time from `/proc/<pid>/stat` (Linux). The start-time (field 22,
+ * jiffies since boot) is a stable per-process GENERATION marker: it lets the force-kill path tell OUR
+ * Chromium leader from an unrelated process that later reused the same pid — load-bearing under the
+ * container's small pid space (`pids_limit=512`), where a freed pgid can be recycled as a new group
+ * leader (issue #50 r5). Fields are parsed after the last ')' so a comm with spaces/parens can't shift
+ * offsets. Returns `undefined` when /proc is unavailable (e.g. macOS CLI) or the pid is gone.
+ */
+function readProcStat(pid: number): { pgrp: number; startTime: string } | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const after = stat.slice(stat.lastIndexOf(")") + 2).split(" "); // [state, ppid, pgrp, ... starttime@idx19]
+    const pgrp = after[2];
+    const startTime = after[19];
+    if (pgrp === undefined || startTime === undefined) return undefined;
+    return { pgrp: Number(pgrp), startTime };
+  } catch {
+    return undefined;
+  }
 }
 
 function captureBrowserProcess(
@@ -406,6 +428,10 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   readonly #pid?: number;
   readonly #child?: ChildProcess;
+  /** The leader's `/proc` start-time, captured at launch — a per-process GENERATION marker so the
+   *  force-kill path never mistakes a RECYCLED pid/pgid for our browser (issue #50 r5). `undefined` when
+   *  /proc is unavailable (macOS CLI) — the reuse check is then skipped (huge pid space → negligible). */
+  readonly #leaderStartTime?: string;
   /** The single persistent page the interactive `drive` verbs act on (absent until navigate()). */
   #activePage?: PatchrightPage;
   /**
@@ -442,6 +468,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     const captured = captureBrowserProcess(context);
     this.#pid = captured?.pid;
     this.#child = captured?.child;
+    this.#leaderStartTime = captured ? readProcStat(captured.pid)?.startTime : undefined;
     if (!captured) {
       // Loud, distinctive, non-fatal (issue #50): the gateway is uptime-critical, so a patchright internal
       // rename must degrade force-kill, not down the whole process. The in-container capture gate is the
@@ -479,13 +506,34 @@ export class PatchrightBrowserCore implements BrowserCore {
     // live browser on a wedged close — codex #50 r4). The solver + windowsUaHosts + redactor are runtime
     // dependencies (not launch args) — pass through.
     const core = new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? [], redact);
-    await restoreOrClose(context, opts.restoreState, async () => {
-      // Graceful close, then force-kill-confirm the process group (issue #50). Best-effort: the ORIGINAL
-      // restore error is what restoreOrClose surfaces. core.kill() short-circuits on an already-empty group.
-      await core.close().catch(() => {});
-      if (core.forceKillAvailable) await core.kill(LAUNCH_CLEANUP_KILL_CONFIRM_MS).catch(() => {});
-    });
+    await restoreOrClose(context, opts.restoreState, () => core.#teardownDiscarded(redact));
     return core;
+  }
+
+  /**
+   * BOUNDED confirmable teardown of a just-launched-then-DISCARDED browser (issue #50 r5) — used when a
+   * restore blob is malformed. There is no session state to preserve, so we FORCE-KILL directly (bounded
+   * by kill()'s own confirm deadline) rather than `await core.close()`, which on a wedged close would hang
+   * launch() forever. Best-effort: the ORIGINAL restore error is what the caller surfaces. When force-kill
+   * is unavailable (no PID), the graceful close is bounded by a timer so it still can't hang (patchright
+   * force-kills at its own internal 30s). RESIDUAL: an unconfirmed force-kill here leaves a best-effort-
+   * SIGKILL'd browser the launch layer can't hand to the manager's `#unconfirmed` set (launch() throws, no
+   * core is returned) — prod's container namespace reaps it; routing it into manager accounting would need
+   * a launch-contract change (tracked). Loudly logged either way.
+   */
+  async #teardownDiscarded(redact?: (s: string) => string): Promise<void> {
+    if (this.forceKillAvailable) {
+      await this.kill(LAUNCH_CLEANUP_KILL_CONFIRM_MS).catch((err) => {
+        process.stderr.write(`[browse-gateway] restore-cleanup: force-kill unconfirmed (${errCode(err, redact)})\n`);
+      });
+      return;
+    }
+    await Promise.race([
+      this.close().catch(() => {}),
+      new Promise<void>((r) => {
+        setTimeout(r, LAUNCH_CLEANUP_KILL_CONFIRM_MS).unref?.();
+      }),
+    ]);
   }
 
   /**
@@ -1228,21 +1276,36 @@ export class PatchrightBrowserCore implements BrowserCore {
       throw new Error("force-kill unavailable: no Chromium PID captured at launch");
     }
     this.#closing = true; // fail-closed during teardown, same as close()
-    if (this.#groupEmpty(pid)) return; // whole tree already gone — nothing to signal
+    if (this.#ourGroupGone(pid)) return; // our whole tree already gone (or the pgid was recycled) — no signal
     this.#sigkill(-pid); // process group: reaps renderers/GPU/zygote even if the leader already died
     if (!childTerminated(this.#child)) this.#sigkill(pid); // leader, only while its pid can't be recycled
-    await this.#confirmGroupEmpty(pid, confirmMs);
+    await this.#confirmGroupGone(pid, confirmMs);
   }
 
-  /** True when NO process remains in group `pid` — `kill(-pid, 0)` throws ESRCH only for an empty group.
-   *  A pgid isn't recycled while any member lives, so this never false-reports empty while our tree lives. */
-  #groupEmpty(pid: number): boolean {
+  /**
+   * True when OUR browser's process group has no living member — the reuse-safe successor to a bare
+   * `kill(-pid,0)` empty check (issue #50 r5). A truly-empty group ESRCHes. A NON-empty group `pid` is
+   * treated as GONE when it is a RECYCLED group — the pid is present AS A GROUP LEADER (`pgrp === pid`)
+   * with a start-time different from the one captured at launch — because under the container's small pid
+   * space (`pids_limit=512`) a freed pgid can be recycled as an unrelated group's leader, and we must
+   * never mistake that group for ours (and so never signal it on a reconfirm). A non-leader that merely
+   * reused the pid sits in a DIFFERENT group, so `kill(-pid, …)` never reaches it — a lingering child
+   * still keeps our group ours. When /proc is unavailable (macOS CLI) the recycle check is skipped.
+   */
+  #ourGroupGone(pid: number): boolean {
     try {
       process.kill(-pid, 0); // group liveness probe (signal 0): succeeds while any member lives
-      return false;
     } catch (err) {
-      return (err as NodeJS.ErrnoException).code === "ESRCH";
+      const code = (err as NodeJS.ErrnoException).code;
+      // ESRCH = truly empty. EPERM = a member we can't signal — not our same-uid Chrome, so our tree is gone.
+      return code === "ESRCH" || code === "EPERM";
     }
+    if (this.#leaderStartTime !== undefined) {
+      const stat = readProcStat(pid);
+      // Recycled group: pid present, IS a group leader (pgrp === pid), DIFFERENT generation → not ours.
+      if (stat && stat.pgrp === pid && stat.startTime !== this.#leaderStartTime) return true;
+    }
+    return false; // ours (leader alive, or a lingering child, or reuse-check unavailable) → non-empty
   }
 
   /** Best-effort SIGKILL. ESRCH (target already gone) is success-shaped input to the confirm step, not an
@@ -1258,9 +1321,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
   }
 
-  /** Resolve once the browser's whole process GROUP is empty (every captured-group member reaped), reject
-   *  if not within `deadlineMs`. Confirms the WHOLE tree is gone, not just the leader. Timers unref'd. */
-  #confirmGroupEmpty(pid: number, deadlineMs: number): Promise<void> {
+  /** Resolve once OUR browser's whole process group is gone (every captured-group member reaped; a
+   *  recycled pgid counts as gone — see {@link #ourGroupGone}), reject if not within `deadlineMs`.
+   *  Confirms the WHOLE tree, not just the leader. Confirm-ONLY — it never re-signals, so it can't hit a
+   *  recycled group. NOT unref'd: a force-kill confirm is foreground and must keep the loop alive. */
+  #confirmGroupGone(pid: number, deadlineMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       const finish = (dead: boolean): void => {
@@ -1269,10 +1334,10 @@ export class PatchrightBrowserCore implements BrowserCore {
         clearInterval(poll);
         clearTimeout(deadline);
         if (dead) resolve();
-        else reject(new Error(`force-kill: process group ${pid} not confirmed empty within ${deadlineMs}ms`));
+        else reject(new Error(`force-kill: process group ${pid} not confirmed gone within ${deadlineMs}ms`));
       };
       const probe = (): void => {
-        if (this.#groupEmpty(pid)) finish(true);
+        if (this.#ourGroupGone(pid)) finish(true);
       };
       // NOT unref'd: an in-flight force-kill confirmation is a foreground operation that must keep the
       // process alive until it settles — the browser ChildProcess handle no longer anchors the event loop
