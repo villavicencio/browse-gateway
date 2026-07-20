@@ -13,6 +13,16 @@ import type { SessionInfo } from "./session.js";
 
 export type CoreFactory = (opts: BrowserCoreOptions) => Promise<BrowserCore>;
 
+/**
+ * Ceiling on how long a single in-flight burst may hold the reaper off before it's treated as a
+ * WEDGED verb (hung browser/CDP, Xvfb wedge) and reclaimed regardless of the in-flight guard. A
+ * legitimate long navigate is ≤ ~210s worst case (PROXY_MAX_ATTEMPTS × (nav + clearance), see
+ * `retrieve.ts`), so 10 min unambiguously means "stuck", and a ≤10-min reclaim latency beats
+ * leaking the session + Chrome process + capacity slot forever. Not env-overridable by design —
+ * env-tunable timeouts are ticket #43; `reapIdle`/`startReaper` take an optional param for tests.
+ */
+export const MAX_INFLIGHT_MS = 600_000;
+
 export type SessionManagerErrorCode = "SESSION_LIMIT" | "CORE_LAUNCH";
 
 export class SessionManagerError extends Error {
@@ -141,13 +151,30 @@ export class SessionManager {
   /**
    * Close every consumer-bound (drive) session whose last activity is older than `ttlMs`, returning
    * the reaped ids. `now` is injectable for testing. Drive sessions are refreshed via
-   * `Session.touch()` on each use, so only genuinely idle ones are reaped — the load-bearing leak
-   * guard for held sessions. Transient (retrieve) sessions are untagged and released synchronously
-   * by their caller, so they are never reaped here and a mid-flight retrieve can't be closed under it.
+   * `Session.beginActivity()/endActivity()` on each use, so only genuinely idle ones are reaped — the
+   * load-bearing leak guard for held sessions. Transient (retrieve) sessions are untagged and released
+   * synchronously by their caller, so they are never reaped here and a mid-flight retrieve can't be
+   * closed under it.
+   *
+   * A session with a verb IN FLIGHT (`inFlight > 0`) is NOT reaped for being idle even past the TTL —
+   * closing the browser mid-navigate would hand a waiting caller a raw `no open session for handle …`.
+   * This mirrors the MCP transport's in-flight guard one layer up (`http-server.ts` `reapIdle`). But
+   * that guard is BOUNDED: a verb still in flight past `maxInFlightMs` is treated as WEDGED (hung
+   * browser/CDP, Xvfb wedge — its `finally` never runs, so `endActivity` never fires) and IS reaped,
+   * so a never-settling verb can't leak its session + Chrome process + capacity slot forever. So a
+   * consumer session is reclaimed when EITHER it is genuinely idle past `ttlMs`, OR it has been stuck
+   * in-flight longer than `maxInFlightMs`.
    */
-  async reapIdle(ttlMs: number, now: number = Date.now()): Promise<string[]> {
+  async reapIdle(
+    ttlMs: number,
+    now: number = Date.now(),
+    maxInFlightMs: number = MAX_INFLIGHT_MS,
+  ): Promise<string[]> {
     const stale = [...this.#sessions.values()].filter(
-      (s) => s.consumerId !== undefined && now - s.lastActivityAt > ttlMs,
+      (s) =>
+        s.consumerId !== undefined &&
+        ((s.inFlight === 0 && now - s.lastActivityAt > ttlMs) ||
+          (s.inFlight > 0 && s.inFlightMs(now) > maxInFlightMs)),
     );
     // Swallow per-session close failures: reapIdle is driven fire-and-forget from the reaper's
     // setInterval, so a single core.close() rejection must not surface as an unhandled rejection.
@@ -155,10 +182,11 @@ export class SessionManager {
     return stale.map((s) => s.id);
   }
 
-  /** Start a background timer that reaps idle sessions every `intervalMs`. Idempotent. */
-  startReaper(ttlMs: number, intervalMs: number): void {
+  /** Start a background timer that reaps idle sessions every `intervalMs`. Idempotent. `maxInFlightMs`
+   *  bounds the in-flight guard so a wedged verb is reclaimed rather than pinning a browser forever. */
+  startReaper(ttlMs: number, intervalMs: number, maxInFlightMs: number = MAX_INFLIGHT_MS): void {
     this.stopReaper();
-    const timer = setInterval(() => void this.reapIdle(ttlMs), intervalMs);
+    const timer = setInterval(() => void this.reapIdle(ttlMs, Date.now(), maxInFlightMs), intervalMs);
     timer.unref?.(); // never keep the process alive just for the reaper
     this.#reaperTimer = timer;
   }
