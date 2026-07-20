@@ -21,6 +21,7 @@ function makeFactory({ failTimes = 0, failGuard = false } = {}) {
       kind: "fake",
       closed: false,
       killed: false,
+      groupAlive: true, // the "process group" — a clean close reaps it; kill() short-circuits once empty
       forceKillAvailable: true,
       renderCalls: [],
       guardCalls: 0,
@@ -36,10 +37,13 @@ function makeFactory({ failTimes = 0, failGuard = false } = {}) {
       },
       async close() {
         this.closed = true;
+        this.groupAlive = false; // a clean close reaps the whole process tree
       },
       async kill() {
+        if (!this.groupAlive) return; // group already empty (clean close) → confirm without force-killing
         this.killed = true;
         this.closed = true;
+        this.groupAlive = false;
       },
     };
     cores.push(core);
@@ -61,6 +65,7 @@ function makeControllableCore({ closeMode = "resolve", killMode = "resolve", for
     kind: "fake",
     closed: false,
     killed: false,
+    groupAlive: true, // the "process group": a clean close reaps it; kill() confirms-empty without a force-kill
     forceKillAvailable,
     closeCalls: 0,
     killCalls: 0,
@@ -76,6 +81,7 @@ function makeControllableCore({ closeMode = "resolve", killMode = "resolve", for
       this.closeCalls++;
       if (this.closeMode === "resolve") {
         this.closed = true;
+        this.groupAlive = false; // clean close reaps the tree
         return;
       }
       if (this.closeMode === "reject") throw new Error("close boom");
@@ -83,6 +89,7 @@ function makeControllableCore({ closeMode = "resolve", killMode = "resolve", for
         closeRelease = (ok) => {
           if (ok) {
             this.closed = true;
+            this.groupAlive = false;
             resolve();
           } else reject(new Error("close boom (late)"));
         };
@@ -90,17 +97,21 @@ function makeControllableCore({ closeMode = "resolve", killMode = "resolve", for
     },
     async kill() {
       this.killCalls++;
+      if (!this.forceKillAvailable) throw new Error("force-kill unavailable"); // no PID captured
+      if (!this.groupAlive) return; // group already empty (e.g. after a clean close) → confirmed, no SIGKILL
       if (this.killMode === "resolve") {
         this.killed = true;
         this.closed = true;
+        this.groupAlive = false;
         return;
       }
-      if (this.killMode === "reject") throw new Error("kill unconfirmed");
+      if (this.killMode === "reject") throw new Error("kill unconfirmed"); // group stays alive (unconfirmed)
       return new Promise((resolve, reject) => {
         killRelease = (ok) => {
           if (ok) {
             this.killed = true;
             this.closed = true;
+            this.groupAlive = false;
             resolve();
           } else reject(new Error("kill unconfirmed (late)"));
         };
@@ -477,15 +488,32 @@ const teardownMgr = (maxSessions, factory, perConsumerMax) =>
     ...(perConsumerMax ? { perConsumerMax } : {}),
   });
 
-test("teardown: a clean close frees the slot without force-killing (non-regression)", async () => {
+test("teardown: a clean close frees the slot without force-killing (group already empty)", async () => {
   const { factory, cores } = makeControllableFactory({ closeMode: "resolve" });
   const mgr = teardownMgr(1, factory);
   const s = await mgr.acquire();
   await mgr.release(s.id);
   assert.equal(mgr.activeCount, 0, "slot freed on clean close");
   assert.equal(cores[0].closed, true);
-  assert.equal(cores[0].killed, false, "a clean close never force-kills");
-  assert.equal(cores[0].killCalls, 0);
+  assert.equal(cores[0].killed, false, "a clean close never actually SIGKILLs");
+  assert.equal(cores[0].killCalls, 1, "kill() is called to CONFIRM the group is empty, but short-circuits");
+});
+
+test("teardown: a clean close with a lingering child force-kills the survivor before freeing (codex #50 r4)", async () => {
+  // close() resolves but the process group is NOT empty (a renderer survived) → the group-confirm must
+  // escalate to a force-kill rather than free the slot with a live subprocess.
+  const { factory, cores } = makeControllableFactory({ closeMode: "resolve", killMode: "resolve" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  cores[0].groupAlive = true; // simulate: close resolves but a child lingers in the group
+  const origClose = cores[0].close.bind(cores[0]);
+  cores[0].close = async function () {
+    await origClose();
+    this.groupAlive = true; // a renderer survived the "clean" close
+  };
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 0, "slot freed only after the survivor was reaped");
+  assert.equal(cores[0].killed, true, "the lingering child was force-killed before the slot freed");
 });
 
 test("teardown: a wedged close escalates to force-kill (grace path) and reclaims the slot", async () => {

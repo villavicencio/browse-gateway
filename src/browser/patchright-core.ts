@@ -65,6 +65,10 @@ type CDPSession = Awaited<ReturnType<PatchrightBrowser["newBrowserCDPSession"]>>
  * it NEVER throws at launch. The in-container gate asserts this succeeds on the shipping `channel:"chrome"`
  * build so a patchright bump that breaks it fails CI before deploy, not silently in prod.
  */
+/** Death-confirmation deadline for the launch-time restore-failure cleanup force-kill (issue #50). Kept
+ *  local to the core (the gateway's KILL_CONFIRM_MS is the teardown-path budget; this is the launch path). */
+const LAUNCH_CLEANUP_KILL_CONFIRM_MS = 5_000;
+
 /** True once a ChildProcess has terminated by EITHER a normal exit (`exitCode` set) or a signal
  *  (`signalCode` set — a SIGKILL'd child keeps `exitCode === null`). The authoritative "process is gone,
  *  do not re-signal its pid" predicate for the force-kill path (issue #50). `undefined` child → not known
@@ -307,6 +311,7 @@ async function applyRestoreState(
 export async function restoreOrClose(
   context: PatchrightContext,
   restore?: RestoreState,
+  teardown?: () => Promise<void>,
 ): Promise<void> {
   if (!restore) return;
   try {
@@ -314,7 +319,11 @@ export async function restoreOrClose(
     // (the core is a dumb injector — host-scoping the cookies is the vault layer's job upstream).
     await applyRestoreState(context, restore.state);
   } catch (err) {
-    await context.close().catch(() => {});
+    // On restore failure, tear the just-launched browser down. When the caller supplies a CONFIRMABLE
+    // teardown (launch() passes graceful-close→force-kill-confirm — issue #50), use it so a wedged close
+    // can't orphan a live browser; direct callers/tests fall back to the legacy best-effort close.
+    if (teardown) await teardown().catch(() => {});
+    else await context.close().catch(() => {});
     throw err;
   }
 }
@@ -465,9 +474,18 @@ export class PatchrightBrowserCore implements BrowserCore {
     // It registers cookies + an init script only — no network request — so it predates and is
     // independent of the navigation guard the gateway installs next. restoreOrClose owns the
     // close-on-failure invariant so a bad blob can't orphan the just-launched Chrome.
-    await restoreOrClose(context, opts.restoreState);
-    // The solver + windowsUaHosts + redactor are runtime dependencies (not launch args) — pass through.
-    return new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? [], redact);
+    // Construct the core NOW — BEFORE restore — so the Chromium PID is captured and a restore failure can
+    // force-kill-CONFIRM the just-launched browser rather than best-effort-closing it (which could orphan a
+    // live browser on a wedged close — codex #50 r4). The solver + windowsUaHosts + redactor are runtime
+    // dependencies (not launch args) — pass through.
+    const core = new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? [], redact);
+    await restoreOrClose(context, opts.restoreState, async () => {
+      // Graceful close, then force-kill-confirm the process group (issue #50). Best-effort: the ORIGINAL
+      // restore error is what restoreOrClose surfaces. core.kill() short-circuits on an already-empty group.
+      await core.close().catch(() => {});
+      if (core.forceKillAvailable) await core.kill(LAUNCH_CLEANUP_KILL_CONFIRM_MS).catch(() => {});
+    });
+    return core;
   }
 
   /**

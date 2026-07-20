@@ -166,6 +166,22 @@ test("restoreOrClose: absent state is a no-op (ordinary cold session, context un
   assert.equal(ctx.initScript, null);
 });
 
+test("restoreOrClose: a supplied CONFIRMABLE teardown replaces the best-effort close on failure (issue #50)", async () => {
+  // launch() passes a graceful-close→force-kill-confirm teardown so a wedged restore-cleanup close can't
+  // orphan the just-launched browser. When supplied, it MUST be used instead of the raw context.close().
+  const boom = new Error("addCookies: malformed cookie");
+  const ctx = fakeContext({ cookiesThrow: boom });
+  const bad = { cookies: [{ name: "sid", value: "x" }], origins: [] };
+  let teardownCalls = 0;
+  await assert.rejects(
+    () => restoreOrClose(ctx, { state: bad, ownerHost: "ex.com" }, async () => { teardownCalls++; }),
+    (e) => e === boom,
+    "rethrows the ORIGINAL restore error",
+  );
+  assert.equal(teardownCalls, 1, "the confirmable teardown ran");
+  assert.equal(ctx.closed, 0, "the raw best-effort context.close() was NOT used when a teardown is supplied");
+});
+
 test("emitted script structurally carries both guards (regression backstop for the eval paths)", () => {
   const script = buildLocalStorageSeedScript(origins);
   assert.match(script, /o\.origin !== here/, "origin-guard present");

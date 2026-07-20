@@ -142,12 +142,17 @@ export class Session {
       grace.promise.then(() => "timeout" as const),
     ]);
     grace.clear(); // don't leave a dangling ~10s timer on the common clean-close path
-    if (outcome === "closed") {
-      this.#state = "closed";
-      return;
+    if (outcome !== "closed") closeP.catch(() => {}); // abandon a still-pending / rejected close cleanly
+    // Confirm the whole browser process GROUP is empty before freeing the slot — on BOTH the clean-close and
+    // the escalation path (codex #50 r4). A graceful close usually reaps the tree, but a lingering
+    // renderer/GPU child would otherwise free the slot with a live subprocess. core.kill() short-circuits
+    // when the group is already empty (the common clean-close case), group-SIGKILLs any survivor otherwise,
+    // and throws if the group can't be confirmed empty → the session stays 'open' (manager retains +
+    // reconfirms). When force-kill is UNAVAILABLE (no PID captured) we cannot group-confirm: a clean close is
+    // then trusted as death (pre-#50 behavior), while a failed/timed-out close is left unconfirmed via kill().
+    if (this.#core.forceKillAvailable || outcome !== "closed") {
+      await this.#core.kill(killConfirmMs);
     }
-    closeP.catch(() => {}); // abandon a still-pending / rejected close without an unhandled rejection
-    await this.#core.kill(killConfirmMs); // throws if death can't be confirmed → session stays 'open'
     this.#state = "closed";
   }
 

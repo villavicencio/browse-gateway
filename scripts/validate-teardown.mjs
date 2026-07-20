@@ -113,12 +113,17 @@ try {
   await mgr.release(s.id);
   check("3c. slot reclaimed after a force-killed session is released", mgr.activeCount === 0);
 
-  // --- Section B: manager teardown reclaims a live session for real -------------------------------
+  // --- Section B: manager teardown (clean close) reclaims a live session AND confirms the group empty ---
   const s2 = await mgr.acquire();
   const pid2 = capturePidFromContext(s2.core.context);
-  await mgr.release(s2.id);
+  const pgid2 = typeof pid2 === "number" ? pgidOf(pid2) : undefined;
+  await mgr.release(s2.id); // clean close path — the group-confirm must still leave the whole group empty
   check("4. release() frees the capacity slot", mgr.activeCount === 0);
-  check("4b. release() left no live browser process behind", pid2 === undefined || isDead(pid2));
+  check("4b. release() left no live leader process behind", pid2 === undefined || isDead(pid2));
+  check(
+    "4c. a CLEAN-close release leaves the whole process group empty (uniform group-confirm)",
+    pgid2 === undefined || procsInGroup(pgid2).length === 0,
+  );
 
   // --- Section C: leader-death != group-empty (the confirm must be group-based) --------------------
   // A detached leader with a surviving same-PGID child. SIGKILL only the leader; the child lives on in the
@@ -143,6 +148,41 @@ try {
     groupEmpty = e.code === "ESRCH";
   }
   check("Cb. a GROUP SIGKILL empties the group (kill(-pgid,0)->ESRCH) — the group-based confirm", groupEmpty);
+
+  // --- Section D: a malformed restore blob must not orphan the just-launched browser (issue #50 r4) ---
+  // launch() constructs the PID-bearing core BEFORE restore, so a restore failure runs a confirmable
+  // teardown (close→force-kill-confirm), not a best-effort close that could leak a live browser.
+  const chromeCount = () => {
+    let n = 0;
+    for (const name of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        const cmd = fs.readFileSync(`/proc/${name}/cmdline`, "utf8");
+        if (/chrome|chromium/i.test(cmd) && !/chrome-sandbox/.test(cmd)) n++;
+      } catch {
+        /* raced exit */
+      }
+    }
+    return n;
+  };
+  const { createBrowserCore } = await import("../dist/browser/index.js");
+  const chromeBefore = chromeCount();
+  const badRestore = {
+    state: { cookies: [{ name: "sid", value: "x" }], origins: [] }, // no domain/url → addCookies rejects
+    ownerHost: "example.com",
+  };
+  let threw = false;
+  try {
+    await createBrowserCore({ ...cfg.core, restoreState: badRestore });
+  } catch {
+    threw = true;
+  }
+  check("D. a malformed restore blob makes launch() throw (no leaked core returned)", threw);
+  // Give the confirmable teardown a moment to reap the just-launched browser, then confirm no net leak.
+  await new Promise((r) => setTimeout(r, 1_000));
+  const chromeAfter = chromeCount();
+  console.log(`     chrome procs: before=${chromeBefore} after=${chromeAfter}`);
+  check("Db. the restore-failed browser was reaped (no orphaned Chrome)", chromeAfter <= chromeBefore);
 } catch (err) {
   console.log(`  FAIL  threw: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
   failures++;
