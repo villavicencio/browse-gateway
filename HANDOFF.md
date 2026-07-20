@@ -1,111 +1,44 @@
-# HANDOFF — 2026-07-14
+# HANDOFF — 2026-07-20, afternoon
 
-Fable security-audit session. Under a `/goal` stop-hook — "resolve each fable finding one by one with
-adversarial review and commit after approvals until the list is exhausted" — closed the entire Fable
-read-only audit: **all 10 findings fixed + committed to `main`**, each landed only after an autonomous
-Codex adversarial-review loop returned `approve`. Then resolved the long-standing untracked `AGENTS.md`
-loose end (symlink → CLAUDE.md), made an operator call to **track (not fix) a newly-derived #11**, and
-compounded **two durable learnings** into `docs/solutions/`. `main == origin/main` at `1381451`; tree
-clean; no open PRs.
+Site-compatibility hardening session. Started from a `/pickup`, then the operator pointed at a wine-research failure inventory (`~/Obsidian/hermes/personal/discoveries/2026-07-17-obscura-site-compatibility-inventory.md`) and asked to turn it into a plan + GitHub tickets. That produced **epic #38 + 10 tickets (#39–#48)** and a self-contained strategy plan. The operator then said "kick off Wave 1" under **ultracode**, so I executed the two highest-leverage tickets (#39 keystone + #46) end-to-end: implemented each in an isolated worktree, drove both through the full Claude↔Codex adversarial-review loop to `approve`, ran the in-container runtime gates, merged, and **deployed both to prod** (#39 alone first, then #46). **Prod now runs `0c19d2a`.** `main == origin/main`; tree clean; no open PRs.
 
 ## What We Built
 
-- **Fable audit — ALL 10 FINDINGS RESOLVED** (`audit/FABLE-AUDIT-REPORT.md`, LOCAL-ONLY/gitignored).
-  #1 was fixed pre-loop (2026-07-07); this session closed #2–#10, each via the Claude↔Codex loop to
-  `approve`. The "Low/Info"-rated items were the deepest — adversarial review upgraded several to real
-  reachable bugs self-review had missed:
-  - **#2 — `4006c97`** redact secrets on the drive session-*open* path (the prior handoff's open item #2).
-  - **#6 — `69c1ab1`** keep `*.www.<domain>` allowlist rules scoped to the www subtree (canonicalize
-    wildcard suffixes www-sensitively; `src/policy/allowlist.ts`). Also a prior open item.
-  - **#9 — `5d59330`** reject ill-formed-Unicode slot fields (`assertSlotField`, `src/security/vault-crypto.ts`)
-    — the wording pass exposed a real **AAD-injectivity bug**: a lone-surrogate slot field collapses under
-    `Buffer.from(v,"utf8").toString("utf8")`, so two distinct slots could share one AAD → cross-slot open.
-  - **#4 — `2655ece`** keep oversized credential leaves redactable + harden `redactSecrets`. Found a real
-    **"regular expression too large" V8 throw** on big folded values → switched to `String.replaceAll`;
-    the reject-at-`put` also introduced (and then fixed) a rotation split-brain regression.
-  - **#5 — `bce0774`** redact all smoke-entry output + a full descriptor-based secure serializer
-    (`src/gateway/smoke-log.ts` `redactValue()`); `redactSecrets` now folds JSON- and `util.inspect`-escaped
-    variants. (10 rounds — the longest loop.)
-  - **#3 — `b2b9fb8`** redact the browser core's own stderr + enforce redactability at every ingress.
-    Contract change: `BrowserCoreOptions.redact` (opaque fn) → `secrets` (structural
-    `{ redactableValues(): readonly string[] }`); `resolveCoreRedactor` unions caller + option-proxy creds
-    in ONE longest-first pass; `addRedactableCredential` guards each credential ingress (rejects <3/marker);
-    captcha-code allowlist (`CAPTCHA_SOLVE_ERROR_CODES`). (11 rounds.)
-  - **#8/#10 — `b0f5025`** vault key-rotation made resumable (decrypt-under-either-key) + guarantees no
-    old-key ciphertext survives — 4 survival paths closed (copied non-canonical name, non-canonical stored
-    host, symlink/hardlink alias, orphaned `*.vault.json.<hex>.tmp`); #10 = documented offline/exclusive-access
-    contract (`src/security/vault-store.ts`).
-  - **#7 — `884ab0c`** frame-agnostic-decision unit test + an in-container committed-cross-site-OOPIF
-    interception leg (`scripts/validate-redirect-guard.mjs`) + de-vacuumed the worker leg.
-  - Two NUL-byte cleanups mid-loop (`ab5fb98`, `f6ec706`) — a stray NUL in a comment/test made git treat
-    the files as binary.
-- **`AGENTS.md` resolved — `c43945e`** symlinked to `CLAUDE.md` (single source of truth). Closes the prior
-  handoff's open item #1; tree is now clean (no untracked files).
-- **Two learnings compounded — `1381451`** via `/ce-compound` Lightweight:
-  - `docs/solutions/best-practices/redact-before-serialize.md` — redact-BEFORE-serialize discipline: union
-    single-pass over actual values (`resolveCoreRedactor`), redactability enforced at the credential ingress,
-    `String.replaceAll` not `new RegExp`, escaped-variant folding, structural `BrowserCoreOptions.secrets`.
-  - `docs/solutions/architecture-patterns/vault-key-rotation-every-file.md` — rotate enumerated files not
-    logical slots; the 4 old-key-survival paths; decrypt-under-either resumability; AAD injectivity; offline
-    boundary.
-  - Both pass the ce-compound frontmatter + claims validators (0 flags); public-repo-safe.
+- **Epic #38 + 10 grounded tickets #39–#48** (each cites real `file:line` change surfaces), plus the strategy/plan doc `docs/plans/2026-07-17-001-site-compatibility-hardening.local.md` (gitignored, self-contained — north star, current-state map, per-ticket change surfaces, dependency spine, milestones). The hermes inventory has a back-reference table to the tickets. Grounding came from 4 parallel Explore agents (proxy/exit, block/CAPTCHA/result-shape, session/breaker, timing/diagnostics).
+- **Execution schedule** verified via a conflict-matrix Workflow (10 touch-set analyses → pairwise conflict matrix → wave schedule): #39–#48 (minus #46) are a near-complete hard-conflict clique on the retrieve path, so #39 (the diagnostics envelope) is the keystone that must land first; #46 is the only fully-disjoint ticket.
+- **Wave 1 SHIPPED + DEPLOYED (2026-07-20):**
+  - **PR #52 = #39** (squash `f0ddff3`) — failure-diagnostics envelope. New `src/observability/` module (`failure-diagnostics.ts`: `FailureDiagnostics` with evidence fields + pre-declared **unset** downstream slots, a single `buildFailureDiagnostics` assembly seam, `redactFailureDiagnostics`). Capture in `patchright-core.ts` (console/pageerror/requestfailed bounded ring buffers, per-top-level-nav reset, redirect-hop accumulation, `page.url()` finalUrl). Surfaced at retrieve↔drive parity via a shared `isRetrieveFailure` predicate + a non-enumerable `.failure` carrier. **607 unit tests**, Codex `approve` (6 rounds), in-container `validate-failure-envelope.mjs` **PASS**. Deployed alone — deploy-http run `29780664248` (gate→swap→verify green).
+  - **PR #51 = #46** (squash → main `0c19d2a`) — in-flight guard. `Session.beginActivity/endActivity` + `#inFlight`/`#inFlightSince` + `MAX_INFLIGHT_MS=600_000`; `useConsumerSession` marks the session in-flight for the whole verb; `reapIdle` skips in-flight sessions but reclaims one stuck past the deadline. **583 unit tests**, Codex `approve`, in-container `validate-drive.mjs` **PASS** (new step 3b: in-flight nav not reaped). Deployed — run `29780875240` (green).
+  - Issues **#39 and #46 CLOSED** as shipped; epic #38 checklist items checked.
+- **#50 filed** — "Confirmable browser teardown (needs force-kill)" — owns all the teardown/death-confirmation work split out of #46; **subsumes #49** (transient-session hang, now CLOSED). WIP preserved on branch **`feat/teardown-confirmation-wip`** (commits `5ad8d8f`, `1024725`).
 
 ## Decisions Made
 
-- **#11 (newly derived, NOT one of the original 10): TRACK, do not fix** (operator call). Codex surfaced it
-  during the #4 loop — `SecretStore.redactableValues()` is never-forgetting by design, so vault-leaf folding
-  + repeated re-captures grow the redaction set unbounded (Low; realistic vaults are small). Its fix is a
-  *design tradeoff* (a per-slot redaction lifecycle would WEAKEN never-forget for vault values), not a bug
-  fix — revisit only when a deliberate `SecretStore` change is scoped.
-- **Landed every fix direct to `main`** (per `authorized-to-push-main`) only after Codex returned `approve`,
-  per `codex-review-loop-sop`. Verify-don't-blind-accept: several rounds' findings were checked before fixing.
-- **Compounded at Lightweight depth** (operator choice) — single-pass, no research subagents; still
-  cross-referenced the existing `vault-observability-redaction-gap.md` and cross-linked the two new docs.
-- **`component:`/`root_cause:` off-enum values are fine for knowledge-track docs here** — the repo's own
-  `vault-observability-redaction-gap.md` established this, and the ce-compound frontmatter validator enforces
-  parser-safety only, not the schema enum.
+- **#46 SPLIT** (operator call, mid-wave): ship the **in-flight guard only**; extract ALL teardown/death-confirmation (counted-until-close accounting, shutdown coordination, force-kill) to **#50**. Rationale: adversarial rounds 2–4 revealed a teardown/shutdown rabbit hole (wedged close leaking a browser past the cap, rejected-close freeing a slot, acquire/shutdown races) whose true fix needs a **force-kill primitive that Patchright's `launchPersistentContext` doesn't expose** (no child-process handle). The in-flight guard is the actual inventory bug and is correct + Codex-approved for its scope.
+- **Precedent set for the whole epic** (operator-ratified): an adversarial-review-found **pre-existing** issue → **COMPLETE it if it finishes your own change**, else **TRACK a new ticket** if it's an orthogonal path. Applied throughout (#46 "complete the reclaim" then split; #49 tracked→#50; #39 residuals documented + accepted).
+- **#39 redaction root fix**: sanitize **known** URLs **structurally** (WHATWG `new URL()` parser, spelling-proof) at the error source — NOT by regex. This ended a 5-round redaction whack-a-mole. Three best-effort residuals **documented + accepted** for internal consumers: http(s) hostname kept (diagnostic; DNS-label exfil is exotic), cross-entry header split (unreachable — atomic console entries, header-free network entries), data:-URL-with-embedded-quote truncation.
+- **Deploy #39 ALONE first** (broad-surface change), confirm in prod, then #46 — operator-chosen finish sequence. Both deployed clean (no rollbacks).
 
 ## What Didn't Work
 
-- **`new RegExp(escapeRegExp(value))` for redaction** — throws V8 "regular expression too large" AT
-  EXECUTION on big folded values + recompiles every call. Replaced with `String.replaceAll` (linear, can't
-  throw on size). Don't reintroduce a regex-per-secret redactor.
-- **`tail -1` to verify a TS build** — masked a compile break (a `*/` inside a JSDoc comment closed the block
-  early) that Codex caught in the #3 loop. **Verify builds with `grep 'error TS'`, not `tail -1`.**
-- **Plain `--background` for the Codex review harness** — killed by the 2-min shell timeout mid-handshake,
-  leaving an orphaned 'running' job with stale status. Run `codex-companion.mjs adversarial-review --wait`
-  inside a DETACHED bg task and verify pid + log mtime, not just the status field.
+- **Regex-scrubbing a KNOWN url** for redaction — an endless whack-a-mole (userinfo, path tokens, escaped `\/` slashes, `)`/`]` delimiters, and finally the non-canonical `https:host` no-slashes spelling that WHATWG accepts). Root fix: sanitize a url you already hold as a structured value **structurally at the source**, and keep the regex net only for UNKNOWN urls in captured free text.
+- **Counted-zombie close WITHOUT force-kill** — you cannot confirm a browser process actually died (Patchright persistent context exposes no child PID; `context.close()` swallows failures), so shutdown/teardown races kept surfacing round after round. This is exactly why #46 was split → #50.
+- **A long Codex adversarial-review background task got KILLED once mid-run** — relaunch captures a fresh verdict (the review is stateless per invocation; you can't resume a killed one).
+- **Chrome docker layer cache MISSED** (base `node:22-bookworm-slim` re-pulled at a new digest → full emulated amd64 build). Avoided a second build with the **mount approach**: build ONE image, then mount each branch's `dist`+`scripts` over it.
 
 ## What's Next
 
-1. ~~**Deploy `main` to prod so the audit hardening goes live.**~~ **DONE 2026-07-14** — deploy-http run
-   `29373029387` (success, no rollback) swapped prod from `069eb4d` (pre-audit) to the `latest` image built
-   from **`e8e3e35` = HEAD** (confirmed via the image's `org.opencontainers.image.revision` label). Post-swap
-   verify passed → the Fable hardening is LIVE. Warm-up config in the prod env file was untouched (still active).
-2. **#11 stays TRACKED — do not fix** unless a deliberate `SecretStore` redesign is being scoped (see
-   Decisions). It's logged in `audit/FABLE-AUDIT-REPORT.md` (LOCAL) and the `fable-audit-resolved` memory.
-3. **Carry-over optionals from the prior (warm-up) session, still open:** a TW liveness-probe tool; naming
-   `REMEMBER_ME` as the durability mechanism in the solution doc; a `warmup=[...]` line on the http-main boot
-   banner. None are blocking.
+1. **#50 — Confirmable browser teardown + force-kill** (the one debt from Wave 1). WIP on `feat/teardown-confirmation-wip`; the missing piece is the force-kill primitive (capture the Chromium child PID at launch + a bounded `core.kill()`), then confirmed-close accounting + shutdown coordination + the transient-session deadline (#49). Design it deliberately with force-kill from the start — don't just port the WIP.
+2. **Wave 2**: `#40` (WAF + CAPTCHA vendor fingerprinting) → `#41` (failure-class taxonomy), then `#42/#43/#44` → `#45` → `#47` → `#48`, per the dependency spine in `docs/plans/2026-07-17-001-...`. The #39 envelope is LIVE, so its pre-declared slots are ready to fill (each downstream ticket fills a slot, no type reshape).
+3. Remaining open epic children: #40, #41, #42, #43, #44, #45, #47, #48, #50.
 
 ## Gotchas & Watch-outs
 
-- **`audit/FABLE-AUDIT-REPORT.md` is LOCAL ONLY (gitignored)** — not on origin, won't survive a fresh clone.
-  All 10 items are marked FIXED with commits inside it; #11 is the only open item there (tracked, not a bug).
-- **The audit hardening is now LIVE in prod** (deployed 2026-07-14, image = HEAD `e8e3e35`; see What's Next #1).
-  Env vars still read at container LAUNCH (`launch-http.sh`), so any future config change needs a redeploy/restart.
-- **Redaction is a redact-BEFORE-serialize discipline now** — if you touch `src/security/secrets.ts`,
-  `src/browser/patchright-core.ts`, or any secret-adjacent sink, read
-  `docs/solutions/best-practices/redact-before-serialize.md` first. Pass the SecretStore
-  (`BrowserCoreOptions.secrets`), never an opaque `redact` fn; register credentials via
-  `addRedactableCredential` (guarded) vs `addRedactable` (permissive fragments).
-- **Vault key rotation must enumerate real files, not logical slots** — see
-  `docs/solutions/architecture-patterns/vault-key-rotation-every-file.md` before touching
-  `rotateVaultKey`/`slotFileName`. Rotation assumes offline/exclusive access (no lock).
-- **`codex-review-loop-sop`:** for the next substantive change, drive the Claude↔Codex `adversarial-review`
-  loop to `approve` before presenting; the gate is the runtime check, not unit tests; commit each fix round.
-- **Fleet hygiene (public repo):** never commit prod host/alias/env-path/consumer tokens — the two new
-  solution docs were written public-safe on purpose.
-- **Prod reads/interactions (SSH, `docker logs`, env greps, deploys) are gated by the auto-mode classifier** —
-  operator runs them or authorizes per-session. (One classifier hiccup this session temporarily blocked a
-  Bash call; read-only file ops were unaffected.)
+- **Prod runs `0c19d2a`** (#39 + #46 live). Deploy flow: merge → **ci.yml** auto-builds + pushes GHCR `latest` from main → `gh workflow run deploy-http.yml -f image_tag=latest` (workflow_dispatch; resolves `latest`→immutable digest, joins tailnet, on-host **gate=`validate-http`→swap→verify→rollback**). The `prod` GitHub-environment gate did NOT require approval this session — watch for that if a reviewer gets configured.
+- **Local `main` goes STALE after `gh pr merge`** (the merge happens GitHub-side). `git pull --ff-only origin main` before committing anything, or you'll commit on a divergent base.
+- **`gh pr merge --delete-branch` fails the LOCAL branch delete when the branch is in a worktree** (harmless — remote branch is deleted, merge succeeds). Clean up worktrees after merge.
+- **`feat/teardown-confirmation-wip` MUST be preserved** — it is #50's starting point. Do not delete it. (`feat/fresh-exit-warm` is a separate pre-existing branch.)
+- **Codex-companion loop**: `~/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs adversarial-review --wait --base main --scope branch "<focus>"`, run inside a DETACHED bg task (plain `--background` dies at the 2-min shell timeout). A long review can be killed — relaunch for a fresh verdict. When a finding is a grounded/tracked out-of-scope residual, tell Codex in the focus so it doesn't block on it.
+- **In-container gate**: build ONE `browse-gateway:gate` image (`docker build --platform linux/amd64 -f docker/Dockerfile -t browse-gateway:gate .`), then `docker run --rm --platform linux/amd64 --shm-size=1g -v <branch-worktree>/dist:/app/dist -v <branch-worktree>/scripts:/app/scripts browse-gateway:gate node scripts/validate-X.mjs`. Do NOT pipe `docker run` through `tail` (Xvfb wedge). Image is amd64 (Chrome is amd64-only) via colima Rosetta; the Chrome apt layer cache is fragile (base re-pull busts it → full emulated build). **colima was brought up for the gate then stopped** (restored to prior state) — `colima start` for future gates.
+- **#39 redaction has 3 accepted best-effort residuals** (hostname-label, cross-entry-unreachable, data:-quote) documented in `redactFailureDiagnostics` + PR #52 — don't re-litigate; if defense is ever wanted it belongs on the capture side (entry atomicity), not the redaction seam.
+- **The strategy plan `docs/plans/2026-07-17-001-...local.md` is gitignored** (local only) — epic #38 + the tickets are the shareable surface; the plan won't survive a fresh clone.
