@@ -1234,6 +1234,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       const onExit = (): void => finish(true);
       if (child) child.once("exit", onExit);
       const probe = (): void => {
+        // Catch an exit that fired between kill()'s exitCode check and the listener attach (a `.once`
+        // added after the event would miss it) — authoritative and immune to PID reuse.
+        if (child && child.exitCode !== null) return finish(true);
         try {
           process.kill(pid, 0); // signal 0 = liveness probe; throws ESRCH once the pid is gone
         } catch (err) {

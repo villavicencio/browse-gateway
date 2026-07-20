@@ -40,6 +40,14 @@ export const CLOSE_GRACE_MS = 10_000;
  */
 export const KILL_CONFIRM_MS = 5_000;
 
+/**
+ * How many extra kill-only reconfirm passes `shutdown()` makes over sessions whose force-kill didn't
+ * confirm on the first pass, before giving up and RETAINING them in accounting (issue #50). A SIGKILL'd
+ * process is almost always reapable within one `KILL_CONFIRM_MS` probe; a couple more passes cover a
+ * briefly-stuck one without letting shutdown hang when force-kill is unavailable (kill rejects fast).
+ */
+export const SHUTDOWN_RECONFIRM_TRIES = 3;
+
 export type SessionManagerErrorCode = "SESSION_LIMIT" | "CORE_LAUNCH";
 
 export class SessionManagerError extends Error {
@@ -146,6 +154,14 @@ export class SessionManager {
   get forceKillAvailable(): boolean {
     for (const s of this.#sessions.values()) if (!s.forceKillAvailable) return false;
     return true;
+  }
+
+  /** Count of browsers whose death could NOT be confirmed — a best-effort SIGKILL was sent but neither a
+   *  clean close nor an ESRCH confirmed the process is gone (issue #50). Retained (never erased) so a
+   *  possibly-alive orphan is observable; the reaper's reconfirm loop keeps retrying these. Non-zero
+   *  means a browser may still be alive despite its teardown — a health/observability signal. */
+  get unconfirmedCount(): number {
+    return this.#unconfirmed.size;
   }
 
   /**
@@ -382,9 +398,22 @@ export class SessionManager {
       ...this.#closing.values(),
       ...remaining.map((s) => this.#beginTeardown(s)),
     ]);
-    await this.#drainUnconfirmed();
-    this.#sessions.clear();
-    this.#closing.clear();
-    this.#unconfirmed.clear();
+    // Retry the kill-only reconfirm a bounded number of times so a just-SIGKILL'd process that wasn't
+    // reapable on the first probe gets a few more chances within shutdown. Bounded so an UNAVAILABLE
+    // force-kill (kill rejects fast) can't spin forever.
+    for (let i = 0; i < SHUTDOWN_RECONFIRM_TRIES && this.#unconfirmed.size > 0; i++) {
+      await this.#drainUnconfirmed();
+    }
+    // Do NOT unconditionally clear the maps (issue #50): a confirmed teardown already removed itself from
+    // #sessions/#closing/#unconfirmed, so anything STILL present is a browser we could not confirm dead.
+    // Erasing it would report a clean shutdown (activeCount 0) while a process may be alive — the exact
+    // invariant this ticket exists to hold. Retain it (honest accounting) and surface it loudly; on prod
+    // the container namespace teardown reaps it regardless, and on the CLI a best-effort SIGKILL was sent.
+    if (this.#unconfirmed.size > 0) {
+      process.stderr.write(
+        `[browse-gateway] shutdown: ${this.#unconfirmed.size} browser teardown(s) could not be confirmed dead ` +
+          `(best-effort SIGKILL sent); accounting retained (unconfirmedCount)\n`,
+      );
+    }
   }
 }

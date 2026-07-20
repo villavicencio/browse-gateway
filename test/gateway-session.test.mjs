@@ -664,3 +664,41 @@ test("teardown: with force-kill unavailable, a wedged close stays a counted zomb
   await mgr.release(s.id);
   assert.equal(mgr.activeCount, 1, "no PID → no confirmed death → slot stays counted (never false-freed)");
 });
+
+test("shutdown: RETAINS a session whose death cannot be confirmed (never erases a possibly-live browser)", async () => {
+  // close rejects and every kill rejects → shutdown must not report a clean, empty manager while the
+  // browser may still be alive (issue #50 invariant; caught by Codex adversarial review).
+  const { factory } = makeControllableFactory({ closeMode: "reject", killMode: "reject" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  await mgr.shutdown();
+  assert.equal(mgr.activeCount, 1, "an unconfirmed-dead session is retained, not erased");
+  assert.equal(mgr.unconfirmedCount, 1, "the unconfirmed browser is observable via unconfirmedCount");
+});
+
+test("shutdown: a shutdown-racing orphan whose kill keeps failing is retained (not silently dropped)", async () => {
+  const gate = deferred();
+  const factory = async () => {
+    await gate.promise;
+    return makeControllableCore({ closeMode: "reject", killMode: "reject" });
+  };
+  const mgr = teardownMgr(2, factory);
+  const acqP = mgr.acquire();
+  await tick();
+  const shutP = mgr.shutdown();
+  await tick();
+  gate.resolve(); // orphan launches into a shutting-down manager → self-teardown fails to confirm
+  await assert.rejects(acqP, (e) => e.code === "SESSION_LIMIT");
+  await shutP;
+  assert.equal(mgr.unconfirmedCount, 1, "the unconfirmed orphan core is retained for observation");
+});
+
+test("shutdown: confirmed teardowns leave the manager empty (no retained accounting)", async () => {
+  const { factory } = makeControllableFactory({ closeMode: "resolve" });
+  const mgr = teardownMgr(2, factory);
+  await mgr.acquire();
+  await mgr.acquire();
+  await mgr.shutdown();
+  assert.equal(mgr.activeCount, 0, "clean closes fully drain the registry");
+  assert.equal(mgr.unconfirmedCount, 0);
+});
