@@ -20,6 +20,8 @@ import {
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
+import { redactFailureDiagnostics, sanitizeUrlForError } from "../observability/index.js";
+import type { FailureDiagnostics } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -82,6 +84,19 @@ export interface RetrieveOptions {
  */
 export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "perimeterx-challenge" | "hard-block" | "blocked";
 
+/**
+ * The single retrieve-FAILURE predicate, shared by {@link retrieve} (to attach + redact the
+ * failure-diagnostics envelope, #39) and the MCP surface (`server.ts`, to fail the tool call) so the
+ * two can never disagree — a page the MCP layer errors on must always carry evidence. A retrieve failed
+ * when it was `blocked`, produced empty/whitespace `markdown` (empty extraction — the status-200 +
+ * blank-body case that `blocked` alone misses), OR the navigation never landed (null status + thin
+ * body — an off-allowlist/unreachable target whose thin error page must not be handed back as content).
+ */
+export function isRetrieveFailure(r: { blocked: boolean; markdown: string; status: number | null }): boolean {
+  const navFailed = r.status === null && r.markdown.length < MIN_CONTENT_LENGTH;
+  return r.blocked || r.markdown.trim().length === 0 || navFailed;
+}
+
 export interface RetrieveResult {
   url: string;
   status: number | null;
@@ -99,6 +114,14 @@ export interface RetrieveResult {
   captchaSolved: boolean;
   /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
   proxyDiagnostic?: EscalationDiagnostics;
+  /**
+   * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
+   * bounded console + network / optional screenshot — surfaced ONLY on a blocked/failed retrieve, and
+   * REDACTED (secret set scrubbed + cookie/authorization stripped) before it reaches here. Absent on a
+   * successful retrieve, so the success shape is unchanged. Distinct from {@link proxyDiagnostic} (the
+   * proxy-escalation tally) — this is the page-evidence bundle the site-compat epic (#38) reports through.
+   */
+  diagnostics?: FailureDiagnostics;
 }
 
 /**
@@ -193,10 +216,18 @@ export function escalationDiagnostics(opts: {
  */
 export class EscalationError extends Error {
   readonly diagnostics: EscalationDiagnostics;
-  constructor(message: string, diagnostics: EscalationDiagnostics) {
+  /**
+   * The page-evidence envelope (issue #39) for this failure — a DISTINCT field from {@link diagnostics}
+   * (the proxy-escalation tally), deliberately NOT overloading it. Carries finalUrl / title / status /
+   * redirect chain / console + network / optional screenshot, already REDACTED by the drive layer that
+   * threw. Absent when no snapshot was captured (e.g. a force-proxy request with no proxy available).
+   */
+  readonly failure?: FailureDiagnostics;
+  constructor(message: string, diagnostics: EscalationDiagnostics, failure?: FailureDiagnostics) {
     super(message);
     this.name = "EscalationError";
     this.diagnostics = diagnostics;
+    if (failure) this.failure = failure;
   }
 }
 
@@ -346,7 +377,9 @@ export async function retrieve(
   // before any navigation, so a non-http target can't read local files or bypass the
   // host-based guard (whose host is empty for those schemes).
   if (!isHttpUrl(url)) {
-    throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
+    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url is never interpolated
+    // raw — sanitizeUrl (new URL) collapses a non-http scheme to `scheme:<redacted>`, spelling-proof.
+    throw new Error(`unsupported URL scheme: only http(s) is allowed (${sanitizeUrlForError(url)})`);
   }
   // clearedTextLength: a page returns as soon as real content (>= MIN_CONTENT_LENGTH) renders
   // instead of polling to the full clearance timeout (the kill-gate keeps the strong-content
@@ -490,6 +523,15 @@ export async function retrieve(
         },
       })
     : undefined;
+  // Failure-evidence envelope (issue #39): surface it on ANY retrieve failure (blocked, empty-content,
+  // or a failed nav — the SHARED {@link isRetrieveFailure} predicate the MCP layer also fails on, so an
+  // errored result always carries evidence), and REDACT it (URL params stripped + secret set scrubbed +
+  // cookie/authorization stripped) before it leaves this seam. The core built the RAW envelope on
+  // `render.diagnostics` (finalUrl = the post-redirect page.url(), the retrieve URL-bug fix). A successful
+  // retrieve carries no envelope, so its shape is unchanged.
+  const failed = isRetrieveFailure({ blocked, markdown: extraction.markdown, status: render.status });
+  const diagnostics =
+    failed && render.diagnostics ? redactFailureDiagnostics(render.diagnostics, secrets) : undefined;
   return {
     url,
     status: render.status,
@@ -501,5 +543,6 @@ export async function retrieve(
     proxyUsed,
     captchaSolved,
     ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
+    ...(diagnostics ? { diagnostics } : {}),
   };
 }

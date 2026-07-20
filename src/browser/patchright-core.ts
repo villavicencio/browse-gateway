@@ -4,6 +4,7 @@
  */
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
+import { buildFailureDiagnostics, FAILURE_DIAGNOSTICS_CAP } from "../observability/index.js";
 import { hostFromUrl, hostMatchesAnySuffix } from "../security/url.js";
 import { SecretStore, redactSecrets } from "../security/secrets.js";
 import { buildWindowsUaOverride, buildNativeUaOverride, READ_LIVE_UA_JS, type LiveUserAgent } from "./os-presentation.js";
@@ -166,6 +167,16 @@ const CAPTCHA_RENDER_POLL_MS = 250;
 const CAPTCHA_RENDER_TIMEOUT_MS = 2_000;
 
 /**
+ * Opt-in flag for the failure screenshot (issue #39): when `BGW_CAPTURE_FAILURE_SCREENSHOT=1`, the core
+ * captures a size-capped base64 PNG into the diagnostics envelope on render()/snapshot(). Default OFF —
+ * a screenshot is expensive and carries rendered page content, so it is a deliberate debug opt-in.
+ */
+const FAILURE_SCREENSHOT_ENV = "BGW_CAPTURE_FAILURE_SCREENSHOT";
+/** Size cap on the base64 screenshot carried in an envelope (~1.5 MB decoded). Over-cap → omitted, never
+ *  truncated (a truncated base64 is invalid). Bounds the envelope so it can't balloon a caller payload. */
+const MAX_SCREENSHOT_B64_LEN = 2_000_000;
+
+/**
  * A snapshot ref looks like `e4` (top frame) or a frame-prefixed `f1e2`; anything else is a raw
  * selector. Drive verbs reference snapshot refs by default; a selector is the escape hatch.
  */
@@ -173,6 +184,21 @@ const REF_PATTERN = /^[a-z]?\d*e\d+$/i;
 
 /** Visible body text — the post-inject advancement signal (catches same-page/AJAX callback updates). */
 const BODY_TEXT_JS = "document.body ? document.body.innerText : ''";
+
+/**
+ * Whether a captured request marks the START of a NEW top-level navigation, so the per-navigation
+ * evidence buffers (console / network / redirect — issue #39) reset. True only for a main-frame
+ * navigation request that is NOT itself a redirect hop of an in-flight navigation: a redirect hop
+ * CONTINUES the same navigation, so it must append to the redirect chain, not wipe it. Pure + exported
+ * so the reset decision is unit-testable without a browser.
+ */
+export function isTopLevelNavStart(
+  isNavigationRequest: boolean,
+  isMainFrame: boolean,
+  isRedirectHop: boolean,
+): boolean {
+  return isNavigationRequest && isMainFrame && !isRedirectHop;
+}
 
 /** Resolve a {@link DriveTarget}'s `target` to a Playwright selector: a ref -> `aria-ref=`, else passthrough. */
 export function targetToSelector(target: string): string {
@@ -331,6 +357,17 @@ export class PatchrightBrowserCore implements BrowserCore {
    * detectable, not only a visible challenge phrase. `undefined` until the first navigation.
    */
   #lastDocStatus?: number | null;
+  /**
+   * Failure-evidence ring buffers (issue #39), each capped at {@link FAILURE_DIAGNOSTICS_CAP} so an
+   * abusive page can never grow them unbounded (oldest dropped). `#redirectChain` accumulates each
+   * main-document hop URL from the CDP Fetch interceptor (so it captures server 3xx hops); the console
+   * and network buffers are filled by per-page listeners installed in render()'s page and the drive
+   * active page. Reset at the start of each render()/navigate() so an envelope reflects the current
+   * navigation, not a prior one.
+   */
+  #redirectChain: string[] = [];
+  #consoleErrors: string[] = [];
+  #networkFailures: string[] = [];
 
   private constructor(
     context: PatchrightContext,
@@ -448,7 +485,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     const clearanceTimeoutMs =
       opts.clearanceTimeoutMs ?? DEFAULT_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    // Fresh per-call page ⇒ a fresh navigation: clear the evidence buffers and attach the console /
+    // pageerror / requestfailed collectors so this render's failure envelope reflects only this page.
+    this.#resetEvidence();
     const page = await this.#context.newPage();
+    this.#attachEvidenceListeners(page);
     try {
       // Present as Windows for opt-in hosts BEFORE the first navigation (fresh per-call page). Inside the
       // try so the finally still closes the page if it throws; fail-closed — a listed host that can't get
@@ -477,7 +518,20 @@ export class PatchrightBrowserCore implements BrowserCore {
         signal = await pollSignal(page);
       }
       const final = await snapshot(page);
-      return { url, status, ...final, clearanceWaitedMs: waited };
+      // Assemble the failure-evidence envelope (issue #39). finalUrl is page.url() AFTER redirects — the
+      // real landed URL (render's own `url` is the requested arg, the bug this fixes). RAW here; the
+      // retrieve surfacing layer redacts before it reaches a caller. Screenshot is opt-in + size-capped.
+      const screenshotRef = await this.#maybeCaptureScreenshot(page);
+      const diagnostics = buildFailureDiagnostics({
+        finalUrl: page.url(),
+        title: final.title,
+        status,
+        redirectChain: this.#redirectChain,
+        consoleErrors: this.#consoleErrors,
+        networkFailures: this.#networkFailures,
+        ...(screenshotRef !== undefined ? { screenshotRef } : {}),
+      });
+      return { url, status, ...final, clearanceWaitedMs: waited, diagnostics };
     } finally {
       await page.close().catch(() => {});
     }
@@ -557,6 +611,8 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   async #onRequestPaused(cdp: CDPSession, event: FetchRequestPaused): Promise<void> {
     const { requestId } = event;
+    // (Redirect-chain capture moved to the page "request" listener in #attachEvidenceListeners — it is
+    // MAIN-FRAME-scoped and fires the per-navigation evidence reset, which the CDP layer can't see here.)
     // During close() Fetch.disable would auto-CONTINUE a still-paused request (allow); fail it instead.
     const decision: NavigationDecision = this.#closing
       ? "block"
@@ -617,6 +673,9 @@ export class PatchrightBrowserCore implements BrowserCore {
     // page as a hard block (4xx + thin tree), so proxied escalation discarded a working exit and
     // eventually reported "could not land a working proxied exit (403)".
     this.#lastDocStatus = null;
+    // A new navigation begins here: clear the evidence buffers so this nav's failure envelope reflects
+    // only this goto onward (the active page's console/requestfailed listeners persist across navs).
+    this.#resetEvidence();
     try {
       await page.goto(url, {
         waitUntil: "domcontentloaded",
@@ -728,6 +787,89 @@ export class PatchrightBrowserCore implements BrowserCore {
     this.#osMode = "native";
   }
 
+  /** Push a line into a bounded evidence buffer, dropping the oldest once it exceeds the cap — so a page
+   *  that logs thousands of console errors / failed requests can never grow the buffer unbounded. */
+  #pushEvidence(buf: string[], line: string): void {
+    buf.push(line);
+    if (buf.length > FAILURE_DIAGNOSTICS_CAP) buf.shift();
+  }
+
+  /** Clear the per-navigation evidence buffers. Called at the start of each render()/navigate() and when
+   *  a fresh active page opens, so an envelope reflects the CURRENT navigation, not a stale prior one. */
+  #resetEvidence(): void {
+    this.#redirectChain = [];
+    this.#consoleErrors = [];
+    this.#networkFailures = [];
+  }
+
+  /**
+   * Install console / pageerror / requestfailed collectors on `page`, feeding the bounded evidence
+   * buffers (issue #39). Best-effort per event — a detached/racing message can throw on access, so each
+   * handler is wrapped. Only error/warning console messages are kept (info/log/debug are noise). Used on
+   * BOTH render()'s per-call page and the drive active page, so the two paths capture the same evidence.
+   */
+  #attachEvidenceListeners(page: PatchrightPage): void {
+    // Scope the evidence to the CURRENT top-level navigation. A main-frame navigation request resets the
+    // buffers at its START (its first hop — `redirectedFrom() === null`) and appends each hop (incl.
+    // server 3xx redirects) to the chain; a redirect hop continues the SAME nav and does NOT reset. This
+    // fires for a click/type-submit/select/key-triggered navigation too — not only the navigate() method —
+    // so a later blocked snapshot never mixes the prior page's console/network evidence (the 50-cap can't
+    // evict the relevant lines with stale ones). A subframe request is ignored (not a top-level nav).
+    page.on("request", (req) => {
+      try {
+        const isNav = req.isNavigationRequest();
+        const isMain = req.frame() === page.mainFrame();
+        if (!isNav || !isMain) return;
+        if (isTopLevelNavStart(isNav, isMain, req.redirectedFrom() !== null)) this.#resetEvidence();
+        this.#pushEvidence(this.#redirectChain, req.url());
+      } catch {
+        // a detached/superseded request can throw on access — ignore
+      }
+    });
+    page.on("console", (msg) => {
+      try {
+        const type = msg.type();
+        if (type === "error" || type === "warning") {
+          this.#pushEvidence(this.#consoleErrors, `${type}: ${msg.text()}`);
+        }
+      } catch {
+        // a message from a detached/navigating frame can throw on access — ignore
+      }
+    });
+    page.on("pageerror", (err) => {
+      try {
+        this.#pushEvidence(this.#consoleErrors, `pageerror: ${err instanceof Error ? err.message : String(err)}`);
+      } catch {
+        // ignore
+      }
+    });
+    page.on("requestfailed", (req) => {
+      try {
+        const errText = req.failure()?.errorText ?? "failed";
+        this.#pushEvidence(this.#networkFailures, `${req.method()} ${req.url()} ${errText}`);
+      } catch {
+        // ignore
+      }
+    });
+  }
+
+  /**
+   * Opt-in, size-capped failure screenshot for the diagnostics envelope (issue #39). Returns a base64
+   * PNG only when `BGW_CAPTURE_FAILURE_SCREENSHOT=1` AND the encoding is under {@link
+   * MAX_SCREENSHOT_B64_LEN}; otherwise undefined (default OFF, or over-cap → omitted, never truncated).
+   * Best-effort: any capture failure yields undefined so it can never break a render/snapshot.
+   */
+  async #maybeCaptureScreenshot(page: PatchrightPage): Promise<string | undefined> {
+    if (process.env[FAILURE_SCREENSHOT_ENV] !== "1") return undefined;
+    try {
+      const buf = await page.screenshot({ timeout: DEFAULT_ACTION_TIMEOUT_MS });
+      const b64 = buf.toString("base64");
+      return b64.length <= MAX_SCREENSHOT_B64_LEN ? b64 : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Open (lazily) the single active page used by the drive verbs, with a listener that tracks its
    * last main-frame navigation status — so every snapshot (including post-action) can carry a status
@@ -738,6 +880,10 @@ export class PatchrightBrowserCore implements BrowserCore {
       const page = await this.#context.newPage();
       this.#lastDocStatus = undefined;
       this.#resetOsPresentation(); // a fresh page starts native; its OS mode is decided on the first nav
+      // A fresh active page ⇒ fresh evidence: clear the buffers and install the console / pageerror /
+      // requestfailed collectors that feed the drive path's failure envelope (issue #39).
+      this.#resetEvidence();
+      this.#attachEvidenceListeners(page);
       // Capture a CLEAN UA baseline from the fresh (about:blank) page BEFORE any site loads, so a later
       // listed-host override is built from the REAL browser identity — not from values a previously-loaded
       // (untrusted) page could have redefined on the shared navigator. Only when the feature is enabled.
@@ -928,7 +1074,23 @@ export class PatchrightBrowserCore implements BrowserCore {
     ) => Promise<string>;
     const tree = String(await aria.call(root, { mode: "ai" }).catch(() => ""));
     const title = await page.title().catch(() => "");
-    return { url: page.url(), title, tree, status: this.#lastDocStatus ?? null };
+    const status = this.#lastDocStatus ?? null;
+    const finalUrl = page.url();
+    // Assemble the failure-evidence envelope (issue #39) into EVERY snapshot — both navigate() and a
+    // post-action snapshot() — so the drive layer can attach it to a thrown failure at parity with
+    // retrieve. RAW here; the drive surfacing seam redacts before it reaches a caller. Screenshot is
+    // opt-in + size-capped.
+    const screenshotRef = await this.#maybeCaptureScreenshot(page);
+    const diagnostics = buildFailureDiagnostics({
+      finalUrl,
+      title,
+      status,
+      redirectChain: this.#redirectChain,
+      consoleErrors: this.#consoleErrors,
+      networkFailures: this.#networkFailures,
+      ...(screenshotRef !== undefined ? { screenshotRef } : {}),
+    });
+    return { url: finalUrl, title, tree, status, diagnostics };
   }
 
   /**

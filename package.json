@@ -22,6 +22,7 @@
     "validate:vault-warm-open": "npm run build && node scripts/validate-vault-warm-open.mjs",
     "validate:vault-host-login": "npm run build && node scripts/validate-vault-host-login.mjs",
     "validate:redirect-guard": "npm run build && node scripts/validate-redirect-guard.mjs",
+    "validate:failure-envelope": "npm run build && node scripts/validate-failure-envelope.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {

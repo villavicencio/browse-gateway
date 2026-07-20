@@ -12,6 +12,7 @@
 export type Category = "cloudflare" | "datadome";
 
 import type { CaptchaSolver } from "./captcha.js";
+import type { FailureDiagnostics } from "../observability/index.js";
 
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
 export interface ProxyConfig {
@@ -175,6 +176,14 @@ export interface RenderResult {
   frameHtml?: string;
   /** Wall-clock ms spent waiting for the page to clear (challenge auto-solve). */
   clearanceWaitedMs: number;
+  /**
+   * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
+   * bounded console + network / optional screenshot. Assembled by the core on every render so the
+   * retrieve path can surface it on a block; the core populates the RAW (unredacted) envelope — the
+   * surfacing layer ({@link import("../verbs/retrieve.js").retrieve}) redacts it before it reaches a
+   * caller. Absent only if the core could not assemble one.
+   */
+  diagnostics?: FailureDiagnostics;
 }
 
 export interface RenderOptions {
@@ -225,6 +234,14 @@ export interface PageSnapshot {
    * boolean so the drive layer can classify a PerimeterX block without carrying page content.
    */
   pxHint?: boolean;
+  /**
+   * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
+   * bounded console + network / optional screenshot. Assembled by the core on every navigate/snapshot;
+   * the drive layer redacts and attaches it to a thrown failure (parity with retrieve). The RAW
+   * (unredacted) envelope — the surfacing seam redacts before it reaches a caller. Absent on a pure
+   * `snapshot()` only if the core could not assemble one.
+   */
+  diagnostics?: FailureDiagnostics;
 }
 
 export type NavigationDecision = "allow" | "block";

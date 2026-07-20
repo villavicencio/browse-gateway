@@ -30,6 +30,8 @@ import {
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck } from "../verbs/index.js";
+import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
+import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
 import type { VaultEntryStore } from "./vault-login.js";
 import type { DriveController } from "./server.js";
@@ -164,6 +166,16 @@ export class GatewayDriveController implements DriveController {
   }
 
   /**
+   * Redact and return the failure-evidence envelope (issue #39) carried on a failed drive snapshot, for
+   * attaching to a thrown failure at parity with retrieve. REDACTS at this seam (secret set scrubbed +
+   * cookie/authorization stripped) since the core built the RAW envelope; undefined when the snapshot
+   * carried none. The SINGLE place drive failures pull the envelope, so the redaction can't be skipped.
+   */
+  #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
+    return snap?.diagnostics ? redactFailureDiagnostics(snap.diagnostics, this.#secrets) : undefined;
+  }
+
+  /**
    * Opt-in egress check (U4): open a fresh proxied session, fetch an ip-info endpoint, and classify
    * the exit as residential vs datacenter from its ASN/org. Best-effort and bounded — any failure
    * (blocked endpoint, dead exit, unparseable body) yields { kind: "unknown" } and never masks the
@@ -228,7 +240,10 @@ export class GatewayDriveController implements DriveController {
     // Scheme allowlist (R14-adjacent): only http(s), rejected before any session/navigation —
     // mirrors retrieve(), so a non-http target can't slip past the host-based guard.
     if (!isHttpUrl(url)) {
-      throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
+      // Structural sanitize (sanitizeUrl/new URL) at the source: the requested url is a KNOWN structured
+      // value, so it must never be interpolated raw — a non-canonical spelling (`https:example.com`, no
+      // `//`) would slip the after-the-fact regex net (issue #39 r5).
+      throw new Error(`unsupported URL scheme: only http(s) is allowed (${sanitizeUrlForError(url)})`);
     }
     // Force residential from the first request when the caller asks (forceProxy) or the host is on
     // the configured force-proxy list — for a known-hostile WAF the direct attempt only wastes a
@@ -267,11 +282,15 @@ export class GatewayDriveController implements DriveController {
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      if (warm) throw this.#warmError(url, snap.status ?? null);
+      const failure = this.#failure(snap);
+      if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null), failure);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
-      throw new Error(
-        `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
-          `reached${proxyAvailable ? " — retry navigate for a fresh exit" : ""}`,
+      throw attachFailure(
+        new Error(
+          `navigation failed (status=${snap.status ?? "n/a"}): the page was blocked or could not be ` +
+            `reached${proxyAvailable ? " — retry navigate for a fresh exit" : ""}`,
+        ),
+        failure,
       );
     }
     return snap;
@@ -302,7 +321,8 @@ export class GatewayDriveController implements DriveController {
         // Fail loud rather than silently fall back to the direct attempt the caller opted out of.
         const dx = this.#escalationDiag({ proxyApplied: false, forced: true, attempts: 0, last: undefined });
         throw new EscalationError(
-          `force-proxy requested for ${url} but no residential proxy is available ` +
+          // Structural sanitize at the source (issue #39 r5): the KNOWN requested url — spelling-proof.
+          `force-proxy requested for ${sanitizeUrlForError(url)} but no residential proxy is available ` +
             `(proxy configured=${dx.proxyConfigured}, on datacenter IP=${this.#onDatacenterIp}) — ` +
             `set BGW_PROXY_* + BGW_ON_DATACENTER_IP, or drop the host from BGW_FORCE_PROXY_HOSTS`,
           dx,
@@ -331,6 +351,7 @@ export class GatewayDriveController implements DriveController {
         `the page was blocked or could not be reached` +
         (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
       dx,
+      this.#failure(direct),
     );
   }
 
@@ -494,7 +515,7 @@ export class GatewayDriveController implements DriveController {
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      throw this.#warmError(url, snap.status ?? null);
+      throw attachFailure(this.#warmError(url, snap.status ?? null), this.#failure(snap));
     }
     this.#pinned = true;
     return snap;
@@ -583,8 +604,9 @@ export class GatewayDriveController implements DriveController {
    *  first-navigate warm path and the reopen-after-reap warm path, so the "stale warm fails LOUD"
    *  guarantee does not depend on whether the session happened to be idle-reaped. */
   #warmStaleError(url: string, status: number | null): Error {
+    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
     return new Error(
-      `warm (logged-in) navigation to ${url} failed (status=${status ?? "n/a"}): the stored session ` +
+      `warm (logged-in) navigation to ${sanitizeUrlForError(url)} failed (status=${status ?? "n/a"}): the stored session ` +
         `is likely expired or blocked — ask the operator to re-capture this credential`,
     );
   }
@@ -594,8 +616,9 @@ export class GatewayDriveController implements DriveController {
    *  re-warms with a DIFFERENT fresh exit. So tell the consumer to retry, not to re-capture (the wrong,
    *  alarming signal here). The pinned path keeps {@link #warmStaleError} (a re-pin retry is pointless). */
   #warmFreshError(url: string, status: number | null): Error {
+    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
     return new Error(
-      `warm (logged-in) navigation to ${url} was blocked (status=${status ?? "n/a"}): the fresh ` +
+      `warm (logged-in) navigation to ${sanitizeUrlForError(url)} was blocked (status=${status ?? "n/a"}): the fresh ` +
         `residential exit was likely burned or unreachable — retry navigate to draw a clean exit`,
     );
   }
@@ -632,7 +655,8 @@ export class GatewayDriveController implements DriveController {
         // Proxy secrets rotated away mid-retry: a distinct error, not the exhausted-exits message
         // below — so ops sees "config removed", not "all exits unhealthy".
         throw new Error(
-          `proxy escalation unavailable for ${url}: residential proxy configuration was removed mid-retry`,
+          // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
+          `proxy escalation unavailable for ${sanitizeUrlForError(url)}: residential proxy configuration was removed mid-retry`,
         );
       }
       attempts = attempt;
@@ -650,11 +674,13 @@ export class GatewayDriveController implements DriveController {
     const exitCheck = this.#verifyEgressEnabled ? await this.#verifyEgress() : undefined;
     const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, exitCheck });
     throw new EscalationError(
-      `could not land a working proxied exit for ${url} after ${PROXY_OPEN_ATTEMPTS} attempts ` +
+      // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
+      `could not land a working proxied exit for ${sanitizeUrlForError(url)} after ${PROXY_OPEN_ATTEMPTS} attempts ` +
         `(last status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}` +
         (exitCheck ? `, exit=${exitCheck.kind}` : "") +
         `)`,
       dx,
+      this.#failure(last),
     );
   }
 
@@ -686,15 +712,33 @@ export class GatewayDriveController implements DriveController {
    */
   async #actAndSnap(act: (session: Session) => Promise<unknown>): Promise<PageSnapshot> {
     return this.#run(async (s) => {
-      await act(s);
+      try {
+        await act(s);
+      } catch (err) {
+        // The ACTION itself threw (a locator timeout, a detached element, a failed fill) BEFORE any
+        // snapshot — otherwise the envelope is dropped and a drive action failure is opaque (issue #39).
+        // Best-effort snapshot the current page so the failure still carries evidence; the page may be
+        // wedged, so its OWN try/catch. Attach the redacted envelope and rethrow — #run's catch preserves
+        // `.failure` across its redaction re-wrap.
+        let failure: FailureDiagnostics | undefined;
+        try {
+          failure = this.#failure(await s.core.snapshot());
+        } catch {
+          // the page is unusable — no snapshot evidence; the action error still propagates with none
+        }
+        throw attachFailure(err instanceof Error ? err : new Error(String(err)), failure);
+      }
       const snap = await s.core.snapshot();
       // The snapshot carries the active page's last navigation status, so navFailed catches a bare
       // reputation block (4xx + thin) reached by the action as well as a visible challenge — neither
       // is handed back as success.
       if (navFailed(snap)) {
-        throw new Error(
-          "the action landed on a blocked/challenge page that did not clear — close and reopen the " +
-            "drive session, then retry the flow",
+        throw attachFailure(
+          new Error(
+            "the action landed on a blocked/challenge page that did not clear — close and reopen the " +
+              "drive session, then retry the flow",
+          ),
+          this.#failure(snap),
         );
       }
       return snap;
@@ -709,7 +753,11 @@ export class GatewayDriveController implements DriveController {
       // Session reaped/closed out from under us -> reset so the next navigate transparently reopens.
       if (!this.#gateway.sessions.get(handle)) this.#handle = undefined;
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(redactSecrets(message, this.#secrets));
+      // Preserve a failure envelope (issue #39) across the redaction re-wrap: an action that landed on a
+      // blocked page throws `attachFailure(...)` INSIDE this #run turn (see #actAndSnap), and the fresh
+      // Error below would otherwise drop the non-enumerable `.failure`. The envelope was already redacted
+      // at #failure(), so re-attaching it is secret-safe.
+      throw attachFailure(new Error(redactSecrets(message, this.#secrets)), failureOf(err));
     }
   }
 }
