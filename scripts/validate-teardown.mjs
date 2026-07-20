@@ -102,11 +102,10 @@ try {
     console.log(`     group ${pgid}: ${after.length} live process(es) after kill`);
     check("3b. the whole process group was reaped (0 remain)", after.length === 0);
 
-    // Reconfirm after a REAL signal-death (the child now carries signalCode='SIGKILL', exitCode=null):
-    // core.kill() must SHORT-CIRCUIT on `childTerminated` rather than re-signal a possibly-recycled pid.
+    // Reconfirm on an already-empty group must return fast WITHOUT re-signaling a possibly-recycled pgid.
     const t0 = Date.now();
     await core.kill(5_000);
-    check("3d. reconfirm after signal-death short-circuits fast (no re-signal)", Date.now() - t0 < 1_000);
+    check("3d. reconfirm on an already-empty group returns fast (no re-signal)", Date.now() - t0 < 1_000);
   }
 
   // The direct kill left the session registered (we bypassed the manager). Release it so the slot frees;
@@ -120,6 +119,30 @@ try {
   await mgr.release(s2.id);
   check("4. release() frees the capacity slot", mgr.activeCount === 0);
   check("4b. release() left no live browser process behind", pid2 === undefined || isDead(pid2));
+
+  // --- Section C: leader-death != group-empty (the confirm must be group-based) --------------------
+  // A detached leader with a surviving same-PGID child. SIGKILL only the leader; the child lives on in the
+  // group — proving leader death is NOT whole-tree death. Then a GROUP SIGKILL empties it — the exact
+  // confirm core.kill() uses (kill(-pgid,0)->ESRCH), not a leader-only probe.
+  const { spawn } = await import("node:child_process");
+  const leader = spawn("bash", ["-c", "sleep 300 & sleep 300 & wait"], { detached: true, stdio: "ignore" });
+  const leaderPid = leader.pid;
+  await new Promise((r) => setTimeout(r, 300)); // let the group populate
+  const grp = pgidOf(leaderPid);
+  process.kill(leaderPid, "SIGKILL"); // kill ONLY the leader
+  await new Promise((r) => setTimeout(r, 300));
+  const groupAfterLeaderKill = procsInGroup(grp);
+  check("C. leader death alone leaves surviving same-group children (confirm can't key off the leader)", groupAfterLeaderKill.length > 0);
+  process.kill(-grp, "SIGKILL"); // group kill — what core.kill() does to reap survivors
+  await new Promise((r) => setTimeout(r, 300));
+  let groupEmpty;
+  try {
+    process.kill(-grp, 0);
+    groupEmpty = false;
+  } catch (e) {
+    groupEmpty = e.code === "ESRCH";
+  }
+  check("Cb. a GROUP SIGKILL empties the group (kill(-pgid,0)->ESRCH) — the group-based confirm", groupEmpty);
 } catch (err) {
   console.log(`  FAIL  threw: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
   failures++;

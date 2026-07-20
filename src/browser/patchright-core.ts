@@ -1188,14 +1188,21 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   /**
-   * Force-kill the browser (issue #50). SIGKILLs the process GROUP (-pid — reaps Chromium's
-   * renderer/GPU/zygote children, since patchright spawns Chrome detached as its own group leader) AND
-   * the leader pid itself as belt-and-braces (in case the group-leader assumption ever fails in a new
-   * env; `--init`/tini then reaps any reparented child). Then CONFIRMS death within `confirmMs` via the
-   * ChildProcess `'exit'` event and/or a `kill(pid,0)` liveness poll on the LEADER pid — never via the
-   * group-kill's own ESRCH (a wrong/absent group would falsely read as dead). Idempotent + re-runnable:
-   * a second call re-signals and re-confirms, so the manager's reconfirm loop can retry an unconfirmed
-   * kill. Rejects immediately when no PID was captured (force-kill unavailable).
+   * Force-kill the browser (issue #50) and CONFIRM its whole process TREE is gone. Confirmation keys off
+   * the process GROUP being empty — NOT the leader pid alone: patchright spawns Chrome detached as its own
+   * group leader, and the leader dying does not imply its renderer/GPU/zygote children are gone (codex #50
+   * r3). So:
+   *  - if the group is ALREADY empty, there is nothing to signal (avoids re-signaling a possibly-recycled
+   *    pgid) — resolve;
+   *  - otherwise SIGKILL the process GROUP (`-pid`) unconditionally (reaps surviving children even when the
+   *    leader already died), and SIGKILL the leader pid only while it is KNOWN-ALIVE (once terminated its
+   *    pid may be recycled — `childTerminated` consults exitCode AND signalCode, since a SIGKILL'd child
+   *    leaves exitCode null and sets signalCode);
+   *  - then poll until the group is empty (`kill(-pid, 0)`→ESRCH), rejecting if not within `confirmMs`.
+   * Group-based confirmation is reuse-safe-DIRECTION: a pgid is not recycled while any member lives, so a
+   * lingering child keeps `-pid` pointing at OUR group and a "non-empty" reading only ever delays (never
+   * false-frees) the confirmation. Idempotent + re-runnable so the manager's reconfirm loop can retry.
+   * Rejects immediately when no PID was captured (force-kill unavailable).
    */
   async kill(confirmMs: number): Promise<void> {
     const pid = this.#pid;
@@ -1203,15 +1210,21 @@ export class PatchrightBrowserCore implements BrowserCore {
       throw new Error("force-kill unavailable: no Chromium PID captured at launch");
     }
     this.#closing = true; // fail-closed during teardown, same as close()
-    const child = this.#child;
-    // Already terminated? Then DON'T re-signal (a reconfirm after our own SIGKILL must not risk hitting a
-    // recycled pid). A child killed by a SIGNAL leaves exitCode === null and records the signal in
-    // signalCode, so BOTH must be consulted — exitCode alone misses exactly the SIGKILL case this kills
-    // with (codex #50 r2). Never child.killed — that only means a signal was SENT, not that the OS reaped it.
-    if (childTerminated(child)) return;
-    this.#sigkill(-pid); // process group: renderers/GPU/zygote
-    this.#sigkill(pid); // leader, belt-and-braces
-    await this.#confirmProcessDead(pid, child, confirmMs);
+    if (this.#groupEmpty(pid)) return; // whole tree already gone — nothing to signal
+    this.#sigkill(-pid); // process group: reaps renderers/GPU/zygote even if the leader already died
+    if (!childTerminated(this.#child)) this.#sigkill(pid); // leader, only while its pid can't be recycled
+    await this.#confirmGroupEmpty(pid, confirmMs);
+  }
+
+  /** True when NO process remains in group `pid` — `kill(-pid, 0)` throws ESRCH only for an empty group.
+   *  A pgid isn't recycled while any member lives, so this never false-reports empty while our tree lives. */
+  #groupEmpty(pid: number): boolean {
+    try {
+      process.kill(-pid, 0); // group liveness probe (signal 0): succeeds while any member lives
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "ESRCH";
+    }
   }
 
   /** Best-effort SIGKILL. ESRCH (target already gone) is success-shaped input to the confirm step, not an
@@ -1227,9 +1240,9 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
   }
 
-  /** Resolve once the LEADER pid is confirmed gone (ChildProcess `'exit'` OR `kill(pid,0)`→ESRCH), reject
-   *  if not confirmed within `deadlineMs`. All timers unref'd; listeners cleaned up on settle. */
-  #confirmProcessDead(pid: number, child: ChildProcess | undefined, deadlineMs: number): Promise<void> {
+  /** Resolve once the browser's whole process GROUP is empty (every captured-group member reaped), reject
+   *  if not within `deadlineMs`. Confirms the WHOLE tree is gone, not just the leader. Timers unref'd. */
+  #confirmGroupEmpty(pid: number, deadlineMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       const finish = (dead: boolean): void => {
@@ -1237,28 +1250,19 @@ export class PatchrightBrowserCore implements BrowserCore {
         settled = true;
         clearInterval(poll);
         clearTimeout(deadline);
-        if (child) child.removeListener("exit", onExit);
         if (dead) resolve();
-        else reject(new Error(`force-kill: pid ${pid} not confirmed dead within ${deadlineMs}ms`));
+        else reject(new Error(`force-kill: process group ${pid} not confirmed empty within ${deadlineMs}ms`));
       };
-      const onExit = (): void => finish(true);
-      if (child) child.once("exit", onExit);
       const probe = (): void => {
-        // Catch a termination that fired between kill()'s check and the listener attach (a `.once` added
-        // after the event would miss it) — authoritative and immune to PID reuse. Consult BOTH exitCode
-        // and signalCode: a SIGKILL'd child leaves exitCode null and sets signalCode (codex #50 r2).
-        if (childTerminated(child)) return finish(true);
-        try {
-          process.kill(pid, 0); // signal 0 = liveness probe; throws ESRCH once the pid is gone
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "ESRCH") finish(true);
-        }
+        if (this.#groupEmpty(pid)) finish(true);
       };
+      // NOT unref'd: an in-flight force-kill confirmation is a foreground operation that must keep the
+      // process alive until it settles — the browser ChildProcess handle no longer anchors the event loop
+      // (we confirm by polling the process group, not the child 'exit' event), and both timers are cleared
+      // the instant finish() runs, so they never linger past the bounded confirm.
       const poll = setInterval(probe, 100);
-      poll.unref?.();
       const deadline = setTimeout(() => finish(false), deadlineMs);
-      deadline.unref?.();
-      probe(); // the process may already be gone
+      probe(); // the group may already be empty
     });
   }
 }

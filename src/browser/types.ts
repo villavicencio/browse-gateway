@@ -320,14 +320,13 @@ export interface BrowserCore {
    */
   close(): Promise<void>;
   /**
-   * Force-kill the browser process (issue #50): SIGKILL the process (group + leader) and CONFIRM the OS
-   * process is gone — resolving ONLY on a confirmed exit (child `'exit'` / `kill(pid,0)`→ESRCH) within
-   * `confirmMs`, REJECTING if death cannot be confirmed in that window. Idempotent and re-runnable: a
-   * second call re-sends the signal and re-confirms, so a session-manager reconfirm loop can retry a
-   * previously-unconfirmed kill. REJECTS immediately when force-kill is unavailable (no PID captured at
-   * launch — see {@link forceKillAvailable}); the caller treats that as an unconfirmed, still-counted
-   * teardown. Confirmation NEVER trusts the group-kill's own ESRCH (a wrong/absent group would falsely
-   * read as dead) — only the leader pid's liveness.
+   * Force-kill the browser process (issue #50): SIGKILL the process group + leader and CONFIRM the whole
+   * process TREE is gone — resolving ONLY once the browser's process GROUP is empty within `confirmMs`
+   * (leader death alone does NOT imply its renderer/GPU children are gone), REJECTING if it cannot be
+   * confirmed empty in that window. Idempotent and re-runnable: a second call re-signals surviving members
+   * and re-confirms, so a session-manager reconfirm loop can retry a previously-unconfirmed kill. REJECTS
+   * immediately when force-kill is unavailable (no PID captured at launch — see {@link forceKillAvailable});
+   * the caller treats that as an unconfirmed, still-counted teardown.
    */
   kill(confirmMs: number): Promise<void>;
   /**
