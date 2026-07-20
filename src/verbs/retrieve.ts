@@ -20,7 +20,7 @@ import {
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
-import { redactFailureDiagnostics } from "../observability/index.js";
+import { redactFailureDiagnostics, sanitizeUrlForError } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
@@ -377,7 +377,9 @@ export async function retrieve(
   // before any navigation, so a non-http target can't read local files or bypass the
   // host-based guard (whose host is empty for those schemes).
   if (!isHttpUrl(url)) {
-    throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
+    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url is never interpolated
+    // raw — sanitizeUrl (new URL) collapses a non-http scheme to `scheme:<redacted>`, spelling-proof.
+    throw new Error(`unsupported URL scheme: only http(s) is allowed (${sanitizeUrlForError(url)})`);
   }
   // clearedTextLength: a page returns as soon as real content (>= MIN_CONTENT_LENGTH) renders
   // instead of polling to the full clearance timeout (the kill-gate keeps the strong-content

@@ -30,7 +30,7 @@ import {
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck } from "../verbs/index.js";
-import { redactFailureDiagnostics, attachFailure, failureOf } from "../observability/index.js";
+import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
 import type { VaultEntryStore } from "./vault-login.js";
@@ -240,7 +240,10 @@ export class GatewayDriveController implements DriveController {
     // Scheme allowlist (R14-adjacent): only http(s), rejected before any session/navigation —
     // mirrors retrieve(), so a non-http target can't slip past the host-based guard.
     if (!isHttpUrl(url)) {
-      throw new Error(`unsupported URL scheme: only http(s) is allowed (${url})`);
+      // Structural sanitize (sanitizeUrl/new URL) at the source: the requested url is a KNOWN structured
+      // value, so it must never be interpolated raw — a non-canonical spelling (`https:example.com`, no
+      // `//`) would slip the after-the-fact regex net (issue #39 r5).
+      throw new Error(`unsupported URL scheme: only http(s) is allowed (${sanitizeUrlForError(url)})`);
     }
     // Force residential from the first request when the caller asks (forceProxy) or the host is on
     // the configured force-proxy list — for a known-hostile WAF the direct attempt only wastes a
@@ -318,7 +321,8 @@ export class GatewayDriveController implements DriveController {
         // Fail loud rather than silently fall back to the direct attempt the caller opted out of.
         const dx = this.#escalationDiag({ proxyApplied: false, forced: true, attempts: 0, last: undefined });
         throw new EscalationError(
-          `force-proxy requested for ${url} but no residential proxy is available ` +
+          // Structural sanitize at the source (issue #39 r5): the KNOWN requested url — spelling-proof.
+          `force-proxy requested for ${sanitizeUrlForError(url)} but no residential proxy is available ` +
             `(proxy configured=${dx.proxyConfigured}, on datacenter IP=${this.#onDatacenterIp}) — ` +
             `set BGW_PROXY_* + BGW_ON_DATACENTER_IP, or drop the host from BGW_FORCE_PROXY_HOSTS`,
           dx,
@@ -600,8 +604,9 @@ export class GatewayDriveController implements DriveController {
    *  first-navigate warm path and the reopen-after-reap warm path, so the "stale warm fails LOUD"
    *  guarantee does not depend on whether the session happened to be idle-reaped. */
   #warmStaleError(url: string, status: number | null): Error {
+    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
     return new Error(
-      `warm (logged-in) navigation to ${url} failed (status=${status ?? "n/a"}): the stored session ` +
+      `warm (logged-in) navigation to ${sanitizeUrlForError(url)} failed (status=${status ?? "n/a"}): the stored session ` +
         `is likely expired or blocked — ask the operator to re-capture this credential`,
     );
   }
@@ -611,8 +616,9 @@ export class GatewayDriveController implements DriveController {
    *  re-warms with a DIFFERENT fresh exit. So tell the consumer to retry, not to re-capture (the wrong,
    *  alarming signal here). The pinned path keeps {@link #warmStaleError} (a re-pin retry is pointless). */
   #warmFreshError(url: string, status: number | null): Error {
+    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
     return new Error(
-      `warm (logged-in) navigation to ${url} was blocked (status=${status ?? "n/a"}): the fresh ` +
+      `warm (logged-in) navigation to ${sanitizeUrlForError(url)} was blocked (status=${status ?? "n/a"}): the fresh ` +
         `residential exit was likely burned or unreachable — retry navigate to draw a clean exit`,
     );
   }
@@ -649,7 +655,8 @@ export class GatewayDriveController implements DriveController {
         // Proxy secrets rotated away mid-retry: a distinct error, not the exhausted-exits message
         // below — so ops sees "config removed", not "all exits unhealthy".
         throw new Error(
-          `proxy escalation unavailable for ${url}: residential proxy configuration was removed mid-retry`,
+          // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
+          `proxy escalation unavailable for ${sanitizeUrlForError(url)}: residential proxy configuration was removed mid-retry`,
         );
       }
       attempts = attempt;
@@ -667,7 +674,8 @@ export class GatewayDriveController implements DriveController {
     const exitCheck = this.#verifyEgressEnabled ? await this.#verifyEgress() : undefined;
     const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, exitCheck });
     throw new EscalationError(
-      `could not land a working proxied exit for ${url} after ${PROXY_OPEN_ATTEMPTS} attempts ` +
+      // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
+      `could not land a working proxied exit for ${sanitizeUrlForError(url)} after ${PROXY_OPEN_ATTEMPTS} attempts ` +
         `(last status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}` +
         (exitCheck ? `, exit=${exitCheck.kind}` : "") +
         `)`,

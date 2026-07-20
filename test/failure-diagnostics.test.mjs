@@ -22,7 +22,9 @@ import {
   FAILURE_DIAGNOSTICS_CAP,
 } from "../dist/observability/index.js";
 import { createGatewayMcpServer } from "../dist/mcp/index.js";
+import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { EscalationError, isRetrieveFailure } from "../dist/verbs/index.js";
+import { SecretStore } from "../dist/security/index.js";
 import { isTopLevelNavStart } from "../dist/browser/patchright-core.js";
 
 // --- (a) redaction ---------------------------------------------------------------------------
@@ -399,6 +401,49 @@ test("the drive fail() surface handles a )-containing valid URL without leaking 
     assert.ok(!text.includes(leak), `a valid-URL tail leaked past the delimiter on the drive surface: ${leak}`);
   }
   assert.ok(!/\?code=/.test(text) && text.includes("https://site.example/"), "origin kept, query gone");
+});
+
+test("MCP drive force-proxy error structurally sanitizes a NON-CANONICAL URL spelling (r5, exact repro)", async () => {
+  // The exact reachable repro: a valid HTTPS url with NO `//` (Zod .url() + new URL() accept it) whose
+  // controller force-proxy error interpolated it raw — the after-the-fact regex net (requires `//`)
+  // missed it. Now sanitized STRUCTURALLY at the source in GatewayDriveController.
+  const open = new Map();
+  let n = 1;
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + n++; open.set(id, { core: {} }); return id; },
+    async useConsumerSession(_t, h, fn) { return fn(open.get(h)); },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  const drive = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok"); // no proxy configured
+  const client = await connect({ drive });
+  const res = await client.callTool({
+    name: "browser_navigate",
+    arguments: { url: "https:example.com/reset/DRIVE_SECRET?code=QUERY_SECRET", forceProxy: true },
+  });
+  assert.equal(res.isError, true);
+  const text = res.content[0].text;
+  for (const leak of ["DRIVE_SECRET", "QUERY_SECRET"]) {
+    assert.ok(!text.includes(leak), `the drive force-proxy surface leaked ${leak}`);
+  }
+  assert.ok(!/\?code=/.test(text), "the query is gone");
+  assert.ok(text.includes("https://example.com"), "the origin is preserved (spelling normalized)");
+});
+
+test("MCP retrieve error surface handles a NON-CANONICAL URL spelling (r5, structural sanitizeUrlForError)", async () => {
+  const client = await connect({
+    retrieve: async () => outcome({ blocked: true, markdown: "", reason: "hard-block", status: 403 }),
+  });
+  const res = await client.callTool({
+    name: "retrieve",
+    arguments: { url: "https:example.com/reset/R5_SECRET?code=R5Q_SECRET" },
+  });
+  assert.equal(res.isError, true);
+  const text = res.content[0].text;
+  for (const leak of ["R5_SECRET", "R5Q_SECRET"]) {
+    assert.ok(!text.includes(leak), `the retrieve surface leaked ${leak}`);
+  }
+  assert.ok(!/\?code=/.test(text) && text.includes("https://example.com"), "query gone, origin preserved");
 });
 
 test("a successful retrieve carries NO failure envelope (success shape unchanged)", async () => {
