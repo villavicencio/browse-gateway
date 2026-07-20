@@ -149,8 +149,16 @@ function sanitizeUrl(raw: string): string {
  *  with its query/token). Two passes: http(s) — matching the backslash-escaped `https:\/\/…` notation
  *  too (the char class keeps backslashes so the escaped path is consumed and normalized inside
  *  sanitizeUrl) — and a scheme-agnostic pass for the RISKY opaque-body schemes (`data:`/`blob:`/
- *  `javascript:`/…), whose payloads must also be collapsed, not just http(s) URLs. */
-const URL_IN_TEXT_RE = /https?:(?:\\?\/){2}[^\s"'<>)\]]+/gi;
+ *  `javascript:`/…), whose payloads must also be collapsed, not just http(s) URLs.
+ *
+ *  Both char classes stop ONLY at whitespace and quotes (the http pass also at `<`/`>`) — deliberately
+ *  NOT at `)` / `]`, which are LEGAL inside a URL: excluding them truncated the match and leaked the
+ *  valid-URL tail after a `)` (e.g. `…/reset/PREFIX)TAIL?code=…`). Over-consuming a trailing `)` / `.` /
+ *  `,` from surrounding prose is the SAFE direction — sanitizeUrl collapses the WHOLE match to
+ *  origin+depth, so the over-consumed prose is discarded, never leaked. Quotes stay excluded (and `<`/`>`
+ *  for http, real JSON/HTML delimiters); a data: payload containing a literal quote is the documented
+ *  truncation residual. */
+const URL_IN_TEXT_RE = /https?:(?:\\?\/){2}[^\s"'<>]+/gi;
 const RISKY_SCHEME_IN_TEXT_RE = /\b(?:data|blob|javascript|vbscript|filesystem|file|about|chrome-error):[^\s"']+/gi;
 function sanitizeUrlsInText(s: string): string {
   return s.replace(URL_IN_TEXT_RE, (m) => sanitizeUrl(m)).replace(RISKY_SCHEME_IN_TEXT_RE, (m) => sanitizeUrl(m));

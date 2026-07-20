@@ -180,6 +180,31 @@ test("fail-closed URL sanitize r3 (EMPTY store): unusual port, basic-auth, data:
   assert.ok(red.consoleErrors[1].includes("Content-Type: text/html"), "a real next COLON field survives");
 });
 
+test("in-text URL match r4 (EMPTY store): a valid-URL tail after )/] can't leak past the delimiter", () => {
+  const red = redactFailureDiagnostics(buildFailureDiagnostics({
+    consoleErrors: [
+      "load https://safe.example/reset/PREFIX)TAIL_RP_SECRET?code=Q_RP_SECRET failed", // ')' is legal in a URL
+      "see [https://safe.example/p/BRACK]TAIL_SB_SECRET?code=Q_SB_SECRET]",             // ']' is legal in a URL
+      'json {"u":"https://safe.example/q/QUOTED?code=Q_QT_SECRET"} done',               // quote IS a delimiter
+    ],
+    networkFailures: [
+      "GET https://safe.example/dl/(GROUP)NET_SECRET?code=Q_NET_SECRET net::ERR_FAILED",
+    ],
+  }), storeOf()); // EMPTY store — closed by URL sanitization alone
+  const blob = JSON.stringify(red);
+  for (const leak of [
+    "TAIL_RP_SECRET", "Q_RP_SECRET", "TAIL_SB_SECRET", "Q_SB_SECRET",
+    "Q_QT_SECRET", "NET_SECRET", "Q_NET_SECRET",
+  ]) {
+    assert.ok(!blob.includes(leak), `a valid-URL tail leaked past the in-text delimiter: ${leak}`);
+  }
+  // origin preserved on each; no ?code= survives.
+  for (const line of [...red.consoleErrors, ...red.networkFailures]) {
+    assert.ok(!/\?code=/.test(line), `?code= survived in: ${line}`);
+    assert.ok(line.includes("https://safe.example/"), `origin lost in: ${line}`);
+  }
+});
+
 // --- isRetrieveFailure predicate (shared by retrieve() and the MCP surface) -------------------
 
 test("isRetrieveFailure: blocked / empty / whitespace / failed-nav are failures; short-valid is not", () => {
@@ -356,6 +381,24 @@ test("the drive fail() surface sanitizes a raw URL in the error message (r3)", a
     assert.ok(!res.content[0].text.includes(leak), `the drive fail() surface echoed a raw ${leak}`);
   }
   assert.ok(res.content[0].text.includes("https://site.example/"), "the origin is preserved");
+});
+
+test("the drive fail() surface handles a )-containing valid URL without leaking the tail (r4)", async () => {
+  const drive = {
+    async open() {},
+    async navigate() { throw new Error("navigation failed for https://site.example/reset/(GRP)DRIVE_RP_TAIL?code=DRIVE_RP_Q"); },
+    async snapshot() { return { url: "u", title: "t", tree: "x", status: 200 }; },
+    async click() {}, async type() {}, async selectOption() {}, async pressKey() {},
+    async waitFor() {}, async screenshot() { return "QUJD"; }, async close() {},
+  };
+  const client = await connect({ drive });
+  const res = await client.callTool({ name: "browser_navigate", arguments: { url: "https://site.example/" } });
+  assert.equal(res.isError, true);
+  const text = res.content[0].text;
+  for (const leak of ["DRIVE_RP_TAIL", "DRIVE_RP_Q"]) {
+    assert.ok(!text.includes(leak), `a valid-URL tail leaked past the delimiter on the drive surface: ${leak}`);
+  }
+  assert.ok(!/\?code=/.test(text) && text.includes("https://site.example/"), "origin kept, query gone");
 });
 
 test("a successful retrieve carries NO failure envelope (success shape unchanged)", async () => {
