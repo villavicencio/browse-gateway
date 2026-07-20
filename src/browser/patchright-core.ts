@@ -65,6 +65,14 @@ type CDPSession = Awaited<ReturnType<PatchrightBrowser["newBrowserCDPSession"]>>
  * it NEVER throws at launch. The in-container gate asserts this succeeds on the shipping `channel:"chrome"`
  * build so a patchright bump that breaks it fails CI before deploy, not silently in prod.
  */
+/** True once a ChildProcess has terminated by EITHER a normal exit (`exitCode` set) or a signal
+ *  (`signalCode` set — a SIGKILL'd child keeps `exitCode === null`). The authoritative "process is gone,
+ *  do not re-signal its pid" predicate for the force-kill path (issue #50). `undefined` child → not known
+ *  terminated (there's nothing to gate on). Never uses `child.killed` (that means "signal sent", not reaped). */
+function childTerminated(child: ChildProcess | undefined): boolean {
+  return child !== undefined && (child.exitCode !== null || child.signalCode !== null);
+}
+
 function captureBrowserProcess(
   context: PatchrightContext,
 ): { pid: number; child: ChildProcess } | undefined {
@@ -1196,9 +1204,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
     this.#closing = true; // fail-closed during teardown, same as close()
     const child = this.#child;
-    // Already reaped? Use exitCode (set on the 'exit' event), NOT child.killed — .killed only means a
-    // signal was successfully SENT, not that the OS reaped the process.
-    if (child && child.exitCode !== null) return;
+    // Already terminated? Then DON'T re-signal (a reconfirm after our own SIGKILL must not risk hitting a
+    // recycled pid). A child killed by a SIGNAL leaves exitCode === null and records the signal in
+    // signalCode, so BOTH must be consulted — exitCode alone misses exactly the SIGKILL case this kills
+    // with (codex #50 r2). Never child.killed — that only means a signal was SENT, not that the OS reaped it.
+    if (childTerminated(child)) return;
     this.#sigkill(-pid); // process group: renderers/GPU/zygote
     this.#sigkill(pid); // leader, belt-and-braces
     await this.#confirmProcessDead(pid, child, confirmMs);
@@ -1234,9 +1244,10 @@ export class PatchrightBrowserCore implements BrowserCore {
       const onExit = (): void => finish(true);
       if (child) child.once("exit", onExit);
       const probe = (): void => {
-        // Catch an exit that fired between kill()'s exitCode check and the listener attach (a `.once`
-        // added after the event would miss it) — authoritative and immune to PID reuse.
-        if (child && child.exitCode !== null) return finish(true);
+        // Catch a termination that fired between kill()'s check and the listener attach (a `.once` added
+        // after the event would miss it) — authoritative and immune to PID reuse. Consult BOTH exitCode
+        // and signalCode: a SIGKILL'd child leaves exitCode null and sets signalCode (codex #50 r2).
+        if (childTerminated(child)) return finish(true);
         try {
           process.kill(pid, 0); // signal 0 = liveness probe; throws ESRCH once the pid is gone
         } catch (err) {

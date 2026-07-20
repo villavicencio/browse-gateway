@@ -161,9 +161,22 @@ export class Session {
    */
   async reconfirm(killConfirmMs: number): Promise<void> {
     if (this.#state === "closed") return;
-    await this.#core.kill(killConfirmMs);
-    this.#state = "closed";
+    // Single-flight (codex #50 r2): overlapping reconfirms — two fire-and-forget reaper ticks, or a reaper
+    // tick racing shutdown — must not start two concurrent `core.kill()` on the same session (which would
+    // re-signal its pid twice). Concurrent callers share the one in-flight kill; the latch clears on settle
+    // so a still-unconfirmed session is retried on the next drain.
+    if (this.#reconfirming) return this.#reconfirming;
+    this.#reconfirming = (async () => {
+      try {
+        await this.#core.kill(killConfirmMs);
+        this.#state = "closed";
+      } finally {
+        this.#reconfirming = undefined;
+      }
+    })();
+    return this.#reconfirming;
   }
+  #reconfirming?: Promise<void>;
 }
 
 /** A cancellable delay: `promise` resolves after `ms`; `clear()` cancels the (unref'd) timer so a

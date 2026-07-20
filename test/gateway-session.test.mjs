@@ -702,3 +702,20 @@ test("shutdown: confirmed teardowns leave the manager empty (no retained account
   assert.equal(mgr.activeCount, 0, "clean closes fully drain the registry");
   assert.equal(mgr.unconfirmedCount, 0);
 });
+
+test("reconfirm is single-flight: overlapping drains issue exactly one kill per session (codex #50 r2)", async () => {
+  const { factory, cores } = makeControllableFactory({ closeMode: "reject", killMode: "reject" });
+  const mgr = teardownMgr(1, factory);
+  const s = await mgr.acquire();
+  await mgr.release(s.id); // close rejects, kill rejects → #unconfirmed, killCalls = 1
+  assert.equal(cores[0].killCalls, 1);
+  cores[0].killMode = "hang"; // the reconfirm's kill hangs until released, holding the single-flight window open
+  const r1 = mgr.reapIdle(60_000, Date.now()); // → #drainUnconfirmed → reconfirm
+  const r2 = mgr.reapIdle(60_000, Date.now()); // concurrent second drain
+  await tick();
+  assert.equal(cores[0].killCalls, 2, "one reconfirm kill despite two concurrent drains (1 initial + 1 shared)");
+  assert.equal(cores[0].closeCalls, 1, "reconfirm never re-ran close");
+  cores[0].releaseKill(true);
+  await Promise.all([r1, r2]);
+  assert.equal(mgr.activeCount, 0, "the shared reconfirm reclaimed the slot");
+});

@@ -101,6 +101,12 @@ try {
     const after = procsInGroup(pgid);
     console.log(`     group ${pgid}: ${after.length} live process(es) after kill`);
     check("3b. the whole process group was reaped (0 remain)", after.length === 0);
+
+    // Reconfirm after a REAL signal-death (the child now carries signalCode='SIGKILL', exitCode=null):
+    // core.kill() must SHORT-CIRCUIT on `childTerminated` rather than re-signal a possibly-recycled pid.
+    const t0 = Date.now();
+    await core.kill(5_000);
+    check("3d. reconfirm after signal-death short-circuits fast (no re-signal)", Date.now() - t0 < 1_000);
   }
 
   // The direct kill left the session registered (we bypassed the manager). Release it so the slot frees;
