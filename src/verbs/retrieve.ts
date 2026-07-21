@@ -287,16 +287,28 @@ export function resolveFailureReason(sig: FailureSignal): BlockReason | null {
 }
 
 /**
- * Whether the render saw a GENUINE network failure — a data/asset request that failed for a reason OTHER
- * than the gateway's own navigation guard (issue #41). The allowlist guard aborts every off-allowlist
- * subresource via `Fetch.failRequest{BlockedByClient}`, surfaced by Chrome as `net::ERR_BLOCKED_BY_CLIENT`
- * in the `requestfailed` evidence line — so a raw `networkFailures.length > 0` is near-always TRUE on real
- * pages (analytics/ads/fonts off-allowlist) and would collapse the `hydration-failed` gate. The gateway is
- * the ONLY client-blocker, so filtering that exact code leaves the genuine failures (ERR_FAILED /
- * ERR_CONNECTION_* / ERR_TIMED_OUT / ERR_NAME_NOT_RESOLVED / ERR_ABORTED) that actually imply a broken load.
+ * Error codes on a `requestfailed` evidence line that are BENIGN — not evidence of a broken load, so they
+ * must not set `networkFailed` and mislabel an empty page as `hydration-failed` (issue #41):
+ *   - `ERR_BLOCKED_BY_CLIENT` — the gateway's OWN allowlist guard aborting an off-allowlist subresource
+ *     (`Fetch.failRequest{BlockedByClient}`). Ubiquitous on real pages (analytics/ads/fonts off-allowlist),
+ *     and the gateway is the ONLY client-blocker, so this exact code is always guard noise.
+ *   - `ERR_ABORTED` — a CANCELLED request, the normal SPA pattern (navigating away or an AbortController
+ *     cancelling an in-flight fetch fires `requestfailed` with this code). Predominantly benign and
+ *     unrelated to hydration (codex #41 r6), so counting it over-fires `hydration-failed`.
+ * What remains as GENUINE (a broken load): ERR_FAILED / ERR_CONNECTION_* / ERR_TIMED_OUT /
+ * ERR_NAME_NOT_RESOLVED, etc.
+ */
+const BENIGN_NETWORK_ERRORS = /ERR_BLOCKED_BY_CLIENT|ERR_ABORTED/i;
+
+/**
+ * Whether the render saw a GENUINE network failure — a data/asset request that failed for a reason that
+ * actually implies a broken load, not the gateway's own guard aborts or a benign SPA cancellation (issue
+ * #41). Filters {@link BENIGN_NETWORK_ERRORS}; without it a raw `networkFailures.length > 0` is near-always
+ * TRUE on real pages and would collapse the `hydration-failed` vs `empty-shell` distinction. A DIAGNOSTIC
+ * discriminator, best-effort by nature.
  */
 export function genuineNetworkFailure(networkFailures: readonly string[] | undefined): boolean {
-  return (networkFailures ?? []).some((line) => !/ERR_BLOCKED_BY_CLIENT/i.test(line));
+  return (networkFailures ?? []).some((line) => !BENIGN_NETWORK_ERRORS.test(line));
 }
 
 /**

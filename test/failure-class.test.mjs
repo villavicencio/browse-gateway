@@ -143,12 +143,14 @@ test("wafVendorFromFailure: every non-block content/nav class → undefined (the
 
 // --- genuineNetworkFailure: exclude the allowlist guard's own aborts (finding #3) ---
 
-test("genuineNetworkFailure: the guard's own ERR_BLOCKED_BY_CLIENT aborts do NOT count; real failures do", () => {
+test("genuineNetworkFailure: guard aborts (BLOCKED_BY_CLIENT) and benign cancellations (ABORTED) do NOT count; real failures do", () => {
   assert.equal(genuineNetworkFailure(["GET https://ads.example/ net::ERR_BLOCKED_BY_CLIENT"]), false);
+  // ERR_ABORTED is a normal SPA cancellation (navigate-away / AbortController), not a broken load (codex r6).
+  assert.equal(genuineNetworkFailure(["GET https://api.example/data net::ERR_ABORTED"]), false);
   assert.equal(genuineNetworkFailure(["GET https://cdn.example/app.js net::ERR_FAILED"]), true);
   assert.equal(genuineNetworkFailure(["GET https://x net::ERR_CONNECTION_REFUSED"]), true);
-  // mixed: at least one genuine failure among guard aborts → true.
-  assert.equal(genuineNetworkFailure(["GET https://a net::ERR_BLOCKED_BY_CLIENT", "GET https://b net::ERR_TIMED_OUT"]), true);
+  // mixed: at least one genuine failure among benign entries → true.
+  assert.equal(genuineNetworkFailure(["GET https://a net::ERR_BLOCKED_BY_CLIENT", "GET https://b net::ERR_ABORTED", "GET https://c net::ERR_TIMED_OUT"]), true);
   assert.equal(genuineNetworkFailure([]), false);
   assert.equal(genuineNetworkFailure(undefined), false);
 });
