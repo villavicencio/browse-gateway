@@ -143,17 +143,20 @@ test("classifyBlock: a thin 200 with a DataDome marker but no block phrase is a 
   assert.equal(classifyBlock({ title: "", text: "short", status: 200, ddHint: true }), null);
 });
 
-test("activeCaptchaKind: binds the kind to the widget CONTAINER class, ignoring loaded libraries + cross-sitekeys (codex #40 r4)", () => {
-  // The exact Codex repro: an active reCAPTCHA widget + a preloaded hCaptcha library must be recaptcha
-  // (the widget), NOT hcaptcha (the library) — detectCaptcha would have returned hcaptcha with the
-  // reCAPTCHA sitekey.
+test("activeCaptchaKind: a placed widget ELEMENT (class token + data-sitekey), bound to its kind (codex #40 r4/r5)", () => {
+  // The r4 repro: an active reCAPTCHA widget + a preloaded hCaptcha library must be recaptcha (the
+  // widget), NOT hcaptcha (the library) — detectCaptcha would have returned hcaptcha with the reCAPTCHA key.
   assert.equal(activeCaptchaKind('<div class="g-recaptcha" data-sitekey="rk"></div><script src="https://js.hcaptcha.com/1/api.js"></script>'), "recaptcha");
-  assert.equal(activeCaptchaKind('<div class="cf-turnstile" data-sitekey="0x4"></div>'), "turnstile");
-  assert.equal(activeCaptchaKind('<div class="h-captcha" data-sitekey="hk"></div>'), "hcaptcha");
-  // A merely-loaded library (no widget container class) is NOT an active widget.
-  assert.equal(activeCaptchaKind('<script src="https://www.google.com/recaptcha/api.js"></script>'), undefined);
-  assert.equal(activeCaptchaKind("grecaptcha.ready(function(){});"), undefined);
-  assert.equal(activeCaptchaKind('<script src="https://js.hcaptcha.com/1/api.js"></script>'), undefined);
+  assert.equal(activeCaptchaKind('<div data-sitekey="0x4" class="cf-turnstile"></div>'), "turnstile"); // attribute order-independent
+  assert.equal(activeCaptchaKind('<div class="row h-captcha col" data-sitekey="hk"></div>'), "hcaptcha"); // multi-class
+});
+
+test("activeCaptchaKind: rejects a loaded library, a compound class, a comment/CSS substring, and a class w/o sitekey (codex #40 r5)", () => {
+  assert.equal(activeCaptchaKind('<script src="https://www.google.com/recaptcha/api.js"></script>'), undefined); // library only
+  assert.equal(activeCaptchaKind("grecaptcha.ready(function(){});"), undefined); // JS global
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha-wrapper" data-sitekey="x"></div>'), undefined); // compound class, not the widget
+  assert.equal(activeCaptchaKind("<style>/* .g-recaptcha { display:none } */</style><div data-sitekey='x'></div>"), undefined); // token in CSS only
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha"></div>'), undefined); // class but no data-sitekey (matches the live gate)
   assert.equal(activeCaptchaKind("<main>no captcha here</main>"), undefined);
 });
 

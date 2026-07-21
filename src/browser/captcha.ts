@@ -67,27 +67,44 @@ export function detectCaptcha(signal: PageSignal, url: string): CaptchaChallenge
   return null;
 }
 
-/** The interactive CAPTCHA widget-CONTAINER classes, per kind — the same containers the live drive gate
- *  ({@link DETECT_LIVE_CAPTCHA_JS}) queries. Distinct from {@link detectCaptcha}'s script markers: a class
- *  appears ONLY for an actual placed widget, never for a merely-loaded library (`recaptcha/api.js`,
- *  `hcaptcha.com/1/api.js` carry no `-captcha`/`-recaptcha`/`cf-turnstile` class token). */
-const WIDGET_CLASS: readonly { kind: Exclude<CaptchaKind, "unknown">; re: RegExp }[] = [
-  { kind: "turnstile", re: /\bcf-turnstile\b/i },
-  { kind: "hcaptcha", re: /\bh-captcha\b/i },
-  { kind: "recaptcha", re: /\bg-recaptcha\b/i },
+/**
+ * A regex for a single ELEMENT that is an active CAPTCHA widget of container class `cls` — the HTML-string
+ * equivalent of the live gate's `.<cls>[data-sitekey]` ({@link DETECT_LIVE_CAPTCHA_JS}): an opening tag
+ * that carries `cls` as a WHOLE class token AND a `data-sitekey` attribute, in EITHER attribute order.
+ *   - the class token is delimited by non-`[\w-]` on both sides, so a COMPOUND class (`g-recaptcha-wrapper`)
+ *     or a stray substring does NOT match (the word-boundary `\b` did — codex #40 r5);
+ *   - it must live inside a real `<…>` tag WITH a `data-sitekey`, so `cls` in an inline stylesheet, an HTML
+ *     comment, or a JS template is not mistaken for a placed widget;
+ *   - a merely-LOADED library (`recaptcha/api.js`, `hcaptcha.com/1/api.js`) carries neither the class token
+ *     nor a widget `data-sitekey`, so it is never a widget.
+ */
+function widgetClassRe(cls: string): RegExp {
+  return new RegExp(
+    `<[a-z][a-z0-9]*(?=[^>]*\\bclass\\s*=\\s*["'][^"']*(?<![\\w-])${cls}(?![\\w-]))(?=[^>]*\\bdata-sitekey\\b)`,
+    "i",
+  );
+}
+
+/** The interactive CAPTCHA widget CONTAINER classes, per kind — the containers the live drive gate
+ *  ({@link DETECT_LIVE_CAPTCHA_JS}) queries. Order mirrors {@link detectCaptcha} for determinism if two
+ *  widget containers ever coexist. */
+const WIDGET_ELEMENT: readonly { kind: Exclude<CaptchaKind, "unknown">; re: RegExp }[] = [
+  { kind: "turnstile", re: widgetClassRe("cf-turnstile") },
+  { kind: "hcaptcha", re: widgetClassRe("h-captcha") },
+  { kind: "recaptcha", re: widgetClassRe("g-recaptcha") },
 ];
 
 /**
- * The kind of an ACTIVE interactive CAPTCHA widget in the rendered HTML — the widget-container class
- * (`cf-turnstile`/`h-captcha`/`g-recaptcha`), or `undefined` when only a captcha LIBRARY is loaded (or
- * none). Purpose-built for vendor attribution (issue #40): unlike {@link detectCaptcha}, the kind here is
- * bound to the widget class itself, so (a) a page that merely preloads a library isn't attributed a
- * CAPTCHA, and (b) a co-present unrelated library can't cross-label the kind — the failure Codex found
- * where detectCaptcha paired a reCAPTCHA sitekey with an hCaptcha kind. Order mirrors detectCaptcha for
- * determinism when (rarely) two widget containers coexist.
+ * The kind of an ACTIVE interactive CAPTCHA widget in the rendered HTML — a placed widget ELEMENT
+ * (container class + `data-sitekey`, per {@link widgetClassRe}) — or `undefined` when only a captcha
+ * LIBRARY is loaded, the token appears in non-element text, or none is present. Purpose-built for vendor
+ * attribution (issue #40): unlike {@link detectCaptcha}, the kind here is bound to the widget element, so
+ * (a) a page that merely preloads a library isn't attributed a CAPTCHA (codex r3), (b) a co-present
+ * unrelated library can't cross-label the kind (r4), and (c) a compound class / comment / stylesheet
+ * substring can't fabricate a widget (r5).
  */
 export function activeCaptchaKind(html: string): CaptchaKind | undefined {
-  return WIDGET_CLASS.find(({ re }) => re.test(html))?.kind;
+  return WIDGET_ELEMENT.find(({ re }) => re.test(html))?.kind;
 }
 
 /** A live, in-DOM CAPTCHA widget read off the active page (drive path). */
