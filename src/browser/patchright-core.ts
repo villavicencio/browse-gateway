@@ -488,6 +488,15 @@ export class PatchrightBrowserCore implements BrowserCore {
   #redirectChain: string[] = [];
   #consoleErrors: string[] = [];
   #networkFailures: string[] = [];
+  /**
+   * #42: the last drive ACTION's settle stages (clearance-poll + captcha-solve wall-clock), stashed by
+   * {@link #act}/{@link pressKey} and consumed ONCE by the next {@link #snapshotOf}. A drive action verb
+   * returns void and its snapshot is a SEPARATE core call, so this bridges the settle timing across that
+   * boundary — otherwise a click that spent 30s in clearance would surface only snapshot-stage timing.
+   * Cleared on read (consume-once), so a later bare `snapshot()` never inherits a stale action's stages;
+   * `navigate()` builds its own timing and ignores this, so it can never leak into a nav snapshot.
+   */
+  #pendingActionTiming?: { clearancePollMs: number; captchaSolveMs?: number };
 
   private constructor(
     context: PatchrightContext,
@@ -968,13 +977,17 @@ export class PatchrightBrowserCore implements BrowserCore {
     await page.keyboard.press(key);
     // A key press (Enter) can submit a form / trigger navigation — wait out any challenge it lands on.
     // If a submit-gated CAPTCHA was solved, replay the key once so the submit completes with the token.
-    // (#42: the action-path settle/solve wall-clock is captured in the controller's per-verb totalMs, not
-    // broken out here — the returned snapshot from an action carries only its own snapshot-stage timing.)
-    const { replay } = await this.#settle(page);
-    if (replay) {
+    const s1 = await this.#settle(page);
+    let clearancePollMs = s1.clearancePollMs;
+    let captchaSolveMs = s1.captchaSolveMs;
+    if (s1.replay) {
       await page.keyboard.press(key).catch(() => {});
-      await this.#settle(page);
+      const s2 = await this.#settle(page);
+      clearancePollMs += s2.clearancePollMs; // #42: sum the poll across both settles
+      captchaSolveMs ??= s2.captchaSolveMs;
     }
+    // #42: stash so the controller's post-action snapshot() attributes this key press's clearance/solve time.
+    this.#pendingActionTiming = { clearancePollMs, ...(captchaSolveMs !== undefined ? { captchaSolveMs } : {}) };
   }
 
   async waitFor(condition: WaitCondition): Promise<void> {
@@ -1163,15 +1176,21 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
     // A navigation-producing action (submit click, select with onchange) may land on a challenge —
     // wait it out so the post-action snapshot is the cleared page, not the interstitial.
-    const { replay } = await this.#settle(page);
-    if (replay) {
+    const s1 = await this.#settle(page);
+    let clearancePollMs = s1.clearancePollMs;
+    let captchaSolveMs = s1.captchaSolveMs;
+    if (s1.replay) {
       // A CAPTCHA that appeared only on this action (e.g. a submit gated on reCAPTCHA) was rejected
       // before a token existed; the solve injected one but did not re-submit. Replay the action ONCE
       // so it completes with the token in place. Best-effort: a now-missing element just no-ops, and
       // the following settle won't re-solve (the response field is filled). (AE3/R8: continue, don't fail.)
       await fn(loc).catch(() => {});
-      await this.#settle(page);
+      const s2 = await this.#settle(page);
+      clearancePollMs += s2.clearancePollMs; // #42: sum the poll across both settles
+      captchaSolveMs ??= s2.captchaSolveMs; // the solve happens in the FIRST settle; the replay rarely re-solves
     }
+    // #42: stash so the controller's post-action snapshot() attributes this action's clearance/solve time.
+    this.#pendingActionTiming = { clearancePollMs, ...(captchaSolveMs !== undefined ? { captchaSolveMs } : {}) };
   }
 
   /**
@@ -1335,7 +1354,12 @@ export class PatchrightBrowserCore implements BrowserCore {
       ...(screenshotRef !== undefined ? { screenshotRef } : {}),
     });
     const snapshotMs = performance.now() - t0;
-    const timing = assembleTiming({ totalMs: snapshotMs, snapshotMs });
+    // #42: fold in any pending drive-action settle stages (consume-once), so a post-action snapshot after a
+    // click/type that triggered a challenge attributes the clearance/solve time. navigate() ignores this
+    // (it builds its own timing from its local settle return) — its #snapshotOf call just clears any leftover.
+    const pending = this.#pendingActionTiming;
+    this.#pendingActionTiming = undefined;
+    const timing = assembleTiming({ totalMs: snapshotMs, snapshotMs, ...pending });
     return { url: finalUrl, title, tree, status, diagnostics, timing };
   }
 

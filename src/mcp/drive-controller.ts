@@ -281,19 +281,30 @@ export class GatewayDriveController implements DriveController {
 
   /**
    * #42: stamp the WHOLE-verb wall-clock as `timing.totalMs` on a snapshot-returning verb's result,
-   * MERGING with the core stage breakdown the snapshot already carries. This is the caller-facing verb
-   * duration — a navigate INCLUDING its escalation retries + warm-up, or an action INCLUDING its
-   * settle/solve; the core snapshot alone would report only its ~tens-of-ms extraction time (the wrong
-   * number an action verb would otherwise surface). SUCCESS path only: a thrown failure propagates
-   * unwrapped — its envelope already carries the core stages and an EscalationError carries `attemptMs`,
-   * so a whole-verb failure total is a documented deferral, not a gap. Runs INSIDE the #serialize turn
-   * (one verb at a time), so the performance.now() diff can never interleave with another verb.
+   * MERGING with the core stage breakdown the snapshot already carries. `t0` is captured by the caller
+   * BEFORE entering {@link #serialize}, so the total is the true caller-facing latency INCLUDING any time
+   * the call spent queued behind another verb (concurrent MCP dispatch) — not just its execution slice.
+   * The total spans a navigate's escalation retries + warm-up, or an action's settle/solve; the core
+   * snapshot alone reports only its ~tens-of-ms extraction time (the wrong number an action verb would
+   * otherwise surface).
+   *
+   * On FAILURE the verb throws with a failure envelope attached (an EscalationError's `.failure`, or a
+   * decorated error) whose `timing.totalMs` is the LAST core navigate only — which would contradict the
+   * `attemptMs` array that sums the whole escalation. So override the envelope's `timing.totalMs` with the
+   * whole-verb elapsed before rethrowing, keeping `totalMs >= sum(attemptMs)` (monotone) on failures too.
+   * The envelope is already redacted and timing is all-numeric, so the in-place update is secret-safe.
    */
-  async #timedSnap(fn: () => Promise<PageSnapshot>): Promise<PageSnapshot> {
-    const t0 = performance.now();
-    const snap = await fn();
-    const timing = assembleTiming({ ...(snap.timing ?? {}), totalMs: performance.now() - t0 });
-    return { ...snap, timing };
+  async #timedSnap(t0: number, fn: () => Promise<PageSnapshot>): Promise<PageSnapshot> {
+    try {
+      const snap = await fn();
+      return { ...snap, timing: assembleTiming({ ...(snap.timing ?? {}), totalMs: performance.now() - t0 }) };
+    } catch (err) {
+      const failure = failureOf(err);
+      if (failure?.timing) {
+        failure.timing = assembleTiming({ ...failure.timing, totalMs: performance.now() - t0 });
+      }
+      throw err;
+    }
   }
 
   async open(): Promise<void> {
@@ -305,7 +316,8 @@ export class GatewayDriveController implements DriveController {
   }
 
   async navigate(url: string, opts: { forceProxy?: boolean } = {}): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#timedSnap(() => this.#navigate(url, opts)));
+    const t0 = performance.now(); // BEFORE #serialize — totalMs includes any queue wait (#42)
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts)));
   }
 
   async #navigate(url: string, opts: { forceProxy?: boolean }): Promise<PageSnapshot> {
@@ -428,27 +440,33 @@ export class GatewayDriveController implements DriveController {
   }
 
   async snapshot(): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#timedSnap(() => this.#run((s) => s.core.snapshot())));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#run((s) => s.core.snapshot())));
   }
 
   async click(target: DriveTarget): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.click(target))));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.click(target))));
   }
 
   async type(target: DriveTarget, text: string, submit?: boolean): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.type(target, text, { submit }))));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.type(target, text, { submit }))));
   }
 
   async selectOption(target: DriveTarget, values: string[]): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.selectOption(target, values))));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.selectOption(target, values))));
   }
 
   async pressKey(key: string): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.pressKey(key))));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.pressKey(key))));
   }
 
   async waitFor(condition: WaitCondition): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.waitFor(condition))));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.waitFor(condition))));
   }
 
   async screenshot(): Promise<string> {
@@ -743,6 +761,11 @@ export class GatewayDriveController implements DriveController {
       attemptMs.push(performance.now() - attempt0);
       if (!navFailed(snap)) {
         this.#pinned = true;
+        // #42 SCOPED FOLLOW-UP: on a SUCCESS-after-retries the collected attemptMs is dropped — a drive
+        // SUCCESS returns a bare PageSnapshot with no escalation-diagnostics channel (drive surfaces those
+        // only on the EscalationError FAILURE, a pre-#42 asymmetry vs retrieve's result-level proxyDiagnostic).
+        // The whole-verb totalMs (stamped by #timedSnap) DOES reflect the failed attempts; surfacing their
+        // per-attempt breakdown on success needs a new PageSnapshot escalation surface — a follow-up.
         return snap;
       }
       last = snap;

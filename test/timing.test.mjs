@@ -197,6 +197,55 @@ test("drive controller: every returned snapshot carries a whole-verb timing.tota
   assert.equal(typeof snap.timing.totalMs, "number", "bare snapshot carries a totalMs too");
 });
 
+/** A drive gateway whose navigate returns a caller-supplied (usually nav-failed) snapshot. `delayMs`
+ *  makes navigate slow, for the queue-latency test. */
+function makeScriptedDriveGateway(navSnap, delayMs = 0) {
+  let nextId = 1;
+  const open = new Map();
+  const core = {
+    async navigate(url) { if (delayMs) await new Promise((r) => setTimeout(r, delayMs)); return { ...navSnap, url }; },
+    async snapshot() { return { url: "u", title: "t", tree: "-", status: 200 }; },
+  };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + nextId++; open.set(id, { core }); return id; },
+    async useConsumerSession(_t, handle, fn) { const s = open.get(handle); if (!s) throw new Error("no session"); return fn(s); },
+    async closeConsumerSession(_t, handle) { open.delete(handle); },
+  };
+  return { gateway };
+}
+
+test("drive FAILURE: the envelope's timing.totalMs is overridden with the WHOLE-verb wall-clock", async () => {
+  // A nav-failed direct navigate (no proxy) throws EscalationError carrying the failure envelope. The core
+  // per-nav timing injects an ABSURD totalMs (999999); the controller's #timedSnap must replace it with the
+  // real (tiny) whole-verb elapsed while PRESERVING the stage breakdown — so totalMs can't contradict attemptMs.
+  const { gateway } = makeScriptedDriveGateway({
+    title: "t", tree: "Forbidden", status: null,
+    diagnostics: { finalUrl: "https://hostile.example/", status: null },
+    timing: { totalMs: 999999, clearancePollMs: 8000, snapshotMs: 12 },
+  });
+  const c = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok");
+  await assert.rejects(c.navigate("https://hostile.example/"), (err) => {
+    const failure = err.failure; // EscalationError carries the (redacted) envelope
+    assert.ok(failure?.timing, "failure envelope carries timing");
+    assert.ok(failure.timing.totalMs < 1000, "the injected core totalMs (999999) was replaced by the real whole-verb elapsed");
+    assert.equal(failure.timing.clearancePollMs, 8000, "the stage breakdown is preserved through the override");
+    return true;
+  });
+});
+
+test("drive: a queued verb's totalMs INCLUDES the time it waited behind another verb (t0 before #serialize)", async () => {
+  // Two concurrent navigates on one controller serialize; the second waits behind the first. Its totalMs
+  // must include that queue wait (t0 is captured before #serialize), not just its own execution slice.
+  const { gateway } = makeScriptedDriveGateway({ title: "t", tree: "x".repeat(200), status: 200 }, 60);
+  const c = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok");
+  const [, second] = await Promise.all([
+    c.navigate("https://example.com/a"),
+    c.navigate("https://example.com/b"),
+  ]);
+  assert.ok(second.timing.totalMs >= 50, `second navigate waited ~60ms behind the first; totalMs=${second.timing.totalMs} must reflect the queue wait`);
+});
+
 test("MCP drive: formatSnapshot surfaces a compact total line on a success snapshot", async () => {
   // A fake drive whose navigate returns a snapshot carrying a timing → the server's formatSnapshot renders
   // a `total: Nms` line (drive SUCCESS surfacing of AC#1).
