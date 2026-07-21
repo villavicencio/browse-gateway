@@ -293,3 +293,53 @@ test("HTTP: the idle reaper does NOT close a session with an in-flight tool call
     await stop({ server, handler, client });
   }
 });
+
+test("HTTP: closeAll AWAITS a fire-and-forget cleanup already in flight (deferred dispose) — #50 follow-up", async () => {
+  // After #50 made the browser teardown async-confirmed, a cleanup started fire-and-forget by
+  // onsessionclosed/onclose leaves its session out of the `sessions` map while its dispose (browser
+  // teardown) is still settling. closeAll must drain those in-flight cleanups, not just iterate `sessions`.
+  let releaseDispose;
+  const disposeGate = new Promise((r) => (releaseDispose = r));
+  const disposed = [];
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  const handler = createHttpHandler({
+    authenticate: (t) => policy.authenticate(t),
+    buildServer: (consumer) => ({
+      server: createGatewayMcpServer({ retrieve: async ({ url }) => outcome({ markdown: `${consumer.id} ${url}` }) }),
+      dispose: async () => {
+        disposed.push(consumer.id);
+        await disposeGate; // the browser teardown is still settling
+      },
+    }),
+  });
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const c = connect(url, "tok-alice");
+    client = c.client;
+    await client.connect(c.transport);
+    assert.equal(handler.sessionCount(), 1);
+    // Explicit DELETE → the server fires onsessionclosed → cleanup() FIRE-AND-FORGET: cleanup removes the
+    // session from `sessions` synchronously, then blocks on the deferred dispose — leaving a cleanup IN
+    // FLIGHT (in `cleanups`) whose session is already gone. (The real onclose/onsessionclosed shutdown race.)
+    await c.transport.terminateSession();
+    for (let i = 0; i < 80 && handler.sessionCount() !== 0; i++) await new Promise((r) => setTimeout(r, 25));
+    assert.equal(handler.sessionCount(), 0, "the session left the sessions map (onclose cleanup ran)");
+    assert.equal(disposed.length, 1, "the fire-and-forget dispose started");
+    // closeAll's `sessions` snapshot is now empty, but the in-flight cleanup's dispose is unsettled — it
+    // must drain `cleanups` and stay pending until that dispose settles.
+    let closed = false;
+    const closeP = handler.closeAll().then(() => (closed = true));
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(closed, false, "closeAll stays pending while an in-flight cleanup's dispose is unsettled");
+    releaseDispose();
+    await closeP;
+    assert.equal(closed, true, "closeAll resolves once the in-flight dispose settles");
+  } finally {
+    releaseDispose(); // never leave the gate closed (would hang teardown)
+    await client?.close().catch(() => {});
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});

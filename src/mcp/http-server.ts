@@ -300,6 +300,11 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       const entry = sessions.get(sid);
       if (entry) await closeSession(sid, entry);
     }
+    // Drain any cleanup ALREADY in flight whose session has already left the `sessions` map — a
+    // fire-and-forget `onclose`/`onsessionclosed`, or an overlapping reap, may be mid-dispose and thus
+    // invisible to the loop above. Without this, closeAll could return while a browser teardown is still
+    // settling, breaking its graceful-shutdown contract (a slot would still be counted).
+    await Promise.all([...cleanups.values()]);
   }
 
   return { handle, reapIdle, startReaper, stopReaper, drain, closeAll, sessionCount: () => sessions.size };
