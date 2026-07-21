@@ -55,7 +55,11 @@ export type WafVendor =
  *   - `empty-shell`     a 2xx/3xx page that yielded NO extractable content — the formalized `empty-content`
  *                       (an unhydrated SPA shell or a genuinely empty page). The common non-block failure.
  *   - `hydration-failed` a 2xx/3xx thin page with an SPA framework root AND a genuine (non-guard) failed
- *                       data/asset request — best-effort; distinguishes a broken hydration from a quiet shell.
+ *                       data/asset request — BEST-EFFORT; distinguishes a broken hydration from a quiet
+ *                       shell. Keys on REQUEST-level failures (`requestfailed`); a subresource that returns a
+ *                       4xx/5xx RESPONSE is not counted, so such a hydration failure degrades to `empty-shell`
+ *                       rather than misclassifying — a documented coarse-first limitation (richer
+ *                       subresource-response capture is a follow-up).
  *   - `real-zero-results` a genuine site-reported empty-state ("no results") — distinguished from a
  *                       block/shell, but STILL a no-content failure (isError:true), not a success.
  *   - `unsupported-browser` an unsupported-browser interstitial phrase.

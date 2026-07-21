@@ -195,6 +195,9 @@ test("hasFrameworkRoot: a hyphen/word-prefixed attribute is NOT a real mount roo
   assert.equal(hasFrameworkRoot('<div aria-id="app"></div>'), false);
   assert.equal(hasFrameworkRoot('<div data-ng-version="17"></div>'), false);
   assert.equal(hasFrameworkRoot('<custom-id="app"></custom-id>'), false);
+  // the attribute-name token quoted INSIDE another attribute's value is not a real mount root (codex r8).
+  assert.equal(hasFrameworkRoot('<p title="id=\'root\'">text</p>'), false);
+  assert.equal(hasFrameworkRoot('<meta content="ng-version=17">'), false);
   // the REAL attributes still resolve.
   assert.equal(hasFrameworkRoot('<div ng-version="17.1.0">app</div>'), true);
   assert.equal(hasFrameworkRoot('<body><div id="root"></div></body>'), true);

@@ -141,14 +141,19 @@ export const UNSUPPORTED_BROWSER_PHRASES: readonly RegExp[] = [
  * id/attribute TOKEN so `id="root"` matches but `id="rootLayout"` does not.
  */
 export const FRAMEWORK_ROOT_HINTS: readonly RegExp[] = [
-  // A REAL `id=`/`ng-version=`/`data-reactroot` attribute — the `(?<![-\w])` guard rejects a hyphen/word
-  // prefix (`data-id="root"`, `aria-id="app"`, `data-ng-version`) that a bare `\b` would wrongly accept
-  // (codex #41 r7), the same real-attribute discipline captcha.ts uses (#40 r8). The id value is a whole
-  // quoted token, so `id="rootLayout"` does not match `root`.
-  /(?<![-\w])id\s*=\s*["'](?:root|app|__next|__nuxt|___gatsby|svelte|q-app)["']/i,
-  /(?<![-\w])id\s*=\s*["']gatsby-focus-wrapper["']/i,
-  /(?<![-\w])data-reactroot(?![-\w])/i,
-  /(?<![-\w])ng-version\s*=/i,
+  // A REAL `id=`/`ng-version=`/`data-reactroot` attribute. The `(?<=\s)` guard requires a whitespace
+  // attribute delimiter — in serialized HTML (page.content()) every attribute name is whitespace-separated —
+  // so it rejects both a hyphen/word prefix (`data-id="root"`, `aria-id="app"`, `data-ng-version`, codex #41
+  // r7) AND the same token quoted INSIDE another attribute's value (`<p title="id='root'">`, codex #41 r8).
+  // The id value is a whole quoted token, so `id="rootLayout"` does not match `root`. This is robust-BEST-
+  // EFFORT at the regex altitude (the #40 doctrine): a token preceded by a space INSIDE an attribute value
+  // (`title=" id='root' "`) is an accepted residual — true element-attribute verification is a DOM-parse
+  // concern the whole HTML-string detection layer forgoes, and this only sub-classifies a thin FAILED page
+  // (empty-shell vs hydration-failed), a diagnostic label that never gates behavior.
+  /(?<=\s)id\s*=\s*["'](?:root|app|__next|__nuxt|___gatsby|svelte|q-app)["']/i,
+  /(?<=\s)id\s*=\s*["']gatsby-focus-wrapper["']/i,
+  /(?<=\s)data-reactroot(?![-\w])/i,
+  /(?<=\s)ng-version\s*=/i,
 ];
 
 /**
