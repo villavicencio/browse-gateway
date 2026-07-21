@@ -926,9 +926,12 @@ export class PatchrightBrowserCore implements BrowserCore {
     // #42: assemble the per-nav Timing — the whole core-navigate wall-clock plus the goto / clearance /
     // captcha-solve / snapshot stages — as a FIRST-CLASS field (independent of the failure-only envelope;
     // the drive #failure seam folds it in on a block). Overrides #snapshotOf's snapshot-only timing.
+    // domContentLoadedMs = the goto wall-clock PLUS #settle's own waitForLoadState wait: for a clean nav the
+    // latter is a ~0 no-op (no double-count), but when the goto ABORTS/times-out before DCL, #settle spends
+    // the real residual wait there — so summing keeps the nav stage accurate instead of dropping that time.
     const timing = assembleTiming({
       totalMs: performance.now() - t0,
-      domContentLoadedMs,
+      domContentLoadedMs: domContentLoadedMs + settled.domContentLoadedMs,
       clearancePollMs: settled.clearancePollMs,
       ...(settled.captchaSolveMs !== undefined ? { captchaSolveMs: settled.captchaSolveMs } : {}),
       ...(base.timing?.snapshotMs !== undefined ? { snapshotMs: base.timing.snapshotMs } : {}),
