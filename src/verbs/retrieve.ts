@@ -274,6 +274,19 @@ export function isChromeErrorUrl(url: string | undefined): boolean {
 }
 
 /**
+ * The block {@link BlockReason} for a FAILED signal, accounting for a dead nav that {@link resolveBlockReason}
+ * (which reads only title/text/status/hints) can't see: a `chrome-error://` final URL is `nav-failed` even
+ * when the render inherited a stale non-null status (codex #41 r4/r5). The SINGLE reason derivation shared by
+ * retrieve's surfaced `reason`, the escalation-diagnostics reason, and (via the same chrome-error check)
+ * {@link classifyFailure}, so all three name ONE reason and the #40 r3 one-reason invariant holds. A
+ * null-status nav is already `nav-failed` inside resolveBlockReason, so only the stale-status chrome-error
+ * case needs the override here.
+ */
+export function resolveFailureReason(sig: FailureSignal): BlockReason | null {
+  return isChromeErrorUrl(sig.finalUrl) ? "nav-failed" : resolveBlockReason(sig);
+}
+
+/**
  * Whether the render saw a GENUINE network failure — a data/asset request that failed for a reason OTHER
  * than the gateway's own navigation guard (issue #41). The allowlist guard aborts every off-allowlist
  * subresource via `Fetch.failRequest{BlockedByClient}`, surfaced by Chrome as `net::ERR_BLOCKED_BY_CLIENT`
@@ -385,7 +398,7 @@ export function escalationDiagnostics(opts: {
   proxyApplied: boolean;
   forced: boolean;
   attempts: number;
-  last: BlockSignal | null;
+  last: FailureSignal | null;
   exitCheck?: EscalationDiagnostics["exitCheck"];
 }): EscalationDiagnostics {
   return {
@@ -394,10 +407,11 @@ export function escalationDiagnostics(opts: {
     forced: opts.forced,
     attempts: opts.attempts,
     lastStatus: opts.last?.status ?? null,
-    // resolveBlockReason (not bare classifyBlock) so the escalation-diagnostics reason matches the
-    // failure-envelope vendor on a bare-CAPTCHA failure — one EscalationError can't carry two reasons
-    // (codex #40 r3). captcha-awareness rides on the signal's captchaKind, so a WAF signal is unchanged.
-    reason: opts.last ? resolveBlockReason(opts.last) : null,
+    // resolveFailureReason (not bare classifyBlock/resolveBlockReason) so the escalation-diagnostics reason
+    // matches the failure-envelope class/vendor on a bare-CAPTCHA failure AND on a stale-status chrome-error
+    // dead nav — one EscalationError can't carry two reasons (codex #40 r3 / #41 r5). captcha-awareness rides
+    // on the signal's captchaKind, and the chrome-error nav-failed override rides on finalUrl.
+    reason: opts.last ? resolveFailureReason(opts.last) : null,
     ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
   };
 }
@@ -637,13 +651,16 @@ export async function retrieve(
         (s) => s.core.render(url, proxiedRenderOpts),
         { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS },
       );
-      // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a still-blocked
-      // result (dead exit / proxy error page), or a PerimeterX press-&-hold (a 200 challenge whose
+      // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a dead exit that
+      // reached a `chrome-error://` page while carrying a STALE 200 (else the loop would treat that dead
+      // exit as healthy and break without trying later exits — defeating PROXY_MAX_ATTEMPTS, codex #41 r5),
+      // a still-blocked result (proxy error page), or a PerimeterX press-&-hold (a 200 challenge whose
       // phrase reaches the HTML/iframe but not innerText — thin OR copy-in-source; #21/#24 follow-up);
       // a thin-but-OK 200 is not retried.
       const pxHintR = hasPerimeterXHint(render.html);
       if (
         render.status !== null &&
+        !isChromeErrorUrl(render.diagnostics?.finalUrl) &&
         !isVisiblyBlocked(render) &&
         !isPerimeterXChallenge(render, pxHintR) &&
         !(pxHintR && hasPxChallengeCopy(render)) &&
@@ -724,11 +741,7 @@ export async function retrieve(
   // attributes only when the block is otherwise generic (so a WAF page that merely preloads a captcha
   // library isn't mislabeled; codex #40 r2). Surfaced so a caller sees WHY a page failed rather than a
   // silent "blocked". `null` when the page is not blocked.
-  const reason: BlockReason | null = !blocked
-    ? null
-    : deadNav
-      ? "nav-failed"
-      : resolveBlockReason(signal);
+  const reason: BlockReason | null = blocked ? resolveFailureReason(signal) : null;
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
   const proxyDiagnostic = proxyUsed
