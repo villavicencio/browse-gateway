@@ -189,6 +189,15 @@ test("activeCaptchaKind: real attribute/token precision — pseudo-class + data-
   assert.equal(activeCaptchaKind('<div class="g-recaptcha" data-config="data-sitekey"></div>'), undefined); // no real data-sitekey= attribute
 });
 
+test("activeCaptchaKind: response-field / iframe evidence must be a REAL attribute, not a data-* suffix (codex #40 r8)", () => {
+  assert.equal(activeCaptchaKind('<div data-name="g-recaptcha-response"></div>'), undefined); // data-name, not name
+  assert.equal(activeCaptchaKind('<div data-id="h-captcha-response"></div>'), undefined); // data-id, not id
+  assert.equal(activeCaptchaKind('<div data-src="https://www.google.com/recaptcha/api2/anchor"></div>'), undefined); // data-src, not src
+  // The real attributes still resolve.
+  assert.equal(activeCaptchaKind('<textarea name="g-recaptcha-response"></textarea>'), "recaptcha");
+  assert.equal(activeCaptchaKind('<iframe src="https://www.google.com/recaptcha/api2/anchor?k=k"></iframe>'), "recaptcha");
+});
+
 // --- wafVendorFromReason: vendor is a projection of the reason (issue #40) ---
 
 test("wafVendorFromReason: each WAF reason maps to its vendor; captcha uses the widget kind", () => {

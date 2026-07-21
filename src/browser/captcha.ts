@@ -83,10 +83,17 @@ function containerRe(cls: string): RegExp {
 }
 
 /** A response-field element (`name`/`id` = `<kind>-response`) — injected only when a widget RENDERS, so it
- *  is evidence of an active/explicit-render widget, never of a merely-loaded library. Matched as a real
- *  attribute value. */
+ *  is evidence of an active/explicit-render widget, never of a merely-loaded library. Matched as a REAL
+ *  `name`/`id` attribute: the `(?<![-\w])` boundary rejects a `data-*` suffix, so dormant metadata such as
+ *  `data-name="g-recaptcha-response"` does not count (codex #40 r8). */
 function responseFieldRe(name: string): RegExp {
-  return new RegExp(`\\b(?:name|id)\\s*=\\s*["']${name}["']`, "i");
+  return new RegExp(`(?<![-\\w])(?:name|id)\\s*=\\s*["']${name}["']`, "i");
+}
+
+/** A RENDERED-iframe `src` whose URL matches `urlRe` — real `src` attribute only (`(?<![-\w])` rejects a
+ *  `data-src` suffix, codex #40 r8), so a dormant `data-src` template value isn't read as a live iframe. */
+function iframeSrcRe(urlRe: string): RegExp {
+  return new RegExp(`(?<![-\\w])src\\s*=\\s*["'][^"']*${urlRe}`, "i");
 }
 
 /** Per-kind evidence of an ACTIVE/RENDERED widget — ANY of: a placed container, a RENDERED iframe
@@ -98,11 +105,11 @@ const WIDGET_EVIDENCE: readonly { kind: Exclude<CaptchaKind, "unknown">; res: re
   { kind: "turnstile", res: [containerRe("cf-turnstile"), responseFieldRe("cf-turnstile-response")] },
   {
     kind: "hcaptcha",
-    res: [containerRe("h-captcha"), responseFieldRe("h-captcha-response"), /\bsrc\s*=\s*["'][^"']*newassets\.hcaptcha\.com/i],
+    res: [containerRe("h-captcha"), responseFieldRe("h-captcha-response"), iframeSrcRe("newassets\\.hcaptcha\\.com")],
   },
   {
     kind: "recaptcha",
-    res: [containerRe("g-recaptcha"), responseFieldRe("g-recaptcha-response"), /\bsrc\s*=\s*["'][^"']*recaptcha\/api2\/(?:anchor|bframe)/i],
+    res: [containerRe("g-recaptcha"), responseFieldRe("g-recaptcha-response"), iframeSrcRe("recaptcha\\/api2\\/(?:anchor|bframe)")],
   },
 ];
 
