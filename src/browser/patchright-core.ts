@@ -995,7 +995,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       await page.keyboard.press(key).catch(() => {});
       const s2 = await this.#settle(page);
       clearancePollMs += s2.clearancePollMs; // #42: sum the poll across both settles
-      captchaSolveMs ??= s2.captchaSolveMs;
+      if (s2.captchaSolveMs !== undefined) captchaSolveMs = (captchaSolveMs ?? 0) + s2.captchaSolveMs; // sum the solve
       domContentLoadedMs += s2.domContentLoadedMs; // sum the nav-to-DCL wait across both settles
     }
     // #42: stash so the controller's post-action snapshot() attributes this key press's clearance/solve/nav time.
@@ -1204,12 +1204,15 @@ export class PatchrightBrowserCore implements BrowserCore {
       await fn(loc).catch(() => {});
       const s2 = await this.#settle(page);
       clearancePollMs += s2.clearancePollMs; // #42: sum the poll across both settles
-      captchaSolveMs ??= s2.captchaSolveMs; // the solve happens in the FIRST settle; the replay rarely re-solves
+      // Sum the solve too (a replay can hit a second / reset widget) — don't drop the second deadline.
+      if (s2.captchaSolveMs !== undefined) captchaSolveMs = (captchaSolveMs ?? 0) + s2.captchaSolveMs;
       domContentLoadedMs += s2.domContentLoadedMs; // sum the nav-to-DCL wait across both settles
     }
     // #42: stash so the controller's post-action snapshot() attributes this action's clearance/solve/nav time.
-    // domContentLoadedMs is included only when the action actually NAVIGATED (>= 1ms) — a non-navigating
-    // click's ~0ms waitForLoadState no-op is omitted, per the Timing contract (absent when nothing navigated).
+    // domContentLoadedMs captures a DEFERRED navigation's DCL wait (a JS handler that navigates after the
+    // click resolves); a SYNCHRONOUS form-submit nav is auto-waited inside the locator action (fn) itself, so
+    // its time lands in the verb totalMs, not here (a Patchright locator-auto-wait limitation). Included only
+    // when >= 1ms — a non-navigating click's ~0ms waitForLoadState no-op is omitted, per the Timing contract.
     this.#pendingActionTiming = {
       clearancePollMs,
       ...(captchaSolveMs !== undefined ? { captchaSolveMs } : {}),

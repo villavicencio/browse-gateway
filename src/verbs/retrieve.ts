@@ -820,6 +820,10 @@ export async function retrieve(
   // BOTH the result field and (on a failure) the folded envelope, so they can never disagree (single
   // derivation). render.timing carries the surfaced render's domContentLoaded/clearancePoll/snapshot; its
   // own core totalMs is overwritten by the whole-call wall-clock here.
+  // SCOPED: on a direct→escalated call the surfaced core stages are the FINAL (proxied) render's, and
+  // attemptMs holds only the proxied attempts — so a slow DIRECT attempt's stage breakdown isn't surfaced
+  // separately. Its duration is still accounted (totalMs − sum(attemptMs) − extraction); a per-attempt
+  // direct/proxied stage split is a follow-up (it would break attemptMs's clean 1:1-with-`attempts` shape).
   const timing: Timing = assembleTiming({ ...(render.timing ?? {}), totalMs: performance.now() - t0 });
   const diagnostics =
     failed && render.diagnostics
