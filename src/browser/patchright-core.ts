@@ -85,7 +85,9 @@ function childTerminated(child: ChildProcess | undefined): boolean {
  * force-kill would silently regress to the r5 cross-session-kill risk (real under `pids_limit=512`). A
  * missing marker therefore reports UNAVAILABLE (health-visible degrade) instead of running unsafe (codex
  * #50 r6). On non-Linux (macOS CLI) /proc is absent by design and the pid space is huge, so only the pid
- * is required. Exported pure for unit coverage. */
+ * is required. A `false` result degrades force-kill loudly (a launch-time stderr line) and is exposed via
+ * the {@link PatchrightBrowserCore.forceKillAvailable} getter as the primitive for an operational health
+ * surface (external wiring tracked as a follow-up). Exported pure for unit coverage. */
 export function computeForceKillAvailable(
   pid: number | undefined,
   startTime: string | undefined,
@@ -497,7 +499,8 @@ export class PatchrightBrowserCore implements BrowserCore {
       );
     } else if (!this.forceKillAvailable) {
       // PID captured but the Linux generation marker was not (a transient /proc read failure). Force-kill
-      // is degraded rather than run reuse-UNSAFE (codex #50 r6) — surface it so it's health-visible.
+      // is degraded rather than run reuse-UNSAFE (codex #50 r6) — logged loudly and exposed via the
+      // forceKillAvailable getter (an operational health surface consuming it is tracked as a follow-up).
       process.stderr.write(
         "[browse-gateway] force-kill DEGRADED: captured the Chromium PID but not its /proc generation " +
           "marker; force-kill disabled to stay reuse-safe — a wedged close will fall back to graceful-close-only\n",

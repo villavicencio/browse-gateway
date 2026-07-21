@@ -330,10 +330,11 @@ export interface BrowserCore {
    */
   kill(confirmMs: number): Promise<void>;
   /**
-   * Whether {@link kill} can actually force-kill this core — true when the Chromium PID was captured at
-   * launch. False means force-kill degraded to unavailable (a patchright internal changed shape); teardown
-   * falls back to graceful-close-only and a wedged close stays a counted zombie. Surfaced to health so a
-   * degraded process is observable without log-grepping.
+   * Whether {@link kill} can actually force-kill this core — true when the Chromium PID (and, on Linux,
+   * its /proc generation marker) was captured at launch. False means force-kill degraded to unavailable
+   * (a patchright internal changed shape, or a transient /proc read failure); teardown falls back to
+   * graceful-close-only and a wedged close stays a counted zombie. Exposed as the primitive for an
+   * operational health surface (wiring tracked as a follow-up); a degradation also logs loudly at launch.
    */
   readonly forceKillAvailable: boolean;
 

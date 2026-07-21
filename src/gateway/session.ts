@@ -22,7 +22,7 @@ export interface SessionInfo {
   /** The owned core's kind, e.g. "patchright". */
   core: string;
   /** Whether this session's browser can be force-killed (issue #50) — false = force-kill degraded to
-   *  graceful-close-only for it (PID capture failed at launch). Surfaced so a degraded process is visible. */
+   *  graceful-close-only for it (no PID / Linux generation marker captured). Exposed for a health surface. */
   forceKillAvailable: boolean;
 }
 

@@ -149,8 +149,9 @@ export class SessionManager {
   }
 
   /** Whether every live core can be force-killed (issue #50). False means at least one session's core
-   *  failed to capture its Chromium PID at launch, so force-kill has degraded to graceful-close-only for
-   *  it — surfaced so a degraded process is observable (health) rather than only in stderr. */
+   *  degraded to graceful-close-only (no Chromium PID / Linux generation marker captured at launch).
+   *  Exposed as the primitive for an operational health surface (wiring tracked as a follow-up); today a
+   *  degradation also emits a loud launch-time stderr line. */
   get forceKillAvailable(): boolean {
     for (const s of this.#sessions.values()) if (!s.forceKillAvailable) return false;
     return true;
@@ -158,8 +159,9 @@ export class SessionManager {
 
   /** Count of browsers whose death could NOT be confirmed — a best-effort SIGKILL was sent but neither a
    *  clean close nor an ESRCH confirmed the process is gone (issue #50). Retained (never erased) so a
-   *  possibly-alive orphan is observable; the reaper's reconfirm loop keeps retrying these. Non-zero
-   *  means a browser may still be alive despite its teardown — a health/observability signal. */
+   *  possibly-alive orphan is accounted for; the reaper's reconfirm loop keeps retrying these. Non-zero
+   *  means a browser may still be alive despite its teardown. Exposed as the primitive for an operational
+   *  health surface (wiring tracked as a follow-up). */
   get unconfirmedCount(): number {
     return this.#unconfirmed.size;
   }
