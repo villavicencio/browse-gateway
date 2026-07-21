@@ -190,14 +190,19 @@ export class GatewayDriveController implements DriveController {
    *
    * Also attaches the mitigation vendor (issue #40): a PROJECTION of {@link classifyBlock}'s reason via
    * {@link wafVendorFromReason} (never a second classifier — so vendor and reason can't disagree), at
-   * parity with retrieve's redact seam. `wafVendor` is a closed vocabulary → passes redaction untouched;
-   * absent when unattributable. NOTE the drive `snapshot()` (post-action) carries no cf/px/dd hints, so
-   * a mid-flow action landing on a challenge inherits the #39 no-hints gap (navigate-failures carry the
+   * parity with retrieve's redact seam. An interactive CAPTCHA widget wins over the WAF markers (mirrors
+   * retrieve's `captcha ? "captcha" : classifyBlock` precedence) so a bare reCAPTCHA/hCaptcha/Turnstile
+   * page attributes its widget kind. `wafVendor` is a closed vocabulary → passes redaction untouched;
+   * absent when unattributable. NOTE a pure `snapshot()` (post-action) carries none of these hints, so a
+   * mid-flow action landing on a challenge inherits the #39 no-hints gap (navigate-failures carry the
    * vendor; action-failures do not — tracked as a follow-up to compute hints in the core #snapshotOf).
    */
   #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
     if (!snap?.diagnostics) return undefined;
-    const wafVendor = wafVendorFromReason(classifyBlock(this.#signalOf(snap)));
+    // Captcha-first, mirroring retrieve: a detected widget kind yields a `captcha` reason (classifyBlock
+    // never returns `captcha`), so its vendor is the widget kind rather than a coarser WAF/hard-block.
+    const reason = snap.captchaKind ? "captcha" : classifyBlock(this.#signalOf(snap));
+    const wafVendor = wafVendorFromReason(reason, snap.captchaKind);
     const diag = wafVendor ? { ...snap.diagnostics, wafVendor } : snap.diagnostics;
     return redactFailureDiagnostics(diag, this.#secrets);
   }

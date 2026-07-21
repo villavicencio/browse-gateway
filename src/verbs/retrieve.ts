@@ -22,7 +22,8 @@ import {
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
 import { redactFailureDiagnostics, sanitizeUrlForError } from "../observability/index.js";
-import type { FailureDiagnostics } from "../observability/index.js";
+import type { FailureDiagnostics, WafVendor } from "../observability/index.js";
+export type { WafVendor } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -186,23 +187,6 @@ export function classifyBlock(sig: BlockSignal): BlockReason | null {
   if (isHardBlock(sig, sig.status)) return "hard-block";
   return "blocked";
 }
-
-/**
- * The mitigation/CAPTCHA vendor attributed to a failure, surfaced on the #39 diagnostics envelope
- * (issue #40) so a caller sees WHO blocked, not just a coarse reason. A CLOSED vocabulary derived from
- * fixed HTML markers — never free text — so it passes {@link redactFailureDiagnostics} untouched and can
- * carry no secret/PII. `akamai`/`imperva` are reserved for a future HTML detector (today they are
- * recognized only as IP-bound cookie names in the vault layer, not surfaced here).
- */
-export type WafVendor =
-  | "cloudflare"
-  | "perimeterx"
-  | "datadome"
-  | "akamai"
-  | "imperva"
-  | "recaptcha"
-  | "hcaptcha"
-  | "turnstile";
 
 /**
  * Project a {@link BlockReason} (+ the CAPTCHA kind, when the block is an interactive widget) onto a
