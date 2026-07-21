@@ -104,13 +104,16 @@ export type FailureClass =
 export interface Timing {
   /** Whole-operation wall-clock ms — a retrieve() call, one drive verb, or a single core render()/navigate(). */
   totalMs: number;
-  /** `page.goto` wall-clock (navigation → domcontentloaded). Absent on a pure snapshot / an action with no nav. */
+  /** Navigation → domcontentloaded wall-clock: `page.goto`'s (retrieve / drive-navigate) or, for a drive
+   *  ACTION that submitted a form, the implicit nav's DCL wait. Absent on a pure snapshot or a non-navigating
+   *  action (its ~0ms waitForLoadState no-op is omitted). */
   domContentLoadedMs?: number;
-  /** Challenge-clearance poll ms — the same interval counter surfaced as `clearanceWaitedMs` on the kill-gate. */
+  /** Challenge-clearance poll WALL-CLOCK ms — the real time spent in the poll loop, `>=` the kill-gate's
+   *  `clearanceWaitedMs` sleep-interval counter (each poll round-trip costs real time in the capped container). */
   clearancePollMs?: number;
   /** Interactive-CAPTCHA solve ms (drive path only; absent when no solve ran). */
   captchaSolveMs?: number;
-  /** Snapshot / aria-tree extraction ms. */
+  /** Snapshot / aria-tree extraction ms — includes the opt-in failure-screenshot capture when it is enabled. */
   snapshotMs?: number;
 }
 

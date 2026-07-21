@@ -389,10 +389,14 @@ interface SolveResult {
   captchaSolveMs?: number;
 }
 
-/** Result of {@link PatchrightBrowserCore.#settle}: the replay signal (as before) plus the #42 clearance-poll
- *  and (bubbled-up) captcha-solve wall-clock, so navigate() can build the per-nav timing breakdown. */
+/** Result of {@link PatchrightBrowserCore.#settle}: the replay signal (as before) plus the #42 stage
+ *  wall-clocks — the action-nav DCL wait, the clearance-poll loop, and (bubbled-up) the captcha solve —
+ *  so navigate() and the action path can build the per-op timing breakdown. `domContentLoadedMs` is a
+ *  ~0ms no-op for navigate() (its goto already reached DCL) and is meaningful only for an ACTION that
+ *  triggered an implicit navigation (a form submit). */
 interface SettleResult {
   replay: boolean;
+  domContentLoadedMs: number;
   clearancePollMs: number;
   captchaSolveMs?: number;
 }
@@ -496,7 +500,7 @@ export class PatchrightBrowserCore implements BrowserCore {
    * Cleared on read (consume-once), so a later bare `snapshot()` never inherits a stale action's stages;
    * `navigate()` builds its own timing and ignores this, so it can never leak into a nav snapshot.
    */
-  #pendingActionTiming?: { clearancePollMs: number; captchaSolveMs?: number };
+  #pendingActionTiming?: { clearancePollMs: number; captchaSolveMs?: number; domContentLoadedMs?: number };
 
   private constructor(
     context: PatchrightContext,
@@ -698,6 +702,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       // Cloudflare especially — solve client-side on a variable delay, so a fixed wait
       // under-counts clearance; this loop is the fix for that flakiness. Each poll fetches
       // only title+text (cheap); the full HTML is serialized once at the end.
+      // #42: clearancePollMs is the WALL-CLOCK of this loop (each pollSignal round-trip costs real time in
+      // the capped container), distinct from `waited` (the sleep-interval counter the kill-gate reads).
+      const poll0 = performance.now();
       let signal = await pollSignal(page);
       let waited = 0;
       while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceTimeoutMs) {
@@ -705,13 +712,16 @@ export class PatchrightBrowserCore implements BrowserCore {
         waited += pollIntervalMs;
         signal = await pollSignal(page);
       }
-      const snap0 = performance.now();
-      const final = await snapshot(page);
-      const snapshotMs = performance.now() - snap0;
+      const clearancePollMs = performance.now() - poll0;
       // Assemble the failure-evidence envelope (issue #39). finalUrl is page.url() AFTER redirects — the
       // real landed URL (render's own `url` is the requested arg, the bug this fixes). RAW here; the
       // retrieve surfacing layer redacts before it reaches a caller. Screenshot is opt-in + size-capped.
+      // #42: snapshotMs spans BOTH the aria/content extraction AND the opt-in screenshot capture (which can
+      // consume its own timeout when enabled), so a capture-on run doesn't leave that time unattributed.
+      const snap0 = performance.now();
+      const final = await snapshot(page);
       const screenshotRef = await this.#maybeCaptureScreenshot(page);
+      const snapshotMs = performance.now() - snap0;
       const diagnostics = buildFailureDiagnostics({
         finalUrl: page.url(),
         title: final.title,
@@ -721,13 +731,13 @@ export class PatchrightBrowserCore implements BrowserCore {
         networkFailures: this.#networkFailures,
         ...(screenshotRef !== undefined ? { screenshotRef } : {}),
       });
-      // #42: clearancePollMs mirrors clearanceWaitedMs (the same poll-interval counter — zero divergence);
-      // clearanceWaitedMs stays a first-class field for the stealth kill-gate. The retrieve verb overwrites
-      // totalMs with the whole-call wall-clock and folds this Timing into the failure envelope.
+      // #42: clearanceWaitedMs (the sleep-interval counter) stays a first-class field for the stealth
+      // kill-gate; timing.clearancePollMs is the accurate wall-clock (>= clearanceWaitedMs). The retrieve
+      // verb overwrites totalMs with the whole-call wall-clock and folds this Timing into the failure envelope.
       const timing = assembleTiming({
         totalMs: performance.now() - t0,
         domContentLoadedMs,
-        clearancePollMs: waited,
+        clearancePollMs,
         snapshotMs,
       });
       return { url, status, ...final, clearanceWaitedMs: waited, diagnostics, timing };
@@ -980,14 +990,20 @@ export class PatchrightBrowserCore implements BrowserCore {
     const s1 = await this.#settle(page);
     let clearancePollMs = s1.clearancePollMs;
     let captchaSolveMs = s1.captchaSolveMs;
+    let domContentLoadedMs = s1.domContentLoadedMs;
     if (s1.replay) {
       await page.keyboard.press(key).catch(() => {});
       const s2 = await this.#settle(page);
       clearancePollMs += s2.clearancePollMs; // #42: sum the poll across both settles
       captchaSolveMs ??= s2.captchaSolveMs;
+      domContentLoadedMs += s2.domContentLoadedMs; // sum the nav-to-DCL wait across both settles
     }
-    // #42: stash so the controller's post-action snapshot() attributes this key press's clearance/solve time.
-    this.#pendingActionTiming = { clearancePollMs, ...(captchaSolveMs !== undefined ? { captchaSolveMs } : {}) };
+    // #42: stash so the controller's post-action snapshot() attributes this key press's clearance/solve/nav time.
+    this.#pendingActionTiming = {
+      clearancePollMs,
+      ...(captchaSolveMs !== undefined ? { captchaSolveMs } : {}),
+      ...(domContentLoadedMs >= 1 ? { domContentLoadedMs } : {}),
+    };
   }
 
   async waitFor(condition: WaitCondition): Promise<void> {
@@ -1179,6 +1195,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     const s1 = await this.#settle(page);
     let clearancePollMs = s1.clearancePollMs;
     let captchaSolveMs = s1.captchaSolveMs;
+    let domContentLoadedMs = s1.domContentLoadedMs;
     if (s1.replay) {
       // A CAPTCHA that appeared only on this action (e.g. a submit gated on reCAPTCHA) was rejected
       // before a token existed; the solve injected one but did not re-submit. Replay the action ONCE
@@ -1188,9 +1205,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       const s2 = await this.#settle(page);
       clearancePollMs += s2.clearancePollMs; // #42: sum the poll across both settles
       captchaSolveMs ??= s2.captchaSolveMs; // the solve happens in the FIRST settle; the replay rarely re-solves
+      domContentLoadedMs += s2.domContentLoadedMs; // sum the nav-to-DCL wait across both settles
     }
-    // #42: stash so the controller's post-action snapshot() attributes this action's clearance/solve time.
-    this.#pendingActionTiming = { clearancePollMs, ...(captchaSolveMs !== undefined ? { captchaSolveMs } : {}) };
+    // #42: stash so the controller's post-action snapshot() attributes this action's clearance/solve/nav time.
+    // domContentLoadedMs is included only when the action actually NAVIGATED (>= 1ms) — a non-navigating
+    // click's ~0ms waitForLoadState no-op is omitted, per the Timing contract (absent when nothing navigated).
+    this.#pendingActionTiming = {
+      clearancePollMs,
+      ...(captchaSolveMs !== undefined ? { captchaSolveMs } : {}),
+      ...(domContentLoadedMs >= 1 ? { domContentLoadedMs } : {}),
+    };
   }
 
   /**
@@ -1206,7 +1230,16 @@ export class PatchrightBrowserCore implements BrowserCore {
   ): Promise<SettleResult> {
     // Let any navigation the prior action triggered reach domcontentloaded, so its response status is
     // captured and the snapshot reflects the landed page (resolves immediately if nothing navigated).
+    // #42: measure this wait — for an ACTION that submitted a form it IS the nav-to-DCL time (the dominant
+    // stage on a slow submit); for navigate() it is a ~0ms no-op (its goto already reached DCL, and it uses
+    // its own goto-based domContentLoadedMs instead).
+    const dcl0 = performance.now();
     await page.waitForLoadState("domcontentloaded").catch(() => {});
+    const domContentLoadedMs = performance.now() - dcl0;
+    // #42: clearancePollMs is the WALL-CLOCK of the poll loop, not the sleep-interval counter — each
+    // pollSignal round-trip (title + innerText evaluate) costs real time in the capped container, so a
+    // "15s" loop can take materially longer. The wall-clock is the accurate "time spent clearing".
+    const poll0 = performance.now();
     let signal = await pollSignal(page);
     let waited = 0;
     let sawBlock = false;
@@ -1226,15 +1259,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       waited += pollIntervalMs;
       signal = await pollSignal(page);
     }
+    const clearancePollMs = performance.now() - poll0;
     // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
     // may still be blocking the flow. Auto-solve it transparently when a solver is configured. `replay`
     // is true when the caller should replay the triggering action to complete a submit-gated flow.
-    // #42: `waited` is the clearance-poll counter (== render()'s clearanceWaitedMs); the solve wall-clock
-    // bubbles up from #trySolveCaptcha.
+    // #42: the solve wall-clock bubbles up from #trySolveCaptcha.
     const solve = await this.#trySolveCaptcha(page);
     return {
       replay: solve.replay,
-      clearancePollMs: waited,
+      domContentLoadedMs,
+      clearancePollMs,
       ...(solve.captchaSolveMs !== undefined ? { captchaSolveMs: solve.captchaSolveMs } : {}),
     };
   }
