@@ -299,9 +299,12 @@ export class GatewayDriveController implements DriveController {
       const snap = await fn();
       return { ...snap, timing: assembleTiming({ ...(snap.timing ?? {}), totalMs: performance.now() - t0 }) };
     } catch (err) {
+      // Ensure a failure envelope ALWAYS carries at least { totalMs } — merging existing core stages when
+      // present — for parity with success snapshots and retrieve failures, even if a partial/alternate core
+      // omitted the optional PageSnapshot.timing (the controller always knows the whole-verb elapsed).
       const failure = failureOf(err);
-      if (failure?.timing) {
-        failure.timing = assembleTiming({ ...failure.timing, totalMs: performance.now() - t0 });
+      if (failure) {
+        failure.timing = assembleTiming({ ...(failure.timing ?? {}), totalMs: performance.now() - t0 });
       }
       throw err;
     }

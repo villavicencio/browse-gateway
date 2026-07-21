@@ -234,6 +234,22 @@ test("drive FAILURE: the envelope's timing.totalMs is overridden with the WHOLE-
   });
 });
 
+test("drive FAILURE: a failure envelope gets a totalMs even when the core snapshot omitted timing (parity)", async () => {
+  // A partial/alternate core can return diagnostics WITHOUT the optional PageSnapshot.timing. The controller
+  // still knows the whole-verb elapsed, so the failure envelope must carry at least { totalMs }.
+  const { gateway } = makeScriptedDriveGateway({
+    title: "t", tree: "Forbidden", status: null,
+    diagnostics: { finalUrl: "https://hostile.example/", status: null }, // NO timing on the snapshot
+  });
+  const c = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok");
+  await assert.rejects(c.navigate("https://hostile.example/"), (err) => {
+    assert.ok(err.failure, "failure envelope attached");
+    assert.ok(err.failure.timing, "envelope gains a timing even without core stages");
+    assert.equal(typeof err.failure.timing.totalMs, "number");
+    return true;
+  });
+});
+
 test("drive: a queued verb's totalMs INCLUDES the time it waited behind another verb (t0 before #serialize)", async () => {
   // Two concurrent navigates on one controller serialize; the second waits behind the first. Its totalMs
   // must include that queue wait (t0 is captured before #serialize), not just its own execution slice.
