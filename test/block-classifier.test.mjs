@@ -12,6 +12,7 @@ import {
   hasDataDomeHint,
   isPerimeterXChallenge,
   hasPerimeterXChallengeCopy,
+  activeCaptchaKind,
 } from "../dist/browser/index.js";
 
 // The real PerimeterX "Press & Hold" interstitial text (from the issue #21 repro).
@@ -140,6 +141,20 @@ test("classifyBlock: a thin 200 with a DataDome marker but no block phrase is a 
   // ddHint is attribution-only (like cfHint/pxHint) — never a `blocked` input. A thin 200 with no visible
   // block phrase and no PX press-&-hold stays a legitimately short page.
   assert.equal(classifyBlock({ title: "", text: "short", status: 200, ddHint: true }), null);
+});
+
+test("activeCaptchaKind: binds the kind to the widget CONTAINER class, ignoring loaded libraries + cross-sitekeys (codex #40 r4)", () => {
+  // The exact Codex repro: an active reCAPTCHA widget + a preloaded hCaptcha library must be recaptcha
+  // (the widget), NOT hcaptcha (the library) — detectCaptcha would have returned hcaptcha with the
+  // reCAPTCHA sitekey.
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha" data-sitekey="rk"></div><script src="https://js.hcaptcha.com/1/api.js"></script>'), "recaptcha");
+  assert.equal(activeCaptchaKind('<div class="cf-turnstile" data-sitekey="0x4"></div>'), "turnstile");
+  assert.equal(activeCaptchaKind('<div class="h-captcha" data-sitekey="hk"></div>'), "hcaptcha");
+  // A merely-loaded library (no widget container class) is NOT an active widget.
+  assert.equal(activeCaptchaKind('<script src="https://www.google.com/recaptcha/api.js"></script>'), undefined);
+  assert.equal(activeCaptchaKind("grecaptcha.ready(function(){});"), undefined);
+  assert.equal(activeCaptchaKind('<script src="https://js.hcaptcha.com/1/api.js"></script>'), undefined);
+  assert.equal(activeCaptchaKind("<main>no captcha here</main>"), undefined);
 });
 
 // --- wafVendorFromReason: vendor is a projection of the reason (issue #40) ---

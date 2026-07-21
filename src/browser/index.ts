@@ -71,6 +71,7 @@ export {
 } from "./launch-options.js";
 export {
   detectCaptcha,
+  activeCaptchaKind,
   NullCaptchaSolver,
   liveCaptchaToChallenge,
   liveCaptchaPendingRender,

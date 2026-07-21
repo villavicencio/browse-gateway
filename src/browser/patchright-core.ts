@@ -13,7 +13,7 @@ import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
   awaitSolvableCaptcha,
-  detectCaptcha,
+  activeCaptchaKind,
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
   type LiveCaptcha,
@@ -852,15 +852,16 @@ export class PatchrightBrowserCore implements BrowserCore {
     // with retrieve). Computed only here in navigate() (not in a pure snapshot()) — the drive surface has
     // no HTML otherwise; detectCaptcha reuses the html already captured, no extra page call.
     const html = String(await page.content().catch(() => ""));
-    // Only an ACTIVE widget (a `data-sitekey` container) counts — detectCaptcha also matches a merely-
-    // loaded captcha library, which must not mislabel a WAF block's vendor (codex #40 r3).
-    const captcha = detectCaptcha({ title: "", text: "", html }, url);
+    // Only an ACTIVE widget (its container class) counts — activeCaptchaKind ignores a merely-loaded
+    // captcha library and binds the kind to the widget, so it can't mislabel a WAF block's vendor or
+    // cross-label from a co-present library (codex #40 r3/r4).
+    const captchaKind = activeCaptchaKind(html);
     return {
       ...(await this.#snapshotOf(page)),
       cfHint: hasCloudflareHint(html),
       pxHint: hasPerimeterXHint(html),
       ddHint: hasDataDomeHint(html),
-      ...(captcha?.siteKey ? { captchaKind: captcha.kind } : {}),
+      ...(captchaKind ? { captchaKind } : {}),
     };
   }
 

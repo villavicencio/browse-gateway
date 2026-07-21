@@ -18,6 +18,7 @@ import {
   hasPerimeterXHint,
   hasDataDomeHint,
   hasPerimeterXChallengeCopy,
+  activeCaptchaKind,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
@@ -556,12 +557,11 @@ export async function retrieve(
   // page.content() serializes only the top frame. This is the boundary-length 200 case #24's
   // thin-content test missed. Absent on a cleared page.
   const pxCopy = hasPxChallengeCopy(render);
-  // The interactive-CAPTCHA widget (if any), computed ONCE and reused for the block `reason` and the
-  // surfaced vendor (issue #40). Only an ACTIVE widget — one with a `data-sitekey` container — counts:
-  // detectCaptcha also matches a merely-LOADED captcha library, which must NOT relabel a generic/unknown
-  // WAF block as that CAPTCHA (codex r3). `captchaKind` is carried on the classification signal.
-  const captcha = detectCaptcha(render, url);
-  const captchaKind = captcha?.siteKey ? captcha.kind : undefined;
+  // The ACTIVE interactive-CAPTCHA widget kind (if any), for the block `reason` and the surfaced vendor
+  // (issue #40). Keyed on the widget CONTAINER class (activeCaptchaKind), not a loaded library or a global
+  // sitekey — so a preloaded API script can't relabel a WAF block, and a co-present unrelated library
+  // can't cross-label the kind (codex r3/r4). Carried on the classification signal.
+  const captchaKind = activeCaptchaKind(render.html);
   // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, a PerimeterX
   // press-&-hold (pxHint + EITHER thin content OR the challenge copy in source — a 200 challenge whose
   // phrase renders in a cross-origin iframe, never reaching render.text; #21/#24 follow-up), or a hard

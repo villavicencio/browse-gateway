@@ -67,6 +67,29 @@ export function detectCaptcha(signal: PageSignal, url: string): CaptchaChallenge
   return null;
 }
 
+/** The interactive CAPTCHA widget-CONTAINER classes, per kind — the same containers the live drive gate
+ *  ({@link DETECT_LIVE_CAPTCHA_JS}) queries. Distinct from {@link detectCaptcha}'s script markers: a class
+ *  appears ONLY for an actual placed widget, never for a merely-loaded library (`recaptcha/api.js`,
+ *  `hcaptcha.com/1/api.js` carry no `-captcha`/`-recaptcha`/`cf-turnstile` class token). */
+const WIDGET_CLASS: readonly { kind: Exclude<CaptchaKind, "unknown">; re: RegExp }[] = [
+  { kind: "turnstile", re: /\bcf-turnstile\b/i },
+  { kind: "hcaptcha", re: /\bh-captcha\b/i },
+  { kind: "recaptcha", re: /\bg-recaptcha\b/i },
+];
+
+/**
+ * The kind of an ACTIVE interactive CAPTCHA widget in the rendered HTML — the widget-container class
+ * (`cf-turnstile`/`h-captcha`/`g-recaptcha`), or `undefined` when only a captcha LIBRARY is loaded (or
+ * none). Purpose-built for vendor attribution (issue #40): unlike {@link detectCaptcha}, the kind here is
+ * bound to the widget class itself, so (a) a page that merely preloads a library isn't attributed a
+ * CAPTCHA, and (b) a co-present unrelated library can't cross-label the kind — the failure Codex found
+ * where detectCaptcha paired a reCAPTCHA sitekey with an hCaptcha kind. Order mirrors detectCaptcha for
+ * determinism when (rarely) two widget containers coexist.
+ */
+export function activeCaptchaKind(html: string): CaptchaKind | undefined {
+  return WIDGET_CLASS.find(({ re }) => re.test(html))?.kind;
+}
+
 /** A live, in-DOM CAPTCHA widget read off the active page (drive path). */
 export interface LiveCaptcha {
   kind: Exclude<CaptchaKind, "unknown">;
