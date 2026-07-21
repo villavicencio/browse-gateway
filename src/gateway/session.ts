@@ -21,6 +21,9 @@ export interface SessionInfo {
   consumerId?: string;
   /** The owned core's kind, e.g. "patchright". */
   core: string;
+  /** Whether this session's browser can be force-killed (issue #50) — false = force-kill degraded to
+   *  graceful-close-only for it (no PID / Linux generation marker captured). Exposed for a health surface. */
+  forceKillAvailable: boolean;
 }
 
 export class Session {
@@ -99,6 +102,11 @@ export class Session {
     return this.#core;
   }
 
+  /** Whether this session's browser can be force-killed (issue #50) — proxies the owned core. */
+  get forceKillAvailable(): boolean {
+    return this.#core.forceKillAvailable;
+  }
+
   get info(): SessionInfo {
     return {
       id: this.id,
@@ -108,17 +116,84 @@ export class Session {
       inFlight: this.#inFlight,
       ...(this.consumerId ? { consumerId: this.consumerId } : {}),
       core: this.#core.kind,
+      forceKillAvailable: this.#core.forceKillAvailable,
     };
   }
 
   /**
-   * Close the underlying core and mark the session closed. Idempotent and
-   * concurrency-safe: the state flips before the await, so a second (or racing) call
-   * is a no-op and the core is never double-closed.
+   * Tear the session down with CONFIRMED death (issue #50): attempt a graceful `core.close()` raced
+   * against `closeGraceMs`; a clean close is trusted death (the core resolves close only once the
+   * process has exited). If the close fails fast OR is still pending at the grace deadline, abandon it
+   * and escalate to `core.kill()` (SIGKILL + confirm within `killConfirmMs`). Flips the session to
+   * `closed` and RESOLVES only when death is confirmed by either path; REJECTS if the force-kill can't
+   * confirm the process died in time, leaving the session `open` (the manager keeps it counted and hands
+   * it to the reconfirm loop). Idempotent: an already-closed session is a no-op.
+   *
+   * The session manager dedupes concurrent teardowns (its `#closing` map), so this runs at most once per
+   * session; the core's own close/kill are the only things touching the browser.
    */
-  async close(): Promise<void> {
+  async teardown(closeGraceMs: number, killConfirmMs: number): Promise<void> {
     if (this.#state === "closed") return;
+    const closeP = this.#core.close();
+    const grace = graceTimer(closeGraceMs);
+    // 'closed' fires only on a CLEAN resolve; a rejecting close surfaces as 'close-failed' → escalate.
+    const outcome = await Promise.race([
+      closeP.then(() => "closed" as const, () => "close-failed" as const),
+      grace.promise.then(() => "timeout" as const),
+    ]);
+    grace.clear(); // don't leave a dangling ~10s timer on the common clean-close path
+    if (outcome !== "closed") closeP.catch(() => {}); // abandon a still-pending / rejected close cleanly
+    // Confirm the whole browser process GROUP is empty before freeing the slot — on BOTH the clean-close and
+    // the escalation path (codex #50 r4). A graceful close usually reaps the tree, but a lingering
+    // renderer/GPU child would otherwise free the slot with a live subprocess. core.kill() short-circuits
+    // when the group is already empty (the common clean-close case), group-SIGKILLs any survivor otherwise,
+    // and throws if the group can't be confirmed empty → the session stays 'open' (manager retains +
+    // reconfirms). When force-kill is UNAVAILABLE (no PID captured) we cannot group-confirm: a clean close is
+    // then trusted as death (pre-#50 behavior), while a failed/timed-out close is left unconfirmed via kill().
+    if (this.#core.forceKillAvailable || outcome !== "closed") {
+      await this.#core.kill(killConfirmMs);
+    }
     this.#state = "closed";
-    await this.#core.close();
   }
+
+  /**
+   * Kill-only reconfirm (issue #50): re-SIGKILL and re-confirm death, WITHOUT ever calling `core.close()`
+   * again. The manager's reconfirm loop calls this every reaper tick for a session whose {@link teardown}
+   * couldn't confirm the kill. Calling `close()` here would be unsafe — after the earlier SIGKILL tore
+   * down the CDP transport, `core.close()` resolves instantly and would be mistaken for a clean death
+   * while the OS process is still alive. `core.kill()` re-probes the real pid, so it only confirms a
+   * genuine exit. Flips to `closed` on confirm; rejects (stays `open`) if still unconfirmed.
+   */
+  async reconfirm(killConfirmMs: number): Promise<void> {
+    if (this.#state === "closed") return;
+    // Single-flight (codex #50 r2): overlapping reconfirms — two fire-and-forget reaper ticks, or a reaper
+    // tick racing shutdown — must not start two concurrent `core.kill()` on the same session (which would
+    // re-signal its pid twice). Concurrent callers share the one in-flight kill; the latch clears on settle
+    // so a still-unconfirmed session is retried on the next drain.
+    if (this.#reconfirming) return this.#reconfirming;
+    this.#reconfirming = (async () => {
+      try {
+        await this.#core.kill(killConfirmMs);
+        this.#state = "closed";
+      } finally {
+        this.#reconfirming = undefined;
+      }
+    })();
+    return this.#reconfirming;
+  }
+  #reconfirming?: Promise<void>;
+}
+
+/** A cancellable delay: `promise` resolves after `ms`; `clear()` cancels the timer so a clean close
+ *  doesn't leave it dangling. NOT unref'd: the grace timer is the escalation trigger for a WEDGED close
+ *  (close hangs → this fires → force-kill), so it must keep the event loop alive until it fires or is
+ *  cleared — an unref'd timer would let the loop empty first and the teardown would hang forever (the same
+ *  foreground-timer rule as the force-kill confirm poll). It always fires or is cleared within one grace
+ *  window, so it never lingers past the teardown. */
+function graceTimer(ms: number): { promise: Promise<void>; clear: () => void } {
+  let handle: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((resolve) => {
+    handle = setTimeout(resolve, ms);
+  });
+  return { promise, clear: () => clearTimeout(handle) };
 }

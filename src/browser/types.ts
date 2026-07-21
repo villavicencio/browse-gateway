@@ -312,8 +312,31 @@ export interface BrowserCore {
    * gateway's authenticated path, which installs a guard before any navigation.
    */
   setNavigationGuard(guard: NavigationGuard): Promise<void>;
-  /** Tear down the browser and release all processes. */
+  /**
+   * Graceful teardown: close the browser and release all processes. RESOLVES only once the process is
+   * confirmed gone (a resolved close is trusted death — the vehicle's own close either exits cleanly or
+   * force-kills on its internal timeout before resolving). REJECTS if the close fails, so the caller can
+   * escalate to {@link kill} rather than mistaking a wedged/failed close for a dead browser (issue #50).
+   */
   close(): Promise<void>;
+  /**
+   * Force-kill the browser process (issue #50): SIGKILL the process group + leader and CONFIRM the whole
+   * process TREE is gone — resolving ONLY once the browser's process GROUP is empty within `confirmMs`
+   * (leader death alone does NOT imply its renderer/GPU children are gone), REJECTING if it cannot be
+   * confirmed empty in that window. Idempotent and re-runnable: a second call re-signals surviving members
+   * and re-confirms, so a session-manager reconfirm loop can retry a previously-unconfirmed kill. REJECTS
+   * immediately when force-kill is unavailable (no PID captured at launch — see {@link forceKillAvailable});
+   * the caller treats that as an unconfirmed, still-counted teardown.
+   */
+  kill(confirmMs: number): Promise<void>;
+  /**
+   * Whether {@link kill} can actually force-kill this core — true when the Chromium PID (and, on Linux,
+   * its /proc generation marker) was captured at launch. False means force-kill degraded to unavailable
+   * (a patchright internal changed shape, or a transient /proc read failure); teardown falls back to
+   * graceful-close-only and a wedged close stays a counted zombie. Exposed as the primitive for an
+   * operational health surface (wiring tracked as a follow-up); a degradation also logs loudly at launch.
+   */
+  readonly forceKillAvailable: boolean;
 
   // --- Interactive `drive` surface (stateful path) -------------------------------------------
   // These act on a single persistent "active page" within the core's guarded context, so every

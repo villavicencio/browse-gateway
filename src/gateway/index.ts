@@ -61,15 +61,23 @@ export class Gateway {
   /**
    * The single internal request path: acquire a session, run `fn`, and ALWAYS release it
    * — even if `fn` throws (e.g. a browser-core crash mid-render). Sessions never leak.
+   *
+   * The transient session is marked in-flight for the whole of `fn` (issue #49, subsumed by #50): a
+   * hung render then holds `inFlight > 0`, so the reaper's wedged-in-flight branch can reclaim it past
+   * the deadline even though a transient is untagged (`consumerId === undefined`) and thus invisible to
+   * the idle-TTL branch. A healthy transient still releases synchronously here in the `finally` before
+   * the reaper ever sees it. Mirrors `useConsumerSession`'s guard for the drive path.
    */
   async withSession<T>(
     fn: (session: Session) => Promise<T>,
     coreOverrides?: BrowserCoreOptions,
   ): Promise<T> {
     const session = await this.#sessions.acquire(coreOverrides);
+    session.beginActivity();
     try {
       return await fn(session);
     } finally {
+      session.endActivity();
       await this.#sessions.release(session.id);
     }
   }
@@ -212,7 +220,13 @@ export class Gateway {
 
 export { loadConfig, DEFAULT_GATEWAY_CONFIG, poolSizingError } from "./config.js";
 export type { GatewayConfig } from "./config.js";
-export { SessionManager, SessionManagerError, MAX_INFLIGHT_MS } from "./session-manager.js";
+export {
+  SessionManager,
+  SessionManagerError,
+  MAX_INFLIGHT_MS,
+  CLOSE_GRACE_MS,
+  KILL_CONFIRM_MS,
+} from "./session-manager.js";
 export type {
   CoreFactory,
   SessionManagerOptions,
