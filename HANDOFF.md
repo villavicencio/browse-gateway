@@ -9,7 +9,9 @@ regression, which became **follow-up PR #56** (5 more Codex rounds) — also mer
 
 **Prod now runs main `580b1ad`** (image `sha256:86ba92ac…`): #50 (PR #55) + the #56 follow-up.
 Deploy gate → smoke → verify all green; rollback anchor recorded. Tree clean, `main == origin/main`,
-no open PRs.
+no open PRs. (Docs commit `a4aa5d7` sits on top — handoff + a `docs/solutions/` entry; its `ci` build
+moved GHCR `latest` to `a4aa5d7` which is byte-identical in `src/`/`dist` to `580b1ad`, so **no
+redeploy is needed** — prod stays on `86ba92ac`; re-running `deploy-http` would be a no-op change.)
 
 ## What shipped
 
