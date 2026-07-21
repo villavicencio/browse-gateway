@@ -32,7 +32,7 @@ import {
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
-import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
+import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError, assembleTiming } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
 import type { VaultEntryStore } from "./vault-login.js";
@@ -175,6 +175,7 @@ export class GatewayDriveController implements DriveController {
     forced: boolean;
     attempts: number;
     last?: PageSnapshot;
+    attemptMs?: number[];
     exitCheck?: EgressCheck;
   }): EscalationDiagnostics {
     return escalationDiagnostics({
@@ -183,6 +184,7 @@ export class GatewayDriveController implements DriveController {
       forced: opts.forced,
       attempts: opts.attempts,
       last: opts.last ? this.#signalOf(opts.last) : null,
+      ...(opts.attemptMs ? { attemptMs: opts.attemptMs } : {}), // #42: per proxied-attempt durations
       ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
     });
   }
@@ -216,10 +218,14 @@ export class GatewayDriveController implements DriveController {
     // classifyFailure via the signal's finalUrl (codex #41 r1/r2), so this seam just gates on navFailed.
     const failureClass: FailureClass | undefined = navFailed(snap) ? classifyFailure(signal) : undefined;
     const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+    // #42: fold the snapshot's first-class per-stage Timing into the envelope at THIS surface seam (like
+    // failureClass/wafVendor) so a thrown drive failure carries the wall-clock breakdown. All-numeric →
+    // redaction passes it through untouched.
     const diag: FailureDiagnostics = {
       ...snap.diagnostics,
       ...(failureClass ? { failureClass } : {}),
       ...(wafVendor ? { wafVendor } : {}),
+      ...(snap.timing ? { timing: snap.timing } : {}),
     };
     return redactFailureDiagnostics(diag, this.#secrets);
   }
@@ -273,6 +279,37 @@ export class GatewayDriveController implements DriveController {
     return run;
   }
 
+  /**
+   * #42: stamp the WHOLE-verb wall-clock as `timing.totalMs` on a snapshot-returning verb's result,
+   * MERGING with the core stage breakdown the snapshot already carries. `t0` is captured by the caller
+   * BEFORE entering {@link #serialize}, so the total is the true caller-facing latency INCLUDING any time
+   * the call spent queued behind another verb (concurrent MCP dispatch) — not just its execution slice.
+   * The total spans a navigate's escalation retries + warm-up, or an action's settle/solve; the core
+   * snapshot alone reports only its ~tens-of-ms extraction time (the wrong number an action verb would
+   * otherwise surface).
+   *
+   * On FAILURE the verb throws with a failure envelope attached (an EscalationError's `.failure`, or a
+   * decorated error) whose `timing.totalMs` is the LAST core navigate only — which would contradict the
+   * `attemptMs` array that sums the whole escalation. So override the envelope's `timing.totalMs` with the
+   * whole-verb elapsed before rethrowing, keeping `totalMs >= sum(attemptMs)` (monotone) on failures too.
+   * The envelope is already redacted and timing is all-numeric, so the in-place update is secret-safe.
+   */
+  async #timedSnap(t0: number, fn: () => Promise<PageSnapshot>): Promise<PageSnapshot> {
+    try {
+      const snap = await fn();
+      return { ...snap, timing: assembleTiming({ ...(snap.timing ?? {}), totalMs: performance.now() - t0 }) };
+    } catch (err) {
+      // Ensure a failure envelope ALWAYS carries at least { totalMs } — merging existing core stages when
+      // present — for parity with success snapshots and retrieve failures, even if a partial/alternate core
+      // omitted the optional PageSnapshot.timing (the controller always knows the whole-verb elapsed).
+      const failure = failureOf(err);
+      if (failure) {
+        failure.timing = assembleTiming({ ...(failure.timing ?? {}), totalMs: performance.now() - t0 });
+      }
+      throw err;
+    }
+  }
+
   async open(): Promise<void> {
     return this.#serialize(async () => {
       // Open a direct session lazily; escalation to a proxied exit (if needed) happens on the first
@@ -282,7 +319,8 @@ export class GatewayDriveController implements DriveController {
   }
 
   async navigate(url: string, opts: { forceProxy?: boolean } = {}): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#navigate(url, opts));
+    const t0 = performance.now(); // BEFORE #serialize — totalMs includes any queue wait (#42)
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts)));
   }
 
   async #navigate(url: string, opts: { forceProxy?: boolean }): Promise<PageSnapshot> {
@@ -405,27 +443,33 @@ export class GatewayDriveController implements DriveController {
   }
 
   async snapshot(): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#run((s) => s.core.snapshot()));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#run((s) => s.core.snapshot())));
   }
 
   async click(target: DriveTarget): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.click(target)));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.click(target))));
   }
 
   async type(target: DriveTarget, text: string, submit?: boolean): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.type(target, text, { submit })));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.type(target, text, { submit }))));
   }
 
   async selectOption(target: DriveTarget, values: string[]): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.selectOption(target, values)));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.selectOption(target, values))));
   }
 
   async pressKey(key: string): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.pressKey(key)));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.pressKey(key))));
   }
 
   async waitFor(condition: WaitCondition): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.waitFor(condition)));
+    const t0 = performance.now();
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#actAndSnap((s) => s.core.waitFor(condition))));
   }
 
   async screenshot(): Promise<string> {
@@ -698,6 +742,9 @@ export class GatewayDriveController implements DriveController {
   async #openHealthyAndNavigate(url: string, forced: boolean): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
     let attempts = 0;
+    // #42: per proxied-attempt wall-clock (session-open + navigate), 1:1 with `attempts`, surfaced on the
+    // EscalationError diagnostics so an exhausted 3× re-roll is legible ("why 200s").
+    const attemptMs: number[] = [];
     for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
       const override = this.#resolveProxyOverride();
       if (!override) {
@@ -709,19 +756,30 @@ export class GatewayDriveController implements DriveController {
         );
       }
       attempts = attempt;
+      const attempt0 = performance.now();
       await this.#openSession(override);
       const snap = await this.#run((s) =>
         s.core.navigate(url, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
       );
       if (!navFailed(snap)) {
         this.#pinned = true;
+        attemptMs.push(performance.now() - attempt0); // the winning attempt has no teardown (it is pinned, not closed)
+        // #42 SCOPED FOLLOW-UP: on a SUCCESS-after-retries the collected attemptMs is dropped — a drive
+        // SUCCESS returns a bare PageSnapshot with no escalation-diagnostics channel (drive surfaces those
+        // only on the EscalationError FAILURE, a pre-#42 asymmetry vs retrieve's result-level proxyDiagnostic).
+        // The whole-verb totalMs (stamped by #timedSnap) DOES reflect the failed attempts; surfacing their
+        // per-attempt breakdown on success needs a new PageSnapshot escalation surface — a follow-up.
         return snap;
       }
       last = snap;
       await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
+      // #42: record AFTER teardown so a FAILED attempt's session close (grace + kill-confirm, up to ~15s of
+      // caller-visible latency) counts toward its attemptMs — else ~45s of three wedged teardowns would sit in
+      // totalMs but in no attemptMs entry. Exactly one push per iteration keeps attemptMs 1:1 with `attempts`.
+      attemptMs.push(performance.now() - attempt0);
     }
     const exitCheck = this.#verifyEgressEnabled ? await this.#verifyEgress() : undefined;
-    const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, exitCheck });
+    const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, attemptMs, exitCheck });
     throw new EscalationError(
       // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
       `could not land a working proxied exit for ${sanitizeUrlForError(url)} after ${PROXY_OPEN_ATTEMPTS} attempts ` +

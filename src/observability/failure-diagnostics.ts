@@ -86,6 +86,61 @@ export type FailureClass =
   | "ok";
 
 /**
+ * Per-stage timing on a retrieve/drive call (issue #42) — the measurement half of the "why did it take 200s"
+ * complaint (#43 is the control half). Every field is WALL-CLOCK MILLISECONDS from `performance.now()` diffs
+ * (the ticket's coarse-Date.now path; the Resource-Timing sub-stages dns/connect/ttfb were deliberately DROPPED
+ * — they are sub-second slivers inside the goto, absent on exactly the proxied/redirect paths that dominate the
+ * budget, and reading them requires binding the goto Response, which throws on an aborted challenge nav and can
+ * destroy the #39 envelope). The 160–220s worst case lives entirely in these wall-clock stages.
+ *
+ * `totalMs` is the only REQUIRED field (the whole-operation wall-clock); every stage is optional because a given
+ * call only runs some of them (a clean page never polls for clearance; only the drive path solves a CAPTCHA). Per
+ * proxied-attempt durations are NOT here — they ride {@link import("../verbs/retrieve.js").EscalationDiagnostics}'s
+ * `attemptMs`, next to the `attempts` count they align 1:1 with. Defined in this low-level module (like
+ * {@link WafVendor}/{@link FailureClass}) so the {@link FailureDiagnostics.timing} slot is TYPED to it; the values
+ * are all numeric, so {@link redactFailureDiagnostics} passes it through UNTOUCHED (the safety basis is
+ * "all-numeric", NOT the closed-vocab-forbids-free-text argument the vendor/class slots rest on).
+ */
+export interface Timing {
+  /** Whole-operation wall-clock ms — a retrieve() call, one drive verb, or a single core render()/navigate(). */
+  totalMs: number;
+  /** Navigation → domcontentloaded wall-clock: `page.goto`'s (retrieve / drive-navigate) or, for a drive
+   *  ACTION that submitted a form, the implicit nav's DCL wait. Absent on a pure snapshot or a non-navigating
+   *  action (its ~0ms waitForLoadState no-op is omitted). */
+  domContentLoadedMs?: number;
+  /** Challenge-clearance poll WALL-CLOCK ms — the real time spent in the poll loop, `>=` the kill-gate's
+   *  `clearanceWaitedMs` sleep-interval counter (each poll round-trip costs real time in the capped container). */
+  clearancePollMs?: number;
+  /** Interactive-CAPTCHA solve ms (drive path only; absent when no solve ran). */
+  captchaSolveMs?: number;
+  /** Snapshot / aria-tree extraction ms — includes the opt-in failure-screenshot capture when it is enabled. */
+  snapshotMs?: number;
+}
+
+/**
+ * Assemble a clean {@link Timing} from raw measured numbers (issue #42): each field is clamped to a NON-NEGATIVE
+ * ROUNDED integer (a `performance.now()` diff is fractional, and a clock read across a boundary can go slightly
+ * negative — a diagnostic must never surface a negative or a noisy fractional ms), and every `undefined` optional
+ * is OMITTED (an absent stage is meaningfully different from a 0 — "did not run" vs "ran instantly"). `totalMs` is
+ * always present. Pure + exported so the shape/clamp/omit contract is unit-testable without a browser.
+ */
+export function assembleTiming(measured: {
+  totalMs: number;
+  domContentLoadedMs?: number;
+  clearancePollMs?: number;
+  captchaSolveMs?: number;
+  snapshotMs?: number;
+}): Timing {
+  const clamp = (n: number): number => Math.max(0, Math.round(n));
+  const out: Timing = { totalMs: clamp(measured.totalMs) };
+  if (measured.domContentLoadedMs !== undefined) out.domContentLoadedMs = clamp(measured.domContentLoadedMs);
+  if (measured.clearancePollMs !== undefined) out.clearancePollMs = clamp(measured.clearancePollMs);
+  if (measured.captchaSolveMs !== undefined) out.captchaSolveMs = clamp(measured.captchaSolveMs);
+  if (measured.snapshotMs !== undefined) out.snapshotMs = clamp(measured.snapshotMs);
+  return out;
+}
+
+/**
  * The evidence envelope surfaced on EVERY failure of both the retrieve and drive paths, at parity.
  * All fields optional so a success shape is unchanged and a partial capture still carries what it has.
  */
@@ -120,8 +175,12 @@ export interface FailureDiagnostics {
    *  because it can never be page-derived free text). Attached at the REDACTION seam (retrieve.ts / drive
    *  #failure), NOT via {@link buildFailureDiagnostics} — same as the vendor label. */
   failureClass?: FailureClass;
-  /** Slot for #42 (per-stage timing). Do NOT populate here. */
-  timing?: Record<string, number>;
+  /** #42 per-stage {@link Timing} — the WALL-CLOCK stage breakdown (totalMs + domContentLoaded/clearancePoll/
+   *  captchaSolve/snapshot). Like {@link wafVendor}/{@link failureClass} it is attached at the REDACTION seam
+   *  (retrieve.ts / drive #failure), NOT via {@link buildFailureDiagnostics}; the folded object is the SAME
+   *  Timing carried on the result, so envelope.timing and result.timing can never disagree. All-numeric →
+   *  passes {@link redactFailureDiagnostics} untouched. */
+  timing?: Timing;
   /** Slot for #44 (why a CAPTCHA solve was/wasn't attempted). Do NOT populate here. */
   captchaSolveReason?: string;
   /** Slot for #44 (whether the failure was solver-eligible). Do NOT populate here. */
@@ -264,7 +323,8 @@ function stripSensitiveHeaders(s: string): string {
  *   3. cookie/set-cookie/authorization header stripping (quoted, JSON, `=`, and indented OR unindented
  *      folded continuations WITHIN an entry; a `key=value` continuation tail is swallowed — the boundary
  *      is a COLON-form next field only).
- * The `screenshotRef` (opaque base64 bytes) and the numeric/boolean slots pass through untouched.
+ * The `screenshotRef` (opaque base64 bytes) and the numeric/boolean slots (wafVendor, failureClass, and the
+ * all-numeric #42 {@link Timing}) pass through untouched.
  * `secrets` is a structural store (`{ redactableValues(): readonly string[] }`) — passing the VALUE SET
  * (not an opaque redactor) keeps the secret pass single-pass so a value can't fragment across redactors.
  *

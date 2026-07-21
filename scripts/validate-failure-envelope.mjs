@@ -20,6 +20,8 @@
  *   6. vendor attribution (issue #40) — a failed nav fabricates NO vendor (wafVendor stays undefined,
  *      the load-bearing #39 gate), and when the CF target actually blocks its envelope attributes
  *      wafVendor='cloudflare' (best-effort — degrades to a note when the challenge clears).
+ *   7. per-stage timing (issue #42) — a failed retrieve's envelope carries a populated, non-negative
+ *      `timing.totalMs` (the whole-call wall-clock), proving the timing folds into the live envelope.
  */
 import { Gateway, loadConfig } from "../dist/gateway/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
@@ -71,11 +73,14 @@ try {
   if (r.diagnostics) {
     check("envelope carries a finalUrl", typeof r.diagnostics.finalUrl === "string" && r.diagnostics.finalUrl.length > 0);
     check("envelope carries the (null) status field", "status" in r.diagnostics);
-    // A failed nav has no attributable vendor — #40 must fabricate none (the load-bearing rule). #41 now
-    // lands the failure CLASS: an off-allowlist nav is classified `nav-failed` (a real class, not a
-    // fabricated vendor). wafVendor stays undefined (nav-failed has none) and timing is unset (#42 unlanded).
-    check("nav-failed is classified failureClass='nav-failed' with NO wafVendor (#40/#41) and timing unset",
-      r.diagnostics.failureClass === "nav-failed" && r.diagnostics.wafVendor === undefined && r.diagnostics.timing === undefined);
+    // A failed nav has no attributable vendor — #40 must fabricate none (the load-bearing rule). #41 lands
+    // the failure CLASS: an off-allowlist nav is classified `nav-failed` (a real class, not a fabricated
+    // vendor). wafVendor stays undefined (nav-failed has none). #42 now lands per-stage timing: the envelope
+    // carries a populated, non-negative totalMs (the whole-call wall-clock).
+    check("nav-failed is classified failureClass='nav-failed' with NO wafVendor (#40/#41)",
+      r.diagnostics.failureClass === "nav-failed" && r.diagnostics.wafVendor === undefined);
+    check("envelope carries #42 timing with a non-negative totalMs (the wall-clock breakdown)",
+      !!r.diagnostics.timing && typeof r.diagnostics.timing.totalMs === "number" && r.diagnostics.timing.totalMs >= 0);
     check("envelope is secret-free (no cookie/authorization value leaked)",
       !/set-cookie:\s*\S/i.test(JSON.stringify(r.diagnostics)) && !/authorization:\s*\S/i.test(JSON.stringify(r.diagnostics)));
   }
