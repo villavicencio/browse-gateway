@@ -109,6 +109,13 @@ test("hasDataDomeHint: matches the DataDome CDN + cookie family; a normal page d
   assert.equal(hasDataDomeHint("<main><h1>Woodford Reserve 1.75L</h1><p>$59.99</p></main>"), false);
 });
 
+test("hasDataDomeHint: the bounded cookie token does NOT fire on ordinary JS (`addCookie`) (codex #40 r6)", () => {
+  // /dd_?cookie/i matched the substring `ddCookie` inside `addCookie(` — a false DataDome attribution on
+  // any blocked page that ships such code. The bounded \bdd_cookie\b token rejects it.
+  assert.equal(hasDataDomeHint("function addCookie(name, value) { document.cookie = name + '=' + value; }"), false);
+  assert.equal(hasDataDomeHint("<script>const paddCookiejar = 1;</script>"), false);
+});
+
 test("classifyBlock: a blocked page carrying a DataDome marker → datadome-challenge (not generic blocked)", () => {
   // A DataDome interstitial: a visible generic block phrase makes it blocked; the ddHint re-labels it
   // from the generic 'blocked' fallthrough to a distinct datadome-challenge (the #40 fix).
@@ -158,6 +165,15 @@ test("activeCaptchaKind: rejects a loaded library, a compound class, a comment/C
   assert.equal(activeCaptchaKind("<style>/* .g-recaptcha { display:none } */</style><div data-sitekey='x'></div>"), undefined); // token in CSS only
   assert.equal(activeCaptchaKind('<div class="g-recaptcha"></div>'), undefined); // class but no data-sitekey (matches the live gate)
   assert.equal(activeCaptchaKind("<main>no captcha here</main>"), undefined);
+});
+
+test("activeCaptchaKind: dormant widget markup in a comment / script / template is NOT a live widget (codex #40 r6)", () => {
+  assert.equal(activeCaptchaKind('<!-- <div class="g-recaptcha" data-sitekey="x"></div> -->'), undefined); // commented out
+  assert.equal(activeCaptchaKind('<script type="text/tmpl"><div class="cf-turnstile" data-sitekey="x"></div></script>'), undefined); // script template
+  assert.equal(activeCaptchaKind('<template><div class="h-captcha" data-sitekey="x"></div></template>'), undefined); // inert template
+  assert.equal(activeCaptchaKind('<style>.g-recaptcha[data-sitekey]{display:block}</style>'), undefined); // stylesheet
+  // A REAL widget alongside a commented-out one still resolves (the live one wins).
+  assert.equal(activeCaptchaKind('<!-- <div class="cf-turnstile" data-sitekey="old"></div> --><div class="g-recaptcha" data-sitekey="live"></div>'), "recaptcha");
 });
 
 // --- wafVendorFromReason: vendor is a projection of the reason (issue #40) ---

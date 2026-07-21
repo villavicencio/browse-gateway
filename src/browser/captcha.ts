@@ -94,17 +94,33 @@ const WIDGET_ELEMENT: readonly { kind: Exclude<CaptchaKind, "unknown">; re: RegE
   { kind: "recaptcha", re: widgetClassRe("g-recaptcha") },
 ];
 
+/** Contexts whose contents are NOT live rendered DOM — a comment, a `<script>`/`<style>`/`<noscript>`
+ *  body, or an inert `<template>` fragment — where dormant widget markup can appear without being a real
+ *  placed widget. Stripped before the widget match so `page.content()` carrying a commented-out or
+ *  templated `<div class="g-recaptcha" data-sitekey>` isn't mistaken for an active challenge (codex #40
+ *  r6). This is the regex module's bounded approximation of "a live element"; true active-element
+ *  verification is a DOM-parse concern the whole HTML-string detection layer deliberately forgoes. */
+const INERT_HTML_CONTEXTS: readonly RegExp[] = [
+  /<!--[\s\S]*?-->/g,
+  /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+  /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+  /<template\b[^>]*>[\s\S]*?<\/template>/gi,
+  /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+];
+
 /**
  * The kind of an ACTIVE interactive CAPTCHA widget in the rendered HTML — a placed widget ELEMENT
- * (container class + `data-sitekey`, per {@link widgetClassRe}) — or `undefined` when only a captcha
- * LIBRARY is loaded, the token appears in non-element text, or none is present. Purpose-built for vendor
- * attribution (issue #40): unlike {@link detectCaptcha}, the kind here is bound to the widget element, so
- * (a) a page that merely preloads a library isn't attributed a CAPTCHA (codex r3), (b) a co-present
- * unrelated library can't cross-label the kind (r4), and (c) a compound class / comment / stylesheet
- * substring can't fabricate a widget (r5).
+ * (container class + `data-sitekey`, per {@link widgetClassRe}), read off the LIVE markup with inert
+ * contexts stripped first — or `undefined` when only a captcha LIBRARY is loaded, the token appears in
+ * non-element/dormant text, or none is present. Purpose-built for vendor attribution (issue #40): unlike
+ * {@link detectCaptcha}, the kind is bound to the widget element, so (a) a page that merely preloads a
+ * library isn't attributed a CAPTCHA (codex r3), (b) a co-present unrelated library can't cross-label the
+ * kind (r4), (c) a compound class / stylesheet substring can't fabricate a widget (r5), and (d) a
+ * commented-out / `<script>`- or `<template>`-embedded widget doesn't count (r6).
  */
 export function activeCaptchaKind(html: string): CaptchaKind | undefined {
-  return WIDGET_ELEMENT.find(({ re }) => re.test(html))?.kind;
+  const live = INERT_HTML_CONTEXTS.reduce((s, re) => s.replace(re, " "), html);
+  return WIDGET_ELEMENT.find(({ re }) => re.test(live))?.kind;
 }
 
 /** A live, in-DOM CAPTCHA widget read off the active page (drive path). */

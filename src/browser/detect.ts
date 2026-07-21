@@ -73,7 +73,10 @@ export const DD_VENDOR_HINTS: readonly RegExp[] = [
   /geo\.captcha-delivery\.com/i,
   /captcha-delivery/i,
   /datadome/i,
-  /dd_?cookie/i,
+  // The DataDome cookie identifier as a WHOLE token — bounded so ordinary JS (`addCookie(`, which
+  // contains the substring `ddCookie`) can't set ddHint and mislabel a generic block as DataDome (codex
+  // #40 r6). The underscore is required (the real cookie form), not optional.
+  /\bdd_cookie\b/i,
 ];
 
 /**
