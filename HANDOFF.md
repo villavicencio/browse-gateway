@@ -4,12 +4,14 @@ Continuation of the site-compat hardening epic (#38), Wave 2. Picked up on `/dv:
 **"go on #40"** (surface mitigation/CAPTCHA vendor + add a DataDome branch to `classifyBlock`). Ran the
 full ultracode pipeline — a pre-code 4-lens adversarial critique panel, implementation, in-container
 runtime gates, and an **8-round Claude↔Codex adversarial-review loop** — then **merged #40 (PR #57,
-squash `7205567`)** and **filed the two follow-ups**. Operator ratified the stopping point (2 reasoned
-residuals routed to #41/#44 rather than scope-creeping detection into #40).
+squash `7205567`), filed the follow-ups, and DEPLOYED #40 to prod**. Operator ratified the stopping
+point (2 reasoned residuals routed to #41/#44 rather than scope-creeping detection into #40).
 
-**Prod is UNCHANGED — still `580b1ad` (image `86ba92ac`).** #40 is on `main` but **NOT deployed** (the
-merge builds GHCR `latest`; deploy is a separate `gh workflow run deploy-http.yml` the operator has not
-requested). Tree clean, `main == origin/main`, no open PRs.
+**Prod now runs #40 — image `sha256:6f84808f…`** (deployed 2026-07-21, run `29852396208`: gate PASS →
+smoke PASS → swap → verify OK, no rollback). **Rollback anchor = `sha256:86ba92ac…`** (the prior #50
+image / `580b1ad`). Tree clean, `main == origin/main`, no open PRs. **Three #40 follow-ups filed:
+#41** (empty-shell, comment), **#44** (Turnstile kind, comment), **#58** (drive action-failure vendor gap,
+standalone issue).
 
 ## What shipped (#40, PR #57)
 
@@ -86,9 +88,9 @@ regression — #40 doesn't touch the stealth path).
    empty-shell input captured on it. Depends on #39 signals + #40 vendor (both live). This is where the
    200-status empty-shell/hydration-failed/real-zero states get separated.
 2. **#42/#43/#44** (per-stage timing, wall-clock budget, CAPTCHA solver eligibility+reason) → #45 → #47 → #48.
-3. **Deploy #40 when ready** — merge built GHCR `latest`; `gh workflow run deploy-http.yml -f image_tag=latest`
-   → on-host `validate-http` gate → pre-swap smoke → swap → verify → rollback. Prod stays `580b1ad`
-   until then.
+3. **#40 is DEPLOYED** (prod = `6f84808f`). The three #40 follow-ups (#41 empty-shell, #44 Turnstile,
+   #58 drive action-failure vendor) are open; #58 is a clean standalone hardening (compute hints in the
+   core `#snapshotOf`).
 4. The two #50 follow-ups (#53 health surface, #54 acquire-side `#reserved` leak) still open.
 
 Plan doc: `docs/plans/2026-07-17-001-site-compatibility-hardening.local.md` (gitignored, self-contained).
