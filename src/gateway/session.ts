@@ -184,13 +184,16 @@ export class Session {
   #reconfirming?: Promise<void>;
 }
 
-/** A cancellable delay: `promise` resolves after `ms`; `clear()` cancels the (unref'd) timer so a
- *  clean close doesn't leave a dangling grace timer alive. */
+/** A cancellable delay: `promise` resolves after `ms`; `clear()` cancels the timer so a clean close
+ *  doesn't leave it dangling. NOT unref'd: the grace timer is the escalation trigger for a WEDGED close
+ *  (close hangs → this fires → force-kill), so it must keep the event loop alive until it fires or is
+ *  cleared — an unref'd timer would let the loop empty first and the teardown would hang forever (the same
+ *  foreground-timer rule as the force-kill confirm poll). It always fires or is cleared within one grace
+ *  window, so it never lingers past the teardown. */
 function graceTimer(ms: number): { promise: Promise<void>; clear: () => void } {
   let handle: ReturnType<typeof setTimeout>;
   const promise = new Promise<void>((resolve) => {
     handle = setTimeout(resolve, ms);
-    handle.unref?.();
   });
   return { promise, clear: () => clearTimeout(handle) };
 }
