@@ -44,6 +44,7 @@ export {
   hasEmptyStateMarker,
   hasUnsupportedBrowserPhrase,
   hasFrameworkRoot,
+  stripInertHtml,
   isPerimeterXChallenge,
   hasPerimeterXChallengeCopy,
   isHardBlock,

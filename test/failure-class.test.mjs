@@ -86,6 +86,19 @@ test("classifyFailure: a THIN shell + framework root + a GENUINE failed load →
   );
 });
 
+test("classifyFailure: a dead nav that reached chrome-error:// (stale non-null status) → nav-failed (codex r1/r2)", () => {
+  // A client-side nav to a dead host leaves the fresh-page status at the prior 200 while finalUrl records
+  // the chrome-error page. The status===null nav-failed test misses it — the finalUrl signal catches it,
+  // and it WINS over the content-arm signals (framework root + a genuine failure would otherwise be
+  // hydration-failed). Both paths derive finalUrl (retrieve: diagnostics.finalUrl; drive: snapshot url).
+  assert.equal(classifyFailure({ title: "", text: "ERR_EMPTY_RESPONSE", status: 200, finalUrl: "chrome-error://chromewebdata/" }), "nav-failed");
+  assert.equal(
+    classifyFailure({ title: "", text: "", status: 200, frameworkRoot: true, networkFailed: true, finalUrl: "chrome-error://chromewebdata/" }),
+    "nav-failed",
+    "chrome-error wins over the hydration-failed content signals",
+  );
+});
+
 test("classifyFailure: a THIN quiet shell (framework root, no genuine failure) → empty-shell (formalized empty-content)", () => {
   assert.equal(classifyFailure({ title: "", text: "", status: 200, frameworkRoot: true, networkFailed: false }), "empty-shell");
   assert.equal(classifyFailure({ title: "", text: "", status: 200 }), "empty-shell"); // no framework root either
@@ -165,4 +178,15 @@ test("hasFrameworkRoot: matches an SPA mount root as a whole token; content / ne
   assert.equal(hasFrameworkRoot('<div id="rootLayout"></div>'), false); // not the whole id token
   assert.equal(hasFrameworkRoot('<div id="approot"></div>'), false);
   assert.equal(hasFrameworkRoot("<main><h1>Real content</h1></main>"), false);
+});
+
+test("hasFrameworkRoot: dormant markup in a comment / script / template is NOT a live mount root (codex #41 r2)", () => {
+  // The #40-trap re-entry: an id="root" example inside inert context must not read as a live SPA shell,
+  // else any thin failure with a genuine network error misclassifies as hydration-failed.
+  assert.equal(hasFrameworkRoot('<!-- <div id="root"></div> -->'), false); // commented out
+  assert.equal(hasFrameworkRoot('<script>var tmpl = \'<div id="app"></div>\';</script>'), false); // script string
+  assert.equal(hasFrameworkRoot('<template><div id="__next"></div></template>'), false); // inert template
+  assert.equal(hasFrameworkRoot('<style>#root{display:none}</style>'), false); // stylesheet (no id= attr anyway)
+  // A REAL mount root alongside a commented-out one still resolves (the live one wins).
+  assert.equal(hasFrameworkRoot('<!-- <div id="app"></div> --><body><div id="root"></div></body>'), true);
 });

@@ -260,6 +260,17 @@ export interface FailureSignal extends BlockSignal {
   /** A GENUINE (non-guard) subresource request failed during the render — {@link genuineNetworkFailure},
    *  which excludes the allowlist guard's own `ERR_BLOCKED_BY_CLIENT` aborts. Retrieve-only. */
   networkFailed?: boolean;
+  /** The final (post-redirect / post-client-nav) URL, so {@link classifyFailure} can recognize a dead nav
+   *  that reached a `chrome-error://` page while inheriting a STALE non-null status (which defeats the
+   *  status===null nav-failed test). retrieve passes render.diagnostics.finalUrl; drive the snapshot url. */
+  finalUrl?: string;
+}
+
+/** True when a URL is a Chrome error page (`chrome-error://…`) — a dead nav (reset socket / unreachable
+ *  host / off-allowlist abort) that produced no real document but can carry a stale status from a prior
+ *  page. The classifier attributes it to `nav-failed` regardless of that stale status (codex #41 r1/r2). */
+export function isChromeErrorUrl(url: string | undefined): boolean {
+  return url !== undefined && url.startsWith("chrome-error://");
 }
 
 /**
@@ -294,6 +305,11 @@ export function genuineNetworkFailure(networkFailures: readonly string[] | undef
  * rendered-evidence DataDome-challenge detector is a follow-up gated on a captured fixture.
  */
 export function classifyFailure(sig: FailureSignal): FailureClass {
+  // A dead nav that reached a chrome-error:// page can inherit a STALE non-null status from a prior
+  // document, defeating resolveBlockReason's status===null nav-failed test — attribute it up front from the
+  // final URL (codex #41 r1/r2). retrieve derives finalUrl from render.diagnostics.finalUrl, drive from the
+  // snapshot url, so both paths agree here rather than at each seam.
+  if (isChromeErrorUrl(sig.finalUrl)) return "nav-failed";
   const reason = resolveBlockReason(sig);
   if (reason === "nav-failed") return "nav-failed";
   if (reason === "captcha") return "captcha";
@@ -686,6 +702,9 @@ export async function retrieve(
     captchaKind,
     frameworkRoot,
     networkFailed,
+    // The post-redirect / post-client-nav landed URL — lets classifyFailure catch a dead nav that reached a
+    // chrome-error page while the (fresh-page) status stayed at the initial 200 (codex #41 r2).
+    ...(render.diagnostics?.finalUrl !== undefined ? { finalUrl: render.diagnostics.finalUrl } : {}),
   };
   // Diagnostic reason for the block: nav-failed (off-allowlist/unreachable) first, then the shared
   // resolveBlockReason — a SPECIFIC WAF vendor (cf/px/datadome) wins, and an interactive CAPTCHA

@@ -2,7 +2,7 @@
  * Outcome verbs (U5). v1 ships `retrieve(url) -> clean markdown`; `synthesize()` and the
  * low-level `drive()` escape hatch are v1.1.
  */
-export { retrieve, classifyBlock, resolveBlockReason, wafVendorFromReason, classifyFailure, wafVendorFromFailure, genuineNetworkFailure, escalationDiagnostics, EscalationError, isRetrieveFailure, classifyExitOrg, parseExitOrg, proxyFromSecrets, mintStickyProxy, newStickyExitId, stickySuffixBootError, stickySuffixRedactables, PROXY_CLEARANCE_TIMEOUT_MS } from "./retrieve.js";
+export { retrieve, classifyBlock, resolveBlockReason, wafVendorFromReason, classifyFailure, wafVendorFromFailure, genuineNetworkFailure, isChromeErrorUrl, escalationDiagnostics, EscalationError, isRetrieveFailure, classifyExitOrg, parseExitOrg, proxyFromSecrets, mintStickyProxy, newStickyExitId, stickySuffixBootError, stickySuffixRedactables, PROXY_CLEARANCE_TIMEOUT_MS } from "./retrieve.js";
 export type { RetrieveOptions, RetrieveResult, BlockReason, BlockSignal, FailureSignal, WafVendor, FailureClass, EscalationDiagnostics, EgressCheck } from "./retrieve.js";
 // WafVendor is defined in observability (so the FailureDiagnostics slot can be typed to it); re-exported
 // above via retrieve.js for callers that reach it through the verbs barrel.

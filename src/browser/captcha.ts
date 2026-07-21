@@ -14,6 +14,7 @@
  *    genuine, blocking widget — never speculatively.
  */
 import type { PageSignal } from "./detect.js";
+import { stripInertHtml } from "./detect.js";
 
 export type CaptchaKind = "recaptcha" | "hcaptcha" | "turnstile" | "unknown";
 
@@ -113,32 +114,20 @@ const WIDGET_EVIDENCE: readonly { kind: Exclude<CaptchaKind, "unknown">; res: re
   },
 ];
 
-/** Contexts whose contents are NOT live rendered DOM — a comment, a `<script>`/`<style>`/`<noscript>`
- *  body, or an inert `<template>` fragment — where dormant widget markup can appear without being a real
- *  placed widget. Stripped before matching so `page.content()` carrying a commented-out or templated
- *  `<div class="g-recaptcha" data-sitekey>` isn't mistaken for an active challenge (codex #40 r6). This is
- *  the regex module's bounded approximation of "a live element"; true active-element verification is a
- *  DOM-parse concern the whole HTML-string detection layer deliberately forgoes. */
-const INERT_HTML_CONTEXTS: readonly RegExp[] = [
-  /<!--[\s\S]*?-->/g,
-  /<script\b[^>]*>[\s\S]*?<\/script>/gi,
-  /<style\b[^>]*>[\s\S]*?<\/style>/gi,
-  /<template\b[^>]*>[\s\S]*?<\/template>/gi,
-  /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
-];
-
 /**
  * The kind of an ACTIVE interactive CAPTCHA widget in the rendered HTML — evidenced by a placed container,
  * a rendered iframe, or a response field ({@link WIDGET_EVIDENCE}), read off the LIVE markup with inert
- * contexts stripped first — or `undefined` when only a captcha LIBRARY is loaded, the marker appears in
- * dormant/non-element text, or none is present. Purpose-built for vendor attribution (issue #40): unlike
- * {@link detectCaptcha} (which also matches a bare library and pairs the first sitekey with any kind), the
- * kind here is bound to real rendered evidence, so it neither over-attributes (library-only r3, cross-label
- * r4, compound-class/substring r5, comment/template r6, pseudo-class/attr-value r7) nor under-attributes
- * (it catches `grecaptcha.render`/explicit-render widgets via their iframe/response field, r7).
+ * contexts stripped first ({@link stripInertHtml} — the shared strip, so a commented-out/templated
+ * `<div class="g-recaptcha" data-sitekey>` isn't mistaken for an active challenge, codex #40 r6) — or
+ * `undefined` when only a captcha LIBRARY is loaded, the marker appears in dormant/non-element text, or none
+ * is present. Purpose-built for vendor attribution (issue #40): unlike {@link detectCaptcha} (which also
+ * matches a bare library and pairs the first sitekey with any kind), the kind here is bound to real rendered
+ * evidence, so it neither over-attributes (library-only r3, cross-label r4, compound-class/substring r5,
+ * comment/template r6, pseudo-class/attr-value r7) nor under-attributes (it catches
+ * `grecaptcha.render`/explicit-render widgets via their iframe/response field, r7).
  */
 export function activeCaptchaKind(html: string): CaptchaKind | undefined {
-  const live = INERT_HTML_CONTEXTS.reduce((s, re) => s.replace(re, " "), html);
+  const live = stripInertHtml(html);
   return WIDGET_EVIDENCE.find(({ res }) => res.some((re) => re.test(live)))?.kind;
 }
 

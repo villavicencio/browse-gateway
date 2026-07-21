@@ -147,6 +147,30 @@ export const FRAMEWORK_ROOT_HINTS: readonly RegExp[] = [
   /\bng-version=/i,
 ];
 
+/**
+ * Contexts whose contents are NOT live rendered DOM — a comment, a `<script>`/`<style>`/`<noscript>` body,
+ * or an inert `<template>` fragment — where dormant markup (a commented-out `<div id="root">`, a widget
+ * example in a docs `<template>`) can appear without being a real placed element. {@link stripInertHtml}
+ * blanks these before an HTML-marker match, so a raw-HTML detector isn't fooled by dormant text. The single
+ * source of truth for this: the CAPTCHA layer's {@link import("./captcha.js").activeCaptchaKind} reuses it
+ * (issue #40 r6), and the #41 framework-root detector uses it too. This is the regex module's bounded
+ * approximation of "a live element"; true active-element verification is a DOM-parse concern the whole
+ * HTML-string detection layer deliberately forgoes.
+ */
+export const INERT_HTML_CONTEXTS: readonly RegExp[] = [
+  /<!--[\s\S]*?-->/g,
+  /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+  /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+  /<template\b[^>]*>[\s\S]*?<\/template>/gi,
+  /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+];
+
+/** Blank out {@link INERT_HTML_CONTEXTS} (comments, script/style/template/noscript bodies) so a raw-HTML
+ *  marker match sees only live markup — the shared inert-context strip for the HTML-string detectors. */
+export function stripInertHtml(html: string): string {
+  return INERT_HTML_CONTEXTS.reduce((s, re) => s.replace(re, " "), html);
+}
+
 /** The page fields detection inspects. */
 export interface PageSignal {
   title: string;
@@ -273,7 +297,10 @@ export function hasUnsupportedBrowserPhrase(signal: Pick<PageSignal, "title" | "
  * "shell present, no content", and + a genuine failed data call means `hydration-failed`.
  */
 export function hasFrameworkRoot(html: string): boolean {
-  return FRAMEWORK_ROOT_HINTS.some((re) => re.test(html));
+  // Strip inert contexts first (codex #41 r2): an `id="root"` inside a comment / `<script>` string /
+  // `<template>` is dormant markup, not a live SPA mount — matching it would misclassify the page as
+  // hydration-failed. Same discipline as activeCaptchaKind (issue #40 r6).
+  return FRAMEWORK_ROOT_HINTS.some((re) => re.test(stripInertHtml(html)));
 }
 
 /**

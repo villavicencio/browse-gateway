@@ -31,7 +31,7 @@ import {
   PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
-import type { EscalationDiagnostics, EgressCheck, BlockSignal, FailureClass } from "../verbs/index.js";
+import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
 import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
@@ -143,12 +143,15 @@ export class GatewayDriveController implements DriveController {
   }
 
   /**
-   * The reduced-surface {@link BlockSignal} a drive snapshot presents to the shared classifier: the
+   * The reduced-surface {@link FailureSignal} a drive snapshot presents to the shared classifier: the
    * accessibility `tree` stands in for visible text, plus the carried cfHint/pxHint/ddHint booleans
-   * (issue #40). The SINGLE builder so escalation diagnostics and the failure-envelope vendor read the
-   * same signal and can't drift from each other (the drive↔retrieve detection-parity invariant).
+   * (issue #40) and the landed `finalUrl` (so classifyFailure catches a stale-status chrome-error dead nav,
+   * codex #41 r1). The SINGLE builder so escalation diagnostics and the failure-envelope class/vendor read
+   * the same signal and can't drift from each other (the drive↔retrieve detection-parity invariant). The
+   * retrieve-only content signals (frameworkRoot/networkFailed) stay unset — the drive path never reaches
+   * classifyFailure's content arm (a thin-200 shell is a returnable snapshot, never a drive failure).
    */
-  #signalOf(snap: PageSnapshot): BlockSignal {
+  #signalOf(snap: PageSnapshot): FailureSignal {
     return {
       title: snap.title,
       text: snap.tree,
@@ -157,6 +160,7 @@ export class GatewayDriveController implements DriveController {
       pxHint: snap.pxHint,
       ddHint: snap.ddHint,
       captchaKind: snap.captchaKind,
+      finalUrl: snap.url,
     };
   }
 
@@ -208,14 +212,9 @@ export class GatewayDriveController implements DriveController {
     // Classify ONLY a genuine drive nav failure — navFailed is the drive failure predicate (null status,
     // a chrome-error dead nav, a visible block, or a hard block). A bare post-action snapshot of a HEALTHY
     // page (an action that threw on a stale ref / locator timeout) is NOT navFailed, so its class stays
-    // unset (no confidently-wrong empty-shell). A dead nav (chrome-error://) can inherit a STALE non-null
-    // status from the prior page, which defeats classifyFailure's status===null nav-failed test — attribute
-    // it from the URL (codex #41 r1). Every other navFailed case classifies cleanly off the signal.
-    const failureClass: FailureClass | undefined = !navFailed(snap)
-      ? undefined
-      : snap.url.startsWith("chrome-error://")
-        ? "nav-failed"
-        : classifyFailure(signal);
+    // unset (no confidently-wrong empty-shell). The chrome-error stale-status case is handled inside
+    // classifyFailure via the signal's finalUrl (codex #41 r1/r2), so this seam just gates on navFailed.
+    const failureClass: FailureClass | undefined = navFailed(snap) ? classifyFailure(signal) : undefined;
     const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
     const diag: FailureDiagnostics = {
       ...snap.diagnostics,
