@@ -296,13 +296,14 @@ export function genuineNetworkFailure(networkFailures: readonly string[] | undef
  * Precedence (most-actionable first): the block/nav classes come straight off resolveBlockReason. In the
  * reason===null arm, `unsupported-browser` is checked BEFORE the thin gate (a definitive interstitial phrase
  * is meaningful even on a fat wrapper); then a fat-innerText-but-unextractable page is `empty-shell`; then,
- * THIN-only, an explicit empty-state marker is `real-zero-results`, an ACTIVE captcha widget is a `captcha`
- * shell (rendered evidence — the #40 machinery, safe on a thin page), a framework root + a genuine failed
- * data call is `hydration-failed`, and the remaining thin page is `empty-shell` (the formalized
- * `empty-content`). NOTE: a persistent DataDome/PX marker is DELIBERATELY NOT used here — it survives a
- * cleared challenge, so keying on it would re-open the #40 persistent-marker false-positive (a thin
- * DataDome-protected page that merely failed extraction is `empty-shell`, not a fabricated block). A
- * rendered-evidence DataDome-challenge detector is a follow-up gated on a captured fixture.
+ * THIN-only, an explicit empty-state marker is `real-zero-results`, a framework root + a genuine failed data
+ * call is `hydration-failed`, and the remaining thin page is `empty-shell` (the formalized `empty-content`).
+ * NOTE: neither a persistent DataDome/PX marker NOR a thin active-captcha widget is used to attribute a
+ * vendor here (codex #41 r3). The persistent markers survive a cleared challenge (re-opening the #40
+ * false-positive), and attributing a captcha/vendor on a page the block classifier reports NOT blocked
+ * (reason===null) makes the envelope disagree with the proxy diagnostic's reason. Both a captcha shell and a
+ * DataDome captcha-delivery shell are surfaced as `empty-shell`; attributing their vendor consistently needs
+ * a rendered-evidence challenge-shell detector that folds into the block DECISION — a deferred follow-up.
  */
 export function classifyFailure(sig: FailureSignal): FailureClass {
   // A dead nav that reached a chrome-error:// page can inherit a STALE non-null status from a prior
@@ -324,8 +325,15 @@ export function classifyFailure(sig: FailureSignal): FailureClass {
   const thin = sig.text.trim().length < MIN_CONTENT_LENGTH;
   if (!thin) return "empty-shell"; // fat innerText but unextractable — no more specific label fits
   if (hasEmptyStateMarker(sig)) return "real-zero-results"; // a genuine thin "no results" state
-  if (sig.captchaKind && sig.captchaKind !== "unknown") return "captcha"; // a thin ACTIVE-widget shell (rendered evidence)
   if (sig.frameworkRoot && sig.networkFailed) return "hydration-failed"; // shell present + a genuine failed load
+  // A thin ACTIVE-captcha shell is DELIBERATELY left as empty-shell here, NOT promoted to `captcha` (codex
+  // #41 r3): attributing captcha/a widget vendor while the block classifier still reports the page NOT
+  // blocked (reason===null) makes the envelope disagree with the proxy diagnostic's reason (null) — the #40
+  // r3 "one reason" invariant. Doing it CONSISTENTLY needs the block DECISION to promote a thin widget shell,
+  // which #40 declined (a fat page with an incidental widget would false-positive). So `wafVendorFromFailure`'s
+  // `captcha` case only fires for a block-decision captcha (hard-block/blocked + active widget), where every
+  // field agrees; a rendered-evidence challenge-shell detector (also the DataDome captcha-delivery case) is a
+  // deferred follow-up. #41 delivers the empty-shell CLASS for these shells; their vendor is not attributed.
   return "empty-shell"; // the formalized empty-content (an unhydrated shell or a genuinely empty page)
 }
 

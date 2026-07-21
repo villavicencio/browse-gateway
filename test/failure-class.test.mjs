@@ -72,11 +72,14 @@ test("classifyFailure: a THIN explicit empty-state → real-zero-results", () =>
   assert.equal(classifyFailure({ title: "", text: "Your search returned no matches", status: 200 }), "real-zero-results");
 });
 
-test("classifyFailure: a THIN shell serving an ACTIVE captcha widget → captcha (the #40 empty-shell follow-up)", () => {
-  // A thin 200 with an active widget kind but NO block phrase: classifyBlock returns null (not blocked),
-  // so reason is null — but on a THIN page a live rendered widget IS the block. Rendered evidence
-  // (activeCaptchaKind) makes this safe; a real login page carrying an incidental captcha is FAT.
-  assert.equal(classifyFailure({ title: "", text: "", status: 200, captchaKind: "recaptcha" }), "captcha");
+test("classifyFailure: a THIN shell serving an active captcha widget → empty-shell, NOT captcha (codex #41 r3)", () => {
+  // A thin 200 with an active widget kind but NO block phrase: classifyBlock returns null (not blocked), so
+  // reason stays null. Promoting it to `captcha`/a widget vendor would make the envelope disagree with the
+  // proxy-diagnostic reason (null) — the #40 r3 "one reason" invariant. It is surfaced as empty-shell (the
+  // CLASS is delivered); attributing the captcha-shell vendor needs a block-decision detector (deferred).
+  const sig = { title: "", text: "", status: 200, captchaKind: "recaptcha" };
+  assert.equal(classifyFailure(sig), "empty-shell");
+  assert.equal(wafVendorFromFailure(classifyFailure(sig), sig), undefined, "no widget vendor on a not-blocked thin shell");
 });
 
 test("classifyFailure: a THIN shell + framework root + a GENUINE failed load → hydration-failed", () => {
