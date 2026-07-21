@@ -22,8 +22,8 @@ import {
   shouldEscalateDrive,
   proxyFromSecrets,
   escalationDiagnostics,
-  resolveBlockReason,
-  wafVendorFromReason,
+  classifyFailure,
+  wafVendorFromFailure,
   EscalationError,
   hostForcesProxy,
   classifyExitOrg,
@@ -31,7 +31,7 @@ import {
   PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
-import type { EscalationDiagnostics, EgressCheck, BlockSignal } from "../verbs/index.js";
+import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
 import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
@@ -143,12 +143,15 @@ export class GatewayDriveController implements DriveController {
   }
 
   /**
-   * The reduced-surface {@link BlockSignal} a drive snapshot presents to the shared classifier: the
+   * The reduced-surface {@link FailureSignal} a drive snapshot presents to the shared classifier: the
    * accessibility `tree` stands in for visible text, plus the carried cfHint/pxHint/ddHint booleans
-   * (issue #40). The SINGLE builder so escalation diagnostics and the failure-envelope vendor read the
-   * same signal and can't drift from each other (the drive↔retrieve detection-parity invariant).
+   * (issue #40) and the landed `finalUrl` (so classifyFailure catches a stale-status chrome-error dead nav,
+   * codex #41 r1). The SINGLE builder so escalation diagnostics and the failure-envelope class/vendor read
+   * the same signal and can't drift from each other (the drive↔retrieve detection-parity invariant). The
+   * retrieve-only content signals (frameworkRoot/networkFailed) stay unset — the drive path never reaches
+   * classifyFailure's content arm (a thin-200 shell is a returnable snapshot, never a drive failure).
    */
-  #signalOf(snap: PageSnapshot): BlockSignal {
+  #signalOf(snap: PageSnapshot): FailureSignal {
     return {
       title: snap.title,
       text: snap.tree,
@@ -157,6 +160,7 @@ export class GatewayDriveController implements DriveController {
       pxHint: snap.pxHint,
       ddHint: snap.ddHint,
       captchaKind: snap.captchaKind,
+      finalUrl: snap.url,
     };
   }
 
@@ -189,21 +193,34 @@ export class GatewayDriveController implements DriveController {
    * cookie/authorization stripped) since the core built the RAW envelope; undefined when the snapshot
    * carried none. The SINGLE place drive failures pull the envelope, so the redaction can't be skipped.
    *
-   * Also attaches the mitigation vendor (issue #40): a PROJECTION of the shared {@link resolveBlockReason}
-   * via {@link wafVendorFromReason} (never a second classifier — so vendor and reason can't disagree), at
-   * parity with retrieve's redact seam. A specific WAF vendor (cf/px/datadome) wins; a bare
-   * reCAPTCHA/hCaptcha/Turnstile page (generic block + a detected widget kind) attributes the widget kind.
-   * `wafVendor` is a closed vocabulary → passes redaction untouched; absent when unattributable. NOTE a
-   * pure `snapshot()` (post-action) carries none of these hints, so a mid-flow action landing on a
-   * challenge inherits the #39 no-hints gap (navigate-failures carry the vendor; action-failures do not —
-   * tracked as a follow-up to compute hints in the core #snapshotOf).
+   * Also attaches the failure CLASS (issue #41) and the mitigation vendor (issue #40) — both a PROJECTION
+   * of the shared classification (never a second classifier), so class, vendor, and the
+   * escalation-diagnostics reason can't disagree (codex #40 r3). Gated on {@link navFailed} — the drive
+   * failure predicate (null status, a chrome-error dead nav, a visible block, or a hard block): a bare
+   * post-action `snapshot()` of a healthy page (an action that threw on a stale ref / locator timeout) is
+   * NOT navFailed, so classifyFailure's reason===null arm can't emit a confidently-WRONG `empty-shell` —
+   * both the class and the vendor stay UNSET there (mirroring the #40 no-hints gap). The content-family
+   * classes (empty-shell / hydration-failed / real-zero-results / unsupported-browser) are a RETRIEVE-path
+   * concern: on the interactive drive path a thin-200 shell is a returnable snapshot, never auto-failed, so
+   * this only ever attaches the block/nav subset {anti-bot-block, captcha, hard-block, nav-failed}. Both are
+   * closed vocabularies → pass redaction untouched.
    */
   #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
     if (!snap?.diagnostics) return undefined;
-    // #signalOf carries captchaKind, so resolveBlockReason and #escalationDiag (which also runs it) agree
-    // on one reason — the failure vendor and the escalation-diagnostics reason can't disagree (codex r3).
-    const wafVendor = wafVendorFromReason(resolveBlockReason(this.#signalOf(snap)), snap.captchaKind);
-    const diag = wafVendor ? { ...snap.diagnostics, wafVendor } : snap.diagnostics;
+    // #signalOf carries captchaKind, so classifyFailure here and #escalationDiag's reason agree on one vendor.
+    const signal = this.#signalOf(snap);
+    // Classify ONLY a genuine drive nav failure — navFailed is the drive failure predicate (null status,
+    // a chrome-error dead nav, a visible block, or a hard block). A bare post-action snapshot of a HEALTHY
+    // page (an action that threw on a stale ref / locator timeout) is NOT navFailed, so its class stays
+    // unset (no confidently-wrong empty-shell). The chrome-error stale-status case is handled inside
+    // classifyFailure via the signal's finalUrl (codex #41 r1/r2), so this seam just gates on navFailed.
+    const failureClass: FailureClass | undefined = navFailed(snap) ? classifyFailure(signal) : undefined;
+    const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+    const diag: FailureDiagnostics = {
+      ...snap.diagnostics,
+      ...(failureClass ? { failureClass } : {}),
+      ...(wafVendor ? { wafVendor } : {}),
+    };
     return redactFailureDiagnostics(diag, this.#secrets);
   }
 

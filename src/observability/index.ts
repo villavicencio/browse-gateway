@@ -15,4 +15,4 @@ export {
   failureOf,
   FAILURE_DIAGNOSTICS_CAP,
 } from "./failure-diagnostics.js";
-export type { FailureDiagnostics, FailureDiagnosticsInput, FailureCarrier, WafVendor } from "./failure-diagnostics.js";
+export type { FailureDiagnostics, FailureDiagnosticsInput, FailureCarrier, WafVendor, FailureClass } from "./failure-diagnostics.js";

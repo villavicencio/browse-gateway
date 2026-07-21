@@ -264,6 +264,18 @@ test("redactFailureDiagnostics passes the #40 wafVendor slot through untouched (
   assert.ok(!/SECRET/.test(JSON.stringify(red)), "an actual secret is still scrubbed alongside it");
 });
 
+test("redactFailureDiagnostics passes the #41 failureClass slot through untouched (closed vocabulary, not free text)", () => {
+  // Like wafVendor, the failure class is attached at the redaction seam (retrieve.ts / drive #failure) and
+  // is a closed FailureClass vocabulary, so the redactor must preserve it verbatim while still scrubbing a
+  // real secret elsewhere in the envelope.
+  const red = redactFailureDiagnostics(
+    { finalUrl: "https://empty.example/?token=SECRET", failureClass: "empty-shell" },
+    { redactableValues: () => ["SECRET"] },
+  );
+  assert.equal(red.failureClass, "empty-shell", "failure class survives redaction unchanged");
+  assert.ok(!/SECRET/.test(JSON.stringify(red)), "an actual secret is still scrubbed alongside it");
+});
+
 test("buildFailureDiagnostics bounds each list to the cap (keeping the most recent)", () => {
   const big = Array.from({ length: FAILURE_DIAGNOSTICS_CAP + 20 }, (_, i) => `line-${i}`);
   const diag = buildFailureDiagnostics({ consoleErrors: big, networkFailures: big, redirectChain: big });
@@ -336,13 +348,16 @@ test("a blocked retrieve surfaces the failure envelope (finalUrl post-redirect +
   assert.match(res.content[0].text, /challenge script failed/);
 });
 
-test("an empty-content retrieve (status 200, blank markdown, NOT blocked) still surfaces the envelope", async () => {
+test("an empty-content retrieve (status 200, blank markdown, NOT blocked) surfaces the envelope + typed class", async () => {
   // Codex r1 coverage finding: population was gated on `blocked`, but the MCP layer fails empty markdown
-  // independently — so a status-200 blank page got NO evidence. It must now carry the (redacted) envelope.
+  // independently — so a status-200 blank page got NO evidence. It must carry the (redacted) envelope, and
+  // #41 now carries the typed failureClass on it (empty-shell), which the MCP `why` surfaces in place of the
+  // old opaque `empty-content` literal.
   const diagnostics = {
     finalUrl: "https://empty.example/article",
     title: "Empty",
     status: 200,
+    failureClass: "empty-shell",
     redirectChain: ["https://empty.example/article"],
     consoleErrors: ["error: hydration failed"],
   };
@@ -351,7 +366,7 @@ test("an empty-content retrieve (status 200, blank markdown, NOT blocked) still 
   });
   const res = await client.callTool({ name: "retrieve", arguments: { url: "https://empty.example/article" } });
   assert.equal(res.isError, true);
-  assert.match(res.content[0].text, /reason=empty-content/);
+  assert.match(res.content[0].text, /reason=empty-shell/);
   assert.match(res.content[0].text, /failure:/, "the empty-content failure carries an evidence envelope");
   assert.match(res.content[0].text, /empty\.example\/article/);
 });

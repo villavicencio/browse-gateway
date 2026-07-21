@@ -129,6 +129,23 @@ test("controller: a navigating action that lands on a dead nav (chrome-error, st
   await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
 });
 
+test("controller: a dead-nav (chrome-error, STALE 200 status) is classified failureClass='nav-failed' (#41, codex r1)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  // navFailed catches the chrome-error:// URL, but the snapshot inherited the prior page's 200 status —
+  // which defeats classifyFailure's status===null nav-failed test. The URL must drive the class so this
+  // genuine unreachable-nav failure isn't left unclassified (or mislabeled empty-shell).
+  const { gateway } = makePostActionBlockGateway({
+    url: "chrome-error://chromewebdata/", title: "", tree: "ERR_EMPTY_RESPONSE", status: 200,
+    diagnostics: { finalUrl: "chrome-error://chromewebdata/", status: 200 },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "the dead nav must throw");
+  assert.equal(failureOf(caught)?.failureClass, "nav-failed", "a stale-status chrome-error dead nav is classified nav-failed");
+});
+
 test("controller: a post-action block preserves the failure envelope across #run's redaction re-wrap (issue #39)", async () => {
   // #actAndSnap throws attachFailure(...) INSIDE #run, whose catch re-wraps into a fresh redacted Error —
   // the non-enumerable `.failure` must be carried over, or the drive envelope is lost on this path.
@@ -189,6 +206,10 @@ test("controller: a THROWING click attaches a best-effort failure envelope (issu
   const env = failureOf(caught);
   assert.ok(env, "the action-exception path attaches an envelope from a best-effort snapshot");
   assert.equal(env.finalUrl, "https://cur.example/");
+  // #41 R2: a bare post-action snapshot of a HEALTHY page (reason===null, status 200) must NOT be
+  // classified — classifyFailure's reason===null arm would emit a confidently-WRONG `empty-shell` for an
+  // ordinary locator-timeout/detached-element failure. The class (like the #40 vendor) stays unset here.
+  assert.equal(env.failureClass, undefined, "an ordinary action failure on a healthy page carries NO failureClass");
 });
 
 test("controller: a THROWING type also carries the envelope", async () => {
@@ -726,6 +747,8 @@ test("controller: a DataDome navigate failure attributes the vendor on both the 
   assert.ok(caught, "a DataDome block with no proxy must throw");
   assert.equal(caught.diagnostics?.reason, "datadome-challenge", "proxy-diagnostic reason attributes DataDome");
   assert.equal(failureOf(caught)?.wafVendor, "datadome", "the #39 envelope carries the DataDome vendor");
+  // #41: a live DataDome block on a drive navigate is classified anti-bot-block (class ↔ vendor agree).
+  assert.equal(failureOf(caught)?.failureClass, "anti-bot-block", "the #41 envelope classifies the block");
 });
 
 test("controller: a bare reCAPTCHA navigate failure attributes the CAPTCHA kind on the envelope (drive/retrieve parity, #40)", async () => {
@@ -751,4 +774,6 @@ test("controller: a bare reCAPTCHA navigate failure attributes the CAPTCHA kind 
   try { await c.navigate("https://cap.example/"); } catch (e) { caught = e; }
   assert.ok(caught, "a bare CAPTCHA block with no proxy must throw");
   assert.equal(failureOf(caught)?.wafVendor, "recaptcha", "the envelope attributes the CAPTCHA widget kind (parity with retrieve)");
+  // #41: a bare active-CAPTCHA block on a drive navigate is classified captcha (class ↔ vendor agree).
+  assert.equal(failureOf(caught)?.failureClass, "captcha", "the #41 envelope classifies it as a captcha block");
 });
