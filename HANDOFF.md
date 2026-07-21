@@ -1,44 +1,91 @@
-# HANDOFF — 2026-07-20, afternoon
+# HANDOFF — 2026-07-20, evening
 
-Site-compatibility hardening session. Started from a `/pickup`, then the operator pointed at a wine-research failure inventory (`~/Obsidian/hermes/personal/discoveries/2026-07-17-obscura-site-compatibility-inventory.md`) and asked to turn it into a plan + GitHub tickets. That produced **epic #38 + 10 tickets (#39–#48)** and a self-contained strategy plan. The operator then said "kick off Wave 1" under **ultracode**, so I executed the two highest-leverage tickets (#39 keystone + #46) end-to-end: implemented each in an isolated worktree, drove both through the full Claude↔Codex adversarial-review loop to `approve`, ran the in-container runtime gates, merged, and **deployed both to prod** (#39 alone first, then #46). **Prod now runs `0c19d2a`.** `main == origin/main`; tree clean; no open PRs.
+Continuation of the site-compat hardening epic (#38). Picked up on `/dv:pickup` → operator said
+**"go on #50"** (the confirmable-teardown + force-kill debt split from #46 during Wave 1). Ran the
+full ultracode pipeline — parallel research, an adversarial critique panel, implementation in an
+isolated worktree, in-container runtime gates, and an 8-round Claude↔Codex adversarial-review loop —
+then merged and **deployed #50 to prod**. The #50 deploy gate then caught a real cross-layer
+regression, which became **follow-up PR #56** (5 more Codex rounds) — also merged and deployed.
 
-## What We Built
+**Prod now runs main `580b1ad`** (image `sha256:86ba92ac…`): #50 (PR #55) + the #56 follow-up.
+Deploy gate → smoke → verify all green; rollback anchor recorded. Tree clean, `main == origin/main`,
+no open PRs.
 
-- **Epic #38 + 10 grounded tickets #39–#48** (each cites real `file:line` change surfaces), plus the strategy/plan doc `docs/plans/2026-07-17-001-site-compatibility-hardening.local.md` (gitignored, self-contained — north star, current-state map, per-ticket change surfaces, dependency spine, milestones). The hermes inventory has a back-reference table to the tickets. Grounding came from 4 parallel Explore agents (proxy/exit, block/CAPTCHA/result-shape, session/breaker, timing/diagnostics).
-- **Execution schedule** verified via a conflict-matrix Workflow (10 touch-set analyses → pairwise conflict matrix → wave schedule): #39–#48 (minus #46) are a near-complete hard-conflict clique on the retrieve path, so #39 (the diagnostics envelope) is the keystone that must land first; #46 is the only fully-disjoint ticket.
-- **Wave 1 SHIPPED + DEPLOYED (2026-07-20):**
-  - **PR #52 = #39** (squash `f0ddff3`) — failure-diagnostics envelope. New `src/observability/` module (`failure-diagnostics.ts`: `FailureDiagnostics` with evidence fields + pre-declared **unset** downstream slots, a single `buildFailureDiagnostics` assembly seam, `redactFailureDiagnostics`). Capture in `patchright-core.ts` (console/pageerror/requestfailed bounded ring buffers, per-top-level-nav reset, redirect-hop accumulation, `page.url()` finalUrl). Surfaced at retrieve↔drive parity via a shared `isRetrieveFailure` predicate + a non-enumerable `.failure` carrier. **607 unit tests**, Codex `approve` (6 rounds), in-container `validate-failure-envelope.mjs` **PASS**. Deployed alone — deploy-http run `29780664248` (gate→swap→verify green).
-  - **PR #51 = #46** (squash → main `0c19d2a`) — in-flight guard. `Session.beginActivity/endActivity` + `#inFlight`/`#inFlightSince` + `MAX_INFLIGHT_MS=600_000`; `useConsumerSession` marks the session in-flight for the whole verb; `reapIdle` skips in-flight sessions but reclaims one stuck past the deadline. **583 unit tests**, Codex `approve`, in-container `validate-drive.mjs` **PASS** (new step 3b: in-flight nav not reaped). Deployed — run `29780875240` (green).
-  - Issues **#39 and #46 CLOSED** as shipped; epic #38 checklist items checked.
-- **#50 filed** — "Confirmable browser teardown (needs force-kill)" — owns all the teardown/death-confirmation work split out of #46; **subsumes #49** (transient-session hang, now CLOSED). WIP preserved on branch **`feat/teardown-confirmation-wip`** (commits `5ad8d8f`, `1024725`).
+## What shipped
 
-## Decisions Made
+- **#50 — confirmable browser teardown + force-kill (PR #55, squash `b9fd004`).** A capacity slot now
+  frees ONLY on CONFIRMED whole-process-group death (clean close OR confirmed SIGKILL). Closes the gap
+  where a wedged/failed close freed a slot while Chrome was still alive (live processes could exceed the
+  caps). New force-kill primitive (`BrowserCore.kill`): capture the Chromium leader PID + ChildProcess
+  at launch via patchright's in-process `toImpl` bridge; SIGKILL the process **group** (detached
+  group-leader) + leader; confirm the whole **group** is empty (`kill(-pid,0)`→ESRCH), reuse-safe via a
+  `/proc` start-time **generation marker** (`pids_limit=512` makes pgid recycling real). Counted-until-
+  confirmed accounting + a `#unconfirmed` set drained by a KILL-ONLY reconfirm (single-flight); shutdown
+  coordination (drains in-flight acquires, retains unconfirmed); transient hung renders wedge-reaped
+  (subsumes #49, now CLOSED). New surfaces: `computeForceKillAvailable`, `SessionManager.unconfirmedCount`,
+  `SessionInfo.forceKillAvailable`. **635 unit tests**; new in-container gate `scripts/validate-teardown.mjs`
+  (Sections A–E) + `validate-drive` + `validate-stealth` (CF 2/2, DataDome 2/2) all green.
+- **#56 — MCP reaper/shutdown must await (bounded) the async teardown #50 introduced (squash `580b1ad`).**
+  Caught by the #50 deploy gate: after #50 made the gateway teardown async-confirmed, the MCP handler was
+  fire-and-forgetting the gateway teardown (via `transport.onclose → void cleanup`), so `reapIdle`/`closeAll`
+  returned before the browser slot was reclaimed → `validate-http` failed (gate aborted safely; prod never
+  broke). Fix in `src/mcp/http-server.ts`: `cleanup()` single-flight so callers share ONE dispose and
+  actually await the teardown; `closeAll` drains in-flight cleanups CONCURRENTLY under ONE bounded deadline
+  (`awaitBounded`, `cleanupAwaitMs`) so a hung drive op can't deadlock shutdown (gateway.shutdown() then
+  force-kills), never compounds N×, and is rejection-safe.
 
-- **#46 SPLIT** (operator call, mid-wave): ship the **in-flight guard only**; extract ALL teardown/death-confirmation (counted-until-close accounting, shutdown coordination, force-kill) to **#50**. Rationale: adversarial rounds 2–4 revealed a teardown/shutdown rabbit hole (wedged close leaking a browser past the cap, rejected-close freeing a slot, acquire/shutdown races) whose true fix needs a **force-kill primitive that Patchright's `launchPersistentContext` doesn't expose** (no child-process handle). The in-flight guard is the actual inventory bug and is correct + Codex-approved for its scope.
-- **Precedent set for the whole epic** (operator-ratified): an adversarial-review-found **pre-existing** issue → **COMPLETE it if it finishes your own change**, else **TRACK a new ticket** if it's an orthogonal path. Applied throughout (#46 "complete the reclaim" then split; #49 tracked→#50; #39 residuals documented + accepted).
-- **#39 redaction root fix**: sanitize **known** URLs **structurally** (WHATWG `new URL()` parser, spelling-proof) at the error source — NOT by regex. This ended a 5-round redaction whack-a-mole. Three best-effort residuals **documented + accepted** for internal consumers: http(s) hostname kept (diagnostic; DNS-label exfil is exotic), cross-entry header split (unreachable — atomic console entries, header-free network entries), data:-URL-with-embedded-quote truncation.
-- **Deploy #39 ALONE first** (broad-surface change), confirm in prod, then #46 — operator-chosen finish sequence. Both deployed clean (no rollbacks).
+## Decisions made
 
-## What Didn't Work
+- **Design hardened by an adversarial critique panel BEFORE coding** — it caught 2 invariant violations in
+  the first design (a self-heal retry that could false-free a slot; an unreachable-untagged-transient leak),
+  both fixed by the `#unconfirmed` kill-only reconfirm. Higher-signal than a generate-and-judge panel here.
+- **Group-based confirm, not leader-based** (Codex r3): leader death ≠ group empty (a renderer can linger).
+- **Reuse-safe via `/proc` generation marker** (Codex r5); on Linux force-kill requires it (Codex r6) — a
+  missing marker degrades loudly rather than running reuse-unsafe.
+- **Correct layering** (Codex r2, #56): the gateway (`#unconfirmed` + its reaper + `gateway.shutdown()`)
+  owns browser-slot confirmation/retention; the MCP handler owns transport+controller lifecycle and awaits
+  teardown-*completion*, bounded. It does NOT duplicate the gateway's accounting.
+- **Follow-ups filed, not crammed in** (operator precedent — complete-if-it-finishes-your-change, else track):
+  **#53** (wire `forceKillAvailable`/`unconfirmedCount` into an operational health surface / `obscura status`),
+  **#54** (acquire-side hung-factory-launch `#reserved` leak — pre-PID, unkillable via #50). Also tracked:
+  per-browser cgroup kill; routing a restore-cleanup unconfirmed-kill into manager `#unconfirmed`;
+  http-main `closeAll()` vs the drive-controller `#lock` (now mitigated by the bound).
 
-- **Regex-scrubbing a KNOWN url** for redaction — an endless whack-a-mole (userinfo, path tokens, escaped `\/` slashes, `)`/`]` delimiters, and finally the non-canonical `https:host` no-slashes spelling that WHATWG accepts). Root fix: sanitize a url you already hold as a structured value **structurally at the source**, and keep the regex net only for UNKNOWN urls in captured free text.
-- **Counted-zombie close WITHOUT force-kill** — you cannot confirm a browser process actually died (Patchright persistent context exposes no child PID; `context.close()` swallows failures), so shutdown/teardown races kept surfacing round after round. This is exactly why #46 was split → #50.
-- **A long Codex adversarial-review background task got KILLED once mid-run** — relaunch captures a fresh verdict (the review is stateless per invocation; you can't resume a killed one).
-- **Chrome docker layer cache MISSED** (base `node:22-bookworm-slim` re-pulled at a new digest → full emulated amd64 build). Avoided a second build with the **mount approach**: build ONE image, then mount each branch's `dist`+`scripts` over it.
+## What didn't work
 
-## What's Next
+- **A wedged-close teardown test hung in CI** — the `graceTimer` (Session.teardown escalation trigger) was
+  `unref`'d, so the event loop emptied before it fired → teardown hung forever. Passed locally (other timers
+  kept the loop alive), failed in CI. Fix: a foreground awaited timer (grace timer, confirm poll) must NOT be
+  unref'd. **CI caught it — trust the pipeline.**
+- **Driving the MCP fire-and-forget cleanup deterministically in a unit test** — `client.close()` doesn't send
+  a DELETE, a TCP drop doesn't fire the server transport `onclose`, and `transport.close()` hangs with a live
+  client. The working trigger is the client's explicit `transport.terminateSession()` (sends the DELETE →
+  `onsessionclosed` → cleanup).
 
-1. **#50 — Confirmable browser teardown + force-kill** (the one debt from Wave 1). WIP on `feat/teardown-confirmation-wip`; the missing piece is the force-kill primitive (capture the Chromium child PID at launch + a bounded `core.kill()`), then confirmed-close accounting + shutdown coordination + the transient-session deadline (#49). Design it deliberately with force-kill from the start — don't just port the WIP.
-2. **Wave 2**: `#40` (WAF + CAPTCHA vendor fingerprinting) → `#41` (failure-class taxonomy), then `#42/#43/#44` → `#45` → `#47` → `#48`, per the dependency spine in `docs/plans/2026-07-17-001-...`. The #39 envelope is LIVE, so its pre-declared slots are ready to fill (each downstream ticket fills a slot, no type reshape).
-3. Remaining open epic children: #40, #41, #42, #43, #44, #45, #47, #48, #50.
+## What's next
 
-## Gotchas & Watch-outs
+1. **Wave 2** of epic #38: `#40` (WAF + CAPTCHA vendor fingerprinting — add DataDome to `classifyBlock`) →
+   `#41` (failure-class taxonomy), then `#42/#43/#44` → `#45` → `#47` → `#48`. The #39 diagnostics envelope
+   is LIVE; its pre-declared slots are ready to fill. See `docs/plans/2026-07-17-001-...local.md`.
+2. **#53 / #54** (the #50 follow-ups above) when convenient.
+3. `feat/teardown-confirmation-wip` (the old #50 starting point) is now obsolete (#50 shipped) — safe to
+   delete when the operator wants. `feat/fresh-exit-warm` is unrelated/pre-existing.
 
-- **Prod runs `0c19d2a`** (#39 + #46 live). Deploy flow: merge → **ci.yml** auto-builds + pushes GHCR `latest` from main → `gh workflow run deploy-http.yml -f image_tag=latest` (workflow_dispatch; resolves `latest`→immutable digest, joins tailnet, on-host **gate=`validate-http`→swap→verify→rollback**). The `prod` GitHub-environment gate did NOT require approval this session — watch for that if a reviewer gets configured.
-- **Local `main` goes STALE after `gh pr merge`** (the merge happens GitHub-side). `git pull --ff-only origin main` before committing anything, or you'll commit on a divergent base.
-- **`gh pr merge --delete-branch` fails the LOCAL branch delete when the branch is in a worktree** (harmless — remote branch is deleted, merge succeeds). Clean up worktrees after merge.
-- **`feat/teardown-confirmation-wip` MUST be preserved** — it is #50's starting point. Do not delete it. (`feat/fresh-exit-warm` is a separate pre-existing branch.)
-- **Codex-companion loop**: `~/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs adversarial-review --wait --base main --scope branch "<focus>"`, run inside a DETACHED bg task (plain `--background` dies at the 2-min shell timeout). A long review can be killed — relaunch for a fresh verdict. When a finding is a grounded/tracked out-of-scope residual, tell Codex in the focus so it doesn't block on it.
-- **In-container gate**: build ONE `browse-gateway:gate` image (`docker build --platform linux/amd64 -f docker/Dockerfile -t browse-gateway:gate .`), then `docker run --rm --platform linux/amd64 --shm-size=1g -v <branch-worktree>/dist:/app/dist -v <branch-worktree>/scripts:/app/scripts browse-gateway:gate node scripts/validate-X.mjs`. Do NOT pipe `docker run` through `tail` (Xvfb wedge). Image is amd64 (Chrome is amd64-only) via colima Rosetta; the Chrome apt layer cache is fragile (base re-pull busts it → full emulated build). **colima was brought up for the gate then stopped** (restored to prior state) — `colima start` for future gates.
-- **#39 redaction has 3 accepted best-effort residuals** (hostname-label, cross-entry-unreachable, data:-quote) documented in `redactFailureDiagnostics` + PR #52 — don't re-litigate; if defense is ever wanted it belongs on the capture side (entry atomicity), not the redaction seam.
-- **The strategy plan `docs/plans/2026-07-17-001-...local.md` is gitignored** (local only) — epic #38 + the tickets are the shareable surface; the plan won't survive a fresh clone.
+## Gotchas & watch-outs
+
+- **Prod runs `580b1ad`** (image `86ba92ac`). Deploy flow unchanged: merge → **ci.yml** builds+pushes GHCR
+  `latest` from main → `gh workflow run deploy-http.yml -f image_tag=latest` → on-host gate (`validate-http`)
+  → real-config pre-swap smoke → swap → verify → rollback. **Deploy `docker rm -f` = immediate SIGKILL** (the
+  SIGTERM/gateway.shutdown() path never runs in a deploy; the container namespace reaps Chrome). The
+  authoritative shutdown path matters for manual `docker stop` and the Mac CLI (`vault-host.ts`).
+- **The deploy gate (`validate-http`) catches cross-layer regressions the unit tests + the in-container
+  teardown gate miss.** #56 existed because of it. When it aborts, prod stays safe — diagnose, don't force.
+- **In-container gates**: `colima start`; build ONE `browse-gateway:gate` base image; then the **overlay trick**
+  (`docker build FROM browse-gateway:gate` with `COPY dist scripts`) — bind-mounts fail because colima's
+  default VM doesn't share `/private/tmp`. Run with `--init` (matches prod `init:true`) for the
+  zero-pgid-remaining reaping check. **colima was brought up for the gates then stopped** (restored to prior
+  state) — `colima start` for future gates; the `gate50` overlay image was removed.
+- **Foreground timers in the teardown/cleanup path must NOT be `unref`'d** (grace timer, confirm poll,
+  `awaitBounded`) — an unref'd one lets the loop empty mid-await and hangs the teardown.
+- **`git pull --ff-only origin main` before committing** — local main goes stale after a GitHub-side merge.
+- Force-kill mechanics reference: `~/Obsidian/browse-gateway/memory/force-kill-teardown-mechanics.md`.
