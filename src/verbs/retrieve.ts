@@ -189,6 +189,23 @@ export function classifyBlock(sig: BlockSignal): BlockReason | null {
 }
 
 /**
+ * The block reason a caller sees, resolving an interactive CAPTCHA against the WAF classification on ONE
+ * shared surface so retrieve and drive can't drift (the detection-parity invariant). {@link classifyBlock}
+ * is authoritative for a SPECIFIC vendor (cf/px/datadome) or a failed nav; a CAPTCHA kind attributes ONLY
+ * when the block is otherwise GENERIC (`hard-block`/`blocked`). This is the key correctness rule (codex
+ * #40 r2): `detectCaptcha` matches a merely-LOADED captcha library (`grecaptcha`, `recaptcha/api.js`),
+ * not only an active widget, so a WAF-blocked page that globally preloads one must NOT be mislabeled as
+ * that CAPTCHA — the real WAF vendor wins; the CAPTCHA only fills a block with no vendor marker.
+ */
+export function resolveBlockReason(sig: BlockSignal, captchaKind?: CaptchaKind): BlockReason | null {
+  const reason = classifyBlock(sig);
+  if (captchaKind && captchaKind !== "unknown" && (reason === "hard-block" || reason === "blocked")) {
+    return "captcha";
+  }
+  return reason;
+}
+
+/**
  * Project a {@link BlockReason} (+ the CAPTCHA kind, when the block is an interactive widget) onto a
  * {@link WafVendor}, or `undefined` when no vendor is attributable (a generic/hard block or a failed nav).
  * Deriving vendor FROM the reason — rather than a second parallel classifier — makes the surfaced vendor
@@ -546,25 +563,19 @@ export async function retrieve(
     isPerimeterXChallenge(render, pxHint) ||
     (pxHint && pxCopy) ||
     isHardBlock(render, render.status);
-  // Diagnostic reason for the block, most-actionable-first: nav-failed (off-allowlist/unreachable),
-  // then captcha (an interactive widget — needs a solver, the v1 gap), then cf-challenge, then a
-  // bare hard-block, else a generic visible block. Surfaced so a caller (and the agent) sees WHY a
-  // page failed rather than a silent "blocked". `null` when the page is not blocked.
+  // Diagnostic reason for the block: nav-failed (off-allowlist/unreachable) first, then the shared
+  // resolveBlockReason — a SPECIFIC WAF vendor (cf/px/datadome) wins, and an interactive CAPTCHA
+  // attributes only when the block is otherwise generic (so a WAF page that merely preloads a captcha
+  // library isn't mislabeled; codex #40 r2). Surfaced so a caller sees WHY a page failed rather than a
+  // silent "blocked". `null` when the page is not blocked.
   const reason: BlockReason | null = !blocked
     ? null
     : render.status === null
       ? "nav-failed"
-      : captcha
-        ? "captcha"
-        : classifyBlock({
-            title: render.title,
-            text: render.text,
-            status: render.status,
-            cfHint,
-            pxHint,
-            ddHint,
-            pxCopy,
-          });
+      : resolveBlockReason(
+          { title: render.title, text: render.text, status: render.status, cfHint, pxHint, ddHint, pxCopy },
+          captcha?.kind,
+        );
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
   const proxyDiagnostic = proxyUsed

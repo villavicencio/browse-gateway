@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyBlock, wafVendorFromReason } from "../dist/verbs/index.js";
+import { classifyBlock, resolveBlockReason, wafVendorFromReason } from "../dist/verbs/index.js";
 import {
   isPerimeterXVisible,
   hasPerimeterXHint,
@@ -160,6 +160,28 @@ test("wafVendorFromReason: unattributable reasons → undefined (the single empt
   // captcha with no/unknown kind is unattributed rather than mislabeled.
   assert.equal(wafVendorFromReason("captcha"), undefined);
   assert.equal(wafVendorFromReason("captcha", "unknown"), undefined);
+});
+
+test("resolveBlockReason: a SPECIFIC WAF vendor wins over a merely-loaded CAPTCHA library (codex #40 r2)", () => {
+  // The exact regression Codex caught: a WAF-blocked page that also preloads a captcha library must NOT
+  // be mislabeled as that captcha. classifyBlock returns the WAF vendor; the captchaKind is ignored.
+  assert.equal(resolveBlockReason({ title: "", text: "Access denied", status: 403, ddHint: true }, "recaptcha"), "datadome-challenge");
+  assert.equal(resolveBlockReason({ title: "Just a moment...", text: "", status: 403, cfHint: true }, "recaptcha"), "cf-challenge");
+  assert.equal(resolveBlockReason({ title: "", text: "Forbidden", status: 403, pxHint: true }, "hcaptcha"), "perimeterx-challenge");
+});
+
+test("resolveBlockReason: a CAPTCHA attributes ONLY when the block is otherwise generic (hard-block/blocked)", () => {
+  // A bare captcha page — a visible verify phrase / hard-block with NO WAF marker — is where the widget
+  // kind is the real vendor. This is the drive/retrieve parity case (#40).
+  assert.equal(resolveBlockReason({ title: "Verify", text: "Please verify you are a human", status: 403 }, "recaptcha"), "captcha");
+  assert.equal(resolveBlockReason({ title: "", text: "Access denied", status: 200 }, "turnstile"), "captcha");
+});
+
+test("resolveBlockReason: with no CAPTCHA it is exactly classifyBlock; an unknown kind never attributes captcha", () => {
+  const sig = { title: "", text: "Forbidden", status: 403 };
+  assert.equal(resolveBlockReason(sig), classifyBlock(sig)); // hard-block passthrough
+  assert.equal(resolveBlockReason(sig, "unknown"), "hard-block"); // 'unknown' kind is not an attribution
+  assert.equal(resolveBlockReason({ title: "Real", text: "x".repeat(1000), status: 200 }, "recaptcha"), null); // not blocked → not captcha
 });
 
 test("wafVendorFromReason∘classifyBlock: the surfaced vendor NEVER contradicts the reason (structural agreement)", () => {

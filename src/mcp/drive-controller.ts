@@ -22,7 +22,7 @@ import {
   shouldEscalateDrive,
   proxyFromSecrets,
   escalationDiagnostics,
-  classifyBlock,
+  resolveBlockReason,
   wafVendorFromReason,
   EscalationError,
   hostForcesProxy,
@@ -188,21 +188,18 @@ export class GatewayDriveController implements DriveController {
    * cookie/authorization stripped) since the core built the RAW envelope; undefined when the snapshot
    * carried none. The SINGLE place drive failures pull the envelope, so the redaction can't be skipped.
    *
-   * Also attaches the mitigation vendor (issue #40): a PROJECTION of {@link classifyBlock}'s reason via
-   * {@link wafVendorFromReason} (never a second classifier — so vendor and reason can't disagree), at
-   * parity with retrieve's redact seam. An interactive CAPTCHA widget wins over the WAF markers (mirrors
-   * retrieve's `captcha ? "captcha" : classifyBlock` precedence) so a bare reCAPTCHA/hCaptcha/Turnstile
-   * page attributes its widget kind. `wafVendor` is a closed vocabulary → passes redaction untouched;
-   * absent when unattributable. NOTE a pure `snapshot()` (post-action) carries none of these hints, so a
-   * mid-flow action landing on a challenge inherits the #39 no-hints gap (navigate-failures carry the
-   * vendor; action-failures do not — tracked as a follow-up to compute hints in the core #snapshotOf).
+   * Also attaches the mitigation vendor (issue #40): a PROJECTION of the shared {@link resolveBlockReason}
+   * via {@link wafVendorFromReason} (never a second classifier — so vendor and reason can't disagree), at
+   * parity with retrieve's redact seam. A specific WAF vendor (cf/px/datadome) wins; a bare
+   * reCAPTCHA/hCaptcha/Turnstile page (generic block + a detected widget kind) attributes the widget kind.
+   * `wafVendor` is a closed vocabulary → passes redaction untouched; absent when unattributable. NOTE a
+   * pure `snapshot()` (post-action) carries none of these hints, so a mid-flow action landing on a
+   * challenge inherits the #39 no-hints gap (navigate-failures carry the vendor; action-failures do not —
+   * tracked as a follow-up to compute hints in the core #snapshotOf).
    */
   #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
     if (!snap?.diagnostics) return undefined;
-    // Captcha-first, mirroring retrieve: a detected widget kind yields a `captcha` reason (classifyBlock
-    // never returns `captcha`), so its vendor is the widget kind rather than a coarser WAF/hard-block.
-    const reason = snap.captchaKind ? "captcha" : classifyBlock(this.#signalOf(snap));
-    const wafVendor = wafVendorFromReason(reason, snap.captchaKind);
+    const wafVendor = wafVendorFromReason(resolveBlockReason(this.#signalOf(snap), snap.captchaKind), snap.captchaKind);
     const diag = wafVendor ? { ...snap.diagnostics, wafVendor } : snap.diagnostics;
     return redactFailureDiagnostics(diag, this.#secrets);
   }

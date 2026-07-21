@@ -451,6 +451,22 @@ test("retrieve: a DataDome block reports reason=datadome-challenge and diagnosti
   assert.equal(r.diagnostics?.wafVendor, "datadome", "vendor surfaced on the #39 envelope");
 });
 
+test("retrieve: a DataDome page that ALSO preloads a reCAPTCHA library stays datadome, not recaptcha (codex #40 r2)", async () => {
+  // detectCaptcha matches a merely-loaded captcha library; the DataDome marker must win so the vendor
+  // isn't mislabeled recaptcha. This is the exact over-attribution Codex flagged.
+  const dd = renderOf({
+    status: 403,
+    title: "",
+    text: "Access denied",
+    html: "<script src='https://js.datadome.co/tags.js'></script><script src='https://www.google.com/recaptcha/api.js'></script>",
+    diagnostics: { finalUrl: "https://dd.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([dd]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://dd.example/" });
+  assert.equal(r.reason, "datadome-challenge", "the real WAF vendor wins over an incidental captcha library");
+  assert.equal(r.diagnostics?.wafVendor, "datadome");
+});
+
 test("retrieve: a reCAPTCHA block surfaces the CAPTCHA kind as wafVendor (reason=captcha)", async () => {
   const rc = renderOf({
     status: 403,
