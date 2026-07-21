@@ -343,3 +343,37 @@ test("HTTP: closeAll AWAITS a fire-and-forget cleanup already in flight (deferre
     server.closeAllConnections?.();
   }
 });
+
+test("HTTP: closeAll does NOT deadlock on a hung dispose — bounded so gateway.shutdown() can still run (#50 follow-up)", async () => {
+  // A hung drive tool call holds the controller lock, so dispose() (drive.close → gateway release) never
+  // settles. closeAll must still return within the bound so http-main can advance to gateway.shutdown()
+  // (the authoritative force-kill). It must NOT wait forever on the browser teardown.
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  const handler = createHttpHandler({
+    authenticate: (t) => policy.authenticate(t),
+    cleanupAwaitMs: 200, // short bound for the test
+    buildServer: (consumer) => ({
+      server: createGatewayMcpServer({ retrieve: async ({ url }) => outcome({ markdown: `${consumer.id} ${url}` }) }),
+      dispose: () => new Promise(() => {}), // NEVER settles (a hung drive op behind the controller lock)
+    }),
+  });
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const c = connect(url, "tok-alice");
+    client = c.client;
+    await client.connect(c.transport);
+    assert.equal(handler.sessionCount(), 1);
+    await client.close().catch(() => {}); // client gone → transport.close() in closeAll resolves fast
+    let closed = false;
+    const closeP = handler.closeAll().then(() => (closed = true));
+    await new Promise((r) => setTimeout(r, 700)); // > the two 200ms bounds closeAll may hit
+    assert.equal(closed, true, "closeAll returned within the bound despite a never-settling dispose");
+    await closeP;
+  } finally {
+    await client?.close().catch(() => {});
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});

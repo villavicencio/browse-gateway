@@ -60,6 +60,10 @@ export interface HttpHandlerDeps {
   allowedOrigins?: string[];
   /** Idle MCP sessions older than this are reaped (covers disconnect-without-DELETE). Default 6m. */
   sessionIdleTtlMs?: number;
+  /** How long a reaper/shutdown cleanup BLOCKS on the browser teardown before proceeding (so a hung drive
+   *  op serialized behind the controller lock can't deadlock shutdown before gateway.shutdown() force-kills).
+   *  Default {@link DEFAULT_CLEANUP_AWAIT_MS}; overridable for tests. */
+  cleanupAwaitMs?: number;
   /** Max request body bytes accepted on POST. Default 4 MiB. */
   maxBodyBytes?: number;
   log?: (msg: string) => void;
@@ -95,6 +99,27 @@ interface SessionEntry {
 
 const DEFAULT_IDLE_TTL_MS = 6 * 60_000; // a touch above the browser idle reaper, so Chrome frees first
 const DEFAULT_MAX_BODY = 4 * 1024 * 1024;
+/**
+ * How long a reaper/shutdown cleanup blocks awaiting the browser teardown before PROCEEDING (issue #50
+ * follow-up). A normal teardown (close→group-confirm, force-kill included) settles well under this; the
+ * bound exists so a HUNG drive tool call — which holds the controller `#lock` and thus stalls
+ * `drive.close()` → the gateway release indefinitely — can't deadlock `closeAll` and prevent http-main from
+ * ever reaching `gateway.shutdown()` (the authoritative force-kill). gateway.shutdown() then reclaims the
+ * stalled browser directly. Generous enough that a clean teardown always completes first.
+ */
+const DEFAULT_CLEANUP_AWAIT_MS = 8_000;
+
+/** Await `p`, but give up after `ms` so a hung cleanup can't block a caller (the timer is cleared the
+ *  instant `p` settles, so a normal fast cleanup incurs no delay). NOT unref'd: it must fire to unblock. */
+function awaitBounded(p: Promise<void>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    void p.finally(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
 
 export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   const log = deps.log ?? (() => {});
@@ -104,6 +129,7 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   const allowedOrigins = deps.allowedOrigins ?? [];
   const dnsRebindProtection = allowedHosts.length > 0 || allowedOrigins.length > 0;
   const idleTtlMs = deps.sessionIdleTtlMs ?? DEFAULT_IDLE_TTL_MS;
+  const cleanupAwaitMs = deps.cleanupAwaitMs ?? DEFAULT_CLEANUP_AWAIT_MS;
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY;
 
   const sessions = new Map<string, SessionEntry>();
@@ -269,7 +295,10 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
    *  belt-and-suspenders cleanup if onclose didn't fire. */
   async function closeSession(sid: string, entry: SessionEntry): Promise<void> {
     await entry.transport.close().catch(() => {});
-    await cleanup(sid);
+    // Bounded: a hung drive tool call holds the controller lock, so the cleanup's dispose (drive.close →
+    // gateway release) can stall indefinitely. Don't let that deadlock the reaper tick / shutdown — proceed
+    // after the bound and let gateway.shutdown() reclaim the stalled browser (codex #50-followup r3).
+    await awaitBounded(cleanup(sid), cleanupAwaitMs);
   }
 
   async function reapIdle(nowTs: number = now()): Promise<string[]> {
@@ -315,8 +344,9 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
     // invisible to the loop above. Without this, closeAll could return while a browser teardown is still
     // running. (This awaits the teardown to COMPLETE; a browser the gateway couldn't confirm dead is
     // retained in the gateway's `#unconfirmed` and reconfirmed by `gateway.shutdown()`, which http-main
-    // runs after closeAll — the gateway, not this handler, owns browser-slot confirmation.)
-    await Promise.all([...cleanups.values()]);
+    // runs after closeAll — the gateway, not this handler, owns browser-slot confirmation.) Bounded so a
+    // hung drive op stalling a dispose can't keep closeAll from returning → gateway.shutdown() always runs.
+    await awaitBounded(Promise.all([...cleanups.values()]).then(() => {}), cleanupAwaitMs);
   }
 
   return { handle, reapIdle, startReaper, stopReaper, drain, closeAll, sessionCount: () => sessions.size };
