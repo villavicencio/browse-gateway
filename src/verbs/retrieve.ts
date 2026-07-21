@@ -304,11 +304,16 @@ const BENIGN_NETWORK_ERRORS = /ERR_BLOCKED_BY_CLIENT|ERR_ABORTED/i;
  * Whether the render saw a GENUINE network failure — a data/asset request that failed for a reason that
  * actually implies a broken load, not the gateway's own guard aborts or a benign SPA cancellation (issue
  * #41). Filters {@link BENIGN_NETWORK_ERRORS}; without it a raw `networkFailures.length > 0` is near-always
- * TRUE on real pages and would collapse the `hydration-failed` vs `empty-shell` distinction. A DIAGNOSTIC
- * discriminator, best-effort by nature.
+ * TRUE on real pages and would collapse the `hydration-failed` vs `empty-shell` distinction. Tests the
+ * TRAILING error field only (each evidence line is `METHOD URL errText`, so a URL that merely CONTAINS
+ * `ERR_ABORTED` must not mask a real trailing `net::ERR_FAILED` — codex #41 r7). A DIAGNOSTIC discriminator,
+ * best-effort by nature.
  */
 export function genuineNetworkFailure(networkFailures: readonly string[] | undefined): boolean {
-  return (networkFailures ?? []).some((line) => !BENIGN_NETWORK_ERRORS.test(line));
+  return (networkFailures ?? []).some((line) => {
+    const errField = line.trim().split(/\s+/).pop() ?? "";
+    return !BENIGN_NETWORK_ERRORS.test(errField);
+  });
 }
 
 /**

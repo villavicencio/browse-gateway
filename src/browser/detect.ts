@@ -141,10 +141,14 @@ export const UNSUPPORTED_BROWSER_PHRASES: readonly RegExp[] = [
  * id/attribute TOKEN so `id="root"` matches but `id="rootLayout"` does not.
  */
 export const FRAMEWORK_ROOT_HINTS: readonly RegExp[] = [
-  /\bid=["'](?:root|app|__next|__nuxt|___gatsby|svelte|q-app)["']/i,
-  /\bid=["']gatsby-focus-wrapper["']/i,
-  /\bdata-reactroot\b/i,
-  /\bng-version=/i,
+  // A REAL `id=`/`ng-version=`/`data-reactroot` attribute — the `(?<![-\w])` guard rejects a hyphen/word
+  // prefix (`data-id="root"`, `aria-id="app"`, `data-ng-version`) that a bare `\b` would wrongly accept
+  // (codex #41 r7), the same real-attribute discipline captcha.ts uses (#40 r8). The id value is a whole
+  // quoted token, so `id="rootLayout"` does not match `root`.
+  /(?<![-\w])id\s*=\s*["'](?:root|app|__next|__nuxt|___gatsby|svelte|q-app)["']/i,
+  /(?<![-\w])id\s*=\s*["']gatsby-focus-wrapper["']/i,
+  /(?<![-\w])data-reactroot(?![-\w])/i,
+  /(?<![-\w])ng-version\s*=/i,
 ];
 
 /**

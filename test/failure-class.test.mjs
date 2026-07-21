@@ -151,6 +151,9 @@ test("genuineNetworkFailure: guard aborts (BLOCKED_BY_CLIENT) and benign cancell
   assert.equal(genuineNetworkFailure(["GET https://x net::ERR_CONNECTION_REFUSED"]), true);
   // mixed: at least one genuine failure among benign entries → true.
   assert.equal(genuineNetworkFailure(["GET https://a net::ERR_BLOCKED_BY_CLIENT", "GET https://b net::ERR_ABORTED", "GET https://c net::ERR_TIMED_OUT"]), true);
+  // the benign match is anchored to the TRAILING error field — a URL that merely CONTAINS a benign code
+  // must not mask a real trailing failure (codex r7).
+  assert.equal(genuineNetworkFailure(["GET https://api.example/ERR_ABORTED net::ERR_FAILED"]), true);
   assert.equal(genuineNetworkFailure([]), false);
   assert.equal(genuineNetworkFailure(undefined), false);
 });
@@ -183,6 +186,18 @@ test("hasFrameworkRoot: matches an SPA mount root as a whole token; content / ne
   assert.equal(hasFrameworkRoot('<div id="rootLayout"></div>'), false); // not the whole id token
   assert.equal(hasFrameworkRoot('<div id="approot"></div>'), false);
   assert.equal(hasFrameworkRoot("<main><h1>Real content</h1></main>"), false);
+});
+
+test("hasFrameworkRoot: a hyphen/word-prefixed attribute is NOT a real mount root (codex #41 r7)", () => {
+  // `\b` matches after a hyphen, so a bare `\bid=` wrongly accepted data-id/aria-id; the (?<![-\w]) guard
+  // requires a real attribute-name delimiter. These must NOT read as SPA roots.
+  assert.equal(hasFrameworkRoot('<div data-id="root"></div>'), false);
+  assert.equal(hasFrameworkRoot('<div aria-id="app"></div>'), false);
+  assert.equal(hasFrameworkRoot('<div data-ng-version="17"></div>'), false);
+  assert.equal(hasFrameworkRoot('<custom-id="app"></custom-id>'), false);
+  // the REAL attributes still resolve.
+  assert.equal(hasFrameworkRoot('<div ng-version="17.1.0">app</div>'), true);
+  assert.equal(hasFrameworkRoot('<body><div id="root"></div></body>'), true);
 });
 
 test("hasFrameworkRoot: dormant markup in a comment / script / template is NOT a live mount root (codex #41 r2)", () => {
