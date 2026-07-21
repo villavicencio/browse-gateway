@@ -107,14 +107,30 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY;
 
   const sessions = new Map<string, SessionEntry>();
+  /** In-flight cleanups, keyed by session id. Makes cleanup SINGLE-FLIGHT so the fire-and-forget callers
+   *  (`onsessionclosed` / `transport.onclose`) and the AWAITING callers (`closeSession` via the reaper /
+   *  `closeAll`) share ONE dispose — the awaiting caller then reliably waits for the browser teardown to
+   *  complete, not just for the transport to close. Load-bearing since #50 made the gateway teardown
+   *  async-confirmed (close→group-confirm→free): without this, a reaper/shutdown returns before the browser
+   *  slot is actually reclaimed. */
+  const cleanups = new Map<string, Promise<void>>();
   let reaperTimer: ReturnType<typeof setInterval> | undefined;
 
-  async function cleanup(sessionId: string): Promise<void> {
+  function cleanup(sessionId: string): Promise<void> {
+    const existing = cleanups.get(sessionId);
+    if (existing) return existing; // a cleanup is already in flight → share it (onclose + reaper race)
     const entry = sessions.get(sessionId);
-    if (!entry) return; // idempotent: onclose + onsessionclosed + reaper can all race to clean
+    if (!entry) return Promise.resolve(); // idempotent: nothing (left) to clean
     sessions.delete(sessionId);
-    await entry.dispose().catch(() => {}); // release the drive session; never throw from teardown
-    log(`session ${sessionId} closed (consumer=${entry.consumerId}); ${sessions.size} live`);
+    const done = entry
+      .dispose()
+      .catch(() => {}) // release the drive session; never throw from teardown
+      .then(() => {
+        cleanups.delete(sessionId);
+        log(`session ${sessionId} closed (consumer=${entry.consumerId}); ${sessions.size} live`);
+      });
+    cleanups.set(sessionId, done);
+    return done;
   }
 
   async function openSession(
@@ -236,11 +252,14 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
     return entry;
   }
 
-  /** Close a session's transport (fires onclose -> cleanup) with a belt-and-suspenders cleanup in
-   *  case onclose didn't fire. Shared by the idle reaper and graceful shutdown. */
+  /** Close a session's transport (fires onclose -> cleanup) and AWAIT the cleanup — including the browser
+   *  teardown. `transport.close()` fires `onclose` which kicks off `cleanup` fire-and-forget; awaiting
+   *  `cleanup(sid)` here returns that same in-flight dispose (single-flight), so the reaper / shutdown wait
+   *  for the browser slot to be reclaimed, not just for the transport to close (load-bearing since #50 made
+   *  the gateway teardown async-confirmed). Also a belt-and-suspenders cleanup if onclose didn't fire. */
   async function closeSession(sid: string, entry: SessionEntry): Promise<void> {
     await entry.transport.close().catch(() => {});
-    if (sessions.has(sid)) await cleanup(sid);
+    await cleanup(sid);
   }
 
   async function reapIdle(nowTs: number = now()): Promise<string[]> {
