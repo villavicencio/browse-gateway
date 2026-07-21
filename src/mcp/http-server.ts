@@ -60,6 +60,10 @@ export interface HttpHandlerDeps {
   allowedOrigins?: string[];
   /** Idle MCP sessions older than this are reaped (covers disconnect-without-DELETE). Default 6m. */
   sessionIdleTtlMs?: number;
+  /** How long a reaper/shutdown cleanup BLOCKS on the browser teardown before proceeding (so a hung drive
+   *  op serialized behind the controller lock can't deadlock shutdown before gateway.shutdown() force-kills).
+   *  Default {@link DEFAULT_CLEANUP_AWAIT_MS}; overridable for tests. */
+  cleanupAwaitMs?: number;
   /** Max request body bytes accepted on POST. Default 4 MiB. */
   maxBodyBytes?: number;
   log?: (msg: string) => void;
@@ -95,6 +99,30 @@ interface SessionEntry {
 
 const DEFAULT_IDLE_TTL_MS = 6 * 60_000; // a touch above the browser idle reaper, so Chrome frees first
 const DEFAULT_MAX_BODY = 4 * 1024 * 1024;
+/**
+ * How long a reaper/shutdown cleanup blocks awaiting the browser teardown before PROCEEDING (issue #50
+ * follow-up). A normal teardown (close→group-confirm, force-kill included) settles well under this; the
+ * bound exists so a HUNG drive tool call — which holds the controller `#lock` and thus stalls
+ * `drive.close()` → the gateway release indefinitely — can't deadlock `closeAll` and prevent http-main from
+ * ever reaching `gateway.shutdown()` (the authoritative force-kill). gateway.shutdown() then reclaims the
+ * stalled browser directly. Generous enough that a clean teardown always completes first.
+ */
+const DEFAULT_CLEANUP_AWAIT_MS = 8_000;
+
+/** Await `p`, but give up after `ms` so a hung cleanup can't block a caller (the timer is cleared the
+ *  instant `p` settles, so a normal fast cleanup incurs no delay). NOT unref'd: it must fire to unblock.
+ *  Rejection-safe: `p.then(settle, settle)` OBSERVES both outcomes, so a rejecting `p` neither propagates
+ *  nor leaves a discarded derived promise to surface as an unhandledRejection (codex r4). Exported for test. */
+export function awaitBounded(p: Promise<void>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    const settle = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    p.then(settle, settle);
+  });
+}
 
 export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   const log = deps.log ?? (() => {});
@@ -104,17 +132,48 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   const allowedOrigins = deps.allowedOrigins ?? [];
   const dnsRebindProtection = allowedHosts.length > 0 || allowedOrigins.length > 0;
   const idleTtlMs = deps.sessionIdleTtlMs ?? DEFAULT_IDLE_TTL_MS;
+  const cleanupAwaitMs = deps.cleanupAwaitMs ?? DEFAULT_CLEANUP_AWAIT_MS;
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY;
 
   const sessions = new Map<string, SessionEntry>();
+  /** In-flight cleanups, keyed by session id. Makes cleanup SINGLE-FLIGHT so the fire-and-forget callers
+   *  (`onsessionclosed` / `transport.onclose`) and the AWAITING callers (`closeSession` via the reaper /
+   *  `closeAll`) share ONE dispose — the awaiting caller then reliably waits for the browser teardown to
+   *  COMPLETE (the gateway release resolves after close→group-confirm), not just for the transport to
+   *  close. Load-bearing since #50 made the gateway teardown async-confirmed: without this a reaper/shutdown
+   *  would return before the teardown even ran (it was fire-and-forget).
+   *
+   *  Note the layering: this waits for the teardown to COMPLETE, not for the browser slot to be
+   *  confirmed reclaimed. A force-kill that can't confirm death does not free the slot — SessionManager
+   *  deliberately RETAINS that browser in its counted `#unconfirmed` set and its own reaper/`shutdown`
+   *  reconfirms it. The gateway (`activeCount`/`unconfirmedCount`) is the source of truth for browser
+   *  slots; this MCP layer owns only the transport + controller lifecycle and must not duplicate that. */
+  const cleanups = new Map<string, Promise<void>>();
   let reaperTimer: ReturnType<typeof setInterval> | undefined;
 
-  async function cleanup(sessionId: string): Promise<void> {
+  function cleanup(sessionId: string): Promise<void> {
+    const existing = cleanups.get(sessionId);
+    if (existing) return existing; // a cleanup is already in flight → share it (onclose + reaper race)
     const entry = sessions.get(sessionId);
-    if (!entry) return; // idempotent: onclose + onsessionclosed + reaper can all race to clean
+    if (!entry) return Promise.resolve(); // idempotent: nothing (left) to clean
     sessions.delete(sessionId);
-    await entry.dispose().catch(() => {}); // release the drive session; never throw from teardown
-    log(`session ${sessionId} closed (consumer=${entry.consumerId}); ${sessions.size} live`);
+    const done = entry
+      .dispose()
+      // dispose (drive.close → gateway.closeConsumerSession → release) never rejects: an unconfirmed
+      // force-kill is a RETAINED counted slot in the gateway, not a rejection. The catch is belt-and-braces.
+      .catch(() => {})
+      .then(() => {
+        cleanups.delete(sessionId);
+        log(`session ${sessionId} transport closed (consumer=${entry.consumerId}); ${sessions.size} live`);
+      })
+      // `done` MUST NOT reject: the fire-and-forget callers (`void cleanup(sid)` in onclose/onsessionclosed)
+      // discard it, so a late throw (e.g. an injected logger that throws) would surface as an
+      // unhandledRejection. Absorb it here so every caller — voided or awaited — is rejection-safe (codex r4).
+      .catch(() => {
+        cleanups.delete(sessionId);
+      });
+    cleanups.set(sessionId, done);
+    return done;
   }
 
   async function openSession(
@@ -236,11 +295,19 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
     return entry;
   }
 
-  /** Close a session's transport (fires onclose -> cleanup) with a belt-and-suspenders cleanup in
-   *  case onclose didn't fire. Shared by the idle reaper and graceful shutdown. */
+  /** Close a session's transport (fires onclose -> cleanup) and AWAIT the cleanup — including the browser
+   *  teardown COMPLETING. `transport.close()` fires `onclose` which kicks off `cleanup` fire-and-forget;
+   *  awaiting `cleanup(sid)` here returns that same in-flight dispose (single-flight), so the reaper /
+   *  shutdown wait for the gateway teardown to complete, not just for the transport to close (load-bearing
+   *  since #50 made the gateway teardown async-confirmed). Confirmation/retention of a browser slot that
+   *  can't be confirmed dead is the gateway's job (its `#unconfirmed` set) — see `cleanup`. Also a
+   *  belt-and-suspenders cleanup if onclose didn't fire. */
   async function closeSession(sid: string, entry: SessionEntry): Promise<void> {
     await entry.transport.close().catch(() => {});
-    if (sessions.has(sid)) await cleanup(sid);
+    // Bounded: a hung drive tool call holds the controller lock, so the cleanup's dispose (drive.close →
+    // gateway release) can stall indefinitely. Don't let that deadlock the reaper tick / shutdown — proceed
+    // after the bound and let gateway.shutdown() reclaim the stalled browser (codex #50-followup r3).
+    await awaitBounded(cleanup(sid), cleanupAwaitMs);
   }
 
   async function reapIdle(nowTs: number = now()): Promise<string[]> {
@@ -277,10 +344,20 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
 
   async function closeAll(): Promise<void> {
     stopReaper();
-    for (const sid of [...sessions.keys()]) {
-      const entry = sessions.get(sid);
-      if (entry) await closeSession(sid, entry);
-    }
+    // Close every transport (each fires onclose → cleanup) and dispose every controller CONCURRENTLY, then
+    // await ALL cleanups — the ones just kicked off plus any already in flight (a fire-and-forget onclose /
+    // overlapping reap) — under ONE shared deadline. Concurrency + a single bound is load-bearing: awaiting
+    // sessions sequentially would COMPOUND the bound (N hung sessions → N×cleanupAwaitMs) and could exceed
+    // the shutdown budget before http-main reaches gateway.shutdown() (codex r4). With this, a hung dispose
+    // (or several) delays closeAll by at most cleanupAwaitMs total. gateway.shutdown() then reclaims any
+    // stalled browser directly (SessionManager `#sessions`, bypassing the controller lock) — the gateway,
+    // not this handler, owns browser-slot confirmation/retention (its `#unconfirmed`).
+    const perSession = [...sessions.entries()].map(async ([sid, entry]) => {
+      await entry.transport.close().catch(() => {});
+      await cleanup(sid);
+    });
+    const drain = Promise.all([...perSession, ...cleanups.values()]).then(() => {});
+    await awaitBounded(drain, cleanupAwaitMs);
   }
 
   return { handle, reapIdle, startReaper, stopReaper, drain, closeAll, sessionCount: () => sessions.size };

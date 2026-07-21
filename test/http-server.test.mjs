@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createHttpHandler, createGatewayMcpServer } from "../dist/mcp/index.js";
+import { createHttpHandler, createGatewayMcpServer, awaitBounded } from "../dist/mcp/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 
 const outcome = (over = {}) => ({ markdown: "# T\n\nbody", title: "T", status: 200, blocked: false, reason: null, degraded: false, proxyUsed: false, captchaSolved: false, ...over });
@@ -291,5 +291,112 @@ test("HTTP: the idle reaper does NOT close a session with an in-flight tool call
     assert.equal((await handler.reapIdle(Date.now() + 10_000)).length, 1, "reapable once the call settles");
   } finally {
     await stop({ server, handler, client });
+  }
+});
+
+test("HTTP: closeAll AWAITS a fire-and-forget cleanup already in flight (deferred dispose) — #50 follow-up", async () => {
+  // After #50 made the browser teardown async-confirmed, a cleanup started fire-and-forget by
+  // onsessionclosed/onclose leaves its session out of the `sessions` map while its dispose (browser
+  // teardown) is still settling. closeAll must drain those in-flight cleanups, not just iterate `sessions`.
+  let releaseDispose;
+  const disposeGate = new Promise((r) => (releaseDispose = r));
+  const disposed = [];
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  const handler = createHttpHandler({
+    authenticate: (t) => policy.authenticate(t),
+    buildServer: (consumer) => ({
+      server: createGatewayMcpServer({ retrieve: async ({ url }) => outcome({ markdown: `${consumer.id} ${url}` }) }),
+      dispose: async () => {
+        disposed.push(consumer.id);
+        await disposeGate; // the browser teardown is still settling
+      },
+    }),
+  });
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const c = connect(url, "tok-alice");
+    client = c.client;
+    await client.connect(c.transport);
+    assert.equal(handler.sessionCount(), 1);
+    // Explicit DELETE → the server fires onsessionclosed → cleanup() FIRE-AND-FORGET: cleanup removes the
+    // session from `sessions` synchronously, then blocks on the deferred dispose — leaving a cleanup IN
+    // FLIGHT (in `cleanups`) whose session is already gone. (The real onclose/onsessionclosed shutdown race.)
+    await c.transport.terminateSession();
+    for (let i = 0; i < 80 && handler.sessionCount() !== 0; i++) await new Promise((r) => setTimeout(r, 25));
+    assert.equal(handler.sessionCount(), 0, "the session left the sessions map (onclose cleanup ran)");
+    assert.equal(disposed.length, 1, "the fire-and-forget dispose started");
+    // closeAll's `sessions` snapshot is now empty, but the in-flight cleanup's dispose is unsettled — it
+    // must drain `cleanups` and stay pending until that dispose settles.
+    let closed = false;
+    const closeP = handler.closeAll().then(() => (closed = true));
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(closed, false, "closeAll stays pending while an in-flight cleanup's dispose is unsettled");
+    releaseDispose();
+    await closeP;
+    assert.equal(closed, true, "closeAll resolves once the in-flight dispose settles");
+  } finally {
+    releaseDispose(); // never leave the gate closed (would hang teardown)
+    await client?.close().catch(() => {});
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("HTTP: closeAll bounds MULTIPLE hung disposes under ONE deadline, not N× (no compounding) — #50 follow-up", async () => {
+  // Several hung drive ops (dispose never settles). closeAll must return within ~one cleanupAwaitMs so
+  // http-main reaches gateway.shutdown() (the authoritative force-kill) — a per-session bound would
+  // compound to N×cleanupAwaitMs and could blow the shutdown budget.
+  const N = 3;
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  const handler = createHttpHandler({
+    authenticate: (t) => policy.authenticate(t),
+    cleanupAwaitMs: 200,
+    buildServer: () => ({
+      server: createGatewayMcpServer({ retrieve: async ({ url }) => outcome({ markdown: url }) }),
+      dispose: () => new Promise(() => {}), // NEVER settles
+    }),
+  });
+  const { server, url } = await startServer(handler);
+  const clients = [];
+  try {
+    for (let i = 0; i < N; i++) {
+      const c = connect(url, "tok-alice");
+      clients.push(c.client);
+      await c.client.connect(c.transport);
+    }
+    assert.equal(handler.sessionCount(), N);
+    for (const cl of clients) await cl.close().catch(() => {}); // clients gone → transport.close() is fast
+    const t0 = Date.now();
+    await handler.closeAll();
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 200 * (N - 1), `closeAll bounded under ONE deadline, not compounded (elapsed ${elapsed}ms for ${N} hung sessions)`);
+  } finally {
+    for (const cl of clients) await cl.close().catch(() => {});
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("awaitBounded: a rejecting promise resolves the bound WITHOUT an unhandledRejection (#50 follow-up)", async () => {
+  // The bounded-await helper must OBSERVE both outcomes of `p` — a rejecting `p` must not propagate nor
+  // leave a discarded derived promise that Node reports as unhandled (the `void p.finally()` trap).
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(e);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const rejecting = Promise.reject(new Error("dispose/log boom"));
+    // Resolves via observing p's rejection (not via the timeout) and does not throw.
+    await awaitBounded(rejecting, 10_000);
+    await new Promise((r) => setTimeout(r, 30)); // give any stray rejection a tick to surface
+    assert.equal(unhandled.length, 0, "no unhandledRejection from a rejecting bounded promise");
+    // And the timeout path still works for a genuinely hung promise.
+    const t0 = Date.now();
+    await awaitBounded(new Promise(() => {}), 50);
+    assert.ok(Date.now() - t0 >= 45, "the timeout path bounds a never-settling promise");
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
   }
 });
