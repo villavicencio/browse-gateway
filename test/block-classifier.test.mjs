@@ -5,10 +5,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyBlock } from "../dist/verbs/index.js";
+import { classifyBlock, wafVendorFromReason } from "../dist/verbs/index.js";
 import {
   isPerimeterXVisible,
   hasPerimeterXHint,
+  hasDataDomeHint,
   isPerimeterXChallenge,
   hasPerimeterXChallengeCopy,
 } from "../dist/browser/index.js";
@@ -96,4 +97,83 @@ test("isPerimeterXVisible: matches the press-and-hold / HUMAN phrases; ordinary 
   assert.equal(isPerimeterXVisible({ title: "", text: PX_TEXT }), true);
   assert.equal(isPerimeterXVisible({ title: "", text: "Powered by HUMAN Security" }), true);
   assert.equal(isPerimeterXVisible({ title: "Cart", text: "Add this item to your shopping cart" }), false);
+});
+
+// --- DataDome (issue #40) ---
+
+test("hasDataDomeHint: matches the DataDome CDN + cookie family; a normal page does not", () => {
+  assert.equal(hasDataDomeHint("<script src='https://js.datadome.co/tags.js'></script>"), true);
+  assert.equal(hasDataDomeHint("<iframe src='https://geo.captcha-delivery.com/captcha/?initialCid=...'></iframe>"), true);
+  assert.equal(hasDataDomeHint("document.cookie = 'datadome=abc; dd_cookie=1'"), true);
+  assert.equal(hasDataDomeHint("<main><h1>Woodford Reserve 1.75L</h1><p>$59.99</p></main>"), false);
+});
+
+test("classifyBlock: a blocked page carrying a DataDome marker → datadome-challenge (not generic blocked)", () => {
+  // A DataDome interstitial: a visible generic block phrase makes it blocked; the ddHint re-labels it
+  // from the generic 'blocked' fallthrough to a distinct datadome-challenge (the #40 fix).
+  assert.equal(
+    classifyBlock({ title: "", text: "Access denied", status: 403, ddHint: true }),
+    "datadome-challenge",
+  );
+});
+
+test("classifyBlock: a DataDome 403 + thin body → datadome-challenge (not hard-block)", () => {
+  // Pre-#40 a bare DataDome 403 fell through to hard-block; the ddHint branch (before hard-block) now
+  // attributes it. Escalation is unaffected — it keys off isHardBlock(signal), not this label.
+  assert.equal(classifyBlock({ title: "", text: "Forbidden", status: 403, ddHint: true }), "datadome-challenge");
+});
+
+test("classifyBlock: Cloudflare and PerimeterX still WIN over a co-occurring DataDome marker (precedence)", () => {
+  // A page tripping overlapping vendor markers attributes to whichever `reason` reports first — cf > px >
+  // dd — so reason and the derived wafVendor can never name different vendors on the same envelope.
+  assert.equal(classifyBlock({ title: "Just a moment...", text: "", status: 403, cfHint: true, ddHint: true }), "cf-challenge");
+  assert.equal(classifyBlock({ title: "", text: "Forbidden", status: 403, pxHint: true, ddHint: true }), "perimeterx-challenge");
+});
+
+test("classifyBlock: a CLEARED page whose DataDome marker persists (200, fat content) is NOT blocked", () => {
+  // datadome/dd_cookie markers stay embedded after a challenge clears, so ddHint is true on success; the
+  // outer !blocked guard (fat 200) means the datadome-challenge branch is never reached — no false-positive.
+  assert.equal(classifyBlock({ title: "Product", text: "x".repeat(1000), status: 200, ddHint: true }), null);
+});
+
+test("classifyBlock: a thin 200 with a DataDome marker but no block phrase is a legit short page, not blocked", () => {
+  // ddHint is attribution-only (like cfHint/pxHint) — never a `blocked` input. A thin 200 with no visible
+  // block phrase and no PX press-&-hold stays a legitimately short page.
+  assert.equal(classifyBlock({ title: "", text: "short", status: 200, ddHint: true }), null);
+});
+
+// --- wafVendorFromReason: vendor is a projection of the reason (issue #40) ---
+
+test("wafVendorFromReason: each WAF reason maps to its vendor; captcha uses the widget kind", () => {
+  assert.equal(wafVendorFromReason("cf-challenge"), "cloudflare");
+  assert.equal(wafVendorFromReason("perimeterx-challenge"), "perimeterx");
+  assert.equal(wafVendorFromReason("datadome-challenge"), "datadome");
+  assert.equal(wafVendorFromReason("captcha", "recaptcha"), "recaptcha");
+  assert.equal(wafVendorFromReason("captcha", "hcaptcha"), "hcaptcha");
+  assert.equal(wafVendorFromReason("captcha", "turnstile"), "turnstile");
+});
+
+test("wafVendorFromReason: unattributable reasons → undefined (the single empty state, keeps the #39 gate green)", () => {
+  for (const r of ["nav-failed", "hard-block", "blocked", null]) {
+    assert.equal(wafVendorFromReason(r), undefined);
+  }
+  // captcha with no/unknown kind is unattributed rather than mislabeled.
+  assert.equal(wafVendorFromReason("captcha"), undefined);
+  assert.equal(wafVendorFromReason("captcha", "unknown"), undefined);
+});
+
+test("wafVendorFromReason∘classifyBlock: the surfaced vendor NEVER contradicts the reason (structural agreement)", () => {
+  // The whole point of deriving vendor FROM the reason: for any signal, the two agree by construction.
+  const sigs = [
+    { title: "Just a moment...", text: "", status: 403, cfHint: true },
+    { title: "", text: "Forbidden", status: 403, pxHint: true },
+    { title: "", text: "Access denied", status: 403, ddHint: true },
+    { title: "Just a moment...", text: "", status: 403, cfHint: true, ddHint: true }, // co-occurring markers
+    { title: "", text: "Forbidden", status: 403, pxHint: true, ddHint: true },
+  ];
+  const reasonToVendor = { "cf-challenge": "cloudflare", "perimeterx-challenge": "perimeterx", "datadome-challenge": "datadome" };
+  for (const sig of sigs) {
+    const reason = classifyBlock(sig);
+    assert.equal(wafVendorFromReason(reason), reasonToVendor[reason], `reason=${reason} must map to its own vendor`);
+  }
 });

@@ -251,6 +251,19 @@ test("buildFailureDiagnostics copies evidence fields and leaves EVERY downstream
   }
 });
 
+test("redactFailureDiagnostics passes the #40 wafVendor slot through untouched (closed vocabulary, not free text)", () => {
+  // The vendor label is attached at the redaction seam (retrieve.ts / drive #failure), not by
+  // buildFailureDiagnostics — so assert the redactor preserves it verbatim. Safe precisely BECAUSE it is a
+  // closed WafVendor vocabulary: it is deliberately not in the scrub list, so a token elsewhere is still
+  // scrubbed while the vendor survives.
+  const red = redactFailureDiagnostics(
+    { finalUrl: "https://dd.example/?token=SECRET", wafVendor: "datadome" },
+    { redactableValues: () => ["SECRET"] },
+  );
+  assert.equal(red.wafVendor, "datadome", "vendor label survives redaction unchanged");
+  assert.ok(!/SECRET/.test(JSON.stringify(red)), "an actual secret is still scrubbed alongside it");
+});
+
 test("buildFailureDiagnostics bounds each list to the cap (keeping the most recent)", () => {
   const big = Array.from({ length: FAILURE_DIAGNOSTICS_CAP + 20 }, (_, i) => `line-${i}`);
   const diag = buildFailureDiagnostics({ consoleErrors: big, networkFailures: big, redirectChain: big });

@@ -8,7 +8,7 @@ import { buildFailureDiagnostics, FAILURE_DIAGNOSTICS_CAP } from "../observabili
 import { hostFromUrl, hostMatchesAnySuffix } from "../security/url.js";
 import { SecretStore, redactSecrets } from "../security/secrets.js";
 import { buildWindowsUaOverride, buildNativeUaOverride, READ_LIVE_UA_JS, type LiveUserAgent } from "./os-presentation.js";
-import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
+import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, hasDataDomeHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
@@ -844,10 +844,17 @@ export class PatchrightBrowserCore implements BrowserCore {
     // once it clears via a full reload — wait for the real document to land content rather than the
     // blank inter-navigation moment. A page still blocked after the budget is surfaced by navFailed.
     await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
-    // Carry the CF vendor-hint signal (the HTML half of retrieve's CF detection) as a scrubbed
-    // boolean, so drive's escalation recognizes a CF interstitial that shows no visible CF phrase.
+    // Carry the CF/PX/DataDome vendor-hint signals (the HTML half of retrieve's detection) as scrubbed
+    // booleans, so drive's escalation recognizes a CF interstitial that shows no visible CF phrase and
+    // its failure envelope can attribute the mitigation vendor (issue #40). Computed only here in
+    // navigate() (not in a pure snapshot()) — the drive surface has no HTML otherwise.
     const html = String(await page.content().catch(() => ""));
-    return { ...(await this.#snapshotOf(page)), cfHint: hasCloudflareHint(html), pxHint: hasPerimeterXHint(html) };
+    return {
+      ...(await this.#snapshotOf(page)),
+      cfHint: hasCloudflareHint(html),
+      pxHint: hasPerimeterXHint(html),
+      ddHint: hasDataDomeHint(html),
+    };
   }
 
   async snapshot(): Promise<PageSnapshot> {

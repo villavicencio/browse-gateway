@@ -16,6 +16,7 @@ import {
   isPerimeterXChallenge,
   hasCloudflareHint,
   hasPerimeterXHint,
+  hasDataDomeHint,
   hasPerimeterXChallengeCopy,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
@@ -29,7 +30,7 @@ import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
 import { detectCaptcha } from "./captcha.js";
-import type { CaptchaSolver } from "./captcha.js";
+import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
 
 /**
  * Proxy-escalation retries (R7). A rotating residential proxy assigns a fresh exit IP per
@@ -79,10 +80,19 @@ export interface RetrieveOptions {
  * `captcha` (an interactive CAPTCHA widget — needs a solver, not wired in v1), `cf-challenge`
  * (a Cloudflare managed challenge), `perimeterx-challenge` (a PerimeterX/HUMAN "Press & Hold"
  * behavioral interstitial — classified for diagnostics, NOT solved by the token CAPTCHA tier),
+ * `datadome-challenge` (a DataDome/HUMAN block — classified for diagnostics via the persistent DataDome
+ * markers; behavioral, NOT solved by the token CAPTCHA tier, and NOT escalated — see escalation.ts),
  * `hard-block` (4xx/5xx + thin body — IP/WAF reputation), `blocked` (some other visible block
  * phrase). `null` when not blocked.
  */
-export type BlockReason = "nav-failed" | "captcha" | "cf-challenge" | "perimeterx-challenge" | "hard-block" | "blocked";
+export type BlockReason =
+  | "nav-failed"
+  | "captcha"
+  | "cf-challenge"
+  | "perimeterx-challenge"
+  | "datadome-challenge"
+  | "hard-block"
+  | "blocked";
 
 /**
  * The single retrieve-FAILURE predicate, shared by {@link retrieve} (to attach + redact the
@@ -137,6 +147,11 @@ export interface BlockSignal {
   status: number | null;
   cfHint?: boolean;
   pxHint?: boolean;
+  /** DataDome HTML marker (`datadome`/`captcha-delivery`/`dd_cookie`) is present — the DataDome sibling
+   * of {@link cfHint}. Attribution only (issue #40): like cfHint/pxHint it PERSISTS after a clear, so it
+   * re-labels an ALREADY-blocked page's reason to `datadome-challenge` but is never itself a `blocked`
+   * input. retrieve computes it from the render HTML; drive carries it on its {@link PageSnapshot}. */
+  ddHint?: boolean;
   /** PerimeterX challenge COPY ("Press & Hold") is present in the page source — the iframe-served
    * challenge whose phrase reaches the HTML but not the innerText `text`. retrieve computes it from
    * the render HTML (drive's snapshot carries no HTML, so it leaves this unset and relies on
@@ -162,8 +177,60 @@ export function classifyBlock(sig: BlockSignal): BlockReason | null {
   if (sig.status === null) return "nav-failed";
   if (isCloudflareVisible(sig) || sig.cfHint === true) return "cf-challenge";
   if (isPerimeterXVisible(sig) || sig.pxHint === true) return "perimeterx-challenge";
+  // DataDome: re-label an already-blocked page carrying a DataDome marker (issue #40) so it stops
+  // falling through to a generic `hard-block`/`blocked`. Mirrors the cfHint branch exactly — a
+  // persistent-marker attribution gated by the outer `!blocked` guard, so a cleared DataDome page
+  // (200, fat content) is never reached. Placed AFTER cf/px (which also have a visible-phrase arm) so
+  // a page tripping overlapping markers attributes to the same vendor `reason` reports first.
+  if (sig.ddHint === true) return "datadome-challenge";
   if (isHardBlock(sig, sig.status)) return "hard-block";
   return "blocked";
+}
+
+/**
+ * The mitigation/CAPTCHA vendor attributed to a failure, surfaced on the #39 diagnostics envelope
+ * (issue #40) so a caller sees WHO blocked, not just a coarse reason. A CLOSED vocabulary derived from
+ * fixed HTML markers — never free text — so it passes {@link redactFailureDiagnostics} untouched and can
+ * carry no secret/PII. `akamai`/`imperva` are reserved for a future HTML detector (today they are
+ * recognized only as IP-bound cookie names in the vault layer, not surfaced here).
+ */
+export type WafVendor =
+  | "cloudflare"
+  | "perimeterx"
+  | "datadome"
+  | "akamai"
+  | "imperva"
+  | "recaptcha"
+  | "hcaptcha"
+  | "turnstile";
+
+/**
+ * Project a {@link BlockReason} (+ the CAPTCHA kind, when the block is an interactive widget) onto a
+ * {@link WafVendor}, or `undefined` when no vendor is attributable (a generic/hard block or a failed nav).
+ * Deriving vendor FROM the reason — rather than a second parallel classifier — makes the surfaced vendor
+ * and reason STRUCTURALLY unable to disagree: {@link classifyBlock} stays the single source of truth for
+ * vendor attribution. `undefined` (absence) is the sole empty state, which keeps the #39 nav-failed gate
+ * green (a failed nav has no vendor) and avoids a `none`/`unknown` sentinel.
+ */
+export function wafVendorFromReason(
+  reason: BlockReason | null,
+  captchaKind?: CaptchaKind,
+): WafVendor | undefined {
+  switch (reason) {
+    case "cf-challenge":
+      return "cloudflare";
+    case "perimeterx-challenge":
+      return "perimeterx";
+    case "datadome-challenge":
+      return "datadome";
+    case "captcha":
+      // The specific interactive widget kind (detectCaptcha only ever yields recaptcha/hcaptcha/turnstile);
+      // an `unknown`/absent kind leaves the vendor unattributed rather than mislabeling it.
+      return captchaKind && captchaKind !== "unknown" ? captchaKind : undefined;
+    default:
+      // nav-failed / hard-block / blocked / null → no attributable vendor.
+      return undefined;
+  }
 }
 
 /**
@@ -467,13 +534,21 @@ export async function retrieve(
     render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
   }
   const extraction = extractMarkdown(render.html, url);
+  const cfHint = hasCloudflareHint(render.html);
   const pxHint = hasPerimeterXHint(render.html);
+  // ddHint: a DataDome marker in the render HTML (issue #40). Attribution only — like cfHint/pxHint it
+  // persists after a clear, so it re-labels an already-blocked page's `reason` to `datadome-challenge`
+  // but is NOT a `blocked` input (a cleared DataDome page still returns content).
+  const ddHint = hasDataDomeHint(render.html);
   // pxCopy: the press-&-hold challenge copy is in the page SOURCE but not the top-doc innerText
   // `render.text` — the widget is in a cross-origin px-captcha-modal iframe. We look at BOTH the
   // top-document HTML and the child-frame HTML the core captured (`render.frameHtml`), because
   // page.content() serializes only the top frame. This is the boundary-length 200 case #24's
   // thin-content test missed. Absent on a cleared page.
   const pxCopy = hasPxChallengeCopy(render);
+  // The interactive-CAPTCHA widget (if any), computed ONCE and reused for both the block `reason` and
+  // the surfaced vendor (issue #40) — detectCaptcha is the only thing that can yield a `captcha` reason.
+  const captcha = detectCaptcha(render, url);
   // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, a PerimeterX
   // press-&-hold (pxHint + EITHER thin content OR the challenge copy in source — a 200 challenge whose
   // phrase renders in a cross-origin iframe, never reaching render.text; #21/#24 follow-up), or a hard
@@ -495,14 +570,15 @@ export async function retrieve(
     ? null
     : render.status === null
       ? "nav-failed"
-      : detectCaptcha(render, url)
+      : captcha
         ? "captcha"
         : classifyBlock({
             title: render.title,
             text: render.text,
             status: render.status,
-            cfHint: hasCloudflareHint(render.html),
+            cfHint,
             pxHint,
+            ddHint,
             pxCopy,
           });
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
@@ -517,8 +593,9 @@ export async function retrieve(
           title: render.title,
           text: render.text,
           status: render.status,
-          cfHint: hasCloudflareHint(render.html),
+          cfHint,
           pxHint,
+          ddHint,
           pxCopy,
         },
       })
@@ -530,8 +607,17 @@ export async function retrieve(
   // `render.diagnostics` (finalUrl = the post-redirect page.url(), the retrieve URL-bug fix). A successful
   // retrieve carries no envelope, so its shape is unchanged.
   const failed = isRetrieveFailure({ blocked, markdown: extraction.markdown, status: render.status });
+  // Mitigation/CAPTCHA vendor (issue #40): a PROJECTION of the already-computed `reason` (never a second
+  // classifier), so vendor and reason can't disagree. Attached to the #39 envelope at THIS redaction seam
+  // — not via buildFailureDiagnostics in the core — because it is a hint-derived slot and the drive core
+  // assembles its envelope without HTML (parity with how cfHint/pxHint attach post-assembly). `wafVendor`
+  // is a closed vocabulary, so it passes redactFailureDiagnostics untouched and carries no secret. Absent
+  // when unattributed (a nav-failed/hard-block), keeping the #39 nav-failed gate green.
+  const wafVendor = wafVendorFromReason(reason, captcha?.kind);
   const diagnostics =
-    failed && render.diagnostics ? redactFailureDiagnostics(render.diagnostics, secrets) : undefined;
+    failed && render.diagnostics
+      ? redactFailureDiagnostics(wafVendor ? { ...render.diagnostics, wafVendor } : render.diagnostics, secrets)
+      : undefined;
   return {
     url,
     status: render.status,

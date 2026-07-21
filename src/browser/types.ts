@@ -235,6 +235,13 @@ export interface PageSnapshot {
    */
   pxHint?: boolean;
   /**
+   * Scrubbed DataDome-hint flag: `true` when the page's HTML carried a DataDome marker (`datadome`,
+   * `captcha-delivery`, `dd_cookie`). The DataDome sibling of {@link cfHint}/{@link pxHint} (issue #40),
+   * surfaced as a boolean so the drive layer can attribute a DataDome block without carrying page
+   * content. Set on `navigate()`; absent on a pure `snapshot()`.
+   */
+  ddHint?: boolean;
+  /**
    * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
    * bounded console + network / optional screenshot. Assembled by the core on every navigate/snapshot;
    * the drive layer redacts and attaches it to a thrown failure (parity with retrieve). The RAW

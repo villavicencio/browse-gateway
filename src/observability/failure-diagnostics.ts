@@ -45,7 +45,12 @@ export interface FailureDiagnostics {
   screenshotRef?: string;
 
   // ---- PRE-DECLARED OPTIONAL SLOTS for downstream tickets (leave UNSET in this ticket) ----
-  /** Slot for #40 (mitigation-vendor label). Do NOT populate here. */
+  /** #40 mitigation/CAPTCHA vendor label — a CLOSED vocabulary (`WafVendor`, verbs/retrieve.ts) derived
+   *  from fixed HTML markers, never free text, so {@link redactFailureDiagnostics} passes it through
+   *  UNTOUCHED (safe only because it is closed — do NOT repurpose this slot for page-derived text without
+   *  adding redaction). Attached at the REDACTION seam (retrieve.ts / drive #failure), NOT via
+   *  {@link buildFailureDiagnostics}: it is a hint-derived slot and the drive envelope is assembled
+   *  without HTML, so — like cfHint/pxHint — the vendor is resolved post-assembly at the surface. */
   wafVendor?: string;
   /** Slot for #41 (failure-class enum). Do NOT populate here. */
   failureClass?: string;

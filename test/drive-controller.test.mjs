@@ -702,3 +702,28 @@ test("warm-open: warm takes precedence over forceProxy (replays its captured pos
   assert.ok(opens[0]?.restoreState, "warm-open won over forceProxy");
   assert.equal(opens[0].proxy, undefined, "direct-captured warm entry replays direct despite forceProxy");
 });
+
+test("controller: a DataDome navigate failure attributes the vendor on both the diagnostics reason and the envelope (issue #40)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  // A DataDome block: a visible generic block phrase (navFailed) + the carried ddHint (attribution). No
+  // proxy configured, so #firstNavigate surfaces it directly as an EscalationError — carrying BOTH the
+  // structured proxy-diagnostic reason and the #39 failure envelope, at parity with retrieve.
+  const ddSnap = {
+    url: "https://dd.example/", title: "", tree: "Access denied", status: 403, ddHint: true,
+    diagnostics: { finalUrl: "https://dd.example/", title: "", status: 403 },
+  };
+  let nextId = 1;
+  const open = new Map();
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + nextId++; open.set(id, { core: { async navigate() { return ddSnap; } } }); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error(`no open session for handle ${h}`); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  let caught;
+  try { await c.navigate("https://dd.example/"); } catch (e) { caught = e; }
+  assert.ok(caught, "a DataDome block with no proxy must throw");
+  assert.equal(caught.diagnostics?.reason, "datadome-challenge", "proxy-diagnostic reason attributes DataDome");
+  assert.equal(failureOf(caught)?.wafVendor, "datadome", "the #39 envelope carries the DataDome vendor");
+});

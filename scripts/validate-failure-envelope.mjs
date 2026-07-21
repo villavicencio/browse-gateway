@@ -17,6 +17,9 @@
  *      real captured evidence, not just a synthetic string.
  *   4. cf-challenge — a real Cloudflare target populates the envelope (finalUrl/status/redirect);
  *      when the challenge clears (or an IP-reputation block hits), degrades to a note.
+ *   6. vendor attribution (issue #40) — a failed nav fabricates NO vendor (wafVendor stays undefined,
+ *      the load-bearing #39 gate), and when the CF target actually blocks its envelope attributes
+ *      wafVendor='cloudflare' (best-effort — degrades to a note when the challenge clears).
  */
 import { Gateway, loadConfig } from "../dist/gateway/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
@@ -68,8 +71,9 @@ try {
   if (r.diagnostics) {
     check("envelope carries a finalUrl", typeof r.diagnostics.finalUrl === "string" && r.diagnostics.finalUrl.length > 0);
     check("envelope carries the (null) status field", "status" in r.diagnostics);
-    // Downstream slots must stay UNSET (this ticket only declares them).
-    check("downstream slots (wafVendor/failureClass/timing) are left unset",
+    // A failed nav has no attributable vendor — #40 must fabricate none (the load-bearing rule that keeps
+    // this assertion true). failureClass/timing remain unset (their tickets aren't landed).
+    check("nav-failed fabricates NO wafVendor (#40) and leaves failureClass/timing unset",
       r.diagnostics.wafVendor === undefined && r.diagnostics.failureClass === undefined && r.diagnostics.timing === undefined);
     check("envelope is secret-free (no cookie/authorization value leaked)",
       !/set-cookie:\s*\S/i.test(JSON.stringify(r.diagnostics)) && !/authorization:\s*\S/i.test(JSON.stringify(r.diagnostics)));
@@ -104,17 +108,27 @@ try {
   }
   await drive.close().catch(() => {});
 
-  // 4) cf-challenge — envelope populated; degrades to a note if the challenge clears / IP-reputation blocks.
+  // 4+6) cf-challenge — envelope populated + vendor attribution (#40). Degrades to a note if the
+  // challenge clears / IP-reputation blocks; a CF block that DOES surface must attribute cloudflare.
   try {
     const cf = await drive.navigate(CF_TARGET);
     const d = cf.diagnostics ?? {};
-    console.log(`  drive(cf): status=${cf.status} finalUrl=${d.finalUrl}`);
+    console.log(`  drive(cf): status=${cf.status} finalUrl=${d.finalUrl} wafVendor=${d.wafVendor}`);
     check("the CF navigate carries a populated envelope (finalUrl + status)",
       !!cf.diagnostics && typeof d.finalUrl === "string" && "status" in d);
+    if (d.wafVendor !== undefined) {
+      check("a surfaced CF vendor attributes cloudflare (#40)", d.wafVendor === "cloudflare");
+    } else {
+      note("CF navigate cleared / not attributed — no wafVendor (expected on a cleared page)");
+    }
   } catch (err) {
     const env = failureOf(err);
     if (env) {
       check("a CF block throws with a populated failure envelope", typeof env.finalUrl === "string" && "status" in env);
+      // #40: a CF challenge names cloudflare; a bare IP-reputation hard-block has no vendor marker → undefined.
+      console.log(`  drive(cf) blocked: wafVendor=${env.wafVendor}`);
+      if (env.wafVendor !== undefined) check("a CF block attributes wafVendor=cloudflare (#40)", env.wafVendor === "cloudflare");
+      else note("CF block had no vendor marker (likely a bare IP-reputation hard-block) — wafVendor correctly undefined");
     } else {
       note(`CF check skipped (${CF_TARGET}): ${err instanceof Error ? err.message.split("\n")[0] : String(err)} — likely IP reputation on a direct session`);
     }
