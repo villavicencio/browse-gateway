@@ -10,7 +10,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildLocalStorageSeedScript, restoreOrClose } from "../dist/browser/index.js";
+import { buildLocalStorageSeedScript, restoreOrClose, computeForceKillAvailable } from "../dist/browser/index.js";
 
 /** A Map-backed stand-in for the DOM `Storage` interface — getItem returns `null` when absent. */
 function fakeLocalStorage(initial = {}) {
@@ -164,6 +164,18 @@ test("restoreOrClose: absent state is a no-op (ordinary cold session, context un
   assert.equal(ctx.closed, 0);
   assert.equal(ctx.cookies, null);
   assert.equal(ctx.initScript, null);
+});
+
+// --- issue #50 r6: force-kill availability requires the /proc generation marker on Linux ---
+test("computeForceKillAvailable: on Linux, a missing generation marker degrades to unavailable (reuse-safe)", () => {
+  // With a PID but no start-time on Linux, #ourGroupGone can't tell our group from a recycled pgid — so
+  // force-kill must report UNAVAILABLE rather than silently run the reuse-unsafe path.
+  assert.equal(computeForceKillAvailable(1234, "998877", "linux"), true, "linux + pid + marker → available");
+  assert.equal(computeForceKillAvailable(1234, undefined, "linux"), false, "linux + pid but NO marker → unavailable");
+  assert.equal(computeForceKillAvailable(undefined, "998877", "linux"), false, "no pid → unavailable");
+  // Non-Linux has no /proc by design and a huge pid space, so only the pid is required.
+  assert.equal(computeForceKillAvailable(1234, undefined, "darwin"), true, "darwin + pid (no /proc) → available");
+  assert.equal(computeForceKillAvailable(undefined, undefined, "darwin"), false, "darwin + no pid → unavailable");
 });
 
 test("restoreOrClose: a supplied CONFIRMABLE teardown replaces the best-effort close on failure (issue #50)", async () => {

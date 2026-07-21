@@ -79,6 +79,24 @@ function childTerminated(child: ChildProcess | undefined): boolean {
 }
 
 /**
+ * Whether the force-kill path can run SAFELY for a core (issue #50). Requires the captured Chromium PID.
+ * On **Linux** it ALSO requires the `/proc` start-time generation marker: without it, the reuse-safe
+ * group check ({@link PatchrightBrowserCore.#ourGroupGone}) can't tell our group from a recycled pgid, so
+ * force-kill would silently regress to the r5 cross-session-kill risk (real under `pids_limit=512`). A
+ * missing marker therefore reports UNAVAILABLE (health-visible degrade) instead of running unsafe (codex
+ * #50 r6). On non-Linux (macOS CLI) /proc is absent by design and the pid space is huge, so only the pid
+ * is required. Exported pure for unit coverage. */
+export function computeForceKillAvailable(
+  pid: number | undefined,
+  startTime: string | undefined,
+  platform: NodeJS.Platform,
+): boolean {
+  if (pid === undefined) return false;
+  if (platform === "linux") return startTime !== undefined;
+  return true;
+}
+
+/**
  * Read `pid`'s process-group id and start-time from `/proc/<pid>/stat` (Linux). The start-time (field 22,
  * jiffies since boot) is a stable per-process GENERATION marker: it lets the force-kill path tell OUR
  * Chromium leader from an unrelated process that later reused the same pid — load-bearing under the
@@ -476,6 +494,13 @@ export class PatchrightBrowserCore implements BrowserCore {
       process.stderr.write(
         "[browse-gateway] force-kill UNAVAILABLE: could not capture the Chromium PID at launch " +
           "(patchright internal shape changed); a wedged close will fall back to graceful-close-only\n",
+      );
+    } else if (!this.forceKillAvailable) {
+      // PID captured but the Linux generation marker was not (a transient /proc read failure). Force-kill
+      // is degraded rather than run reuse-UNSAFE (codex #50 r6) — surface it so it's health-visible.
+      process.stderr.write(
+        "[browse-gateway] force-kill DEGRADED: captured the Chromium PID but not its /proc generation " +
+          "marker; force-kill disabled to stay reuse-safe — a wedged close will fall back to graceful-close-only\n",
       );
     }
   }
@@ -1229,9 +1254,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     return this.#context;
   }
 
-  /** Whether {@link kill} can force-kill this core — true iff the Chromium PID was captured at launch. */
+  /** Whether {@link kill} can force-kill this core SAFELY — see {@link computeForceKillAvailable}. On Linux
+   *  this requires the generation marker too, so a missing marker degrades LOUDLY (health-visible) rather
+   *  than silently running the reuse-unsafe path (codex #50 r6). */
   get forceKillAvailable(): boolean {
-    return this.#pid !== undefined;
+    return computeForceKillAvailable(this.#pid, this.#leaderStartTime, process.platform);
   }
 
   async close(): Promise<void> {
@@ -1272,8 +1299,11 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   async kill(confirmMs: number): Promise<void> {
     const pid = this.#pid;
-    if (pid === undefined) {
-      throw new Error("force-kill unavailable: no Chromium PID captured at launch");
+    // Refuse unless force-kill is SAFELY available (a captured PID, plus the /proc generation marker on
+    // Linux — codex #50 r6). Refusing here degrades a wedged teardown to a counted zombie (the caller
+    // retains + reconfirms) rather than running the reuse-unsafe group signal.
+    if (pid === undefined || !this.forceKillAvailable) {
+      throw new Error("force-kill unavailable: no Chromium PID / generation marker captured at launch");
     }
     this.#closing = true; // fail-closed during teardown, same as close()
     if (this.#ourGroupGone(pid)) return; // our whole tree already gone (or the pgid was recycled) — no signal
