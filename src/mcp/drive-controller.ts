@@ -22,7 +22,6 @@ import {
   shouldEscalateDrive,
   proxyFromSecrets,
   escalationDiagnostics,
-  resolveBlockReason,
   classifyFailure,
   wafVendorFromFailure,
   EscalationError,
@@ -32,7 +31,7 @@ import {
   PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
-import type { EscalationDiagnostics, EgressCheck, BlockSignal } from "../verbs/index.js";
+import type { EscalationDiagnostics, EgressCheck, BlockSignal, FailureClass } from "../verbs/index.js";
 import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
@@ -192,22 +191,31 @@ export class GatewayDriveController implements DriveController {
    *
    * Also attaches the failure CLASS (issue #41) and the mitigation vendor (issue #40) — both a PROJECTION
    * of the shared classification (never a second classifier), so class, vendor, and the
-   * escalation-diagnostics reason can't disagree (codex #40 r3). Gated on navigate EVIDENCE
-   * (resolveBlockReason non-null OR a failed nav, status===null): a bare post-action `snapshot()` of a
-   * healthy page (an action that threw on a stale ref / locator timeout) has reason===null and a fat tree,
-   * so classifyFailure's reason===null arm would emit a confidently-WRONG `empty-shell` — leave both the
-   * class and the vendor UNSET there (mirroring the #40 no-hints gap). The content-family classes
-   * (empty-shell / hydration-failed / real-zero-results / unsupported-browser) are a RETRIEVE-path concern:
-   * on the interactive drive path a thin-200 shell is a returnable snapshot, never auto-failed, so this
-   * only ever attaches the block/nav subset {anti-bot-block, captcha, hard-block, nav-failed}. Both are
+   * escalation-diagnostics reason can't disagree (codex #40 r3). Gated on {@link navFailed} — the drive
+   * failure predicate (null status, a chrome-error dead nav, a visible block, or a hard block): a bare
+   * post-action `snapshot()` of a healthy page (an action that threw on a stale ref / locator timeout) is
+   * NOT navFailed, so classifyFailure's reason===null arm can't emit a confidently-WRONG `empty-shell` —
+   * both the class and the vendor stay UNSET there (mirroring the #40 no-hints gap). The content-family
+   * classes (empty-shell / hydration-failed / real-zero-results / unsupported-browser) are a RETRIEVE-path
+   * concern: on the interactive drive path a thin-200 shell is a returnable snapshot, never auto-failed, so
+   * this only ever attaches the block/nav subset {anti-bot-block, captcha, hard-block, nav-failed}. Both are
    * closed vocabularies → pass redaction untouched.
    */
   #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
     if (!snap?.diagnostics) return undefined;
-    // #signalOf carries captchaKind, so resolveBlockReason here and in #escalationDiag agree on one reason.
+    // #signalOf carries captchaKind, so classifyFailure here and #escalationDiag's reason agree on one vendor.
     const signal = this.#signalOf(snap);
-    const reason = resolveBlockReason(signal);
-    const failureClass = reason !== null || signal.status === null ? classifyFailure(signal) : undefined;
+    // Classify ONLY a genuine drive nav failure — navFailed is the drive failure predicate (null status,
+    // a chrome-error dead nav, a visible block, or a hard block). A bare post-action snapshot of a HEALTHY
+    // page (an action that threw on a stale ref / locator timeout) is NOT navFailed, so its class stays
+    // unset (no confidently-wrong empty-shell). A dead nav (chrome-error://) can inherit a STALE non-null
+    // status from the prior page, which defeats classifyFailure's status===null nav-failed test — attribute
+    // it from the URL (codex #41 r1). Every other navFailed case classifies cleanly off the signal.
+    const failureClass: FailureClass | undefined = !navFailed(snap)
+      ? undefined
+      : snap.url.startsWith("chrome-error://")
+        ? "nav-failed"
+        : classifyFailure(signal);
     const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
     const diag: FailureDiagnostics = {
       ...snap.diagnostics,

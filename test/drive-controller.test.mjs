@@ -129,6 +129,23 @@ test("controller: a navigating action that lands on a dead nav (chrome-error, st
   await assert.rejects(c.click({ target: "e1" }), /blocked\/challenge page|did not clear/);
 });
 
+test("controller: a dead-nav (chrome-error, STALE 200 status) is classified failureClass='nav-failed' (#41, codex r1)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  // navFailed catches the chrome-error:// URL, but the snapshot inherited the prior page's 200 status —
+  // which defeats classifyFailure's status===null nav-failed test. The URL must drive the class so this
+  // genuine unreachable-nav failure isn't left unclassified (or mislabeled empty-shell).
+  const { gateway } = makePostActionBlockGateway({
+    url: "chrome-error://chromewebdata/", title: "", tree: "ERR_EMPTY_RESPONSE", status: 200,
+    diagnostics: { finalUrl: "chrome-error://chromewebdata/", status: 200 },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "the dead nav must throw");
+  assert.equal(failureOf(caught)?.failureClass, "nav-failed", "a stale-status chrome-error dead nav is classified nav-failed");
+});
+
 test("controller: a post-action block preserves the failure envelope across #run's redaction re-wrap (issue #39)", async () => {
   // #actAndSnap throws attachFailure(...) INSIDE #run, whose catch re-wraps into a fresh redacted Error —
   // the non-enumerable `.failure` must be carried over, or the drive envelope is lost on this path.

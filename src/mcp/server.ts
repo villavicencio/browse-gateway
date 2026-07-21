@@ -122,7 +122,10 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           // hydration-failed / real-zero-results / unsupported-browser instead of an opaque `empty-content`).
           // The literal remains only as a defensive last resort (an outcome carrying no envelope at all).
           const why = result.reason ?? result.diagnostics?.failureClass ?? "empty-content";
-          const hint = result.reason === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
+          // Hint on the surfaced `why` (not just `result.reason`), so a thin-shell CAPTCHA served as a
+          // 200 — surfaced as failureClass=captcha with reason=null (the #40 empty-shell follow-up) — still
+          // tells the caller it needs a solver, at parity with a reason=captcha block.
+          const hint = why === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
           const diag = result.proxyDiagnostic ? `\ndiagnostics: ${JSON.stringify(result.proxyDiagnostic)}` : "";
           // Surface the failure-evidence envelope (issue #39) — finalUrl / title / status / redirect chain /
           // console + network — so a retrieve failure is diagnosable instead of opaque. Already redacted.
