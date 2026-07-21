@@ -110,9 +110,15 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   /** In-flight cleanups, keyed by session id. Makes cleanup SINGLE-FLIGHT so the fire-and-forget callers
    *  (`onsessionclosed` / `transport.onclose`) and the AWAITING callers (`closeSession` via the reaper /
    *  `closeAll`) share ONE dispose — the awaiting caller then reliably waits for the browser teardown to
-   *  complete, not just for the transport to close. Load-bearing since #50 made the gateway teardown
-   *  async-confirmed (close→group-confirm→free): without this, a reaper/shutdown returns before the browser
-   *  slot is actually reclaimed. */
+   *  COMPLETE (the gateway release resolves after close→group-confirm), not just for the transport to
+   *  close. Load-bearing since #50 made the gateway teardown async-confirmed: without this a reaper/shutdown
+   *  would return before the teardown even ran (it was fire-and-forget).
+   *
+   *  Note the layering: this waits for the teardown to COMPLETE, not for the browser slot to be
+   *  confirmed reclaimed. A force-kill that can't confirm death does not free the slot — SessionManager
+   *  deliberately RETAINS that browser in its counted `#unconfirmed` set and its own reaper/`shutdown`
+   *  reconfirms it. The gateway (`activeCount`/`unconfirmedCount`) is the source of truth for browser
+   *  slots; this MCP layer owns only the transport + controller lifecycle and must not duplicate that. */
   const cleanups = new Map<string, Promise<void>>();
   let reaperTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -124,10 +130,12 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
     sessions.delete(sessionId);
     const done = entry
       .dispose()
-      .catch(() => {}) // release the drive session; never throw from teardown
+      // dispose (drive.close → gateway.closeConsumerSession → release) never rejects: an unconfirmed
+      // force-kill is a RETAINED counted slot in the gateway, not a rejection. The catch is belt-and-braces.
+      .catch(() => {})
       .then(() => {
         cleanups.delete(sessionId);
-        log(`session ${sessionId} closed (consumer=${entry.consumerId}); ${sessions.size} live`);
+        log(`session ${sessionId} transport closed (consumer=${entry.consumerId}); ${sessions.size} live`);
       });
     cleanups.set(sessionId, done);
     return done;
@@ -253,10 +261,12 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   }
 
   /** Close a session's transport (fires onclose -> cleanup) and AWAIT the cleanup — including the browser
-   *  teardown. `transport.close()` fires `onclose` which kicks off `cleanup` fire-and-forget; awaiting
-   *  `cleanup(sid)` here returns that same in-flight dispose (single-flight), so the reaper / shutdown wait
-   *  for the browser slot to be reclaimed, not just for the transport to close (load-bearing since #50 made
-   *  the gateway teardown async-confirmed). Also a belt-and-suspenders cleanup if onclose didn't fire. */
+   *  teardown COMPLETING. `transport.close()` fires `onclose` which kicks off `cleanup` fire-and-forget;
+   *  awaiting `cleanup(sid)` here returns that same in-flight dispose (single-flight), so the reaper /
+   *  shutdown wait for the gateway teardown to complete, not just for the transport to close (load-bearing
+   *  since #50 made the gateway teardown async-confirmed). Confirmation/retention of a browser slot that
+   *  can't be confirmed dead is the gateway's job (its `#unconfirmed` set) — see `cleanup`. Also a
+   *  belt-and-suspenders cleanup if onclose didn't fire. */
   async function closeSession(sid: string, entry: SessionEntry): Promise<void> {
     await entry.transport.close().catch(() => {});
     await cleanup(sid);
@@ -303,7 +313,9 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
     // Drain any cleanup ALREADY in flight whose session has already left the `sessions` map — a
     // fire-and-forget `onclose`/`onsessionclosed`, or an overlapping reap, may be mid-dispose and thus
     // invisible to the loop above. Without this, closeAll could return while a browser teardown is still
-    // settling, breaking its graceful-shutdown contract (a slot would still be counted).
+    // running. (This awaits the teardown to COMPLETE; a browser the gateway couldn't confirm dead is
+    // retained in the gateway's `#unconfirmed` and reconfirmed by `gateway.shutdown()`, which http-main
+    // runs after closeAll — the gateway, not this handler, owns browser-slot confirmation.)
     await Promise.all([...cleanups.values()]);
   }
 
