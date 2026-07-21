@@ -1,93 +1,94 @@
-# HANDOFF — 2026-07-20, evening
+# HANDOFF — 2026-07-21
 
-Continuation of the site-compat hardening epic (#38). Picked up on `/dv:pickup` → operator said
-**"go on #50"** (the confirmable-teardown + force-kill debt split from #46 during Wave 1). Ran the
-full ultracode pipeline — parallel research, an adversarial critique panel, implementation in an
-isolated worktree, in-container runtime gates, and an 8-round Claude↔Codex adversarial-review loop —
-then merged and **deployed #50 to prod**. The #50 deploy gate then caught a real cross-layer
-regression, which became **follow-up PR #56** (5 more Codex rounds) — also merged and deployed.
+Continuation of the site-compat hardening epic (#38), Wave 2. Picked up on `/dv:pickup` → operator said
+**"go on #40"** (surface mitigation/CAPTCHA vendor + add a DataDome branch to `classifyBlock`). Ran the
+full ultracode pipeline — a pre-code 4-lens adversarial critique panel, implementation, in-container
+runtime gates, and an **8-round Claude↔Codex adversarial-review loop** — then **merged #40 (PR #57,
+squash `7205567`)** and **filed the two follow-ups**. Operator ratified the stopping point (2 reasoned
+residuals routed to #41/#44 rather than scope-creeping detection into #40).
 
-**Prod now runs main `580b1ad`** (image `sha256:86ba92ac…`): #50 (PR #55) + the #56 follow-up.
-Deploy gate → smoke → verify all green; rollback anchor recorded. Tree clean, `main == origin/main`,
-no open PRs. (Docs commit `a4aa5d7` sits on top — handoff + a `docs/solutions/` entry; its `ci` build
-moved GHCR `latest` to `a4aa5d7` which is byte-identical in `src/`/`dist` to `580b1ad`, so **no
-redeploy is needed** — prod stays on `86ba92ac`; re-running `deploy-http` would be a no-op change.)
+**Prod is UNCHANGED — still `580b1ad` (image `86ba92ac`).** #40 is on `main` but **NOT deployed** (the
+merge builds GHCR `latest`; deploy is a separate `gh workflow run deploy-http.yml` the operator has not
+requested). Tree clean, `main == origin/main`, no open PRs.
 
-## What shipped
+## What shipped (#40, PR #57)
 
-- **#50 — confirmable browser teardown + force-kill (PR #55, squash `b9fd004`).** A capacity slot now
-  frees ONLY on CONFIRMED whole-process-group death (clean close OR confirmed SIGKILL). Closes the gap
-  where a wedged/failed close freed a slot while Chrome was still alive (live processes could exceed the
-  caps). New force-kill primitive (`BrowserCore.kill`): capture the Chromium leader PID + ChildProcess
-  at launch via patchright's in-process `toImpl` bridge; SIGKILL the process **group** (detached
-  group-leader) + leader; confirm the whole **group** is empty (`kill(-pid,0)`→ESRCH), reuse-safe via a
-  `/proc` start-time **generation marker** (`pids_limit=512` makes pgid recycling real). Counted-until-
-  confirmed accounting + a `#unconfirmed` set drained by a KILL-ONLY reconfirm (single-flight); shutdown
-  coordination (drains in-flight acquires, retains unconfirmed); transient hung renders wedge-reaped
-  (subsumes #49, now CLOSED). New surfaces: `computeForceKillAvailable`, `SessionManager.unconfirmedCount`,
-  `SessionInfo.forceKillAvailable`. **635 unit tests**; new in-container gate `scripts/validate-teardown.mjs`
-  (Sections A–E) + `validate-drive` + `validate-stealth` (CF 2/2, DataDome 2/2) all green.
-- **#56 — MCP reaper/shutdown must await (bounded) the async teardown #50 introduced (squash `580b1ad`).**
-  Caught by the #50 deploy gate: after #50 made the gateway teardown async-confirmed, the MCP handler was
-  fire-and-forgetting the gateway teardown (via `transport.onclose → void cleanup`), so `reapIdle`/`closeAll`
-  returned before the browser slot was reclaimed → `validate-http` failed (gate aborted safely; prod never
-  broke). Fix in `src/mcp/http-server.ts`: `cleanup()` single-flight so callers share ONE dispose and
-  actually await the teardown; `closeAll` drains in-flight cleanups CONCURRENTLY under ONE bounded deadline
-  (`awaitBounded`, `cleanupAwaitMs`) so a hung drive op can't deadlock shutdown (gateway.shutdown() then
-  force-kills), never compounds N×, and is rejection-safe.
+A failure envelope now names WHO blocked, at retrieve↔drive parity:
+- **`classifyBlock` + `datadome-challenge` branch** (`ddHint`) — a DataDome block stops falling through
+  to generic `blocked`/`hard-block`. Escalation is untouched (it keys off raw `isHardBlock`/
+  `isCloudflareBlock`, not the label).
+- **`wafVendor` on the #39 envelope** (both paths), a **PROJECTION of `BlockReason`**
+  (`wafVendorFromReason`) — never a second classifier, so vendor and reason can't disagree. Shared
+  `resolveBlockReason(signal)` keeps retrieve/drive/escalation-diagnostics from drifting.
+- **WAF-first precedence**: a specific vendor (cf/px/datadome) wins; a CAPTCHA attributes only an
+  otherwise-generic block, so a page that merely preloads a captcha library can't override the WAF.
+- **`WafVendor` closed-vocab TYPE** (moved to observability) on the envelope slot — redaction
+  pass-through enforced by the compiler, not a comment.
+- **`activeCaptchaKind`** (browser/captcha.ts) — CAPTCHA kind from real RENDERED evidence (container
+  class-token + real `data-sitekey=` attr / rendered iframe / `<kind>-response` field), catching
+  declarative + explicit-render widgets while rejecting loaded libraries, comments/templates, compound/
+  pseudo classes, and `data-*` suffixes.
+
+**664 unit tests**; in-container `validate:failure-envelope` PASS (the load-bearing "nav-failed
+fabricates no `wafVendor`" assertion held on live evidence) + `validate:stealth` PASS (kill-gate, no
+regression — #40 doesn't touch the stealth path).
 
 ## Decisions made
 
-- **Design hardened by an adversarial critique panel BEFORE coding** — it caught 2 invariant violations in
-  the first design (a self-heal retry that could false-free a slot; an unreachable-untagged-transient leak),
-  both fixed by the `#unconfirmed` kill-only reconfirm. Higher-signal than a generate-and-judge panel here.
-- **Group-based confirm, not leader-based** (Codex r3): leader death ≠ group empty (a renderer can linger).
-- **Reuse-safe via `/proc` generation marker** (Codex r5); on Linux force-kill requires it (Codex r6) — a
-  missing marker degrades loudly rather than running reuse-unsafe.
-- **Correct layering** (Codex r2, #56): the gateway (`#unconfirmed` + its reaper + `gateway.shutdown()`)
-  owns browser-slot confirmation/retention; the MCP handler owns transport+controller lifecycle and awaits
-  teardown-*completion*, bounded. It does NOT duplicate the gateway's accounting.
-- **Follow-ups filed, not crammed in** (operator precedent — complete-if-it-finishes-your-change, else track):
-  **#53** (wire `forceKillAvailable`/`unconfirmedCount` into an operational health surface / `obscura status`),
-  **#54** (acquire-side hung-factory-launch `#reserved` leak — pre-PID, unkillable via #50). Also tracked:
-  per-browser cgroup kill; routing a restore-cleanup unconfirmed-kill into manager `#unconfirmed`;
-  http-main `closeAll()` vs the drive-controller `#lock` (now mitigated by the bound).
+- **Design hardened by a 4-lens critique panel BEFORE coding** — it caught that a standalone vendor
+  classifier would contradict `classifyBlock`; the derive-from-reason design makes them structurally
+  consistent. Higher-signal than a generate-and-judge panel.
+- **The Codex loop stopped at r8 without `approve`, by design.** Every *in-scope* finding across 8 rounds
+  was fixed (drive parity, WAF-override regression, sitekey cross-labeling, explicit-render regression,
+  and a cascade of regex false-positives). `approve` was unreachable because Codex re-flags the
+  empty-shell finding every round, and fixing it means scope-creeping #41 into #40 — the
+  "verify-don't-blind-accept overrides drive-to-approve" case. Presented to the operator, who ratified.
 
-## What didn't work
+## Follow-ups filed (residuals, deliberately out of #40's labeling scope)
 
-- **A wedged-close teardown test hung in CI** — the `graceTimer` (Session.teardown escalation trigger) was
-  `unref`'d, so the event loop emptied before it fired → teardown hung forever. Passed locally (other timers
-  kept the loop alive), failed in CI. Fix: a foreground awaited timer (grace timer, confirm poll) must NOT be
-  unref'd. **CI caught it — trust the pipeline.**
-- **Driving the MCP fire-and-forget cleanup deterministically in a unit test** — `client.close()` doesn't send
-  a DELETE, a TCP drop doesn't fire the server transport `onclose`, and `transport.close()` hangs with a live
-  client. The working trigger is the client's explicit `transport.terminateSession()` (sends the DELETE →
-  `onsessionclosed` → cleanup).
+1. **#41 (empty-shell)** — comment filed. A 200 CAPTCHA/DataDome shell with no visible phrase fails via
+   retrieve's empty-markdown arm with `reason=null`, so no vendor surfaces. Folding it into the `blocked`
+   DECISION would false-positive real pages with an incidental widget (the class `detect.ts` avoids).
+   #41's named "empty-shell" failure class owns it; the pieces (`activeCaptchaKind`, `hasDataDomeHint`,
+   `wafVendorFromReason`) are in place.
+2. **#44 (Turnstile kind)** — comment filed. A rendered Turnstile widget's iframe carries
+   `challenge-platform` → `cfHint` → attributes `cloudflare` (a correct coarser mitigation vendor —
+   Turnstile IS Cloudflare). The finer `turnstile` kind matters for solver eligibility; separating an
+   embedded widget from a managed challenge needs a captured managed-challenge fixture first.
+3. **Drive ACTION-failure envelopes** carry no vendor — a bare `snapshot()` computes no hints (inherited
+   #39 gap). Documented in `drive-controller.ts` `#failure` docstring; NOT yet a standalone issue
+   (offered to file — operator hasn't said). Fix = compute cf/px/dd hints in the core `#snapshotOf`
+   (closes the cf/px gap too; cost = `page.content()` per action).
+
+## What didn't work / gotchas
+
+- **Regex can't verify "a live DOM element."** Six Codex rounds chased ever-more-marginal HTML-substring
+  false-positives (compound class, comment, `data-*` suffix). The escape was reframing to RENDERED
+  evidence (container+sitekey / iframe / response-field), not more class-substring precision. For a
+  diagnostic *label*, robust-best-effort at the regex altitude is correct; perfect active-element
+  detection is a DOM-parse concern the whole `detect.ts` layer forgoes. See
+  `docs/solutions/architecture-patterns/vendor-label-as-projection-not-parallel-classifier.md`.
+- **colima flakiness:** the final gate rebuild hit a Docker layer-cache snapshot corruption
+  (`apply layer error … parent snapshot … not found`) — infra, not code. A fresh image tag + retry
+  cleared it. colima was brought up for the gates then **stopped** (restored to prior state); `colima
+  start` for future gates.
+- **`codex-companion.mjs` is gone** (lived in a prior session's scratch). The loop now drives the
+  `codex` CLI directly: `codex exec review --base main` (run detached; buffers all output until the end;
+  strip the `rmcp::transport::worker`/`codex_models_manager` MCP-noise lines; verdict is the final
+  `codex` block). `--base` can't combine with a custom prompt (default review only). Do NOT pass
+  `--dangerously-bypass-approvals-and-sandbox` — the harness safety classifier blocks it; the plain
+  sandboxed review works read-only.
+- **`git pull --ff-only origin main` before committing** — local main goes stale after a GitHub-side merge.
 
 ## What's next
 
-1. **Wave 2** of epic #38: `#40` (WAF + CAPTCHA vendor fingerprinting — add DataDome to `classifyBlock`) →
-   `#41` (failure-class taxonomy), then `#42/#43/#44` → `#45` → `#47` → `#48`. The #39 diagnostics envelope
-   is LIVE; its pre-declared slots are ready to fill. See `docs/plans/2026-07-17-001-...local.md`.
-2. **#53 / #54** (the #50 follow-ups above) when convenient.
-3. `feat/teardown-confirmation-wip` (the old #50 starting point) is now obsolete (#50 shipped) — safe to
-   delete when the operator wants. `feat/fresh-exit-warm` is unrelated/pre-existing.
+1. **#41 (typed failure-class taxonomy)** — the natural next Wave-2 ticket, and it now has the #40
+   empty-shell input captured on it. Depends on #39 signals + #40 vendor (both live). This is where the
+   200-status empty-shell/hydration-failed/real-zero states get separated.
+2. **#42/#43/#44** (per-stage timing, wall-clock budget, CAPTCHA solver eligibility+reason) → #45 → #47 → #48.
+3. **Deploy #40 when ready** — merge built GHCR `latest`; `gh workflow run deploy-http.yml -f image_tag=latest`
+   → on-host `validate-http` gate → pre-swap smoke → swap → verify → rollback. Prod stays `580b1ad`
+   until then.
+4. The two #50 follow-ups (#53 health surface, #54 acquire-side `#reserved` leak) still open.
 
-## Gotchas & watch-outs
-
-- **Prod runs `580b1ad`** (image `86ba92ac`). Deploy flow unchanged: merge → **ci.yml** builds+pushes GHCR
-  `latest` from main → `gh workflow run deploy-http.yml -f image_tag=latest` → on-host gate (`validate-http`)
-  → real-config pre-swap smoke → swap → verify → rollback. **Deploy `docker rm -f` = immediate SIGKILL** (the
-  SIGTERM/gateway.shutdown() path never runs in a deploy; the container namespace reaps Chrome). The
-  authoritative shutdown path matters for manual `docker stop` and the Mac CLI (`vault-host.ts`).
-- **The deploy gate (`validate-http`) catches cross-layer regressions the unit tests + the in-container
-  teardown gate miss.** #56 existed because of it. When it aborts, prod stays safe — diagnose, don't force.
-- **In-container gates**: `colima start`; build ONE `browse-gateway:gate` base image; then the **overlay trick**
-  (`docker build FROM browse-gateway:gate` with `COPY dist scripts`) — bind-mounts fail because colima's
-  default VM doesn't share `/private/tmp`. Run with `--init` (matches prod `init:true`) for the
-  zero-pgid-remaining reaping check. **colima was brought up for the gates then stopped** (restored to prior
-  state) — `colima start` for future gates; the `gate50` overlay image was removed.
-- **Foreground timers in the teardown/cleanup path must NOT be `unref`'d** (grace timer, confirm poll,
-  `awaitBounded`) — an unref'd one lets the loop empty mid-await and hangs the teardown.
-- **`git pull --ff-only origin main` before committing** — local main goes stale after a GitHub-side merge.
-- Force-kill mechanics reference: `~/Obsidian/browse-gateway/memory/force-kill-teardown-mechanics.md`.
+Plan doc: `docs/plans/2026-07-17-001-site-compatibility-hardening.local.md` (gitignored, self-contained).
