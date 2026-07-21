@@ -176,6 +176,19 @@ test("activeCaptchaKind: dormant widget markup in a comment / script / template 
   assert.equal(activeCaptchaKind('<!-- <div class="cf-turnstile" data-sitekey="old"></div> --><div class="g-recaptcha" data-sitekey="live"></div>'), "recaptcha");
 });
 
+test("activeCaptchaKind: catches EXPLICIT-render widgets (iframe / response field), no regression (codex #40 r7)", () => {
+  // grecaptcha.render into an arbitrary container: no .g-recaptcha[data-sitekey], but a rendered iframe /
+  // response field IS present — must still attribute recaptcha (the r7 regression the widget-class-only
+  // gate introduced).
+  assert.equal(activeCaptchaKind('<div id="cap"><iframe title="reCAPTCHA" src="https://www.google.com/recaptcha/api2/anchor?k=key"></iframe></div>'), "recaptcha");
+  assert.equal(activeCaptchaKind('<form><textarea id="g-recaptcha-response" name="g-recaptcha-response"></textarea></form>'), "recaptcha");
+});
+
+test("activeCaptchaKind: real attribute/token precision — pseudo-class + data-sitekey-as-VALUE do not fire (codex #40 r7)", () => {
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha:disabled" data-sitekey="x"></div>'), undefined); // pseudo/compound class token
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha" data-config="data-sitekey"></div>'), undefined); // no real data-sitekey= attribute
+});
+
 // --- wafVendorFromReason: vendor is a projection of the reason (issue #40) ---
 
 test("wafVendorFromReason: each WAF reason maps to its vendor; captcha uses the widget kind", () => {

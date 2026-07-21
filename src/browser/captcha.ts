@@ -68,38 +68,50 @@ export function detectCaptcha(signal: PageSignal, url: string): CaptchaChallenge
 }
 
 /**
- * A regex for a single ELEMENT that is an active CAPTCHA widget of container class `cls` — the HTML-string
- * equivalent of the live gate's `.<cls>[data-sitekey]` ({@link DETECT_LIVE_CAPTCHA_JS}): an opening tag
- * that carries `cls` as a WHOLE class token AND a `data-sitekey` attribute, in EITHER attribute order.
- *   - the class token is delimited by non-`[\w-]` on both sides, so a COMPOUND class (`g-recaptcha-wrapper`)
- *     or a stray substring does NOT match (the word-boundary `\b` did — codex #40 r5);
- *   - it must live inside a real `<…>` tag WITH a `data-sitekey`, so `cls` in an inline stylesheet, an HTML
- *     comment, or a JS template is not mistaken for a placed widget;
- *   - a merely-LOADED library (`recaptcha/api.js`, `hcaptcha.com/1/api.js`) carries neither the class token
- *     nor a widget `data-sitekey`, so it is never a widget.
+ * A regex for a single ELEMENT that is a placed widget CONTAINER of class `cls` — the HTML-string form of
+ * the live gate's `.<cls>[data-sitekey]` ({@link DETECT_LIVE_CAPTCHA_JS}): an opening tag carrying `cls` as
+ * a whole CLASS-VALUE token (delimited by the attribute quote or whitespace — so a COMPOUND class
+ * `g-recaptcha-wrapper` or a pseudo `g-recaptcha:disabled` does NOT match, codex #40 r5/r7) AND a real
+ * `data-sitekey=` ATTRIBUTE (matched with a trailing `=`, so a `data-config="data-sitekey"` VALUE does not
+ * satisfy it, r7), in either attribute order.
  */
-function widgetClassRe(cls: string): RegExp {
+function containerRe(cls: string): RegExp {
   return new RegExp(
-    `<[a-z][a-z0-9]*(?=[^>]*\\bclass\\s*=\\s*["'][^"']*(?<![\\w-])${cls}(?![\\w-]))(?=[^>]*\\bdata-sitekey\\b)`,
+    `<[a-z][a-z0-9]*(?=[^>]*\\sclass\\s*=\\s*["'][^"']*(?<=["'\\s])${cls}(?=["'\\s])[^"']*["'])(?=[^>]*\\sdata-sitekey\\s*=)`,
     "i",
   );
 }
 
-/** The interactive CAPTCHA widget CONTAINER classes, per kind — the containers the live drive gate
- *  ({@link DETECT_LIVE_CAPTCHA_JS}) queries. Order mirrors {@link detectCaptcha} for determinism if two
- *  widget containers ever coexist. */
-const WIDGET_ELEMENT: readonly { kind: Exclude<CaptchaKind, "unknown">; re: RegExp }[] = [
-  { kind: "turnstile", re: widgetClassRe("cf-turnstile") },
-  { kind: "hcaptcha", re: widgetClassRe("h-captcha") },
-  { kind: "recaptcha", re: widgetClassRe("g-recaptcha") },
+/** A response-field element (`name`/`id` = `<kind>-response`) — injected only when a widget RENDERS, so it
+ *  is evidence of an active/explicit-render widget, never of a merely-loaded library. Matched as a real
+ *  attribute value. */
+function responseFieldRe(name: string): RegExp {
+  return new RegExp(`\\b(?:name|id)\\s*=\\s*["']${name}["']`, "i");
+}
+
+/** Per-kind evidence of an ACTIVE/RENDERED widget — ANY of: a placed container, a RENDERED iframe
+ *  (distinct from the library `api.js` URL — e.g. reCAPTCHA's `api2/anchor`, hCaptcha's asset host), or a
+ *  response field. This catches BOTH declarative widgets AND `grecaptcha.render`/explicit-render
+ *  integrations that inject into an arbitrary container (codex #40 r7), while a mere `<script src=…api.js>`
+ *  matches none. Order mirrors {@link detectCaptcha} for determinism if kinds ever coexist. */
+const WIDGET_EVIDENCE: readonly { kind: Exclude<CaptchaKind, "unknown">; res: readonly RegExp[] }[] = [
+  { kind: "turnstile", res: [containerRe("cf-turnstile"), responseFieldRe("cf-turnstile-response")] },
+  {
+    kind: "hcaptcha",
+    res: [containerRe("h-captcha"), responseFieldRe("h-captcha-response"), /\bsrc\s*=\s*["'][^"']*newassets\.hcaptcha\.com/i],
+  },
+  {
+    kind: "recaptcha",
+    res: [containerRe("g-recaptcha"), responseFieldRe("g-recaptcha-response"), /\bsrc\s*=\s*["'][^"']*recaptcha\/api2\/(?:anchor|bframe)/i],
+  },
 ];
 
 /** Contexts whose contents are NOT live rendered DOM — a comment, a `<script>`/`<style>`/`<noscript>`
  *  body, or an inert `<template>` fragment — where dormant widget markup can appear without being a real
- *  placed widget. Stripped before the widget match so `page.content()` carrying a commented-out or
- *  templated `<div class="g-recaptcha" data-sitekey>` isn't mistaken for an active challenge (codex #40
- *  r6). This is the regex module's bounded approximation of "a live element"; true active-element
- *  verification is a DOM-parse concern the whole HTML-string detection layer deliberately forgoes. */
+ *  placed widget. Stripped before matching so `page.content()` carrying a commented-out or templated
+ *  `<div class="g-recaptcha" data-sitekey>` isn't mistaken for an active challenge (codex #40 r6). This is
+ *  the regex module's bounded approximation of "a live element"; true active-element verification is a
+ *  DOM-parse concern the whole HTML-string detection layer deliberately forgoes. */
 const INERT_HTML_CONTEXTS: readonly RegExp[] = [
   /<!--[\s\S]*?-->/g,
   /<script\b[^>]*>[\s\S]*?<\/script>/gi,
@@ -109,18 +121,18 @@ const INERT_HTML_CONTEXTS: readonly RegExp[] = [
 ];
 
 /**
- * The kind of an ACTIVE interactive CAPTCHA widget in the rendered HTML — a placed widget ELEMENT
- * (container class + `data-sitekey`, per {@link widgetClassRe}), read off the LIVE markup with inert
- * contexts stripped first — or `undefined` when only a captcha LIBRARY is loaded, the token appears in
- * non-element/dormant text, or none is present. Purpose-built for vendor attribution (issue #40): unlike
- * {@link detectCaptcha}, the kind is bound to the widget element, so (a) a page that merely preloads a
- * library isn't attributed a CAPTCHA (codex r3), (b) a co-present unrelated library can't cross-label the
- * kind (r4), (c) a compound class / stylesheet substring can't fabricate a widget (r5), and (d) a
- * commented-out / `<script>`- or `<template>`-embedded widget doesn't count (r6).
+ * The kind of an ACTIVE interactive CAPTCHA widget in the rendered HTML — evidenced by a placed container,
+ * a rendered iframe, or a response field ({@link WIDGET_EVIDENCE}), read off the LIVE markup with inert
+ * contexts stripped first — or `undefined` when only a captcha LIBRARY is loaded, the marker appears in
+ * dormant/non-element text, or none is present. Purpose-built for vendor attribution (issue #40): unlike
+ * {@link detectCaptcha} (which also matches a bare library and pairs the first sitekey with any kind), the
+ * kind here is bound to real rendered evidence, so it neither over-attributes (library-only r3, cross-label
+ * r4, compound-class/substring r5, comment/template r6, pseudo-class/attr-value r7) nor under-attributes
+ * (it catches `grecaptcha.render`/explicit-render widgets via their iframe/response field, r7).
  */
 export function activeCaptchaKind(html: string): CaptchaKind | undefined {
   const live = INERT_HTML_CONTEXTS.reduce((s, re) => s.replace(re, " "), html);
-  return WIDGET_ELEMENT.find(({ re }) => re.test(live))?.kind;
+  return WIDGET_EVIDENCE.find(({ res }) => res.some((re) => re.test(live)))?.kind;
 }
 
 /** A live, in-DOM CAPTCHA widget read off the active page (drive path). */
