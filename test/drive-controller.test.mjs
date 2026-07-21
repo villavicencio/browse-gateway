@@ -189,6 +189,10 @@ test("controller: a THROWING click attaches a best-effort failure envelope (issu
   const env = failureOf(caught);
   assert.ok(env, "the action-exception path attaches an envelope from a best-effort snapshot");
   assert.equal(env.finalUrl, "https://cur.example/");
+  // #41 R2: a bare post-action snapshot of a HEALTHY page (reason===null, status 200) must NOT be
+  // classified — classifyFailure's reason===null arm would emit a confidently-WRONG `empty-shell` for an
+  // ordinary locator-timeout/detached-element failure. The class (like the #40 vendor) stays unset here.
+  assert.equal(env.failureClass, undefined, "an ordinary action failure on a healthy page carries NO failureClass");
 });
 
 test("controller: a THROWING type also carries the envelope", async () => {
@@ -726,6 +730,8 @@ test("controller: a DataDome navigate failure attributes the vendor on both the 
   assert.ok(caught, "a DataDome block with no proxy must throw");
   assert.equal(caught.diagnostics?.reason, "datadome-challenge", "proxy-diagnostic reason attributes DataDome");
   assert.equal(failureOf(caught)?.wafVendor, "datadome", "the #39 envelope carries the DataDome vendor");
+  // #41: a live DataDome block on a drive navigate is classified anti-bot-block (class ↔ vendor agree).
+  assert.equal(failureOf(caught)?.failureClass, "anti-bot-block", "the #41 envelope classifies the block");
 });
 
 test("controller: a bare reCAPTCHA navigate failure attributes the CAPTCHA kind on the envelope (drive/retrieve parity, #40)", async () => {
@@ -751,4 +757,6 @@ test("controller: a bare reCAPTCHA navigate failure attributes the CAPTCHA kind 
   try { await c.navigate("https://cap.example/"); } catch (e) { caught = e; }
   assert.ok(caught, "a bare CAPTCHA block with no proxy must throw");
   assert.equal(failureOf(caught)?.wafVendor, "recaptcha", "the envelope attributes the CAPTCHA widget kind (parity with retrieve)");
+  // #41: a bare active-CAPTCHA block on a drive navigate is classified captcha (class ↔ vendor agree).
+  assert.equal(failureOf(caught)?.failureClass, "captcha", "the #41 envelope classifies it as a captcha block");
 });

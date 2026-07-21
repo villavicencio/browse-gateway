@@ -18,13 +18,16 @@ import {
   hasPerimeterXHint,
   hasDataDomeHint,
   hasPerimeterXChallengeCopy,
+  hasEmptyStateMarker,
+  hasUnsupportedBrowserPhrase,
+  hasFrameworkRoot,
   activeCaptchaKind,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
 import { redactFailureDiagnostics, sanitizeUrlForError } from "../observability/index.js";
-import type { FailureDiagnostics, WafVendor } from "../observability/index.js";
-export type { WafVendor } from "../observability/index.js";
+import type { FailureDiagnostics, WafVendor, FailureClass } from "../observability/index.js";
+export type { WafVendor, FailureClass } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -237,6 +240,94 @@ export function wafVendorFromReason(
       return captchaKind && captchaKind !== "unknown" ? captchaKind : undefined;
     default:
       // nav-failed / hard-block / blocked / null → no attributable vendor.
+      return undefined;
+  }
+}
+
+/**
+ * The signal surface the FAILURE classifier ({@link classifyFailure}) reads: a {@link BlockSignal} (which
+ * the block layer classifies) PLUS two RETRIEVE-ONLY content signals it needs to separate the reason===null
+ * 200-states. Kept as a supertype rather than widening {@link BlockSignal} (whose contract is
+ * block-classification inputs only, so classifyBlock never sees fields it must ignore, issue #41). Both
+ * added fields are DIAGNOSTIC sub-classifiers of an already-thin, already-failed, non-blocked page — NEVER
+ * a `blocked` input.
+ */
+export interface FailureSignal extends BlockSignal {
+  /** An SPA framework mount root is present in the HTML (`hasFrameworkRoot`). True on a hydrated page too,
+   *  so it only means "unhydrated shell" WHEN the page is also thin. Retrieve-only (computed from
+   *  render.html); the drive path never reaches the content arm that reads it. */
+  frameworkRoot?: boolean;
+  /** A GENUINE (non-guard) subresource request failed during the render — {@link genuineNetworkFailure},
+   *  which excludes the allowlist guard's own `ERR_BLOCKED_BY_CLIENT` aborts. Retrieve-only. */
+  networkFailed?: boolean;
+}
+
+/**
+ * Whether the render saw a GENUINE network failure — a data/asset request that failed for a reason OTHER
+ * than the gateway's own navigation guard (issue #41). The allowlist guard aborts every off-allowlist
+ * subresource via `Fetch.failRequest{BlockedByClient}`, surfaced by Chrome as `net::ERR_BLOCKED_BY_CLIENT`
+ * in the `requestfailed` evidence line — so a raw `networkFailures.length > 0` is near-always TRUE on real
+ * pages (analytics/ads/fonts off-allowlist) and would collapse the `hydration-failed` gate. The gateway is
+ * the ONLY client-blocker, so filtering that exact code leaves the genuine failures (ERR_FAILED /
+ * ERR_CONNECTION_* / ERR_TIMED_OUT / ERR_NAME_NOT_RESOLVED / ERR_ABORTED) that actually imply a broken load.
+ */
+export function genuineNetworkFailure(networkFailures: readonly string[] | undefined): boolean {
+  return (networkFailures ?? []).some((line) => !/ERR_BLOCKED_BY_CLIENT/i.test(line));
+}
+
+/**
+ * Classify WHY a call FAILED into a {@link FailureClass} (issue #41) — a classifier LAYERED on top of the
+ * block classifier: the block/nav layer ({@link resolveBlockReason}) is authoritative for WHO blocked, and
+ * the reason===null arm sub-classifies a 2xx/3xx page that produced no extractable content into the
+ * hard-to-distinguish 200-states. Called ONLY on an already-FAILED call (retrieve's empty-markdown/blocked
+ * gate, or a thrown drive failure), so it never returns `ok`/`burned-exit`/`timeout` (those are reserved).
+ *
+ * Precedence (most-actionable first): the block/nav classes come straight off resolveBlockReason. In the
+ * reason===null arm, `unsupported-browser` is checked BEFORE the thin gate (a definitive interstitial phrase
+ * is meaningful even on a fat wrapper); then a fat-innerText-but-unextractable page is `empty-shell`; then,
+ * THIN-only, an explicit empty-state marker is `real-zero-results`, an ACTIVE captcha widget is a `captcha`
+ * shell (rendered evidence — the #40 machinery, safe on a thin page), a framework root + a genuine failed
+ * data call is `hydration-failed`, and the remaining thin page is `empty-shell` (the formalized
+ * `empty-content`). NOTE: a persistent DataDome/PX marker is DELIBERATELY NOT used here — it survives a
+ * cleared challenge, so keying on it would re-open the #40 persistent-marker false-positive (a thin
+ * DataDome-protected page that merely failed extraction is `empty-shell`, not a fabricated block). A
+ * rendered-evidence DataDome-challenge detector is a follow-up gated on a captured fixture.
+ */
+export function classifyFailure(sig: FailureSignal): FailureClass {
+  const reason = resolveBlockReason(sig);
+  if (reason === "nav-failed") return "nav-failed";
+  if (reason === "captcha") return "captcha";
+  if (reason === "cf-challenge" || reason === "perimeterx-challenge" || reason === "datadome-challenge") {
+    return "anti-bot-block";
+  }
+  if (reason === "hard-block") return "hard-block";
+  if (reason === "blocked") return "anti-bot-block"; // a generic visible block phrase, no attributable vendor
+  // reason === null: a 2xx/3xx page, no visible block phrase, not a hard block, that still yielded no
+  // extractable content (retrieve's empty-markdown arm). Sub-classify the 200-state.
+  if (hasUnsupportedBrowserPhrase(sig)) return "unsupported-browser"; // definitive; meaningful even when fat
+  const thin = sig.text.trim().length < MIN_CONTENT_LENGTH;
+  if (!thin) return "empty-shell"; // fat innerText but unextractable — no more specific label fits
+  if (hasEmptyStateMarker(sig)) return "real-zero-results"; // a genuine thin "no results" state
+  if (sig.captchaKind && sig.captchaKind !== "unknown") return "captcha"; // a thin ACTIVE-widget shell (rendered evidence)
+  if (sig.frameworkRoot && sig.networkFailed) return "hydration-failed"; // shell present + a genuine failed load
+  return "empty-shell"; // the formalized empty-content (an unhydrated shell or a genuinely empty page)
+}
+
+/**
+ * Project a {@link FailureClass} onto a {@link WafVendor} (issue #41) — vendor stays a PROJECTION of the
+ * classification, never a parallel classifier (the #40 doctrine), so vendor and class can't disagree. For
+ * `captcha` the vendor is the active widget kind; for `anti-bot-block` it is whatever
+ * {@link wafVendorFromReason} attributes off the (necessarily non-null) block reason — anti-bot-block is
+ * only produced from a real block reason (cf/px/datadome/blocked), so a persistent-marker guess is never
+ * needed (deliberately: that would re-open the #40 false-positive). Every other class → no vendor.
+ */
+export function wafVendorFromFailure(fc: FailureClass, sig: FailureSignal): WafVendor | undefined {
+  switch (fc) {
+    case "captcha":
+      return sig.captchaKind && sig.captchaKind !== "unknown" ? sig.captchaKind : undefined;
+    case "anti-bot-block":
+      return wafVendorFromReason(resolveBlockReason(sig), sig.captchaKind);
+    default:
       return undefined;
   }
 }
@@ -575,6 +666,27 @@ export async function retrieve(
     isPerimeterXChallenge(render, pxHint) ||
     (pxHint && pxCopy) ||
     isHardBlock(render, render.status);
+  // SPA framework mount root present + a GENUINE (non-guard) failed subresource load — the two
+  // retrieve-only content signals that separate the reason===null 200-states (issue #41: empty-shell vs
+  // hydration-failed). frameworkRoot is NEVER a `blocked` input (true on a hydrated page too); networkFailed
+  // excludes the allowlist guard's own ERR_BLOCKED_BY_CLIENT aborts so it isn't near-always-true.
+  const frameworkRoot = hasFrameworkRoot(render.html);
+  const networkFailed = genuineNetworkFailure(render.diagnostics?.networkFailures);
+  // The single classification signal shared by the block reason, the failure class, and the escalation
+  // diagnostics, so they can't drift (the detection-parity invariant, extended for #41 with the two
+  // content signals; resolveBlockReason/classifyBlock read only the BlockSignal subset and ignore them).
+  const signal: FailureSignal = {
+    title: render.title,
+    text: render.text,
+    status: render.status,
+    cfHint,
+    pxHint,
+    ddHint,
+    pxCopy,
+    captchaKind,
+    frameworkRoot,
+    networkFailed,
+  };
   // Diagnostic reason for the block: nav-failed (off-allowlist/unreachable) first, then the shared
   // resolveBlockReason — a SPECIFIC WAF vendor (cf/px/datadome) wins, and an interactive CAPTCHA
   // attributes only when the block is otherwise generic (so a WAF page that merely preloads a captcha
@@ -584,7 +696,7 @@ export async function retrieve(
     ? null
     : render.status === null
       ? "nav-failed"
-      : resolveBlockReason({ title: render.title, text: render.text, status: render.status, cfHint, pxHint, ddHint, pxCopy, captchaKind });
+      : resolveBlockReason(signal);
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
   const proxyDiagnostic = proxyUsed
@@ -593,16 +705,7 @@ export async function retrieve(
         proxyApplied: true,
         forced,
         attempts: proxyAttempts,
-        last: {
-          title: render.title,
-          text: render.text,
-          status: render.status,
-          cfHint,
-          pxHint,
-          ddHint,
-          pxCopy,
-          captchaKind,
-        },
+        last: signal,
       })
     : undefined;
   // Failure-evidence envelope (issue #39): surface it on ANY retrieve failure (blocked, empty-content,
@@ -612,16 +715,21 @@ export async function retrieve(
   // `render.diagnostics` (finalUrl = the post-redirect page.url(), the retrieve URL-bug fix). A successful
   // retrieve carries no envelope, so its shape is unchanged.
   const failed = isRetrieveFailure({ blocked, markdown: extraction.markdown, status: render.status });
-  // Mitigation/CAPTCHA vendor (issue #40): a PROJECTION of the already-computed `reason` (never a second
-  // classifier), so vendor and reason can't disagree. Attached to the #39 envelope at THIS redaction seam
-  // — not via buildFailureDiagnostics in the core — because it is a hint-derived slot and the drive core
-  // assembles its envelope without HTML (parity with how cfHint/pxHint attach post-assembly). `wafVendor`
-  // is a closed vocabulary, so it passes redactFailureDiagnostics untouched and carries no secret. Absent
-  // when unattributed (a nav-failed/hard-block), keeping the #39 nav-failed gate green.
-  const wafVendor = wafVendorFromReason(reason, captchaKind);
+  // Failure CLASS (issue #41) + mitigation/CAPTCHA vendor (issue #40), both a PROJECTION of the same
+  // classification (never a parallel classifier), so class and vendor can't disagree. classifyFailure
+  // layers on resolveBlockReason: the block/nav classes come off it, and its reason===null arm
+  // sub-classifies the 200-states (empty-shell / hydration-failed / real-zero-results / unsupported-browser)
+  // — formalizing the old MCP-layer `empty-content` fallback into the typed enum. Computed only on a
+  // FAILURE, so the success shape is unchanged; attached at THIS redaction seam (like wafVendor), not via
+  // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
+  const failureClass: FailureClass | undefined = failed ? classifyFailure(signal) : undefined;
+  const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
   const diagnostics =
     failed && render.diagnostics
-      ? redactFailureDiagnostics(wafVendor ? { ...render.diagnostics, wafVendor } : render.diagnostics, secrets)
+      ? redactFailureDiagnostics(
+          { ...render.diagnostics, ...(failureClass ? { failureClass } : {}), ...(wafVendor ? { wafVendor } : {}) },
+          secrets,
+        )
       : undefined;
   return {
     url,

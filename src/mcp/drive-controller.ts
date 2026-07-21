@@ -23,7 +23,8 @@ import {
   proxyFromSecrets,
   escalationDiagnostics,
   resolveBlockReason,
-  wafVendorFromReason,
+  classifyFailure,
+  wafVendorFromFailure,
   EscalationError,
   hostForcesProxy,
   classifyExitOrg,
@@ -189,21 +190,30 @@ export class GatewayDriveController implements DriveController {
    * cookie/authorization stripped) since the core built the RAW envelope; undefined when the snapshot
    * carried none. The SINGLE place drive failures pull the envelope, so the redaction can't be skipped.
    *
-   * Also attaches the mitigation vendor (issue #40): a PROJECTION of the shared {@link resolveBlockReason}
-   * via {@link wafVendorFromReason} (never a second classifier — so vendor and reason can't disagree), at
-   * parity with retrieve's redact seam. A specific WAF vendor (cf/px/datadome) wins; a bare
-   * reCAPTCHA/hCaptcha/Turnstile page (generic block + a detected widget kind) attributes the widget kind.
-   * `wafVendor` is a closed vocabulary → passes redaction untouched; absent when unattributable. NOTE a
-   * pure `snapshot()` (post-action) carries none of these hints, so a mid-flow action landing on a
-   * challenge inherits the #39 no-hints gap (navigate-failures carry the vendor; action-failures do not —
-   * tracked as a follow-up to compute hints in the core #snapshotOf).
+   * Also attaches the failure CLASS (issue #41) and the mitigation vendor (issue #40) — both a PROJECTION
+   * of the shared classification (never a second classifier), so class, vendor, and the
+   * escalation-diagnostics reason can't disagree (codex #40 r3). Gated on navigate EVIDENCE
+   * (resolveBlockReason non-null OR a failed nav, status===null): a bare post-action `snapshot()` of a
+   * healthy page (an action that threw on a stale ref / locator timeout) has reason===null and a fat tree,
+   * so classifyFailure's reason===null arm would emit a confidently-WRONG `empty-shell` — leave both the
+   * class and the vendor UNSET there (mirroring the #40 no-hints gap). The content-family classes
+   * (empty-shell / hydration-failed / real-zero-results / unsupported-browser) are a RETRIEVE-path concern:
+   * on the interactive drive path a thin-200 shell is a returnable snapshot, never auto-failed, so this
+   * only ever attaches the block/nav subset {anti-bot-block, captcha, hard-block, nav-failed}. Both are
+   * closed vocabularies → pass redaction untouched.
    */
   #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
     if (!snap?.diagnostics) return undefined;
-    // #signalOf carries captchaKind, so resolveBlockReason and #escalationDiag (which also runs it) agree
-    // on one reason — the failure vendor and the escalation-diagnostics reason can't disagree (codex r3).
-    const wafVendor = wafVendorFromReason(resolveBlockReason(this.#signalOf(snap)), snap.captchaKind);
-    const diag = wafVendor ? { ...snap.diagnostics, wafVendor } : snap.diagnostics;
+    // #signalOf carries captchaKind, so resolveBlockReason here and in #escalationDiag agree on one reason.
+    const signal = this.#signalOf(snap);
+    const reason = resolveBlockReason(signal);
+    const failureClass = reason !== null || signal.status === null ? classifyFailure(signal) : undefined;
+    const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+    const diag: FailureDiagnostics = {
+      ...snap.diagnostics,
+      ...(failureClass ? { failureClass } : {}),
+      ...(wafVendor ? { wafVendor } : {}),
+    };
     return redactFailureDiagnostics(diag, this.#secrets);
   }
 

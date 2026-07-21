@@ -42,6 +42,46 @@ export type WafVendor =
   | "turnstile";
 
 /**
+ * The typed failure CLASS attributed to a failed retrieve/drive call (issue #41) — a CLOSED vocabulary,
+ * defined here (not in a verb) for the same reason as {@link WafVendor}: so the
+ * {@link FailureDiagnostics.failureClass} slot is TYPED to it and {@link redactFailureDiagnostics} can pass
+ * it through UNTOUCHED (the value can never be page-derived free text — the type is the enforcement). The
+ * classifier that PRODUCES it is layered on top of the block classifier and lives with it:
+ * {@link import("../verbs/retrieve.js").classifyFailure}. Values:
+ *   - `anti-bot-block`  a visible/vendor-attributed WAF challenge or a generic visible block phrase
+ *                       (carries {@link WafVendor} when attributable).
+ *   - `captcha`         an ACTIVE interactive CAPTCHA widget is the block (carries the widget-kind vendor).
+ *   - `hard-block`      4xx/5xx + thin body, no vendor marker (IP/WAF reputation).
+ *   - `empty-shell`     a 2xx/3xx page that yielded NO extractable content — the formalized `empty-content`
+ *                       (an unhydrated SPA shell or a genuinely empty page). The common non-block failure.
+ *   - `hydration-failed` a 2xx/3xx thin page with an SPA framework root AND a genuine (non-guard) failed
+ *                       data/asset request — best-effort; distinguishes a broken hydration from a quiet shell.
+ *   - `real-zero-results` a genuine site-reported empty-state ("no results") — distinguished from a
+ *                       block/shell, but STILL a no-content failure (isError:true), not a success.
+ *   - `unsupported-browser` an unsupported-browser interstitial phrase.
+ *   - `nav-failed`      no response captured (status===null) — off-allowlist/unreachable.
+ *   - `burned-exit`     RESERVED for #45 (not produced by the #41 classifier).
+ *   - `timeout`         RESERVED for #43 (not produced by the #41 classifier).
+ *   - `ok`              RESERVED — the #41 classifier only runs on FAILURES, so it never returns this;
+ *                       held for a future success/home-fallback annotation.
+ * On the RETRIEVE (outcome) path the classifier can produce the full vocabulary; on the interactive DRIVE
+ * path a thin-200 shell is a returnable snapshot (never auto-failed), so drive emits only the block/nav
+ * subset {anti-bot-block, captcha, hard-block, nav-failed} (issue #41; see classifyFailure's callers).
+ */
+export type FailureClass =
+  | "anti-bot-block"
+  | "captcha"
+  | "hard-block"
+  | "empty-shell"
+  | "hydration-failed"
+  | "real-zero-results"
+  | "unsupported-browser"
+  | "nav-failed"
+  | "burned-exit"
+  | "timeout"
+  | "ok";
+
+/**
  * The evidence envelope surfaced on EVERY failure of both the retrieve and drive paths, at parity.
  * All fields optional so a success shape is unchanged and a partial capture still carries what it has.
  */
@@ -71,8 +111,11 @@ export interface FailureDiagnostics {
    *  hint-derived slot and the drive envelope is assembled without HTML, so — like cfHint/pxHint — the
    *  vendor is resolved post-assembly at the surface. */
   wafVendor?: WafVendor;
-  /** Slot for #41 (failure-class enum). Do NOT populate here. */
-  failureClass?: string;
+  /** #41 failure CLASS — the {@link FailureClass} CLOSED vocabulary (the TYPE is the safety enforcement,
+   *  like {@link wafVendor}: {@link redactFailureDiagnostics} passes it through UNTOUCHED, safe only
+   *  because it can never be page-derived free text). Attached at the REDACTION seam (retrieve.ts / drive
+   *  #failure), NOT via {@link buildFailureDiagnostics} — same as the vendor label. */
+  failureClass?: FailureClass;
   /** Slot for #42 (per-stage timing). Do NOT populate here. */
   timing?: Record<string, number>;
   /** Slot for #44 (why a CAPTCHA solve was/wasn't attempted). Do NOT populate here. */

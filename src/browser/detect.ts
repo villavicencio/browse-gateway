@@ -90,6 +90,63 @@ export const VENDOR_SCRIPT_HINTS: readonly RegExp[] = [
   ...DD_VENDOR_HINTS,
 ];
 
+/**
+ * Empty-state markers (issue #41) — visible copy a page renders when a query/list genuinely has NO
+ * results ("no results", "0 results", "nothing found"). Matched against the visible TITLE + TEXT only
+ * (the detect.ts rule — never raw HTML), like {@link BLOCK_PHRASES}. Used ONLY to sub-classify an
+ * ALREADY-FAILED, thin, non-blocked page (the {@link import("../verbs/retrieve.js").classifyFailure}
+ * reason===null arm) into `real-zero-results` vs an unhydrated `empty-shell` — NEVER a `blocked` input, so
+ * an incidental "no results" phrase can't flip a page to blocked. Phrases are bounded (no unbounded `.*`)
+ * and gated thin-only at the call site, so filter/autocomplete "no results" hints on a FAT working page
+ * never reach them. A genuine zero-results page that renders its copy as body TEXT extracts to non-empty
+ * markdown and is returned as content (the correct outcome); this fires on the empty-markdown slice where
+ * the "no results" signal is in the title / non-extractable text.
+ */
+export const EMPTY_STATE_PHRASES: readonly RegExp[] = [
+  /\bno results?\b/i,
+  /\b0 results?\b/i,
+  /\bno (?:matches|matching)\b/i,
+  /\bno (?:items?|products?|listings?|records?)\s+(?:found|match|to show)\b/i,
+  /\bnothing (?:found|to (?:show|display))\b/i,
+  /\bwe (?:could ?n[o']t|did ?n[o']t) find any\b/i,
+  /\byour search .{0,40}?returned no\b/i,
+  /\bthere are no .{0,30}?(?:to (?:display|show)|available|found)\b/i,
+];
+
+/**
+ * Unsupported-browser interstitial phrases (issue #41) — a page that refuses to render because it does
+ * not support the browser ("your browser is not supported", "please update your browser"). Visible
+ * TITLE + TEXT only. Distinct from an anti-bot "enable JavaScript" block (a {@link BLOCK_PHRASES} entry,
+ * classified upstream as a block) — this is a site COMPATIBILITY interstitial, not a WAF challenge.
+ * Tight, interstitial-specific phrasings so an in-page "for the best experience, update your browser"
+ * footer note on a real (fat) page is unlikely to match; the call site also gates on an already-failed
+ * (empty-markdown) call. Diagnostic label only.
+ */
+export const UNSUPPORTED_BROWSER_PHRASES: readonly RegExp[] = [
+  /\b(?:un|not )supported browser\b/i,
+  /\bbrowser (?:is )?(?:not supported|unsupported|out of date|no longer supported)\b/i,
+  /\byour browser is (?:out of date|no longer supported|not supported|too old)\b/i,
+  /\bthis browser is (?:not supported|no longer supported)\b/i,
+  /\b(?:please )?(?:update|upgrade) your browser\b/i,
+  /\b(?:use|switch to) a (?:modern|different|supported|newer) browser\b/i,
+];
+
+/**
+ * SPA framework mount-root markers (issue #41) — the empty `<div id="root">` / `id="app"` / `id="__next"`
+ * an SPA hydrates INTO. The ONE raw-HTML detector in this module, deliberately exempt from the "never
+ * match HTML" rule because it is NEVER a `blocked`/challenge input (it is TRUE on a fully-hydrated page
+ * too, since the root is always present): it only sub-classifies an ALREADY-thin, already-failed,
+ * non-blocked page — combined with thin content it means "shell present, no content rendered", and with a
+ * genuine failed data call it means `hydration-failed` vs a quiet `empty-shell`. Matched as a whole
+ * id/attribute TOKEN so `id="root"` matches but `id="rootLayout"` does not.
+ */
+export const FRAMEWORK_ROOT_HINTS: readonly RegExp[] = [
+  /\bid=["'](?:root|app|__next|__nuxt|___gatsby|svelte|q-app)["']/i,
+  /\bid=["']gatsby-focus-wrapper["']/i,
+  /\bdata-reactroot\b/i,
+  /\bng-version=/i,
+];
+
 /** The page fields detection inspects. */
 export interface PageSignal {
   title: string;
@@ -186,6 +243,37 @@ export function hasPerimeterXHint(html: string): boolean {
  */
 export function hasDataDomeHint(html: string): boolean {
   return DD_VENDOR_HINTS.some((re) => re.test(html));
+}
+
+/**
+ * True when a genuine empty-state marker ({@link EMPTY_STATE_PHRASES}) is present in the visible title or
+ * text (issue #41) — the discriminator between a `real-zero-results` page and an unhydrated `empty-shell`.
+ * Text-only (never HTML); the caller gates it thin-only so a filter/autocomplete "no results" hint on a
+ * fat working page can't reach it, and it is NEVER a `blocked` input.
+ */
+export function hasEmptyStateMarker(signal: Pick<PageSignal, "title" | "text">): boolean {
+  const haystack = `${signal.title}\n${signal.text}`;
+  return EMPTY_STATE_PHRASES.some((re) => re.test(haystack));
+}
+
+/**
+ * True when an unsupported-browser interstitial phrase ({@link UNSUPPORTED_BROWSER_PHRASES}) is present in
+ * the visible title or text (issue #41). Text-only. Distinct from an anti-bot block (classified upstream);
+ * a diagnostic label for a site COMPATIBILITY interstitial, never a `blocked` input.
+ */
+export function hasUnsupportedBrowserPhrase(signal: Pick<PageSignal, "title" | "text">): boolean {
+  const haystack = `${signal.title}\n${signal.text}`;
+  return UNSUPPORTED_BROWSER_PHRASES.some((re) => re.test(haystack));
+}
+
+/**
+ * True when the HTML carries an SPA framework mount-root marker ({@link FRAMEWORK_ROOT_HINTS}) — issue #41.
+ * The ONE raw-HTML detector here; safe because it is NEVER a `blocked` input (true on a hydrated page too),
+ * only a sub-classifier of an already-thin, already-failed, non-blocked page: thin + framework-root means
+ * "shell present, no content", and + a genuine failed data call means `hydration-failed`.
+ */
+export function hasFrameworkRoot(html: string): boolean {
+  return FRAMEWORK_ROOT_HINTS.some((re) => re.test(html));
 }
 
 /**

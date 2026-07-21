@@ -71,10 +71,11 @@ try {
   if (r.diagnostics) {
     check("envelope carries a finalUrl", typeof r.diagnostics.finalUrl === "string" && r.diagnostics.finalUrl.length > 0);
     check("envelope carries the (null) status field", "status" in r.diagnostics);
-    // A failed nav has no attributable vendor — #40 must fabricate none (the load-bearing rule that keeps
-    // this assertion true). failureClass/timing remain unset (their tickets aren't landed).
-    check("nav-failed fabricates NO wafVendor (#40) and leaves failureClass/timing unset",
-      r.diagnostics.wafVendor === undefined && r.diagnostics.failureClass === undefined && r.diagnostics.timing === undefined);
+    // A failed nav has no attributable vendor — #40 must fabricate none (the load-bearing rule). #41 now
+    // lands the failure CLASS: an off-allowlist nav is classified `nav-failed` (a real class, not a
+    // fabricated vendor). wafVendor stays undefined (nav-failed has none) and timing is unset (#42 unlanded).
+    check("nav-failed is classified failureClass='nav-failed' with NO wafVendor (#40/#41) and timing unset",
+      r.diagnostics.failureClass === "nav-failed" && r.diagnostics.wafVendor === undefined && r.diagnostics.timing === undefined);
     check("envelope is secret-free (no cookie/authorization value leaked)",
       !/set-cookie:\s*\S/i.test(JSON.stringify(r.diagnostics)) && !/authorization:\s*\S/i.test(JSON.stringify(r.diagnostics)));
   }
@@ -126,9 +127,18 @@ try {
     if (env) {
       check("a CF block throws with a populated failure envelope", typeof env.finalUrl === "string" && "status" in env);
       // #40: a CF challenge names cloudflare; a bare IP-reputation hard-block has no vendor marker → undefined.
-      console.log(`  drive(cf) blocked: wafVendor=${env.wafVendor}`);
-      if (env.wafVendor !== undefined) check("a CF block attributes wafVendor=cloudflare (#40)", env.wafVendor === "cloudflare");
-      else note("CF block had no vendor marker (likely a bare IP-reputation hard-block) — wafVendor correctly undefined");
+      console.log(`  drive(cf) blocked: wafVendor=${env.wafVendor} failureClass=${env.failureClass}`);
+      if (env.wafVendor !== undefined) {
+        check("a CF block attributes wafVendor=cloudflare (#40)", env.wafVendor === "cloudflare");
+        // #41: class and vendor are one projection — a cloudflare vendor MUST ride an anti-bot-block class.
+        check("a CF block is classified failureClass='anti-bot-block' (#41, class↔vendor agree on live evidence)",
+          env.failureClass === "anti-bot-block");
+      } else {
+        note("CF block had no vendor marker (likely a bare IP-reputation hard-block) — wafVendor correctly undefined");
+        // A bare hard-block still gets a class (hard-block / nav-failed), never the reason===null content family.
+        check("a CF hard/nav block carries a block/nav failureClass (#41), never a content-family class",
+          ["hard-block", "nav-failed", "anti-bot-block", "captcha"].includes(env.failureClass));
+      }
     } else {
       note(`CF check skipped (${CF_TARGET}): ${err instanceof Error ? err.message.split("\n")[0] : String(err)} — likely IP reputation on a direct session`);
     }

@@ -73,9 +73,20 @@ test("failed navigation (null status + thin content) surfaces a clean error, not
   assert.match(res.content[0].text, /Could not retrieve/i);
 });
 
-test("empty extraction (real status, no markdown, not blocked) names reason=empty-content", async () => {
-  // The page rendered with a real status but Readability produced nothing — not a block, but still
-  // an error. Exercises server.ts's `why = result.reason ?? "empty-content"` fallback.
+test("empty extraction with a typed failure class names reason=<failureClass> (#41 formalizes empty-content)", async () => {
+  // The real retrieve path ALWAYS attaches a #39 envelope on a failure and #41 always sets a failureClass,
+  // so a non-blocked empty-markdown 200 surfaces the typed class (here empty-shell) via
+  // `why = result.reason ?? result.diagnostics?.failureClass ?? "empty-content"` — not the opaque literal.
+  const client = await connect(async () =>
+    outcome({ status: 200, markdown: "", blocked: false, reason: null, diagnostics: { failureClass: "empty-shell", finalUrl: "https://empty.example/", status: 200 } }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://empty.example/" } });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /reason=empty-shell/);
+});
+
+test("empty extraction with NO envelope falls back to reason=empty-content (defensive last resort)", async () => {
+  // The bare literal remains only for an outcome that carries no #39 envelope at all (production-unreachable
+  // on the real retrieve path, where render() always builds one) — the last leg of the fallback chain.
   const client = await connect(async () => outcome({ status: 200, markdown: "", blocked: false, reason: null }));
   const res = await client.callTool({ name: "retrieve", arguments: { url: "https://empty.example/" } });
   assert.equal(res.isError, true);

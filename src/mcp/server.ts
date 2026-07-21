@@ -116,7 +116,12 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           // Surface WHY, plus whether escalation engaged, so a failure is diagnosable instead of a
           // silent "blocked". `captcha` is the actionable one — it means an interactive challenge
           // with no solver wired (v1), which no proxy can clear.
-          const why = result.reason ?? "empty-content";
+          // Prefer the block `reason`; else the typed failure CLASS from the #39 envelope (#41 — this
+          // formalizes the old `empty-content` literal into the enum: on a non-blocked empty/thin failure
+          // the real retrieve path always attaches a failureClass, so a reader sees empty-shell /
+          // hydration-failed / real-zero-results / unsupported-browser instead of an opaque `empty-content`).
+          // The literal remains only as a defensive last resort (an outcome carrying no envelope at all).
+          const why = result.reason ?? result.diagnostics?.failureClass ?? "empty-content";
           const hint = result.reason === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
           const diag = result.proxyDiagnostic ? `\ndiagnostics: ${JSON.stringify(result.proxyDiagnostic)}` : "";
           // Surface the failure-evidence envelope (issue #39) — finalUrl / title / status / redirect chain /
