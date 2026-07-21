@@ -467,6 +467,22 @@ test("retrieve: a DataDome page that ALSO preloads a reCAPTCHA library stays dat
   assert.equal(r.diagnostics?.wafVendor, "datadome");
 });
 
+test("retrieve: a generic block that merely LOADS a reCAPTCHA library (no widget/sitekey) is NOT labeled captcha (codex #40 r3)", async () => {
+  // No CF/PX/DD marker and no active widget — just the library script. captchaKind requires a sitekey'd
+  // container, so this stays a hard-block with no fabricated captcha vendor.
+  const libOnly = renderOf({
+    status: 403,
+    title: "",
+    text: "Forbidden",
+    html: "<script src='https://www.google.com/recaptcha/api.js'></script>",
+    diagnostics: { finalUrl: "https://x.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([libOnly]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://x.example/" });
+  assert.equal(r.reason, "hard-block", "a loaded library must not promote a generic block to captcha");
+  assert.equal(r.diagnostics?.wafVendor, undefined, "no captcha vendor fabricated from a library load");
+});
+
 test("retrieve: a reCAPTCHA block surfaces the CAPTCHA kind as wafVendor (reason=captcha)", async () => {
   const rc = renderOf({
     status: 403,

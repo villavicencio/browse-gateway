@@ -852,13 +852,15 @@ export class PatchrightBrowserCore implements BrowserCore {
     // with retrieve). Computed only here in navigate() (not in a pure snapshot()) — the drive surface has
     // no HTML otherwise; detectCaptcha reuses the html already captured, no extra page call.
     const html = String(await page.content().catch(() => ""));
+    // Only an ACTIVE widget (a `data-sitekey` container) counts — detectCaptcha also matches a merely-
+    // loaded captcha library, which must not mislabel a WAF block's vendor (codex #40 r3).
     const captcha = detectCaptcha({ title: "", text: "", html }, url);
     return {
       ...(await this.#snapshotOf(page)),
       cfHint: hasCloudflareHint(html),
       pxHint: hasPerimeterXHint(html),
       ddHint: hasDataDomeHint(html),
-      ...(captcha ? { captchaKind: captcha.kind } : {}),
+      ...(captcha?.siteKey ? { captchaKind: captcha.kind } : {}),
     };
   }
 

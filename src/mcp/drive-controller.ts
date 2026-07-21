@@ -156,6 +156,7 @@ export class GatewayDriveController implements DriveController {
       cfHint: snap.cfHint,
       pxHint: snap.pxHint,
       ddHint: snap.ddHint,
+      captchaKind: snap.captchaKind,
     };
   }
 
@@ -199,7 +200,9 @@ export class GatewayDriveController implements DriveController {
    */
   #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
     if (!snap?.diagnostics) return undefined;
-    const wafVendor = wafVendorFromReason(resolveBlockReason(this.#signalOf(snap), snap.captchaKind), snap.captchaKind);
+    // #signalOf carries captchaKind, so resolveBlockReason and #escalationDiag (which also runs it) agree
+    // on one reason — the failure vendor and the escalation-diagnostics reason can't disagree (codex r3).
+    const wafVendor = wafVendorFromReason(resolveBlockReason(this.#signalOf(snap)), snap.captchaKind);
     const diag = wafVendor ? { ...snap.diagnostics, wafVendor } : snap.diagnostics;
     return redactFailureDiagnostics(diag, this.#secrets);
   }
