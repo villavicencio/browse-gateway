@@ -761,9 +761,9 @@ export class GatewayDriveController implements DriveController {
       const snap = await this.#run((s) =>
         s.core.navigate(url, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
       );
-      attemptMs.push(performance.now() - attempt0);
       if (!navFailed(snap)) {
         this.#pinned = true;
+        attemptMs.push(performance.now() - attempt0); // the winning attempt has no teardown (it is pinned, not closed)
         // #42 SCOPED FOLLOW-UP: on a SUCCESS-after-retries the collected attemptMs is dropped — a drive
         // SUCCESS returns a bare PageSnapshot with no escalation-diagnostics channel (drive surfaces those
         // only on the EscalationError FAILURE, a pre-#42 asymmetry vs retrieve's result-level proxyDiagnostic).
@@ -773,6 +773,10 @@ export class GatewayDriveController implements DriveController {
       }
       last = snap;
       await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
+      // #42: record AFTER teardown so a FAILED attempt's session close (grace + kill-confirm, up to ~15s of
+      // caller-visible latency) counts toward its attemptMs — else ~45s of three wedged teardowns would sit in
+      // totalMs but in no attemptMs entry. Exactly one push per iteration keeps attemptMs 1:1 with `attempts`.
+      attemptMs.push(performance.now() - attempt0);
     }
     const exitCheck = this.#verifyEgressEnabled ? await this.#verifyEgress() : undefined;
     const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, attemptMs, exitCheck });

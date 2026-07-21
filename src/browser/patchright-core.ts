@@ -734,6 +734,10 @@ export class PatchrightBrowserCore implements BrowserCore {
       // #42: clearanceWaitedMs (the sleep-interval counter) stays a first-class field for the stealth
       // kill-gate; timing.clearancePollMs is the accurate wall-clock (>= clearanceWaitedMs). The retrieve
       // verb overwrites totalMs with the whole-call wall-clock and folds this Timing into the failure envelope.
+      // SCOPED: this totalMs is the render BODY wall-clock and excludes the finally's awaited page.close()
+      // (computed in the return expression, before finally runs). The retrieve whole-call totalMs — which is
+      // what callers surface — DOES include that close (its t0 spans withConsumerSession); only a direct
+      // BrowserCore.render() caller reading this intermediate value sees the body-only total.
       const timing = assembleTiming({
         totalMs: performance.now() - t0,
         domContentLoadedMs,
