@@ -40,6 +40,7 @@ export {
   hasCloudflareHint,
   isPerimeterXVisible,
   hasPerimeterXHint,
+  hasDataDomeHint,
   isPerimeterXChallenge,
   hasPerimeterXChallengeCopy,
   isHardBlock,
@@ -51,6 +52,7 @@ export {
   VENDOR_SCRIPT_HINTS,
   CF_VENDOR_HINTS,
   PX_VENDOR_HINTS,
+  DD_VENDOR_HINTS,
   MIN_CONTENT_LENGTH,
   STRONG_CONTENT_LENGTH,
   type Assessment,
@@ -69,6 +71,7 @@ export {
 } from "./launch-options.js";
 export {
   detectCaptcha,
+  activeCaptchaKind,
   NullCaptchaSolver,
   liveCaptchaToChallenge,
   liveCaptchaPendingRender,

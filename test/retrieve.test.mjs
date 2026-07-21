@@ -111,6 +111,13 @@ test("detectCaptcha: recognizes recaptcha/hcaptcha/turnstile + sitekey, else nul
   assert.equal(rc?.siteKey, "sk-abc");
   assert.equal(detectCaptcha({ title: "", text: "", html: '<div class="cf-turnstile"></div>' }, "u")?.kind, "turnstile");
   assert.equal(detectCaptcha({ title: "", text: "", html: "<main>no captcha here</main>" }, "u"), null);
+  // A CF MANAGED challenge ("Just a moment") loads the challenge-platform script, NOT a Turnstile widget —
+  // detectCaptcha must return null so its reason stays cf-challenge (→ wafVendor cloudflare), not captcha
+  // (→ turnstile). This locks the captcha-vs-cf boundary the #40 vendor projection relies on.
+  assert.equal(
+    detectCaptcha({ title: "Just a moment...", text: "", html: "<script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script>" }, "u"),
+    null,
+  );
 });
 
 test("proxyFromSecrets: builds config from secrets, undefined when absent", () => {
@@ -425,4 +432,90 @@ test("retrieve: a generic visible block (200, non-CF, non-captcha) reports reaso
   const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://waf.example/" });
   assert.equal(r.blocked, true, "a visible block phrase is blocked even at status 200");
   assert.equal(r.reason, "blocked", "not CF/captcha/hard-block -> generic blocked");
+});
+
+// --- issue #40: mitigation/CAPTCHA vendor on the retrieve failure envelope ---
+
+test("retrieve: a DataDome block reports reason=datadome-challenge and diagnostics.wafVendor=datadome (no longer generic 'blocked')", async () => {
+  const dd = renderOf({
+    status: 403,
+    title: "",
+    text: "Access denied",
+    html: "<script src='https://js.datadome.co/tags.js'></script>",
+    diagnostics: { finalUrl: "https://dd.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([dd]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://dd.example/" });
+  assert.equal(r.blocked, true);
+  assert.equal(r.reason, "datadome-challenge", "DataDome is re-labeled, not left as generic blocked");
+  assert.equal(r.diagnostics?.wafVendor, "datadome", "vendor surfaced on the #39 envelope");
+});
+
+test("retrieve: a DataDome page that ALSO preloads a reCAPTCHA library stays datadome, not recaptcha (codex #40 r2)", async () => {
+  // detectCaptcha matches a merely-loaded captcha library; the DataDome marker must win so the vendor
+  // isn't mislabeled recaptcha. This is the exact over-attribution Codex flagged.
+  const dd = renderOf({
+    status: 403,
+    title: "",
+    text: "Access denied",
+    html: "<script src='https://js.datadome.co/tags.js'></script><script src='https://www.google.com/recaptcha/api.js'></script>",
+    diagnostics: { finalUrl: "https://dd.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([dd]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://dd.example/" });
+  assert.equal(r.reason, "datadome-challenge", "the real WAF vendor wins over an incidental captcha library");
+  assert.equal(r.diagnostics?.wafVendor, "datadome");
+});
+
+test("retrieve: a generic block that merely LOADS a reCAPTCHA library (no widget/sitekey) is NOT labeled captcha (codex #40 r3)", async () => {
+  // No CF/PX/DD marker and no active widget — just the library script. captchaKind requires a sitekey'd
+  // container, so this stays a hard-block with no fabricated captcha vendor.
+  const libOnly = renderOf({
+    status: 403,
+    title: "",
+    text: "Forbidden",
+    html: "<script src='https://www.google.com/recaptcha/api.js'></script>",
+    diagnostics: { finalUrl: "https://x.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([libOnly]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://x.example/" });
+  assert.equal(r.reason, "hard-block", "a loaded library must not promote a generic block to captcha");
+  assert.equal(r.diagnostics?.wafVendor, undefined, "no captcha vendor fabricated from a library load");
+});
+
+test("retrieve: a reCAPTCHA block surfaces the CAPTCHA kind as wafVendor (reason=captcha)", async () => {
+  const rc = renderOf({
+    status: 403,
+    title: "Verify",
+    text: "Please verify you are a human",
+    html: '<div class="g-recaptcha" data-sitekey="sk-1"></div><script src="https://www.google.com/recaptcha/api.js"></script>',
+    diagnostics: { finalUrl: "https://c.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([rc]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://c.example/" });
+  assert.equal(r.reason, "captcha");
+  assert.equal(r.diagnostics?.wafVendor, "recaptcha");
+});
+
+test("retrieve: a CF managed challenge surfaces wafVendor=cloudflare (not turnstile — detectCaptcha misses the challenge-platform)", async () => {
+  const cf = renderOf({
+    status: 403,
+    title: "Just a moment...",
+    text: "Enable JavaScript and cookies to continue",
+    html: "<div class='cf-chl-opt' id='challenge-platform'></div>",
+    diagnostics: { finalUrl: "https://cf.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([cf]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cf.example/" });
+  assert.equal(r.reason, "cf-challenge");
+  assert.equal(r.diagnostics?.wafVendor, "cloudflare");
+});
+
+test("retrieve: a failed nav (null status) carries the envelope but NO wafVendor (unattributed — keeps the #39 gate)", async () => {
+  const navFail = renderOf({ status: null, title: "", text: "", html: "", diagnostics: { finalUrl: "https://x.example/", status: null } });
+  const { gateway } = makeFakeGateway([navFail]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://x.example/" });
+  assert.equal(r.reason, "nav-failed");
+  assert.ok(r.diagnostics, "the failure envelope is still attached");
+  assert.equal(r.diagnostics.wafVendor, undefined, "no vendor is fabricated for a failed nav");
 });

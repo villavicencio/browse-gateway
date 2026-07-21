@@ -23,6 +23,25 @@
 import { redactSecrets } from "../security/secrets.js";
 
 /**
+ * The mitigation/CAPTCHA vendor attributed to a failure (issue #40) — a CLOSED vocabulary. Defined in
+ * this low-level module (not in a verb) precisely so the {@link FailureDiagnostics.wafVendor} slot can be
+ * TYPED to it: {@link redactFailureDiagnostics} passes wafVendor through UNTOUCHED, which is safe ONLY
+ * because the value can never be page-derived free text. The type is the enforcement — a producer cannot
+ * assign an un-redacted string into the slot. `akamai`/`imperva` are reserved for a future HTML detector
+ * (today recognized only as IP-bound cookie names in the vault layer, not surfaced here). The projection
+ * from a block reason lives with the classifier: {@link import("../verbs/retrieve.js").wafVendorFromReason}.
+ */
+export type WafVendor =
+  | "cloudflare"
+  | "perimeterx"
+  | "datadome"
+  | "akamai"
+  | "imperva"
+  | "recaptcha"
+  | "hcaptcha"
+  | "turnstile";
+
+/**
  * The evidence envelope surfaced on EVERY failure of both the retrieve and drive paths, at parity.
  * All fields optional so a success shape is unchanged and a partial capture still carries what it has.
  */
@@ -45,8 +64,13 @@ export interface FailureDiagnostics {
   screenshotRef?: string;
 
   // ---- PRE-DECLARED OPTIONAL SLOTS for downstream tickets (leave UNSET in this ticket) ----
-  /** Slot for #40 (mitigation-vendor label). Do NOT populate here. */
-  wafVendor?: string;
+  /** #40 mitigation/CAPTCHA vendor label — the {@link WafVendor} CLOSED vocabulary (the TYPE is the
+   *  safety enforcement: {@link redactFailureDiagnostics} passes wafVendor through UNTOUCHED, safe only
+   *  because it can never be page-derived free text — the type forbids assigning one). Attached at the
+   *  REDACTION seam (retrieve.ts / drive #failure), NOT via {@link buildFailureDiagnostics}: it is a
+   *  hint-derived slot and the drive envelope is assembled without HTML, so — like cfHint/pxHint — the
+   *  vendor is resolved post-assembly at the surface. */
+  wafVendor?: WafVendor;
   /** Slot for #41 (failure-class enum). Do NOT populate here. */
   failureClass?: string;
   /** Slot for #42 (per-stage timing). Do NOT populate here. */

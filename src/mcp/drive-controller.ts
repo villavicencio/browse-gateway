@@ -22,6 +22,8 @@ import {
   shouldEscalateDrive,
   proxyFromSecrets,
   escalationDiagnostics,
+  resolveBlockReason,
+  wafVendorFromReason,
   EscalationError,
   hostForcesProxy,
   classifyExitOrg,
@@ -29,7 +31,7 @@ import {
   PROXY_OPEN_ATTEMPTS,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
-import type { EscalationDiagnostics, EgressCheck } from "../verbs/index.js";
+import type { EscalationDiagnostics, EgressCheck, BlockSignal } from "../verbs/index.js";
 import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
@@ -141,9 +143,27 @@ export class GatewayDriveController implements DriveController {
   }
 
   /**
+   * The reduced-surface {@link BlockSignal} a drive snapshot presents to the shared classifier: the
+   * accessibility `tree` stands in for visible text, plus the carried cfHint/pxHint/ddHint booleans
+   * (issue #40). The SINGLE builder so escalation diagnostics and the failure-envelope vendor read the
+   * same signal and can't drift from each other (the drive↔retrieve detection-parity invariant).
+   */
+  #signalOf(snap: PageSnapshot): BlockSignal {
+    return {
+      title: snap.title,
+      text: snap.tree,
+      status: snap.status ?? null,
+      cfHint: snap.cfHint,
+      pxHint: snap.pxHint,
+      ddHint: snap.ddHint,
+      captchaKind: snap.captchaKind,
+    };
+  }
+
+  /**
    * Build structured escalation diagnostics from the last failed snapshot, reading proxy-configured
    * straight from the (possibly rotated) secret store. The drive snapshot's accessibility `tree` is
-   * the reduced text surface classification reads; cfHint/pxHint are carried booleans. Secrets-free
+   * the reduced text surface classification reads; cfHint/pxHint/ddHint are carried booleans. Secrets-free
    * by construction (no creds, no proxy host).
    */
   #escalationDiag(opts: {
@@ -158,9 +178,7 @@ export class GatewayDriveController implements DriveController {
       proxyApplied: opts.proxyApplied,
       forced: opts.forced,
       attempts: opts.attempts,
-      last: opts.last
-        ? { title: opts.last.title, text: opts.last.tree, status: opts.last.status ?? null, cfHint: opts.last.cfHint, pxHint: opts.last.pxHint }
-        : null,
+      last: opts.last ? this.#signalOf(opts.last) : null,
       ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
     });
   }
@@ -170,9 +188,23 @@ export class GatewayDriveController implements DriveController {
    * attaching to a thrown failure at parity with retrieve. REDACTS at this seam (secret set scrubbed +
    * cookie/authorization stripped) since the core built the RAW envelope; undefined when the snapshot
    * carried none. The SINGLE place drive failures pull the envelope, so the redaction can't be skipped.
+   *
+   * Also attaches the mitigation vendor (issue #40): a PROJECTION of the shared {@link resolveBlockReason}
+   * via {@link wafVendorFromReason} (never a second classifier — so vendor and reason can't disagree), at
+   * parity with retrieve's redact seam. A specific WAF vendor (cf/px/datadome) wins; a bare
+   * reCAPTCHA/hCaptcha/Turnstile page (generic block + a detected widget kind) attributes the widget kind.
+   * `wafVendor` is a closed vocabulary → passes redaction untouched; absent when unattributable. NOTE a
+   * pure `snapshot()` (post-action) carries none of these hints, so a mid-flow action landing on a
+   * challenge inherits the #39 no-hints gap (navigate-failures carry the vendor; action-failures do not —
+   * tracked as a follow-up to compute hints in the core #snapshotOf).
    */
   #failure(snap?: PageSnapshot): FailureDiagnostics | undefined {
-    return snap?.diagnostics ? redactFailureDiagnostics(snap.diagnostics, this.#secrets) : undefined;
+    if (!snap?.diagnostics) return undefined;
+    // #signalOf carries captchaKind, so resolveBlockReason and #escalationDiag (which also runs it) agree
+    // on one reason — the failure vendor and the escalation-diagnostics reason can't disagree (codex r3).
+    const wafVendor = wafVendorFromReason(resolveBlockReason(this.#signalOf(snap)), snap.captchaKind);
+    const diag = wafVendor ? { ...snap.diagnostics, wafVendor } : snap.diagnostics;
+    return redactFailureDiagnostics(diag, this.#secrets);
   }
 
   /**

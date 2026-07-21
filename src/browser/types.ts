@@ -11,7 +11,7 @@
 /** Which anti-bot family a target exercises — used to gate per-category in the kill-gate. */
 export type Category = "cloudflare" | "datadome";
 
-import type { CaptchaSolver } from "./captcha.js";
+import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
@@ -234,6 +234,21 @@ export interface PageSnapshot {
    * boolean so the drive layer can classify a PerimeterX block without carrying page content.
    */
   pxHint?: boolean;
+  /**
+   * Scrubbed DataDome-hint flag: `true` when the page's HTML carried a DataDome marker (`datadome`,
+   * `captcha-delivery`, `dd_cookie`). The DataDome sibling of {@link cfHint}/{@link pxHint} (issue #40),
+   * surfaced as a boolean so the drive layer can attribute a DataDome block without carrying page
+   * content. Set on `navigate()`; absent on a pure `snapshot()`.
+   */
+  ddHint?: boolean;
+  /**
+   * The interactive CAPTCHA widget kind ({@link CaptchaKind}: recaptcha/hcaptcha/turnstile) detected in
+   * the page HTML at `navigate()`, or absent when none. Carried so the drive failure envelope can
+   * attribute a bare CAPTCHA page's vendor at parity with retrieve (issue #40) — a widget with a visible
+   * verify phrase but no CF/PX/DD marker would otherwise classify as generic `blocked` with no vendor.
+   * Set on `navigate()`; absent on a pure `snapshot()` (so a post-action CAPTCHA is not attributed).
+   */
+  captchaKind?: CaptchaKind;
   /**
    * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
    * bounded console + network / optional screenshot. Assembled by the core on every navigate/snapshot;

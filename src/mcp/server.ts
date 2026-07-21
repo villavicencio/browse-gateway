@@ -62,14 +62,15 @@ export interface GatewayMcpDeps {
 }
 
 /** Render a snapshot for the agent: a url/title header plus the ref-annotated accessibility tree. The
- *  header now surfaces the captured status + CF/PX vendor hints (issue #39 — they were computed on the
- *  snapshot but dropped here); only non-empty signals are shown, so a clean 2xx page with no hints keeps
- *  the original two-line header. */
+ *  header surfaces the captured status + CF/PX/DataDome vendor hints (issue #39/#40 — computed on the
+ *  snapshot but otherwise dropped here); only non-empty signals are shown, so a clean 2xx page with no
+ *  hints keeps the original two-line header. */
 function formatSnapshot(snap: PageSnapshot): string {
   const bits: string[] = [];
   if (snap.status != null) bits.push(`status: ${snap.status}`);
   if (snap.cfHint) bits.push("cfHint: true");
   if (snap.pxHint) bits.push("pxHint: true");
+  if (snap.ddHint) bits.push("ddHint: true");
   const meta = bits.length ? `\n${bits.join("  ")}` : "";
   return `url: ${snap.url}\ntitle: ${snap.title}${meta}\n\n${snap.tree}`;
 }

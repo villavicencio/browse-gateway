@@ -65,18 +65,29 @@ export const PX_VENDOR_HINTS: readonly RegExp[] = [
   /\b_px3\b/i,
 ];
 
+/** DataDome scripts/cookies/hosts in HTML — the captcha-delivery CDN + the `datadome`/`dd_cookie`
+ *  cookie family. The DataDome sibling of {@link CF_VENDOR_HINTS}/{@link PX_VENDOR_HINTS}, so vendor
+ *  attribution reads DataDome off one source of truth. Like the others these PERSIST after a challenge
+ *  clears (see the header) — DIAGNOSTIC/attribution only, never a `blocked` input. */
+export const DD_VENDOR_HINTS: readonly RegExp[] = [
+  /geo\.captcha-delivery\.com/i,
+  /captcha-delivery/i,
+  /datadome/i,
+  // The DataDome cookie identifier as a WHOLE token — bounded so ordinary JS (`addCookie(`, which
+  // contains the substring `ddCookie`) can't set ddHint and mislabel a generic block as DataDome (codex
+  // #40 r6). The underscore is required (the real cookie form), not optional.
+  /\bdd_cookie\b/i,
+];
+
 /**
  * Vendor protection scripts/cookies/hosts that persist in page HTML even AFTER a challenge
  * clears. DIAGNOSTIC ONLY — never used to decide "blocked" (that's what caused false
- * positives). Surfaced for logging/observability and future vendor attribution.
+ * positives). Surfaced for logging/observability and vendor attribution (issue #40).
  */
 export const VENDOR_SCRIPT_HINTS: readonly RegExp[] = [
   ...CF_VENDOR_HINTS,
   ...PX_VENDOR_HINTS,
-  /geo\.captcha-delivery\.com/i,
-  /captcha-delivery/i,
-  /datadome/i,
-  /dd_?cookie/i,
+  ...DD_VENDOR_HINTS,
 ];
 
 /** The page fields detection inspects. */
@@ -164,6 +175,17 @@ export function isPerimeterXVisible(signal: Pick<PageSignal, "title" | "text">):
  */
 export function hasPerimeterXHint(html: string): boolean {
   return PX_VENDOR_HINTS.some((re) => re.test(html));
+}
+
+/**
+ * True when the page HTML carries a DataDome script/cookie marker (`captcha-delivery`, `datadome`,
+ * `dd_cookie`) — the DataDome sibling of {@link hasCloudflareHint}/{@link hasPerimeterXHint}, surfaced
+ * as a scrubbed boolean (`ddHint`) so a drive {@link PageSnapshot} can carry the DataDome signal without
+ * raw HTML. Attribution only (issue #40): like the CF/PX hints these markers PERSIST after a challenge
+ * clears, so this is never a `blocked` input — it only labels an already-blocked page's vendor.
+ */
+export function hasDataDomeHint(html: string): boolean {
+  return DD_VENDOR_HINTS.some((re) => re.test(html));
 }
 
 /**

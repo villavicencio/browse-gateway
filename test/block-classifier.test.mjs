@@ -5,12 +5,14 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyBlock } from "../dist/verbs/index.js";
+import { classifyBlock, resolveBlockReason, wafVendorFromReason, escalationDiagnostics } from "../dist/verbs/index.js";
 import {
   isPerimeterXVisible,
   hasPerimeterXHint,
+  hasDataDomeHint,
   isPerimeterXChallenge,
   hasPerimeterXChallengeCopy,
+  activeCaptchaKind,
 } from "../dist/browser/index.js";
 
 // The real PerimeterX "Press & Hold" interstitial text (from the issue #21 repro).
@@ -96,4 +98,173 @@ test("isPerimeterXVisible: matches the press-and-hold / HUMAN phrases; ordinary 
   assert.equal(isPerimeterXVisible({ title: "", text: PX_TEXT }), true);
   assert.equal(isPerimeterXVisible({ title: "", text: "Powered by HUMAN Security" }), true);
   assert.equal(isPerimeterXVisible({ title: "Cart", text: "Add this item to your shopping cart" }), false);
+});
+
+// --- DataDome (issue #40) ---
+
+test("hasDataDomeHint: matches the DataDome CDN + cookie family; a normal page does not", () => {
+  assert.equal(hasDataDomeHint("<script src='https://js.datadome.co/tags.js'></script>"), true);
+  assert.equal(hasDataDomeHint("<iframe src='https://geo.captcha-delivery.com/captcha/?initialCid=...'></iframe>"), true);
+  assert.equal(hasDataDomeHint("document.cookie = 'datadome=abc; dd_cookie=1'"), true);
+  assert.equal(hasDataDomeHint("<main><h1>Woodford Reserve 1.75L</h1><p>$59.99</p></main>"), false);
+});
+
+test("hasDataDomeHint: the bounded cookie token does NOT fire on ordinary JS (`addCookie`) (codex #40 r6)", () => {
+  // /dd_?cookie/i matched the substring `ddCookie` inside `addCookie(` — a false DataDome attribution on
+  // any blocked page that ships such code. The bounded \bdd_cookie\b token rejects it.
+  assert.equal(hasDataDomeHint("function addCookie(name, value) { document.cookie = name + '=' + value; }"), false);
+  assert.equal(hasDataDomeHint("<script>const paddCookiejar = 1;</script>"), false);
+});
+
+test("classifyBlock: a blocked page carrying a DataDome marker → datadome-challenge (not generic blocked)", () => {
+  // A DataDome interstitial: a visible generic block phrase makes it blocked; the ddHint re-labels it
+  // from the generic 'blocked' fallthrough to a distinct datadome-challenge (the #40 fix).
+  assert.equal(
+    classifyBlock({ title: "", text: "Access denied", status: 403, ddHint: true }),
+    "datadome-challenge",
+  );
+});
+
+test("classifyBlock: a DataDome 403 + thin body → datadome-challenge (not hard-block)", () => {
+  // Pre-#40 a bare DataDome 403 fell through to hard-block; the ddHint branch (before hard-block) now
+  // attributes it. Escalation is unaffected — it keys off isHardBlock(signal), not this label.
+  assert.equal(classifyBlock({ title: "", text: "Forbidden", status: 403, ddHint: true }), "datadome-challenge");
+});
+
+test("classifyBlock: Cloudflare and PerimeterX still WIN over a co-occurring DataDome marker (precedence)", () => {
+  // A page tripping overlapping vendor markers attributes to whichever `reason` reports first — cf > px >
+  // dd — so reason and the derived wafVendor can never name different vendors on the same envelope.
+  assert.equal(classifyBlock({ title: "Just a moment...", text: "", status: 403, cfHint: true, ddHint: true }), "cf-challenge");
+  assert.equal(classifyBlock({ title: "", text: "Forbidden", status: 403, pxHint: true, ddHint: true }), "perimeterx-challenge");
+});
+
+test("classifyBlock: a CLEARED page whose DataDome marker persists (200, fat content) is NOT blocked", () => {
+  // datadome/dd_cookie markers stay embedded after a challenge clears, so ddHint is true on success; the
+  // outer !blocked guard (fat 200) means the datadome-challenge branch is never reached — no false-positive.
+  assert.equal(classifyBlock({ title: "Product", text: "x".repeat(1000), status: 200, ddHint: true }), null);
+});
+
+test("classifyBlock: a thin 200 with a DataDome marker but no block phrase is a legit short page, not blocked", () => {
+  // ddHint is attribution-only (like cfHint/pxHint) — never a `blocked` input. A thin 200 with no visible
+  // block phrase and no PX press-&-hold stays a legitimately short page.
+  assert.equal(classifyBlock({ title: "", text: "short", status: 200, ddHint: true }), null);
+});
+
+test("activeCaptchaKind: a placed widget ELEMENT (class token + data-sitekey), bound to its kind (codex #40 r4/r5)", () => {
+  // The r4 repro: an active reCAPTCHA widget + a preloaded hCaptcha library must be recaptcha (the
+  // widget), NOT hcaptcha (the library) — detectCaptcha would have returned hcaptcha with the reCAPTCHA key.
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha" data-sitekey="rk"></div><script src="https://js.hcaptcha.com/1/api.js"></script>'), "recaptcha");
+  assert.equal(activeCaptchaKind('<div data-sitekey="0x4" class="cf-turnstile"></div>'), "turnstile"); // attribute order-independent
+  assert.equal(activeCaptchaKind('<div class="row h-captcha col" data-sitekey="hk"></div>'), "hcaptcha"); // multi-class
+});
+
+test("activeCaptchaKind: rejects a loaded library, a compound class, a comment/CSS substring, and a class w/o sitekey (codex #40 r5)", () => {
+  assert.equal(activeCaptchaKind('<script src="https://www.google.com/recaptcha/api.js"></script>'), undefined); // library only
+  assert.equal(activeCaptchaKind("grecaptcha.ready(function(){});"), undefined); // JS global
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha-wrapper" data-sitekey="x"></div>'), undefined); // compound class, not the widget
+  assert.equal(activeCaptchaKind("<style>/* .g-recaptcha { display:none } */</style><div data-sitekey='x'></div>"), undefined); // token in CSS only
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha"></div>'), undefined); // class but no data-sitekey (matches the live gate)
+  assert.equal(activeCaptchaKind("<main>no captcha here</main>"), undefined);
+});
+
+test("activeCaptchaKind: dormant widget markup in a comment / script / template is NOT a live widget (codex #40 r6)", () => {
+  assert.equal(activeCaptchaKind('<!-- <div class="g-recaptcha" data-sitekey="x"></div> -->'), undefined); // commented out
+  assert.equal(activeCaptchaKind('<script type="text/tmpl"><div class="cf-turnstile" data-sitekey="x"></div></script>'), undefined); // script template
+  assert.equal(activeCaptchaKind('<template><div class="h-captcha" data-sitekey="x"></div></template>'), undefined); // inert template
+  assert.equal(activeCaptchaKind('<style>.g-recaptcha[data-sitekey]{display:block}</style>'), undefined); // stylesheet
+  // A REAL widget alongside a commented-out one still resolves (the live one wins).
+  assert.equal(activeCaptchaKind('<!-- <div class="cf-turnstile" data-sitekey="old"></div> --><div class="g-recaptcha" data-sitekey="live"></div>'), "recaptcha");
+});
+
+test("activeCaptchaKind: catches EXPLICIT-render widgets (iframe / response field), no regression (codex #40 r7)", () => {
+  // grecaptcha.render into an arbitrary container: no .g-recaptcha[data-sitekey], but a rendered iframe /
+  // response field IS present — must still attribute recaptcha (the r7 regression the widget-class-only
+  // gate introduced).
+  assert.equal(activeCaptchaKind('<div id="cap"><iframe title="reCAPTCHA" src="https://www.google.com/recaptcha/api2/anchor?k=key"></iframe></div>'), "recaptcha");
+  assert.equal(activeCaptchaKind('<form><textarea id="g-recaptcha-response" name="g-recaptcha-response"></textarea></form>'), "recaptcha");
+});
+
+test("activeCaptchaKind: real attribute/token precision — pseudo-class + data-sitekey-as-VALUE do not fire (codex #40 r7)", () => {
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha:disabled" data-sitekey="x"></div>'), undefined); // pseudo/compound class token
+  assert.equal(activeCaptchaKind('<div class="g-recaptcha" data-config="data-sitekey"></div>'), undefined); // no real data-sitekey= attribute
+});
+
+test("activeCaptchaKind: response-field / iframe evidence must be a REAL attribute, not a data-* suffix (codex #40 r8)", () => {
+  assert.equal(activeCaptchaKind('<div data-name="g-recaptcha-response"></div>'), undefined); // data-name, not name
+  assert.equal(activeCaptchaKind('<div data-id="h-captcha-response"></div>'), undefined); // data-id, not id
+  assert.equal(activeCaptchaKind('<div data-src="https://www.google.com/recaptcha/api2/anchor"></div>'), undefined); // data-src, not src
+  // The real attributes still resolve.
+  assert.equal(activeCaptchaKind('<textarea name="g-recaptcha-response"></textarea>'), "recaptcha");
+  assert.equal(activeCaptchaKind('<iframe src="https://www.google.com/recaptcha/api2/anchor?k=k"></iframe>'), "recaptcha");
+});
+
+// --- wafVendorFromReason: vendor is a projection of the reason (issue #40) ---
+
+test("wafVendorFromReason: each WAF reason maps to its vendor; captcha uses the widget kind", () => {
+  assert.equal(wafVendorFromReason("cf-challenge"), "cloudflare");
+  assert.equal(wafVendorFromReason("perimeterx-challenge"), "perimeterx");
+  assert.equal(wafVendorFromReason("datadome-challenge"), "datadome");
+  assert.equal(wafVendorFromReason("captcha", "recaptcha"), "recaptcha");
+  assert.equal(wafVendorFromReason("captcha", "hcaptcha"), "hcaptcha");
+  assert.equal(wafVendorFromReason("captcha", "turnstile"), "turnstile");
+});
+
+test("wafVendorFromReason: unattributable reasons → undefined (the single empty state, keeps the #39 gate green)", () => {
+  for (const r of ["nav-failed", "hard-block", "blocked", null]) {
+    assert.equal(wafVendorFromReason(r), undefined);
+  }
+  // captcha with no/unknown kind is unattributed rather than mislabeled.
+  assert.equal(wafVendorFromReason("captcha"), undefined);
+  assert.equal(wafVendorFromReason("captcha", "unknown"), undefined);
+});
+
+test("resolveBlockReason: a SPECIFIC WAF vendor wins over a co-detected CAPTCHA kind (codex #40 r2)", () => {
+  // The exact regression Codex caught: a WAF-blocked page (with a co-present captcha widget) must NOT be
+  // mislabeled as captcha. classifyBlock returns the WAF vendor; the signal's captchaKind is ignored.
+  assert.equal(resolveBlockReason({ title: "", text: "Access denied", status: 403, ddHint: true, captchaKind: "recaptcha" }), "datadome-challenge");
+  assert.equal(resolveBlockReason({ title: "Just a moment...", text: "", status: 403, cfHint: true, captchaKind: "recaptcha" }), "cf-challenge");
+  assert.equal(resolveBlockReason({ title: "", text: "Forbidden", status: 403, pxHint: true, captchaKind: "hcaptcha" }), "perimeterx-challenge");
+});
+
+test("resolveBlockReason: a CAPTCHA kind attributes ONLY when the block is otherwise generic (hard-block/blocked)", () => {
+  // A bare captcha page — a visible verify phrase / hard-block with NO WAF marker — is where the widget
+  // kind is the real vendor. captchaKind is set by the core only for an ACTIVE (sitekey'd) widget (#40).
+  assert.equal(resolveBlockReason({ title: "Verify", text: "Please verify you are a human", status: 403, captchaKind: "recaptcha" }), "captcha");
+  assert.equal(resolveBlockReason({ title: "", text: "Access denied", status: 200, captchaKind: "turnstile" }), "captcha");
+});
+
+test("resolveBlockReason: with no CAPTCHA it is exactly classifyBlock; an unknown kind never attributes captcha", () => {
+  const sig = { title: "", text: "Forbidden", status: 403 };
+  assert.equal(resolveBlockReason(sig), classifyBlock(sig)); // hard-block passthrough
+  assert.equal(resolveBlockReason({ ...sig, captchaKind: "unknown" }), "hard-block"); // 'unknown' kind is not an attribution
+  assert.equal(resolveBlockReason({ title: "Real", text: "x".repeat(1000), status: 200, captchaKind: "recaptcha" }), null); // not blocked → not captcha
+});
+
+test("escalationDiagnostics: reason is captcha-aware, matching the failure vendor on a bare-CAPTCHA block (codex #40 r3)", () => {
+  // The escalation-diagnostics reason and the failure-envelope vendor must agree on ONE reason — a bare
+  // active-CAPTCHA block (generic + captchaKind) resolves to 'captcha' in BOTH, not hard-block in one.
+  const cap = escalationDiagnostics({ proxyConfigured: true, proxyApplied: true, forced: false, attempts: 1,
+    last: { title: "Verify", text: "Please verify you are a human", status: 403, captchaKind: "recaptcha" } });
+  assert.equal(cap.reason, "captcha");
+  assert.equal(wafVendorFromReason(cap.reason, "recaptcha"), "recaptcha");
+  // A real WAF block is unchanged — the specific vendor still wins over a co-present captcha kind.
+  const dd = escalationDiagnostics({ proxyConfigured: true, proxyApplied: true, forced: false, attempts: 1,
+    last: { title: "", text: "Access denied", status: 403, ddHint: true, captchaKind: "recaptcha" } });
+  assert.equal(dd.reason, "datadome-challenge");
+});
+
+test("wafVendorFromReason∘classifyBlock: the surfaced vendor NEVER contradicts the reason (structural agreement)", () => {
+  // The whole point of deriving vendor FROM the reason: for any signal, the two agree by construction.
+  const sigs = [
+    { title: "Just a moment...", text: "", status: 403, cfHint: true },
+    { title: "", text: "Forbidden", status: 403, pxHint: true },
+    { title: "", text: "Access denied", status: 403, ddHint: true },
+    { title: "Just a moment...", text: "", status: 403, cfHint: true, ddHint: true }, // co-occurring markers
+    { title: "", text: "Forbidden", status: 403, pxHint: true, ddHint: true },
+  ];
+  const reasonToVendor = { "cf-challenge": "cloudflare", "perimeterx-challenge": "perimeterx", "datadome-challenge": "datadome" };
+  for (const sig of sigs) {
+    const reason = classifyBlock(sig);
+    assert.equal(wafVendorFromReason(reason), reasonToVendor[reason], `reason=${reason} must map to its own vendor`);
+  }
 });

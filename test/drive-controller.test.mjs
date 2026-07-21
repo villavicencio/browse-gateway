@@ -702,3 +702,53 @@ test("warm-open: warm takes precedence over forceProxy (replays its captured pos
   assert.ok(opens[0]?.restoreState, "warm-open won over forceProxy");
   assert.equal(opens[0].proxy, undefined, "direct-captured warm entry replays direct despite forceProxy");
 });
+
+test("controller: a DataDome navigate failure attributes the vendor on both the diagnostics reason and the envelope (issue #40)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  // A DataDome block: a visible generic block phrase (navFailed) + the carried ddHint (attribution). No
+  // proxy configured, so #firstNavigate surfaces it directly as an EscalationError — carrying BOTH the
+  // structured proxy-diagnostic reason and the #39 failure envelope, at parity with retrieve.
+  const ddSnap = {
+    url: "https://dd.example/", title: "", tree: "Access denied", status: 403, ddHint: true,
+    diagnostics: { finalUrl: "https://dd.example/", title: "", status: 403 },
+  };
+  let nextId = 1;
+  const open = new Map();
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + nextId++; open.set(id, { core: { async navigate() { return ddSnap; } } }); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error(`no open session for handle ${h}`); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  let caught;
+  try { await c.navigate("https://dd.example/"); } catch (e) { caught = e; }
+  assert.ok(caught, "a DataDome block with no proxy must throw");
+  assert.equal(caught.diagnostics?.reason, "datadome-challenge", "proxy-diagnostic reason attributes DataDome");
+  assert.equal(failureOf(caught)?.wafVendor, "datadome", "the #39 envelope carries the DataDome vendor");
+});
+
+test("controller: a bare reCAPTCHA navigate failure attributes the CAPTCHA kind on the envelope (drive/retrieve parity, #40)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  // A bare interactive-CAPTCHA page: a visible verify phrase (navFailed) + the core-detected widget kind,
+  // NO CF/PX/DD marker. classifyBlock alone would return generic `blocked` (no vendor); the carried
+  // captchaKind wins (captcha-first, mirroring retrieve) so the envelope names the widget vendor — the
+  // parity gap Codex caught: retrieve labels this recaptcha, drive must too.
+  const capSnap = {
+    url: "https://cap.example/", title: "Verify", tree: "Please verify you are a human", status: 403,
+    captchaKind: "recaptcha", diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  };
+  let nextId = 1;
+  const open = new Map();
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + nextId++; open.set(id, { core: { async navigate() { return capSnap; } } }); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error(`no open session for handle ${h}`); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  let caught;
+  try { await c.navigate("https://cap.example/"); } catch (e) { caught = e; }
+  assert.ok(caught, "a bare CAPTCHA block with no proxy must throw");
+  assert.equal(failureOf(caught)?.wafVendor, "recaptcha", "the envelope attributes the CAPTCHA widget kind (parity with retrieve)");
+});
