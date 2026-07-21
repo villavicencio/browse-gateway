@@ -110,14 +110,17 @@ const DEFAULT_MAX_BODY = 4 * 1024 * 1024;
 const DEFAULT_CLEANUP_AWAIT_MS = 8_000;
 
 /** Await `p`, but give up after `ms` so a hung cleanup can't block a caller (the timer is cleared the
- *  instant `p` settles, so a normal fast cleanup incurs no delay). NOT unref'd: it must fire to unblock. */
-function awaitBounded(p: Promise<void>, ms: number): Promise<void> {
+ *  instant `p` settles, so a normal fast cleanup incurs no delay). NOT unref'd: it must fire to unblock.
+ *  Rejection-safe: `p.then(settle, settle)` OBSERVES both outcomes, so a rejecting `p` neither propagates
+ *  nor leaves a discarded derived promise to surface as an unhandledRejection (codex r4). Exported for test. */
+export function awaitBounded(p: Promise<void>, ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, ms);
-    void p.finally(() => {
+    const settle = (): void => {
       clearTimeout(timer);
       resolve();
-    });
+    };
+    p.then(settle, settle);
   });
 }
 
@@ -162,6 +165,12 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       .then(() => {
         cleanups.delete(sessionId);
         log(`session ${sessionId} transport closed (consumer=${entry.consumerId}); ${sessions.size} live`);
+      })
+      // `done` MUST NOT reject: the fire-and-forget callers (`void cleanup(sid)` in onclose/onsessionclosed)
+      // discard it, so a late throw (e.g. an injected logger that throws) would surface as an
+      // unhandledRejection. Absorb it here so every caller — voided or awaited — is rejection-safe (codex r4).
+      .catch(() => {
+        cleanups.delete(sessionId);
       });
     cleanups.set(sessionId, done);
     return done;
@@ -335,18 +344,20 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
 
   async function closeAll(): Promise<void> {
     stopReaper();
-    for (const sid of [...sessions.keys()]) {
-      const entry = sessions.get(sid);
-      if (entry) await closeSession(sid, entry);
-    }
-    // Drain any cleanup ALREADY in flight whose session has already left the `sessions` map — a
-    // fire-and-forget `onclose`/`onsessionclosed`, or an overlapping reap, may be mid-dispose and thus
-    // invisible to the loop above. Without this, closeAll could return while a browser teardown is still
-    // running. (This awaits the teardown to COMPLETE; a browser the gateway couldn't confirm dead is
-    // retained in the gateway's `#unconfirmed` and reconfirmed by `gateway.shutdown()`, which http-main
-    // runs after closeAll — the gateway, not this handler, owns browser-slot confirmation.) Bounded so a
-    // hung drive op stalling a dispose can't keep closeAll from returning → gateway.shutdown() always runs.
-    await awaitBounded(Promise.all([...cleanups.values()]).then(() => {}), cleanupAwaitMs);
+    // Close every transport (each fires onclose → cleanup) and dispose every controller CONCURRENTLY, then
+    // await ALL cleanups — the ones just kicked off plus any already in flight (a fire-and-forget onclose /
+    // overlapping reap) — under ONE shared deadline. Concurrency + a single bound is load-bearing: awaiting
+    // sessions sequentially would COMPOUND the bound (N hung sessions → N×cleanupAwaitMs) and could exceed
+    // the shutdown budget before http-main reaches gateway.shutdown() (codex r4). With this, a hung dispose
+    // (or several) delays closeAll by at most cleanupAwaitMs total. gateway.shutdown() then reclaims any
+    // stalled browser directly (SessionManager `#sessions`, bypassing the controller lock) — the gateway,
+    // not this handler, owns browser-slot confirmation/retention (its `#unconfirmed`).
+    const perSession = [...sessions.entries()].map(async ([sid, entry]) => {
+      await entry.transport.close().catch(() => {});
+      await cleanup(sid);
+    });
+    const drain = Promise.all([...perSession, ...cleanups.values()]).then(() => {});
+    await awaitBounded(drain, cleanupAwaitMs);
   }
 
   return { handle, reapIdle, startReaper, stopReaper, drain, closeAll, sessionCount: () => sessions.size };
