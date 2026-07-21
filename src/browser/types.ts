@@ -12,7 +12,7 @@
 export type Category = "cloudflare" | "datadome";
 
 import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
-import type { FailureDiagnostics } from "../observability/index.js";
+import type { FailureDiagnostics, Timing } from "../observability/index.js";
 
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
 export interface ProxyConfig {
@@ -174,7 +174,9 @@ export interface RenderResult {
    * a PX marker is present — so an iframe-served press-&-hold is detectable, since `html`
    * (page.content()) is top-document only. Absent on an ordinary render. */
   frameHtml?: string;
-  /** Wall-clock ms spent waiting for the page to clear (challenge auto-solve). */
+  /** Wall-clock ms spent waiting for the page to clear (challenge auto-solve). The stealth kill-gate
+   *  (`scripts/validate-stealth.mjs`) reads this; #42 additionally surfaces the same value as
+   *  {@link Timing.clearancePollMs} in the unified {@link timing} breakdown. */
   clearanceWaitedMs: number;
   /**
    * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
@@ -184,6 +186,14 @@ export interface RenderResult {
    * caller. Absent only if the core could not assemble one.
    */
   diagnostics?: FailureDiagnostics;
+  /**
+   * Per-stage {@link Timing} (issue #42) — the wall-clock stage breakdown (totalMs + domContentLoaded /
+   * clearancePoll / snapshot). Set by the core on EVERY render (success and failure), a first-class field
+   * independent of the failure-only {@link diagnostics} envelope. The retrieve verb overwrites `totalMs`
+   * with the whole-call wall-clock and folds the assembled Timing into the envelope on a failure. Absent
+   * only if the core could not assemble one (e.g. a hand-built test fixture).
+   */
+  timing?: Timing;
 }
 
 export interface RenderOptions {
@@ -257,6 +267,14 @@ export interface PageSnapshot {
    * `snapshot()` only if the core could not assemble one.
    */
   diagnostics?: FailureDiagnostics;
+  /**
+   * Per-stage {@link Timing} (issue #42) — the wall-clock stage breakdown for this snapshot. `navigate()`
+   * carries the full per-nav timing (totalMs + domContentLoaded / clearancePoll / captchaSolve / snapshot);
+   * a pure `snapshot()` carries only `{ totalMs, snapshotMs }` (its own extraction wall-clock). The drive
+   * controller overrides `totalMs` with the whole-verb wall-clock and folds the Timing into the failure
+   * envelope. A first-class field, independent of the failure-only {@link diagnostics} envelope.
+   */
+  timing?: Timing;
 }
 
 export type NavigationDecision = "allow" | "block";

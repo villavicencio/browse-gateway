@@ -4,7 +4,7 @@
  */
 import { chromium } from "patchright";
 import { assertLocalCdpOnly } from "../security/cdp.js";
-import { buildFailureDiagnostics, FAILURE_DIAGNOSTICS_CAP } from "../observability/index.js";
+import { buildFailureDiagnostics, assembleTiming, FAILURE_DIAGNOSTICS_CAP } from "../observability/index.js";
 import { hostFromUrl, hostMatchesAnySuffix } from "../security/url.js";
 import { SecretStore, redactSecrets } from "../security/secrets.js";
 import { buildWindowsUaOverride, buildNativeUaOverride, READ_LIVE_UA_JS, type LiveUserAgent } from "./os-presentation.js";
@@ -382,6 +382,21 @@ async function snapshot(page: PatchrightPage): Promise<PageSignal> {
   return { title, text, html, frameHtml };
 }
 
+/** Result of {@link PatchrightBrowserCore.#trySolveCaptcha}: whether the caller must replay the triggering
+ *  action, plus the #42 solve wall-clock (present only when a solve was actually attempted). */
+interface SolveResult {
+  replay: boolean;
+  captchaSolveMs?: number;
+}
+
+/** Result of {@link PatchrightBrowserCore.#settle}: the replay signal (as before) plus the #42 clearance-poll
+ *  and (bubbled-up) captcha-solve wall-clock, so navigate() can build the per-nav timing breakdown. */
+interface SettleResult {
+  replay: boolean;
+  clearancePollMs: number;
+  captchaSolveMs?: number;
+}
+
 export class PatchrightBrowserCore implements BrowserCore {
   readonly kind = "patchright";
   readonly #context: PatchrightContext;
@@ -641,6 +656,10 @@ export class PatchrightBrowserCore implements BrowserCore {
     const clearanceTimeoutMs =
       opts.clearanceTimeoutMs ?? DEFAULT_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    // #42 per-stage timing: WALL-CLOCK (performance.now) diffs only. t0 bounds the whole render body —
+    // read INSIDE the return expression (before the finally closes the page), so page.close() time is
+    // excluded from totalMs (it isn't part of the caller-visible retrieve latency).
+    const t0 = performance.now();
     // Fresh per-call page ⇒ a fresh navigation: clear the evidence buffers and attach the console /
     // pageerror / requestfailed collectors so this render's failure envelope reflects only this page.
     this.#resetEvidence();
@@ -652,6 +671,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       // the Windows identity errors out rather than rendering as Linux. Non-listed host = no-op (native).
       if (this.#shouldPresentWindows(url)) await this.#applyWindowsToFreshPage(page);
       let status: number | null = null;
+      // domContentLoadedMs = goto wall-clock (waitUntil:"domcontentloaded" resolves AT DCL). Measured around
+      // the try so a goto that THROWS (timeout / challenge abort) still records its time-to-abort.
+      const goto0 = performance.now();
       try {
         const resp = await page.goto(url, {
           waitUntil: "domcontentloaded",
@@ -661,6 +683,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       } catch {
         // Navigation may time out or be aborted by a challenge; assess whatever rendered.
       }
+      const domContentLoadedMs = performance.now() - goto0;
 
       // Poll until the challenge clears (markers gone + content) or we time out. Challenges —
       // Cloudflare especially — solve client-side on a variable delay, so a fixed wait
@@ -673,7 +696,9 @@ export class PatchrightBrowserCore implements BrowserCore {
         waited += pollIntervalMs;
         signal = await pollSignal(page);
       }
+      const snap0 = performance.now();
       const final = await snapshot(page);
+      const snapshotMs = performance.now() - snap0;
       // Assemble the failure-evidence envelope (issue #39). finalUrl is page.url() AFTER redirects — the
       // real landed URL (render's own `url` is the requested arg, the bug this fixes). RAW here; the
       // retrieve surfacing layer redacts before it reaches a caller. Screenshot is opt-in + size-capped.
@@ -687,7 +712,16 @@ export class PatchrightBrowserCore implements BrowserCore {
         networkFailures: this.#networkFailures,
         ...(screenshotRef !== undefined ? { screenshotRef } : {}),
       });
-      return { url, status, ...final, clearanceWaitedMs: waited, diagnostics };
+      // #42: clearancePollMs mirrors clearanceWaitedMs (the same poll-interval counter — zero divergence);
+      // clearanceWaitedMs stays a first-class field for the stealth kill-gate. The retrieve verb overwrites
+      // totalMs with the whole-call wall-clock and folds this Timing into the failure envelope.
+      const timing = assembleTiming({
+        totalMs: performance.now() - t0,
+        domContentLoadedMs,
+        clearancePollMs: waited,
+        snapshotMs,
+      });
+      return { url, status, ...final, clearanceWaitedMs: waited, diagnostics, timing };
     } finally {
       await page.close().catch(() => {});
     }
@@ -803,6 +837,9 @@ export class PatchrightBrowserCore implements BrowserCore {
   async navigate(url: string, opts: RenderOptions = {}): Promise<PageSnapshot> {
     const clearanceTimeoutMs = opts.clearanceTimeoutMs ?? DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    // #42 per-stage timing: t0 bounds this core navigate() (goto + settle + snapshot). The drive
+    // CONTROLLER overwrites totalMs with the whole-verb wall-clock (incl. escalation retries).
+    const t0 = performance.now();
     let page = await this.#ensureActivePage();
     // Drive the active page's OS presentation to match THIS host BEFORE the goto: Windows for a listed
     // host, native otherwise — actively restoring native on a listed→non-listed transition so the Windows
@@ -832,6 +869,10 @@ export class PatchrightBrowserCore implements BrowserCore {
     // A new navigation begins here: clear the evidence buffers so this nav's failure envelope reflects
     // only this goto onward (the active page's console/requestfailed listeners persist across navs).
     this.#resetEvidence();
+    // domContentLoadedMs = goto wall-clock (measured around the try so an aborted nav still records its
+    // time-to-abort). Deliberately do NOT bind the goto response — status stays on #lastDocStatus (a CF
+    // 403→200 reload makes goto's first response the wrong one; see the #lastDocStatus note above).
+    const goto0 = performance.now();
     try {
       await page.goto(url, {
         waitUntil: "domcontentloaded",
@@ -841,10 +882,12 @@ export class PatchrightBrowserCore implements BrowserCore {
       // A challenge/redirect/dead-exit may abort the navigation; settle on whatever rendered. With no
       // main-frame response the listener leaves status null, so the drive layer treats it as a failed nav.
     }
+    const domContentLoadedMs = performance.now() - goto0;
     // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does, and —
     // once it clears via a full reload — wait for the real document to land content rather than the
     // blank inter-navigation moment. A page still blocked after the budget is surfaced by navFailed.
-    await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
+    // #settle returns its clearance-poll + captcha-solve wall-clock for the #42 timing breakdown.
+    const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
     // Carry the CF/PX/DataDome vendor-hint signals (the HTML half of retrieve's detection) as scrubbed
     // booleans, plus the interactive-CAPTCHA widget KIND (issue #40) — so drive's escalation recognizes a
     // CF interstitial with no visible CF phrase AND its failure envelope can attribute the mitigation
@@ -856,12 +899,24 @@ export class PatchrightBrowserCore implements BrowserCore {
     // captcha library and binds the kind to the widget, so it can't mislabel a WAF block's vendor or
     // cross-label from a co-present library (codex #40 r3/r4).
     const captchaKind = activeCaptchaKind(html);
+    const base = await this.#snapshotOf(page);
+    // #42: assemble the per-nav Timing — the whole core-navigate wall-clock plus the goto / clearance /
+    // captcha-solve / snapshot stages — as a FIRST-CLASS field (independent of the failure-only envelope;
+    // the drive #failure seam folds it in on a block). Overrides #snapshotOf's snapshot-only timing.
+    const timing = assembleTiming({
+      totalMs: performance.now() - t0,
+      domContentLoadedMs,
+      clearancePollMs: settled.clearancePollMs,
+      ...(settled.captchaSolveMs !== undefined ? { captchaSolveMs: settled.captchaSolveMs } : {}),
+      ...(base.timing?.snapshotMs !== undefined ? { snapshotMs: base.timing.snapshotMs } : {}),
+    });
     return {
-      ...(await this.#snapshotOf(page)),
+      ...base,
       cfHint: hasCloudflareHint(html),
       pxHint: hasPerimeterXHint(html),
       ddHint: hasDataDomeHint(html),
       ...(captchaKind ? { captchaKind } : {}),
+      timing,
     };
   }
 
@@ -913,8 +968,10 @@ export class PatchrightBrowserCore implements BrowserCore {
     await page.keyboard.press(key);
     // A key press (Enter) can submit a form / trigger navigation — wait out any challenge it lands on.
     // If a submit-gated CAPTCHA was solved, replay the key once so the submit completes with the token.
-    const replayNeeded = await this.#settle(page);
-    if (replayNeeded) {
+    // (#42: the action-path settle/solve wall-clock is captured in the controller's per-verb totalMs, not
+    // broken out here — the returned snapshot from an action carries only its own snapshot-stage timing.)
+    const { replay } = await this.#settle(page);
+    if (replay) {
       await page.keyboard.press(key).catch(() => {});
       await this.#settle(page);
     }
@@ -1106,8 +1163,8 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
     // A navigation-producing action (submit click, select with onchange) may land on a challenge —
     // wait it out so the post-action snapshot is the cleared page, not the interstitial.
-    const replayNeeded = await this.#settle(page);
-    if (replayNeeded) {
+    const { replay } = await this.#settle(page);
+    if (replay) {
       // A CAPTCHA that appeared only on this action (e.g. a submit gated on reCAPTCHA) was rejected
       // before a token existed; the solve injected one but did not re-submit. Replay the action ONCE
       // so it completes with the token in place. Best-effort: a now-missing element just no-ops, and
@@ -1127,7 +1184,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     page: PatchrightPage,
     clearanceTimeoutMs: number = DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS,
     pollIntervalMs: number = DEFAULT_POLL_INTERVAL_MS,
-  ): Promise<boolean> {
+  ): Promise<SettleResult> {
     // Let any navigation the prior action triggered reach domcontentloaded, so its response status is
     // captured and the snapshot reflects the landed page (resolves immediately if nothing navigated).
     await page.waitForLoadState("domcontentloaded").catch(() => {});
@@ -1151,9 +1208,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       signal = await pollSignal(page);
     }
     // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
-    // may still be blocking the flow. Auto-solve it transparently when a solver is configured. Returns
-    // true when the caller should replay the triggering action to complete a submit-gated flow.
-    return this.#trySolveCaptcha(page);
+    // may still be blocking the flow. Auto-solve it transparently when a solver is configured. `replay`
+    // is true when the caller should replay the triggering action to complete a submit-gated flow.
+    // #42: `waited` is the clearance-poll counter (== render()'s clearanceWaitedMs); the solve wall-clock
+    // bubbles up from #trySolveCaptcha.
+    const solve = await this.#trySolveCaptcha(page);
+    return {
+      replay: solve.replay,
+      clearancePollMs: waited,
+      ...(solve.captchaSolveMs !== undefined ? { captchaSolveMs: solve.captchaSolveMs } : {}),
+    };
   }
 
   /**
@@ -1165,15 +1229,17 @@ export class PatchrightBrowserCore implements BrowserCore {
    * is populated on success, so a re-entry would no-op on the gate. Cost/rate limiting is the solver's
    * own budget (R8). render() (retrieve) never reaches here — its CF tier is cleared by proxy, not a solver.
    *
-   * Returns `true` when a token was injected but the page did NOT advance on its own — i.e. the caller
-   * should REPLAY the triggering action to complete the flow. This is the mid-flow case: a form whose
-   * submit was rejected for lack of a token, where injecting the token alone re-submits nothing. When
-   * the widget's own `data-callback` advances the page (URL changes during the post-inject wait), this
-   * returns `false` so the caller does NOT replay — avoiding a double-submit. No solve / no token /
-   * stale page all return `false`.
+   * Returns `replay: true` when a token was injected but the page did NOT advance on its own — i.e. the
+   * caller should REPLAY the triggering action to complete the flow. This is the mid-flow case: a form
+   * whose submit was rejected for lack of a token, where injecting the token alone re-submits nothing.
+   * When the widget's own `data-callback` advances the page (URL changes during the post-inject wait),
+   * this returns `replay: false` so the caller does NOT replay — avoiding a double-submit. No solve / no
+   * token / stale page all return `replay: false`. #42: `captchaSolveMs` (the solver wall-clock) is set
+   * whenever a solve was ATTEMPTED (a widget was found), including a solve that errored — so the drive
+   * timing breakdown attributes the seconds a solve spent even when it ultimately failed.
    */
-  async #trySolveCaptcha(page: PatchrightPage): Promise<boolean> {
-    if (!this.#solver) return false;
+  async #trySolveCaptcha(page: PatchrightPage): Promise<SolveResult> {
+    if (!this.#solver) return { replay: false };
     // Resolve the widget, polling out its render race: navigate() resolves at domcontentloaded, but
     // the response field is injected by a later async script, so a one-shot detect sees the container
     // with no field yet and would skip forever (the next detect pass re-navigates and re-races).
@@ -1183,7 +1249,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       (ms) => page.waitForTimeout(ms).catch(() => {}),
       { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: CAPTCHA_RENDER_TIMEOUT_MS },
     );
-    if (!challenge) return false;
+    if (!challenge) return { replay: false };
+    // #42: measure the solver wall-clock from here (a widget IS present, so a solve is being attempted).
+    const solve0 = performance.now();
     let token: string;
     try {
       token = await this.#solver.solve(challenge);
@@ -1197,14 +1265,15 @@ export class PatchrightBrowserCore implements BrowserCore {
       const raw = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
       const code = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw) ? raw : "error";
       process.stderr.write(`[browse-gateway] captcha solve failed (${errCode(code, this.#redact)}); page left challenged\n`);
-      return false;
+      return { replay: false, captchaSolveMs: performance.now() - solve0 };
     }
-    if (!token) return false;
+    const captchaSolveMs = performance.now() - solve0;
+    if (!token) return { replay: false, captchaSolveMs };
     // The solve can run up to the solver's deadline; if the page navigated or the widget changed in
     // the meantime, the token is bound to a now-stale (url, siteKey). Re-verify before injecting, so a
     // token minted for the old page isn't written into a different one.
     const after = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
-    if (!after || after.siteKey !== challenge.siteKey || page.url() !== challenge.url) return false;
+    if (!after || after.siteKey !== challenge.siteKey || page.url() !== challenge.url) return { replay: false, captchaSolveMs };
     // Snapshot the visible page state before injecting, so we can tell the site's own continuation
     // (advance — do NOT replay) from a stalled submit (nothing happened — DO replay). The widget's own
     // mutations (its iframe, the hidden response textarea) don't change main-document innerText, so it
@@ -1222,9 +1291,9 @@ export class PatchrightBrowserCore implements BrowserCore {
     // in-place/AJAX update from the widget's data-callback (visible-text change). A URL-only check
     // misses same-page callbacks and would double-submit them. If nothing advanced, the triggering
     // action was rejected pre-token and the caller must replay it once.
-    if (page.url() !== challenge.url) return false;
+    if (page.url() !== challenge.url) return { replay: false, captchaSolveMs };
     const afterText = await page.evaluate(BODY_TEXT_JS).catch(() => null);
-    return afterText !== null && afterText === beforeText; // unchanged ⇒ stalled ⇒ replay needed
+    return { replay: afterText !== null && afterText === beforeText, captchaSolveMs }; // unchanged ⇒ stalled ⇒ replay
   }
 
   /**
@@ -1238,6 +1307,10 @@ export class PatchrightBrowserCore implements BrowserCore {
    * keep the pinned version ≥ 1.60.
    */
   async #snapshotOf(page: PatchrightPage): Promise<PageSnapshot> {
+    // #42: t0 bounds the aria/title/screenshot extraction — the snapshotMs stage, and a bare snapshot()
+    // verb's whole cost (its totalMs). navigate() and the drive controller override totalMs with the wider
+    // nav/verb wall-clock.
+    const t0 = performance.now();
     const root = page.locator("html");
     const aria = root.ariaSnapshot as unknown as (
       opts: Record<string, unknown>,
@@ -1249,7 +1322,8 @@ export class PatchrightBrowserCore implements BrowserCore {
     // Assemble the failure-evidence envelope (issue #39) into EVERY snapshot — both navigate() and a
     // post-action snapshot() — so the drive layer can attach it to a thrown failure at parity with
     // retrieve. RAW here; the drive surfacing seam redacts before it reaches a caller. Screenshot is
-    // opt-in + size-capped.
+    // opt-in + size-capped. Timing is NOT folded here — it rides the first-class `timing` field below and
+    // is folded into the envelope at the surface seam (#failure), matching the #40/#41 slot pattern.
     const screenshotRef = await this.#maybeCaptureScreenshot(page);
     const diagnostics = buildFailureDiagnostics({
       finalUrl,
@@ -1260,7 +1334,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       networkFailures: this.#networkFailures,
       ...(screenshotRef !== undefined ? { screenshotRef } : {}),
     });
-    return { url: finalUrl, title, tree, status, diagnostics };
+    const snapshotMs = performance.now() - t0;
+    const timing = assembleTiming({ totalMs: snapshotMs, snapshotMs });
+    return { url: finalUrl, title, tree, status, diagnostics, timing };
   }
 
   /**

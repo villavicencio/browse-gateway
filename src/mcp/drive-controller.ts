@@ -32,7 +32,7 @@ import {
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
-import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError } from "../observability/index.js";
+import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError, assembleTiming } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
 import type { VaultEntryStore } from "./vault-login.js";
@@ -175,6 +175,7 @@ export class GatewayDriveController implements DriveController {
     forced: boolean;
     attempts: number;
     last?: PageSnapshot;
+    attemptMs?: number[];
     exitCheck?: EgressCheck;
   }): EscalationDiagnostics {
     return escalationDiagnostics({
@@ -183,6 +184,7 @@ export class GatewayDriveController implements DriveController {
       forced: opts.forced,
       attempts: opts.attempts,
       last: opts.last ? this.#signalOf(opts.last) : null,
+      ...(opts.attemptMs ? { attemptMs: opts.attemptMs } : {}), // #42: per proxied-attempt durations
       ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
     });
   }
@@ -216,10 +218,14 @@ export class GatewayDriveController implements DriveController {
     // classifyFailure via the signal's finalUrl (codex #41 r1/r2), so this seam just gates on navFailed.
     const failureClass: FailureClass | undefined = navFailed(snap) ? classifyFailure(signal) : undefined;
     const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+    // #42: fold the snapshot's first-class per-stage Timing into the envelope at THIS surface seam (like
+    // failureClass/wafVendor) so a thrown drive failure carries the wall-clock breakdown. All-numeric →
+    // redaction passes it through untouched.
     const diag: FailureDiagnostics = {
       ...snap.diagnostics,
       ...(failureClass ? { failureClass } : {}),
       ...(wafVendor ? { wafVendor } : {}),
+      ...(snap.timing ? { timing: snap.timing } : {}),
     };
     return redactFailureDiagnostics(diag, this.#secrets);
   }
@@ -273,6 +279,23 @@ export class GatewayDriveController implements DriveController {
     return run;
   }
 
+  /**
+   * #42: stamp the WHOLE-verb wall-clock as `timing.totalMs` on a snapshot-returning verb's result,
+   * MERGING with the core stage breakdown the snapshot already carries. This is the caller-facing verb
+   * duration — a navigate INCLUDING its escalation retries + warm-up, or an action INCLUDING its
+   * settle/solve; the core snapshot alone would report only its ~tens-of-ms extraction time (the wrong
+   * number an action verb would otherwise surface). SUCCESS path only: a thrown failure propagates
+   * unwrapped — its envelope already carries the core stages and an EscalationError carries `attemptMs`,
+   * so a whole-verb failure total is a documented deferral, not a gap. Runs INSIDE the #serialize turn
+   * (one verb at a time), so the performance.now() diff can never interleave with another verb.
+   */
+  async #timedSnap(fn: () => Promise<PageSnapshot>): Promise<PageSnapshot> {
+    const t0 = performance.now();
+    const snap = await fn();
+    const timing = assembleTiming({ ...(snap.timing ?? {}), totalMs: performance.now() - t0 });
+    return { ...snap, timing };
+  }
+
   async open(): Promise<void> {
     return this.#serialize(async () => {
       // Open a direct session lazily; escalation to a proxied exit (if needed) happens on the first
@@ -282,7 +305,7 @@ export class GatewayDriveController implements DriveController {
   }
 
   async navigate(url: string, opts: { forceProxy?: boolean } = {}): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#navigate(url, opts));
+    return this.#serialize(() => this.#timedSnap(() => this.#navigate(url, opts)));
   }
 
   async #navigate(url: string, opts: { forceProxy?: boolean }): Promise<PageSnapshot> {
@@ -405,27 +428,27 @@ export class GatewayDriveController implements DriveController {
   }
 
   async snapshot(): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#run((s) => s.core.snapshot()));
+    return this.#serialize(() => this.#timedSnap(() => this.#run((s) => s.core.snapshot())));
   }
 
   async click(target: DriveTarget): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.click(target)));
+    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.click(target))));
   }
 
   async type(target: DriveTarget, text: string, submit?: boolean): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.type(target, text, { submit })));
+    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.type(target, text, { submit }))));
   }
 
   async selectOption(target: DriveTarget, values: string[]): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.selectOption(target, values)));
+    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.selectOption(target, values))));
   }
 
   async pressKey(key: string): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.pressKey(key)));
+    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.pressKey(key))));
   }
 
   async waitFor(condition: WaitCondition): Promise<PageSnapshot> {
-    return this.#serialize(() => this.#actAndSnap((s) => s.core.waitFor(condition)));
+    return this.#serialize(() => this.#timedSnap(() => this.#actAndSnap((s) => s.core.waitFor(condition))));
   }
 
   async screenshot(): Promise<string> {
@@ -698,6 +721,9 @@ export class GatewayDriveController implements DriveController {
   async #openHealthyAndNavigate(url: string, forced: boolean): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
     let attempts = 0;
+    // #42: per proxied-attempt wall-clock (session-open + navigate), 1:1 with `attempts`, surfaced on the
+    // EscalationError diagnostics so an exhausted 3× re-roll is legible ("why 200s").
+    const attemptMs: number[] = [];
     for (let attempt = 1; attempt <= PROXY_OPEN_ATTEMPTS; attempt++) {
       const override = this.#resolveProxyOverride();
       if (!override) {
@@ -709,10 +735,12 @@ export class GatewayDriveController implements DriveController {
         );
       }
       attempts = attempt;
+      const attempt0 = performance.now();
       await this.#openSession(override);
       const snap = await this.#run((s) =>
         s.core.navigate(url, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
       );
+      attemptMs.push(performance.now() - attempt0);
       if (!navFailed(snap)) {
         this.#pinned = true;
         return snap;
@@ -721,7 +749,7 @@ export class GatewayDriveController implements DriveController {
       await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
     }
     const exitCheck = this.#verifyEgressEnabled ? await this.#verifyEgress() : undefined;
-    const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, exitCheck });
+    const dx = this.#escalationDiag({ proxyApplied: true, forced, attempts, last, attemptMs, exitCheck });
     throw new EscalationError(
       // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
       `could not land a working proxied exit for ${sanitizeUrlForError(url)} after ${PROXY_OPEN_ATTEMPTS} attempts ` +

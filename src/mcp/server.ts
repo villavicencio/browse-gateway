@@ -10,7 +10,7 @@ import type { DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.
 import type { BlockReason, EscalationDiagnostics } from "../verbs/index.js";
 import { EscalationError, isRetrieveFailure } from "../verbs/index.js";
 import { summarizeFailureDiagnostics, failureOf, sanitizeUrlForError, sanitizeUrlsInErrorText } from "../observability/index.js";
-import type { FailureDiagnostics } from "../observability/index.js";
+import type { FailureDiagnostics, Timing } from "../observability/index.js";
 
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
@@ -29,6 +29,11 @@ export interface RetrieveOutcome {
   /** Failure-evidence envelope (issue #39): finalUrl / title / status / redirect chain / console +
    *  network / optional screenshot — present ONLY on a blocked/failed retrieve, already redacted. */
   diagnostics?: FailureDiagnostics;
+  /** Per-stage {@link Timing} (issue #42) — the wall-clock breakdown of this retrieve call. Always present
+   *  on a real retrieve; on a FAILURE it is also inside {@link diagnostics} (rendered in the tool error).
+   *  On a SUCCESS the tool returns clean markdown (no timing line — content purity), so this carries the
+   *  breakdown at the result-object level for a programmatic caller. */
+  timing?: Timing;
 }
 
 export type RetrieveFn = (input: { url: string; forceProxy?: boolean }) => Promise<RetrieveOutcome>;
@@ -71,6 +76,9 @@ function formatSnapshot(snap: PageSnapshot): string {
   if (snap.cfHint) bits.push("cfHint: true");
   if (snap.pxHint) bits.push("pxHint: true");
   if (snap.ddHint) bits.push("ddHint: true");
+  // #42: surface the whole-verb wall-clock so a slow drive nav is legible even on SUCCESS (the failure
+  // path already renders the full timing breakdown via the envelope). Compact — just the total.
+  if (snap.timing?.totalMs != null) bits.push(`total: ${snap.timing.totalMs}ms`);
   const meta = bits.length ? `\n${bits.join("  ")}` : "";
   return `url: ${snap.url}\ntitle: ${snap.title}${meta}\n\n${snap.tree}`;
 }

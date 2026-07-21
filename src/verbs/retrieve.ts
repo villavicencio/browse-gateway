@@ -25,9 +25,9 @@ import {
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
-import { redactFailureDiagnostics, sanitizeUrlForError } from "../observability/index.js";
-import type { FailureDiagnostics, WafVendor, FailureClass } from "../observability/index.js";
-export type { WafVendor, FailureClass } from "../observability/index.js";
+import { redactFailureDiagnostics, sanitizeUrlForError, assembleTiming } from "../observability/index.js";
+import type { FailureDiagnostics, WafVendor, FailureClass, Timing } from "../observability/index.js";
+export type { WafVendor, FailureClass, Timing } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -137,6 +137,14 @@ export interface RetrieveResult {
    * proxy-escalation tally) — this is the page-evidence bundle the site-compat epic (#38) reports through.
    */
   diagnostics?: FailureDiagnostics;
+  /**
+   * Per-stage {@link Timing} (issue #42) — the wall-clock breakdown for the WHOLE retrieve call: `totalMs`
+   * (this call, start to finish) plus the final surfaced render's core stages (domContentLoaded /
+   * clearancePoll / snapshot). ALWAYS present (success and failure) — the measurement half of "why did it
+   * take 200s". Per proxied-attempt durations ride {@link EscalationDiagnostics.attemptMs}. On a failed
+   * retrieve the SAME Timing is folded into {@link diagnostics}, so the two can never disagree.
+   */
+  timing: Timing;
 }
 
 /**
@@ -405,6 +413,15 @@ export interface EscalationDiagnostics {
   lastStatus: number | null;
   /** Vendor/hard-block classification of the last failed page; null when it was not blocked. */
   reason: BlockReason | null;
+  /**
+   * Per proxied-attempt wall-clock ms (issue #42), aligned 1:1 with {@link attempts} — one entry per
+   * escalation attempt (a full session-open + navigate), so a 3× re-roll that consumed the budget is
+   * legible ("why 200s"). INCLUDES session acquisition (a fresh proxied context launch per attempt),
+   * which is often the dominant term. Present only when the proxy was engaged; the direct attempt is
+   * NOT counted here (its cost is in the surfaced render's core stages + the whole-call totalMs).
+   * Secrets-free by construction (durations only).
+   */
+  attemptMs?: number[];
   /** Residential-vs-datacenter exit verification (opt-in egress probe, U4); absent unless requested. */
   exitCheck?: EgressCheck;
 }
@@ -416,6 +433,8 @@ export function escalationDiagnostics(opts: {
   forced: boolean;
   attempts: number;
   last: FailureSignal | null;
+  /** Per proxied-attempt wall-clock ms (issue #42), 1:1 with `attempts`; omitted when empty. */
+  attemptMs?: number[];
   exitCheck?: EscalationDiagnostics["exitCheck"];
 }): EscalationDiagnostics {
   return {
@@ -424,6 +443,7 @@ export function escalationDiagnostics(opts: {
     forced: opts.forced,
     attempts: opts.attempts,
     lastStatus: opts.last?.status ?? null,
+    ...(opts.attemptMs && opts.attemptMs.length ? { attemptMs: opts.attemptMs } : {}),
     // resolveFailureReason (not bare classifyBlock/resolveBlockReason) so the escalation-diagnostics reason
     // matches the failure-envelope class/vendor on a bare-CAPTCHA failure AND on a stale-status chrome-error
     // dead nav — one EscalationError can't carry two reasons (codex #40 r3 / #41 r5). captcha-awareness rides
@@ -597,6 +617,9 @@ export async function retrieve(
   opts: RetrieveOptions,
 ): Promise<RetrieveResult> {
   const { token, url } = opts;
+  // #42 per-stage timing: t0 bounds the WHOLE retrieve call (every render attempt + extraction). The
+  // surfaced core stages come from the final render; attemptMs breaks down the proxied retry loop.
+  const t0 = performance.now();
   // Scheme allowlist (R14-adjacent): only http(s). Rejects file:/data:/blob:/ftp:/view-source:
   // before any navigation, so a non-http target can't read local files or bypass the
   // host-based guard (whose host is empty for those schemes).
@@ -620,6 +643,9 @@ export async function retrieve(
   let captchaSolved = false;
   let proxyUsed = false;
   let proxyAttempts = 0;
+  // #42: per proxied-attempt wall-clock (one entry per escalation attempt, incl. its session-open),
+  // surfaced on the proxyDiagnostic aligned 1:1 with `proxyAttempts`. The direct attempt is not counted.
+  const attemptMs: number[] = [];
 
   // force-proxy (issue #21): skip the direct attempt and go residential from the FIRST render for a
   // known-hostile host. Only honored when a proxy is available (configured + datacenter IP); else it
@@ -663,11 +689,14 @@ export async function retrieve(
     proxyUsed = true;
     for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
       proxyAttempts = attempt;
+      // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
+      const attempt0 = performance.now();
       render = await gateway.withConsumerSession(
         token,
         (s) => s.core.render(url, proxiedRenderOpts),
         { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS },
       );
+      attemptMs.push(performance.now() - attempt0);
       // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a dead exit that
       // reached a `chrome-error://` page while carrying a STALE 200 (else the loop would treat that dead
       // exit as healthy and break without trying later exits — defeating PROXY_MAX_ATTEMPTS, codex #41 r5),
@@ -768,6 +797,7 @@ export async function retrieve(
         forced,
         attempts: proxyAttempts,
         last: signal,
+        attemptMs, // #42: per-attempt durations, 1:1 with attempts
       })
     : undefined;
   // Failure-evidence envelope (issue #39): surface it on ANY retrieve failure (blocked, empty-content,
@@ -786,10 +816,15 @@ export async function retrieve(
   // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
   const failureClass: FailureClass | undefined = failed ? classifyFailure(signal) : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+  // #42: assemble ONE Timing — the whole-call totalMs over the final render's core stages — and use it for
+  // BOTH the result field and (on a failure) the folded envelope, so they can never disagree (single
+  // derivation). render.timing carries the surfaced render's domContentLoaded/clearancePoll/snapshot; its
+  // own core totalMs is overwritten by the whole-call wall-clock here.
+  const timing: Timing = assembleTiming({ ...(render.timing ?? {}), totalMs: performance.now() - t0 });
   const diagnostics =
     failed && render.diagnostics
       ? redactFailureDiagnostics(
-          { ...render.diagnostics, ...(failureClass ? { failureClass } : {}), ...(wafVendor ? { wafVendor } : {}) },
+          { ...render.diagnostics, ...(failureClass ? { failureClass } : {}), ...(wafVendor ? { wafVendor } : {}), timing },
           secrets,
         )
       : undefined;
@@ -803,6 +838,7 @@ export async function retrieve(
     reason,
     proxyUsed,
     captchaSolved,
+    timing,
     ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
     ...(diagnostics ? { diagnostics } : {}),
   };
