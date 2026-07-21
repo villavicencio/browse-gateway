@@ -15,6 +15,7 @@ import {
   mintStickyProxy,
   stickySuffixBootError,
   retrieve,
+  isRetrieveFailure,
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../dist/verbs/index.js";
 import { SecretStore } from "../dist/security/index.js";
@@ -329,6 +330,22 @@ test("retrieve: when every proxy exit fails (null status), the result is reporte
   assert.equal(calls.length, 4, "direct + 3 dead-exit attempts");
   assert.equal(r.blocked, true, "a failed nav (null status) reports blocked, not empty success");
   assert.equal(r.reason, "nav-failed", "every exit dead (null status) -> nav-failed");
+});
+
+test("retrieve: a render that ended on chrome-error:// with a STALE 200 + error-text markdown is a nav failure, not content (codex #41 r4)", async () => {
+  // A client-side crash to a dead host: the fresh-page status stays at the initial 200 while page.url() is
+  // chrome-error, and the Chrome error DOM extracts to NON-empty markdown. Without folding the chrome-error
+  // final URL into the failure decision, isRetrieveFailure would be false and the browser's error text would
+  // be handed back as page content. The chrome-error URL is unambiguous, so it is SAFE to fail the call.
+  const errHtml = "<html><body><div id='main-message'>This site can’t be reached. ERR_EMPTY_RESPONSE</div></body></html>";
+  const { gateway } = makeFakeGateway([
+    renderOf({ status: 200, title: "", text: "This site can’t be reached. ERR_EMPTY_RESPONSE", html: errHtml, diagnostics: { finalUrl: "chrome-error://chromewebdata/", status: 200 } }),
+  ]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://dead.example/" });
+  assert.equal(r.blocked, true, "a chrome-error render is reported blocked, not returned as content");
+  assert.equal(r.reason, "nav-failed", "a dead nav to chrome-error is nav-failed even with a stale 200");
+  assert.equal(r.diagnostics?.failureClass, "nav-failed", "the envelope classifies it nav-failed");
+  assert.equal(isRetrieveFailure(r), true, "the MCP layer fails the call instead of surfacing the browser error text");
 });
 
 test("retrieve: rejects non-http(s) URLs before any session opens (file:// local-read)", async () => {

@@ -677,15 +677,20 @@ export async function retrieve(
   // sitekey — so a preloaded API script can't relabel a WAF block, and a co-present unrelated library
   // can't cross-label the kind (codex r3/r4). Carried on the classification signal.
   const captchaKind = activeCaptchaKind(render.html);
-  // Blocked = a failed navigation (no response captured), a visible anti-bot phrase, a PerimeterX
-  // press-&-hold (pxHint + EITHER thin content OR the challenge copy in source — a 200 challenge whose
-  // phrase renders in a cross-origin iframe, never reaching render.text; #21/#24 follow-up), or a hard
-  // block (4xx/5xx + thin body) on the FINAL render — so a reputation 403, or an exhausted proxy retry
-  // where every exit was dead, is reported as blocked instead of returning the error/empty/challenge
-  // body as content (F1 finding #2). A thin *200* with no PX marker is still NOT blocked, so a
-  // legitimately short page isn't flagged.
+  // A DEAD nav: no response captured (status null) OR the render ended on a `chrome-error://` page — a reset
+  // socket / unreachable host that produced no real document, which can inherit a STALE non-null status from
+  // a prior in-page navigation (codex #41 r4). A chrome-error final URL is UNAMBIGUOUS (a real page never has
+  // one), unlike an HTML phrase, so folding it into the failure decision is SAFE — otherwise the browser's
+  // error DOM extracts to non-empty markdown and is handed back to the caller as page content.
+  const deadNav = render.status === null || isChromeErrorUrl(render.diagnostics?.finalUrl);
+  // Blocked = a dead nav, a visible anti-bot phrase, a PerimeterX press-&-hold (pxHint + EITHER thin content
+  // OR the challenge copy in source — a 200 challenge whose phrase renders in a cross-origin iframe, never
+  // reaching render.text; #21/#24 follow-up), or a hard block (4xx/5xx + thin body) on the FINAL render — so
+  // a reputation 403, an exhausted proxy retry where every exit was dead, or a client-side crash to a Chrome
+  // error page is reported as blocked instead of returning the error/empty/challenge body as content (F1
+  // finding #2). A thin *200* with no PX marker is still NOT blocked, so a legitimately short page isn't flagged.
   const blocked =
-    render.status === null ||
+    deadNav ||
     isVisiblyBlocked(render) ||
     isPerimeterXChallenge(render, pxHint) ||
     (pxHint && pxCopy) ||
@@ -721,7 +726,7 @@ export async function retrieve(
   // silent "blocked". `null` when the page is not blocked.
   const reason: BlockReason | null = !blocked
     ? null
-    : render.status === null
+    : deadNav
       ? "nav-failed"
       : resolveBlockReason(signal);
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
