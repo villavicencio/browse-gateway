@@ -646,11 +646,12 @@ function makeSlowGateway(result, delayMs) {
   const calls = [];
   const gateway = {
     async withConsumerSession(token, fn, coreOverrides) {
-      calls.push({ coreOverrides });
+      const call = { coreOverrides };
+      calls.push(call);
       const session = {
         core: {
           kind: "fake",
-          async render() { await new Promise((r) => setTimeout(r, delayMs)); return renderOf({ ...result }); },
+          async render(_url, renderOpts) { call.renderOpts = renderOpts; await new Promise((r) => setTimeout(r, delayMs)); return renderOf({ ...result }); },
           async setNavigationGuard() {},
           async close() {},
         },
@@ -660,6 +661,31 @@ function makeSlowGateway(result, delayMs) {
   };
   return { gateway, calls };
 }
+
+test("#43: a proxied attempt's nav+clearance are CLAMPED to the remaining budget (true outer bound, codex r1)", async () => {
+  // With a 30s budget and an instant direct render, the first proxied attempt sees ~30s remaining: nav is
+  // clamped to min(25s, 30s)=25s, and clearance to min(45s, 30s−25s)=5s — well under the 45s default, so the
+  // attempt's own wall-clock cannot overrun the budget. (A pre-attempt check alone let it finish at ~140s.)
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 0);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 30000, proxyMaxAttempts: 1 },
+  });
+  const proxied = calls[1];
+  assert.ok(proxied.coreOverrides?.navigationTimeoutMs <= DEFAULT_CALL_TIMEOUTS.proxyNavTimeoutMs, "nav within its default");
+  assert.ok(
+    proxied.renderOpts?.clearanceTimeoutMs < DEFAULT_CALL_TIMEOUTS.proxyClearanceTimeoutMs,
+    `clearance clamped below the 45s default by the budget (got ${proxied.renderOpts?.clearanceTimeoutMs})`,
+  );
+  assert.ok(
+    (proxied.coreOverrides?.navigationTimeoutMs ?? 0) + (proxied.renderOpts?.clearanceTimeoutMs ?? 0) <= 30000,
+    "nav + clearance sum to at most the remaining budget",
+  );
+});
 
 test("#43: the escalation loop stops at the global call budget with a typed timeout failure", async () => {
   // The direct render (~25ms) already blows a 10ms budget, so the loop stops BEFORE spending a proxied

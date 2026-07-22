@@ -60,6 +60,11 @@ export const PROXY_NAV_TIMEOUT_MS = 25_000;
  */
 export const PROXY_CLEARANCE_TIMEOUT_MS = 45_000;
 
+/** #43: once fewer than this remains in the global call budget, don't start another proxied attempt — a
+ *  sub-2s window can't meaningfully open an exit + navigate + clear, and starting one risks a near-zero
+ *  navigationTimeoutMs (which Playwright treats as INFINITE). Below it, the loop stops with a typed timeout. */
+export const MIN_ATTEMPT_BUDGET_MS = 2_000;
+
 export interface RetrieveOptions {
   token: string;
   url: string;
@@ -717,22 +722,27 @@ export async function retrieve(
     // caller wires opts.solver, so this is the vestigial-seam correctness case, not a prod path.)
     solveAttemptReason = undefined;
     for (let attempt = 1; attempt <= timeouts.proxyMaxAttempts; attempt++) {
-      // #43: enforce the GLOBAL per-call budget BEFORE spending another proxied attempt (fresh session-open
-      // + up to proxyNav + proxyClearance). Stacking attempts is the dominant "why 200s" source, so this
-      // bounds the total wall-clock regardless of the per-attempt math and returns a decisive typed
-      // `timeout` failure instead of running to attempt exhaustion. The direct attempt already happened
-      // (its own clearance-bounded render); the budget covers the escalation tail.
-      if (performance.now() - t0 >= timeouts.callBudgetMs) {
+      // #43: make callBudgetMs a TRUE outer wall-clock bound (codex r1). A pre-attempt check alone doesn't
+      // bound it — an in-flight attempt (up to proxyNav + proxyClearance ≈ 70s on defaults) could start just
+      // under the deadline and finish far past it. So (a) stop once too little budget remains for a
+      // meaningful attempt, and (b) CLAMP this attempt's nav + clearance to the remaining budget — nav first
+      // (usually fast: a dead exit fails in ~1s), clearance (the pollable stage) gets the REST — so their sum
+      // can't overrun. clearanceTimeoutMs=0 is a no-op poll (a while-loop, not a Playwright timeout), so a
+      // fully-consumed clearance simply skips the wait rather than hanging.
+      const remaining = timeouts.callBudgetMs - (performance.now() - t0);
+      if (remaining <= MIN_ATTEMPT_BUDGET_MS) {
         budgetExceeded = true;
         break;
       }
       proxyAttempts = attempt;
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
       const attempt0 = performance.now();
+      const navBudget = Math.min(timeouts.proxyNavTimeoutMs, remaining);
+      const clearanceBudget = Math.min(proxiedRenderOpts.clearanceTimeoutMs ?? timeouts.proxyClearanceTimeoutMs, remaining - navBudget);
       render = await gateway.withConsumerSession(
         token,
-        (s) => s.core.render(url, proxiedRenderOpts),
-        { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: timeouts.proxyNavTimeoutMs },
+        (s) => s.core.render(url, { ...proxiedRenderOpts, clearanceTimeoutMs: clearanceBudget }),
+        { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: navBudget },
       );
       attemptMs.push(performance.now() - attempt0);
       // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a dead exit that
@@ -753,6 +763,10 @@ export async function retrieve(
         break;
       }
     }
+    // #43 (codex r1): also flag a timeout when the attempts exhausted right at the deadline (the clamped
+    // last attempt ran the budget out) rather than tripping the pre-attempt break — so a still-failing
+    // result that consumed the whole budget is classified `timeout`, not the incidental block class.
+    if (!budgetExceeded && performance.now() - t0 >= timeouts.callBudgetMs) budgetExceeded = true;
   }
 
   // render is assigned by here: non-forced did a direct render; forced implies a proxy so it ran >=1

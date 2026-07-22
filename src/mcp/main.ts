@@ -56,6 +56,7 @@ async function main(): Promise<void> {
   // solver is shared across the consumer's drive sessions; render() (retrieve) never invokes it.
   config.core.solver = httpCaptchaSolverFromSecrets(secrets, process.env.BGW_CAPTCHA_API_URL, {
     budget: DEFAULT_CAPTCHA_BUDGET,
+    timeoutMs: config.timeouts.captchaSolveTimeoutMs, // #43: env-overridable solve deadline (stdio path, codex r1)
   });
   // R9: the browser core's own stderr diagnostics (errCode) scrub the known-secret set via this store —
   // not just URL-strip — so a bare proxy password can't surface in a core diagnostic line (audit #3).
@@ -103,7 +104,7 @@ async function main(): Promise<void> {
     retrieve: async ({ url, forceProxy }) => {
       try {
         const forced = (forceProxy ?? false) || hostForcesProxy(new URL(url).hostname, forceProxyHosts);
-        return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix, forceProxy: forced });
+        return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix, forceProxy: forced, timeouts: config.timeouts });
       } catch (err) {
         // Never let a proxy/browser error message carry BYO secret material to the consumer (R9).
         const message = err instanceof Error ? err.message : String(err);
