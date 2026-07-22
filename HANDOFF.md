@@ -1,11 +1,42 @@
-# HANDOFF — 2026-07-22, late morning
+# HANDOFF — 2026-07-22, midday
 
-Picked up from the overnight run (which banked #47/#58/#44/#43 to main, undeployed). This session did
-two full gate+deploy cycles and one ticket end-to-end: (1) **gated + deployed the overnight #42-batch**;
-(2) **reshaped, implemented, 11-round-Codex-reviewed, merged, gated, and deployed #45**. Both are now
-**live in prod**. Everything below is committed; the working tree is clean and there are no open PRs.
+**Latest (this session): #48 silent-home-fallback detector — PR #68 OPEN, Codex-clean, awaiting your
+review + gate + deploy.** Branch `feat/48-silent-home-fallback-detector`. Drove the Claude↔Codex loop to
+convergence (4 rounds — each surfaced a genuine new URL false-positive/negative, all fixed; clean on r4)
+plus a parallel 3-lens adversarial workflow that independently corroborated the headline finding + a
+test-coverage gap. **778 tests pass, 0 TS errors.** NOT merged, NOT deployed — merge/gate/deploy are your
+call (deploy needs the batched in-container stealth gate). Detail below under "What We Built".
+
+**Prod is UNCHANGED: `sha256:0aa02c94…` (git `7fba0b9` = #45).** #48 is additive legibility (a derived
+diagnostic, never a behavior/security gate), so no prod risk while it waits.
+
+_Prior context (still true):_ the earlier part of this session gated+deployed the overnight #42-batch and
+reshaped/implemented/merged/gated/deployed #45 — both live in prod.
 
 ## What We Built
+
+- **#48 — silent home-fallback detector — PR #68 (NOT merged/deployed).** A deep link (non-root path /
+  query) that silently lands on the site's **bare root** is flagged so a caller can tell a real zero-result
+  from lost location/query state. Design (grounded by a 6-reader understand-workflow that found #48 was
+  *pre-wired*: a reserved `FailureDiagnostics.homeFallback` slot, a reserved `'ok'` FailureClass, and
+  `sanitizeUrl` preserving root-vs-deep for exactly this):
+  - **One shared pure predicate** `isHomeFallback(requestedUrl, finalUrl)` beside `isDeadExit`. Fires iff:
+    same-host http(s) (via `canonicalizeHost`), landing is a **bare root** (root path, no fragment, no
+    intent-bearing non-tracking query), AND the request carried intent now gone (deep path — index files
+    root-equivalent — or a non-tracking query key). Positive-signal-only, on RAW urls pre-redaction.
+  - **Orthogonal EVIDENCE, not a FailureClass** (preserves #40 one-reason). **One derivation, three carriers**
+    (you chose the complete surface over envelope-only via AskUserQuestion): top-level
+    `RetrieveResult.homeFallback` (carries the SUCCESS shape — a fat homepage has no envelope) + the
+    pre-declared `FailureDiagnostics.homeFallback` slot on failures + a non-fatal `PageSnapshot.homeFallback`
+    drive annotation (shared detector, differentiated disposition — a homepage is a returnable snapshot).
+    MCP success uses `structuredContent` (markdown stays pure).
+  - **Codex loop, 4 rounds → clean.** Fixed FPs/FNs each round: tracking-param canonicalization, index files,
+    landed hash-router fragments, path→query canonicalization, trailing-dot/case host equivalence. Files:
+    `verbs/retrieve.ts` (predicate+seam+field), `verbs/index.ts`, `observability/failure-diagnostics.ts`,
+    `browser/types.ts`, `mcp/drive-controller.ts`, `mcp/server.ts`. Tests: `test/home-fallback.test.mjs` (18)
+    + 5 `mcp-surface.test.mjs` client-boundary cases. Learning:
+    `docs/solutions/architecture-patterns/derived-evidence-boolean-carries-both-success-and-failure-shapes.md`.
+  - **HELD (operator HOLD #2):** the location-context primitive (postal/store pre-seed) — not built.
 
 - **Deployed the overnight batch (#47/#58/#44/#43).** A 4-agent coverage-audit workflow found the pre-chosen
   gate asserted *none* of the tickets' new fields, and that **#43's wall-clock bound was never observed on a
@@ -58,9 +89,11 @@ two full gate+deploy cycles and one ticket end-to-end: (1) **gated + deployed th
 
 ## What's Next
 
-1. **Continue the spine: `#48 → #53 → #54`.** #45 is done + deployed. **#48** ships the silent-home-fallback
-   detector cleanly (its location-primitive half is operator HOLD #2). **#53** conservative authed-MCP slice
-   (HOLD #3). **#54** slot-release + orphan-reap (HOLD #4).
+1. **Review + merge + gate + deploy #48 (PR #68).** Codex-clean, 778 tests green, additive-legibility (no
+   prod risk). Merge (squash), then the batched in-container stealth gate (~$10 IPRoyal PAYG leg at
+   ATTEMPTS=1/REQUIRED=1) before `gh workflow run deploy-http.yml -f image_tag=latest`. Then **continue the
+   spine: `#53 → #54`.** **#53** conservative authed-MCP slice (HOLD #3). **#54** slot-release + orphan-reap
+   (HOLD #4). (#48's location-primitive half stays operator HOLD #2 — not built.)
 2. **#45 follow-ups (filed, deferred):**
    - **#66 (r11):** a budget-truncated drive `goto` (headers before DCL) can pin a partial-200 as *success*
      not *timeout*. A naive fix breaks CF-clearance (same goto-throw → `#lastDocStatus` path) — needs a
