@@ -57,6 +57,21 @@ smokes to ATTEMPTS=1/REQUIRED=1 to spare the $10 burn.
   3× re-roll loop (a stateful session can't swap its exit mid-flow, KTD-5), so it doesn't stack toward 200s.
   **Coordinate with #45**, which restructures the drive escalation loop.
 
+## What Didn't Work (dead-ends the review loop exposed — don't relitigate)
+
+- **#44: "only reCAPTCHA is solvable" was WRONG.** The ticket (and my first pass) claimed it; the solver's
+  `TASK_TYPE` actually maps **reCAPTCHA v2 + Turnstile + hCaptcha**. Codex r1 caught the contradictory
+  eligibility. Fix: single-sourced `SOLVABLE_CAPTCHA_KINDS`, **drift-locked to `solverTaskTypeFor` by a test**.
+  Lesson: verify the solver map, not the ticket's prose.
+- **#43: you cannot make the budget a true wall-clock bound by clamping per-stage timeouts.** Nav-first-then-
+  rest starved clearance (r4); min-each-stage didn't bound the sum (r5). Both failed. The working fix is a
+  **shared core-level deadline** passed into `render()` (`budgetDeadlineMs`) that bounds goto + the wall-clock
+  clearance poll together. A *perfect* ceiling (unbounded pollSignal/CPU/lifecycle) needs a top-level
+  `Promise.race`/AbortSignal — **explicitly ruled OUT of #43's scope** (documented follow-up, coord #54).
+- **Background-Codex mechanics:** a raw `&` gives no completion notification (use `run_in_background: true`);
+  chaining `git commit && codex exec review` in one backgrounded call got the task **killed** — run the commit
+  foreground, launch Codex as its own backgrounded call.
+
 ## What's next — remaining spine
 
 `#45 → #48 → #53 → #54`.
