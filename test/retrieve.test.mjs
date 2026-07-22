@@ -445,6 +445,26 @@ test("#44: retrieve with a SUPPLIED solver that FAILS reports the typed code, no
   assert.equal(r.diagnostics?.captchaSolveReason, "vendor-error", "the supplied solver's typed code is surfaced");
 });
 
+test("#44: a stale direct-render solve reason is NOT attached after escalation replaces the render (codex r4)", async () => {
+  // opts.solver FAILS on the DIRECT captcha render, then escalation replaces `render` with proxied ones. The
+  // direct render's code must NOT ride the final envelope — it never described the surfaced (proxied) page.
+  const capBlock = () => renderOf({
+    status: 403, title: "", text: "Forbidden",
+    html: '<div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://hard.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([capBlock(), capBlock(), capBlock(), capBlock()]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  let solveCalls = 0;
+  const solver = { async solve() { solveCalls++; const e = new Error("vendor boom"); e.code = "vendor-error"; throw e; } };
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true }, solver });
+  assert.equal(r.proxyUsed, true, "escalation ran (the direct hard-block escalated)");
+  assert.equal(solveCalls, 1, "the solve was attempted once, on the direct render only");
+  assert.equal(r.diagnostics?.solverEligible, true, "the final render still carries a solvable widget");
+  assert.notEqual(r.diagnostics?.captchaSolveReason, "vendor-error", "the STALE direct-render code must not ride the final envelope");
+  assert.equal(r.diagnostics?.captchaSolveReason, undefined, "no solve was attempted on the surfaced render → omitted");
+});
+
 test("#44: retrieve preserves the CAPTCHA reason when a WAF marker takes class precedence (codex r3)", async () => {
   // A DataDome page ALSO serving a reCAPTCHA: classifyFailure keeps anti-bot-block (WAF-first), but a real
   // solvable widget is present — so solverEligible + captchaSolveReason must ride the DETECTED captcha, not

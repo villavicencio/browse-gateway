@@ -697,6 +697,11 @@ export async function retrieve(
   //    the 20s default (probe, 2026-06-09).
   if (proxy && (forced || (render !== undefined && shouldEscalateToProxy(render, render.status, escalation)))) {
     proxyUsed = true;
+    // #44 (codex r4): the solve hook above ran on the DIRECT render; escalation now REPLACES `render` with a
+    // proxied one, so any direct-render solve reason is STALE — it does not describe the surfaced page (which
+    // was never handed to the solver). Clear it so a stale code can't ride the final envelope. (No production
+    // caller wires opts.solver, so this is the vestigial-seam correctness case, not a prod path.)
+    solveAttemptReason = undefined;
     for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
       proxyAttempts = attempt;
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
