@@ -12,6 +12,36 @@ import { EscalationError, isRetrieveFailure } from "../verbs/index.js";
 import { summarizeFailureDiagnostics, failureOf, sanitizeUrlForError, sanitizeUrlsInErrorText } from "../observability/index.js";
 import type { FailureDiagnostics, Timing } from "../observability/index.js";
 
+/**
+ * `_meta` key on a tool ERROR result carrying a machine-readable failure kind (issue #47), so a
+ * client-side circuit breaker (a downstream consumer, out of this repo) can act on the failure without
+ * parsing the human-readable text. Namespaced under a prefix this repo controls (the `io.modelcontextprotocol/*`
+ * prefix is reserved for the spec). The base MCP `Result` `_meta` is passthrough, so the value reaches
+ * the client verbatim.
+ */
+export const ERROR_KIND_META_KEY = "browse-gateway/error-kind";
+
+/**
+ * The kind tag on a tool error (issue #47), keyed by {@link ERROR_KIND_META_KEY}:
+ *  - `in-band`  — a COMPLETED round-trip that returned a negative result: a WAF/challenge block, an empty
+ *                 extraction, or a nav that failed to reach the target. The gateway is HEALTHY; the page /
+ *                 target was the problem. A breaker must NOT count this toward unreachability.
+ *  - `internal` — the gateway or browser itself threw but the server still RESPONDED (a browser crash, an
+ *                 action error like a locator timeout, a config error, a session-limit refusal). Alive-but-
+ *                 errored — NOT a transport failure either way.
+ * The distinction is drawn from the ACTUAL failure verdict, never the error wrapper: retrieve's shared
+ * in-band failure predicate (`isRetrieveFailure`), or — on the drive path — whether the failure envelope
+ * carries a `failureClass`, which the drive layer sets only for a genuine navFailed block/nav-failure (so a
+ * healthy-page locator timeout or a "no proxy available" config error, both merely enveloped, stay
+ * `internal`). Genuine TRANSPORT failures (connection refused / reset / request timeout) never produce a
+ * tool result at all — the client's transport observes those directly — so they are deliberately not
+ * enumerated here; a breaker cools on transport failures, exempts `in-band`, and treats `internal` at its
+ * discretion.
+ */
+export type ErrorKind = "in-band" | "internal";
+
+const errorKindMeta = (kind: ErrorKind) => ({ [ERROR_KIND_META_KEY]: kind });
+
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
   markdown: string;
@@ -140,6 +170,9 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           const failure = result.diagnostics ? renderFailure(result.diagnostics) : "";
           return {
             isError: true,
+            // #47: in-band — a completed round-trip that returned a blocked / empty / unreachable result
+            // (the shared isRetrieveFailure predicate). The gateway is healthy; a breaker must not count it.
+            _meta: errorKindMeta("in-band"),
             content: [
               {
                 type: "text",
@@ -157,6 +190,9 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
         const message = err instanceof Error ? err.message : String(err);
         return {
           isError: true,
+          // #47: the retrieve call threw — the gateway responded but a sub-op errored (alive, not a
+          // transport failure). Typed `internal` so a breaker can distinguish it from an in-band block.
+          _meta: errorKindMeta("internal"),
           content: [{ type: "text", text: `browse-gateway error: ${sanitizeUrlsInErrorText(message)}` }],
         };
       }
@@ -180,7 +216,13 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
       // EscalationError's `.failure` or a plain drive error decorated by attachFailure. Already redacted.
       const failure = failureOf(err);
       if (failure) text += renderFailure(failure);
-      return { isError: true as const, content: [{ type: "text" as const, text }] };
+      // #47: type the failure kind for a client breaker from the ACTUAL failure verdict, not the wrapper
+      // (codex r1). The envelope carries a `failureClass` ONLY for a genuine navFailed block/nav-failure —
+      // so a real WAF/challenge/unreachable failure is `in-band` (gateway healthy), while a healthy-page
+      // action error (locator timeout, enveloped but unclassified) OR a config EscalationError (force-proxy
+      // with no proxy available, thrown with no envelope) correctly stays `internal`.
+      const kind: ErrorKind = failure?.failureClass ? "in-band" : "internal";
+      return { isError: true as const, _meta: errorKindMeta(kind), content: [{ type: "text" as const, text }] };
     };
     const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
     const snap = async (run: () => Promise<PageSnapshot>) => {
@@ -330,8 +372,15 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
       "browser_close",
       {
         title: "Close the drive session",
-        description: "Close the drive session and free its browser. Call when the interactive task is done.",
+        description:
+          "Close the drive session and free its browser. Call when the interactive task is done. " +
+          "Always safe and idempotent: closing an already-closed or never-opened session is a no-op, " +
+          "so a client may call it for cleanup unconditionally (and exempt it from any breaker cooldown).",
         inputSchema: {},
+        // #47: advertise the cleanup verb as idempotent/always-safe so a client-side breaker can exempt
+        // it from a cooldown gate. close() -> gateway release is a no-op for an unknown/closed id and
+        // swallows errors, so it neither destroys data nor depends on session state.
+        annotations: { idempotentHint: true, destructiveHint: false, openWorldHint: false },
       },
       async () => {
         try {

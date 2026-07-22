@@ -7,7 +7,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createGatewayMcpServer } from "../dist/mcp/index.js";
+import { createGatewayMcpServer, ERROR_KIND_META_KEY } from "../dist/mcp/index.js";
+import { EscalationError } from "../dist/verbs/index.js";
+import { attachFailure } from "../dist/observability/index.js";
 
 const outcome = (over = {}) => ({
   markdown: "# Title\n\nbody",
@@ -215,4 +217,93 @@ test("browser_close invokes the controller's close", async () => {
   const client = await connectWithDrive(drive);
   await client.callTool({ name: "browser_close", arguments: {} });
   assert.ok(calls.some((c) => c[0] === "close"));
+});
+
+// --- #47: client-breaker affordances (error-kind _meta + idempotent tag) ---------------------
+
+const kindOf = (res) => res._meta?.[ERROR_KIND_META_KEY];
+// A genuine drive block/nav-failure carries a failureClass on its envelope (the drive layer sets it only
+// when navFailed); a healthy-page action error or a config failure carries none. The classifier keys off
+// this, NOT the wrapper (codex r1).
+const blockEnvelope = { finalUrl: "https://blocked/", status: 403, failureClass: "hard-block" };
+const healthyPageEnvelope = { finalUrl: "https://ok/", status: 200 }; // enveloped but NO failureClass
+
+test("#47: a retrieve in-band failure (block/empty/unreachable) tags error-kind=in-band", async () => {
+  const client = await connect(async () =>
+    outcome({ blocked: true, markdown: "", reason: "hard-block", status: 403, proxyUsed: true }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://blocked/" } });
+  assert.equal(res.isError, true);
+  assert.equal(kindOf(res), "in-band");
+});
+
+test("#47: a retrieve gateway-down throw tags error-kind=internal (alive, not a transport failure)", async () => {
+  const client = await connect(async () => {
+    throw new Error("gateway unreachable");
+  });
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://x/" } });
+  assert.equal(res.isError, true);
+  assert.equal(kindOf(res), "internal");
+});
+
+test("#47: a successful retrieve carries no error-kind (_meta clean on success)", async () => {
+  const client = await connect(async () => outcome({ markdown: "content" }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://ok/" } });
+  assert.equal(res.isError ?? false, false);
+  assert.equal(kindOf(res), undefined);
+});
+
+test("#47: a drive block (envelope carries a failureClass) tags error-kind=in-band", async () => {
+  const { drive } = makeFakeDrive();
+  drive.navigate = async () => {
+    throw new EscalationError("navigation failed via proxy", { attempts: 3, proxyUsed: true }, blockEnvelope);
+  };
+  const client = await connectWithDrive(drive);
+  const res = await client.callTool({ name: "browser_navigate", arguments: { url: "https://blocked/" } });
+  assert.equal(res.isError, true);
+  assert.equal(kindOf(res), "in-band");
+  // The structured escalation diagnostics still ride the human-readable text (unchanged by #47).
+  assert.match(res.content[0].text, /diagnostics/);
+});
+
+test("#47: a config EscalationError with NO block envelope (e.g. force-proxy, no proxy) tags internal", async () => {
+  // codex r1 regression: the presence of an EscalationError wrapper must NOT imply a page block — a
+  // configuration failure is thrown with no failure envelope (no failureClass) and is genuinely internal.
+  const { drive } = makeFakeDrive();
+  drive.navigate = async () => {
+    throw new EscalationError("force-proxy requested but no residential proxy is available", { attempts: 0, proxyUsed: false });
+  };
+  const client = await connectWithDrive(drive);
+  const res = await client.callTool({ name: "browser_navigate", arguments: { url: "https://forced/" } });
+  assert.equal(res.isError, true);
+  assert.equal(kindOf(res), "internal");
+});
+
+test("#47: a healthy-page action error that got a best-effort envelope (no failureClass) tags internal", async () => {
+  // codex r1 regression: #actAndSnap attaches a best-effort envelope to a locator timeout on a HEALTHY
+  // page — that envelope has no failureClass, so it must classify internal, not in-band.
+  const { drive } = makeFakeDrive();
+  drive.click = async () => {
+    throw attachFailure(new Error("locator timed out"), healthyPageEnvelope);
+  };
+  const client = await connectWithDrive(drive);
+  const res = await client.callTool({ name: "browser_click", arguments: { target: "e4" } });
+  assert.equal(res.isError, true);
+  assert.equal(kindOf(res), "internal");
+});
+
+test("#47: a plain drive error with no envelope at all tags error-kind=internal", async () => {
+  const { drive } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  const res = await client.callTool({ name: "browser_navigate", arguments: { url: "https://boom/" } });
+  assert.equal(res.isError, true);
+  assert.equal(kindOf(res), "internal");
+});
+
+test("#47: browser_close is advertised idempotent (annotations.idempotentHint)", async () => {
+  const { drive } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  const close = (await client.listTools()).tools.find((t) => t.name === "browser_close");
+  assert.ok(close, "browser_close must be listed");
+  assert.equal(close.annotations?.idempotentHint, true);
+  assert.match(close.description, /idempotent/i);
 });

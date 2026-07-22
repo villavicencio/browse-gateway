@@ -33,6 +33,16 @@ export interface ConsumerServer {
 }
 
 /**
+ * The liveness/health payload the `GET /health` route returns (issue #47). A cheap, browser-session-free
+ * signal a client-side breaker re-probes instead of blind-cooling. Deliberately minimal here — issue #53
+ * enriches it with pool-degradation counters (forceKillAvailable / unconfirmedCount / activeCount /
+ * maxSessions) by extending the injected `health` producer, without changing this route's plumbing.
+ */
+export interface HealthReport {
+  status: "ok";
+}
+
+/**
  * The shared HTTP launcher's fail-closed DNS-rebinding boot check. `BGW_ALLOWED_HOSTS` is MANDATORY:
  * MCP clients are non-browser, so they send no `Origin` header, and the SDK only validates the `Host`
  * header when `allowedHosts` is non-empty. `allowedOrigins` is therefore ADDITIVE (browser-origin
@@ -66,6 +76,10 @@ export interface HttpHandlerDeps {
   cleanupAwaitMs?: number;
   /** Max request body bytes accepted on POST. Default 4 MiB. */
   maxBodyBytes?: number;
+  /** Liveness/health producer for the `GET /health` route (issue #47). Cheap + browser-session-free —
+   *  it must NOT acquire a browser or block. Absent → the route returns a bare `{ status: "ok" }`.
+   *  Issue #53 injects a producer that folds in the gateway's pool-degradation counters. */
+  health?: () => HealthReport;
   log?: (msg: string) => void;
   now?: () => number;
   /** Injectable session-id generator (tests). Default `randomUUID`. */
@@ -237,6 +251,19 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       return sendError(res, 401, -32002, "unauthorized");
     }
 
+    // Liveness/health (issue #47): a cheap, browser-session-free signal a client-side breaker re-probes
+    // instead of blind-cooling. Session-INDEPENDENT (no MCP initialize handshake) and authed through the
+    // single policy point above. This route bypasses the SDK transport, so it must apply the SAME
+    // fail-closed DNS-rebinding Host/Origin validation the transport enforces on the MCP routes — the Host
+    // allowlist is load-bearing here (codex r2), doubly so once #53 exposes pool internals on this body.
+    // (Distinct path from `/mcp`, so it never collides with the session-keyed MCP routing below.)
+    if (method === "GET" && requestPath(req) === "/health") {
+      if (dnsRebindProtection && dnsRebindRequestError(req, allowedHosts, allowedOrigins)) {
+        return sendError(res, 403, -32003, "forbidden");
+      }
+      return sendHealth(res, deps.health);
+    }
+
     const sessionId = headerValue(req.headers["mcp-session-id"]);
 
     if (method === "POST") {
@@ -373,6 +400,45 @@ function parseBearer(header: string | string[] | undefined): string {
 
 function headerValue(header: string | string[] | undefined): string | undefined {
   return Array.isArray(header) ? header[0] : header;
+}
+
+/**
+ * The SDK transport's DNS-rebinding check, mirrored for routes that bypass it (the `/health` route —
+ * issue #47, codex r2). Same semantics as `StreamableHTTPServerTransport.validateRequestHeaders`: with an
+ * `allowedHosts` allowlist, the `Host` header MUST be on it; with `allowedOrigins`, a present `Origin` MUST
+ * be on it. Callers gate on `dnsRebindProtection` first, so this assumes protection is on. Returns an error
+ * string when the request should be rejected, else null. Kept in lockstep with the SDK so `/health` and the
+ * MCP routes never diverge on which requests the Host guard blocks.
+ */
+function dnsRebindRequestError(req: IncomingMessage, allowedHosts: string[], allowedOrigins: string[]): string | null {
+  if (allowedHosts.length > 0) {
+    const host = headerValue(req.headers.host);
+    if (!host || !allowedHosts.includes(host)) return `Invalid Host header: ${host ?? ""}`;
+  }
+  if (allowedOrigins.length > 0) {
+    const origin = headerValue(req.headers.origin);
+    if (origin && !allowedOrigins.includes(origin)) return `Invalid Origin header: ${origin}`;
+  }
+  return null;
+}
+
+/** The request path (pathname only, query stripped) from an origin-form request-target. A missing/odd
+ *  target falls back to "/", so it never throws and can't accidentally match "/health". */
+function requestPath(req: IncomingMessage): string {
+  try {
+    return new URL(req.url ?? "/", "http://localhost").pathname;
+  } catch {
+    return "/";
+  }
+}
+
+/** Write the liveness payload (issue #47): a small JSON body, no-store, consuming no browser session.
+ *  `no-store` so an intermediary can't serve a stale "ok" for a since-degraded gateway (matters once
+ *  #53 folds degradation counters into the body). */
+function sendHealth(res: ServerResponse, health?: () => HealthReport): void {
+  const body = JSON.stringify(health ? health() : { status: "ok" });
+  res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(body);
 }
 
 /** Write a JSON-RPC 2.0 error envelope with an HTTP status, so MCP clients parse it cleanly. */
