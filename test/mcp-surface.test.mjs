@@ -307,3 +307,54 @@ test("#47: browser_close is advertised idempotent (annotations.idempotentHint)",
   assert.equal(close.annotations?.idempotentHint, true);
   assert.match(close.description, /idempotent/i);
 });
+
+// --- #48 silent home-fallback: surface at the client boundary ------------------------------------
+
+test("#48: a SUCCESS-shaped home-fallback surfaces homeFallback via structuredContent, markdown stays PURE", async () => {
+  // A fat-homepage fallback carries no failure envelope, so structuredContent is the SOLE carrier of the
+  // flag to an MCP consumer. The returned text must be byte-for-byte the page markdown (content purity).
+  const client = await connect(async () => outcome({ markdown: "# Home\n\nwelcome", homeFallback: true }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://store/search?q=milk" } });
+  assert.equal(res.isError ?? false, false, "a fat-homepage fallback is still a SUCCESS");
+  assert.equal(res.content[0].text, "# Home\n\nwelcome", "markdown is pure — no gateway chrome injected");
+  assert.equal(res.structuredContent?.homeFallback, true, "the flag rides the structuredContent channel");
+});
+
+test("#48: a clean success carries NO structuredContent key (omit-when-false)", async () => {
+  const client = await connect(async () => outcome({ markdown: "# Real\n\npage" }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://store/deep" } });
+  assert.equal(res.isError ?? false, false);
+  assert.equal(res.structuredContent, undefined, "no home-fallback → no structuredContent");
+});
+
+test("#48: a FAILURE-shaped home-fallback renders homeFallback in the failure envelope text", async () => {
+  const client = await connect(async () =>
+    outcome({ blocked: false, markdown: "", status: 200, homeFallback: true, diagnostics: { finalUrl: "https://store/", failureClass: "empty-shell", homeFallback: true } }));
+  const res = await client.callTool({ name: "retrieve", arguments: { url: "https://store/search?q=milk" } });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /homeFallback":true/, "the envelope carries the flag alongside the class");
+  assert.match(res.content[0].text, /empty-shell/, "the per-signal class rides alongside, not replaced");
+});
+
+test("#48: drive browser_navigate renders a homeFallback header line when annotated", async () => {
+  const calls = [];
+  const snap = (over = {}) => ({ url: "https://store/", title: "Home", tree: '- link "x" [ref=e1]', ...over });
+  const drive = {
+    async open() {}, async close() {},
+    async navigate(url) { calls.push(url); return snap({ homeFallback: true }); },
+    async snapshot() { return snap(); }, async click() { return snap(); }, async type() { return snap(); },
+    async selectOption() { return snap(); }, async pressKey() { return snap(); }, async waitFor() { return snap(); },
+    async screenshot() { return "QUJD"; },
+  };
+  const client = await connectWithDrive(drive);
+  const nav = await client.callTool({ name: "browser_navigate", arguments: { url: "https://store/search?q=milk" } });
+  assert.equal(nav.isError ?? false, false, "a home page is a returnable snapshot, not a drive error");
+  assert.match(nav.content[0].text, /homeFallback: true/, "the header surfaces the annotation to the in-loop agent");
+});
+
+test("#48: drive browser_navigate has NO homeFallback header on a normal landing", async () => {
+  const { drive } = makeFakeDrive();
+  const client = await connectWithDrive(drive);
+  const nav = await client.callTool({ name: "browser_navigate", arguments: { url: "https://example.com/" } });
+  assert.doesNotMatch(nav.content[0].text, /homeFallback/, "omitted when not detected");
+});

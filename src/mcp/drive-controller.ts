@@ -31,6 +31,7 @@ import {
   classifyExitOrg,
   parseExitOrg,
   isDeadExit,
+  isHomeFallback,
   MIN_ATTEMPT_BUDGET_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
@@ -358,7 +359,16 @@ export class GatewayDriveController implements DriveController {
     // full-budget verb would receive a FRESH callBudgetMs and the caller-visible time could reach multiples
     // of the bound. Threaded into #navigate (not recomputed there) so the whole verb shares ONE deadline.
     const budgetDeadlineMs = t0 + this.#timeouts.callBudgetMs;
-    return this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts, budgetDeadlineMs)));
+    const snap = await this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts, budgetDeadlineMs)));
+    // #48: annotate a SILENT HOME-FALLBACK on the returned snapshot — the requested DEEP link (non-root path
+    // / query) landed on the site's bare root (snap.url is the raw post-redirect page.url()). NON-FATAL: a
+    // homepage is a legitimately returnable snapshot (never a drive failure), so this ANNOTATES and returns,
+    // letting the in-loop agent decide — unlike retrieve, which surfaces it as an outcome flag. The SHARED
+    // isHomeFallback predicate keeps drive/retrieve detection from drifting (the parity invariant). Only
+    // navigate() has a requested target; post-action snapshot()/click()/… never carry this. A drive nav that
+    // FAILS throws before here (the block/nav class is the story there); the fallback-on-failure envelope
+    // slot is a documented deferral.
+    return isHomeFallback(url, snap.url) ? { ...snap, homeFallback: true } : snap;
   }
 
   async #navigate(url: string, opts: { forceProxy?: boolean }, budgetDeadlineMs: number): Promise<PageSnapshot> {

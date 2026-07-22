@@ -30,7 +30,7 @@ import type { FailureDiagnostics, WafVendor, FailureClass, Timing } from "../obs
 export type { WafVendor, FailureClass, Timing } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { DEFAULT_CALL_TIMEOUTS, type CallTimeouts } from "../gateway/config.js";
-import { isHttpUrl } from "../security/index.js";
+import { isHttpUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
@@ -137,6 +137,16 @@ export interface RetrieveResult {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the solver. */
   captchaSolved: boolean;
+  /**
+   * A SILENT HOME-FALLBACK was detected (issue #48): the requested DEEP link (non-root path / query)
+   * silently landed on the site's bare root, so the homepage — not the requested page — was rendered.
+   * Omitted (never `false`) when not detected ({@link isHomeFallback}). Orthogonal to {@link blocked} /
+   * {@link reason}: a fat homepage is a SUCCESS shape, and THIS is the only fallback signal that shape
+   * carries since {@link diagnostics} is failure-only; a fallback that ALSO lands thin keeps its
+   * {@link FailureClass} with this riding alongside as the "why" (so the #40 one-reason invariant holds).
+   * On a failed retrieve the same boolean is also folded into {@link diagnostics}, so the two can't disagree.
+   */
+  homeFallback?: boolean;
   /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
   proxyDiagnostic?: EscalationDiagnostics;
   /**
@@ -303,6 +313,88 @@ export function isChromeErrorUrl(url: string | undefined): boolean {
  */
 export function isDeadExit(status: number | null, finalUrl: string | undefined): boolean {
   return status === null || isChromeErrorUrl(finalUrl);
+}
+
+/**
+ * A SILENT HOME-FALLBACK signal (#48): the caller requested a DEEP link (a non-root path or a query — a
+ * search / location / deep-content URL) but the navigation LANDED on the same site's bare root, silently
+ * dropping the deep path / query. This is the "deep link resolved to home / dropped its query" case the
+ * site-compat epic (#38) reports so a caller can tell a real zero-result from lost location/query state,
+ * instead of the homepage being handed back as if it were the requested page.
+ *
+ * A PURE derivation over signals BOTH verbs already carry (the requested URL + the landed finalUrl), no
+ * probe — mirrors {@link isDeadExit}. It is orthogonal EVIDENCE, never a {@link FailureClass}: a fat
+ * homepage is a SUCCESS shape, and a fallback that ALSO lands thin keeps its per-signal class with this
+ * riding alongside as the "why" — so the #40 one-reason invariant holds. Runs on the RAW urls BEFORE
+ * {@link sanitizeUrl} collapses the path (the redactor preserves the root-vs-deep distinction precisely so
+ * this can surface only a boolean).
+ *
+ * POSITIVE-SIGNAL-ONLY and conservative to avoid false-positives on ordinary redirects — it fires ONLY when
+ *   - both URLs are same-host http(s), hosts compared via the shared {@link canonicalizeHost} contract
+ *     (trailing-dot FQDN / case normalized). A cross-host landing — an auth / consent / geo interstitial —
+ *     is NOT a home-fallback of the requested site; it is governed by the nav policy, not this signal. AND
+ *   - the landing is a BARE root — a root path, NO fragment, and NO intent-bearing (non-{@link isTrackingParam
+ *     tracking}) query. A fragment (hash-router route `/#/products/123`) or a non-tracking landed query (a
+ *     `/search/milk` → `/?q=milk` path→query canonicalization) means the requested state may be PRESERVED in
+ *     the landing, so it is not a bare homepage. AND
+ *   - the REQUEST carried intent that is now gone — a real deep path (an index-filename `/index.html` is
+ *     root-equivalent, not deep) OR an intent-bearing query key (both are necessarily lost, since the bare
+ *     landing carries neither).
+ * Deliberately does NOT fire on: a same-host deep→deep redirect; a trailing-slash / locale canonicalization
+ * to a deep equivalent; a tracking-only root request (`/?utm_source=…`, `/?gclid=…`) canonicalized to `/`;
+ * an index-filename canonicalization; a landing that preserved the state in a fragment or a query. Unparseable
+ * URLs → false (fail-safe: assert nothing). KNOWN conservative false-NEGATIVES, left as documented deferrals:
+ * www↔apex host normalization; a requested hash-router link (`/#/deep` → `/`, depth lives in the fragment,
+ * unseen); and a query-only link whose key is retained but whose VALUE is dropped (`/?store=123` →
+ * `/?store=0`) — the bare-landing test is key-presence-only, to avoid value-canonicalization FPs.
+ */
+export function isHomeFallback(requestedUrl: string | undefined, finalUrl: string | undefined): boolean {
+  if (requestedUrl === undefined || finalUrl === undefined) return false;
+  let req: URL;
+  let fin: URL;
+  try {
+    req = new URL(requestedUrl);
+    fin = new URL(finalUrl);
+  } catch {
+    return false; // fail-safe: never assert a fallback from an unparseable URL
+  }
+  const httpish = (u: URL): boolean => u.protocol === "http:" || u.protocol === "https:";
+  if (!httpish(req) || !httpish(fin)) return false;
+  // Same host (a cross-host landing is a different, policy-governed case), via the shared canonicalizeHost
+  // contract so a trailing-dot FQDN / case difference doesn't spuriously suppress the signal.
+  if (canonicalizeHost(req.hostname) !== canonicalizeHost(fin.hostname)) return false;
+  const isRootPath = (p: string): boolean => p === "" || p === "/";
+  const intentKeys = (u: URL): string[] => [...u.searchParams.keys()].filter((k) => !isTrackingParam(k));
+  // The landing must be a BARE root: a root path, NO fragment (a hash route preserves deep state), and NO
+  // intent-bearing query (a path→query canonicalization keeps the state in the landed query). Any of those
+  // means the requested state may be preserved there — not a silent home-fallback (positive-signal-only).
+  if (!isRootPath(fin.pathname) || fin.hash !== "" || intentKeys(fin).length > 0) return false;
+  // The landing is bare. Fire iff the REQUEST actually carried intent that is now gone — a real deep path (an
+  // index-filename like /index.html is root-equivalent, not deep) OR an intent-bearing query key.
+  const reqDeepPath = !isRootPath(req.pathname) && !isIndexFilenamePath(req.pathname);
+  return reqDeepPath || intentKeys(req).length > 0;
+}
+
+/** Well-known tracking / campaign / click-id query keys — disposable metadata that carries NO location or
+ *  search state, so a homepage requested with one and canonicalized to a clean root is not a lost deep link
+ *  (issue #48, codex review). Any `utm_*` key plus this closed set; matched case-insensitively. Biased to
+ *  OVER-include (a mislabel here yields a safe false-NEGATIVE — a missed fallback — never a false alarm). */
+const TRACKING_PARAMS = new Set([
+  "gclid", "gclsrc", "gbraid", "wbraid", "dclid", "fbclid", "msclkid", "yclid", "ttclid", "twclid",
+  "igshid", "mc_cid", "mc_eid", "_ga", "_gl", "ref", "ref_src", "ref_url", "referrer", "source",
+  "campaign", "cmpid", "cmp", "mkt_tok", "s_kwcid", "_hsenc", "_hsmi", "vero_id", "oly_anon_id",
+]);
+function isTrackingParam(key: string): boolean {
+  const k = key.toLowerCase();
+  return k.startsWith("utm_") || TRACKING_PARAMS.has(k);
+}
+
+/** A single index-filename path (`/index.html`, `/default.aspx`, `/home`) that a site canonicalizes to `/`
+ *  — root-equivalent, so requesting it and landing on `/` is not a lost deep link (issue #48, codex review).
+ *  Only a SOLE segment counts: `/foo/index.html` → `/` still lost the `/foo` depth. */
+const INDEX_FILENAMES = new Set(["index.html", "index.htm", "index.php", "default.aspx", "default.asp", "home"]);
+function isIndexFilenamePath(pathname: string): boolean {
+  return INDEX_FILENAMES.has(pathname.replace(/^\//, "").toLowerCase());
 }
 
 /**
@@ -966,6 +1058,15 @@ export async function retrieve(
         : classifyFailure(signal)
     : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+  // #48: a SILENT HOME-FALLBACK — the requested DEEP link (non-root path / query) silently landed on the
+  // site's bare root, so the homepage was handed back instead of the requested page. A pure derivation
+  // (isHomeFallback) over the requested `url` and the landed render.diagnostics.finalUrl, on the RAW urls
+  // BEFORE redaction collapses the path. Orthogonal EVIDENCE, NOT a FailureClass (the #40 doctrine): it
+  // rides ALONGSIDE the per-signal class — a fallback that also lands thin still classifies real-zero-results
+  // / empty-shell, this boolean says WHY — so it never competes with `reason`/`failureClass`. Surfaced on the
+  // top-level result (so a SUCCESS-shaped fat-homepage fallback is legible where no envelope is built) AND,
+  // on a failure, folded into the evidence envelope from the SAME derivation so the two can't disagree.
+  const homeFallback = isHomeFallback(url, render.diagnostics?.finalUrl);
   // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
   // BOTH gate on a DETECTED active CAPTCHA (signal.captchaKind), NOT on failureClass==="captcha" — a page can
   // carry a genuine solvable widget while a higher-precedence WAF marker makes the primary class
@@ -1015,6 +1116,7 @@ export async function retrieve(
             timing,
             ...(solverEligible !== undefined ? { solverEligible } : {}),
             ...(captchaSolveReason ? { captchaSolveReason } : {}),
+            ...(homeFallback ? { homeFallback } : {}), // #48: same derivation as the top-level flag
           },
           secrets,
         )
@@ -1030,6 +1132,7 @@ export async function retrieve(
     proxyUsed,
     captchaSolved,
     timing,
+    ...(homeFallback ? { homeFallback } : {}), // #48: omit-when-false; carries the SUCCESS shape too
     ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
     ...(diagnostics ? { diagnostics } : {}),
   };
