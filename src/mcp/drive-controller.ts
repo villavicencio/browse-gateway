@@ -388,7 +388,7 @@ export class GatewayDriveController implements DriveController {
     // a LIVE pinned session already carries the token from its first warm-up, so re-warming every navigate
     // would be wrong (and wasteful). A revoked entry already failed LOUD inside #ensureOpen above.
     if (reopening && this.#warmHost !== undefined) {
-      await this.#warmUpForTarget(url);
+      await this.#warmUpForTarget(url, budgetDeadlineMs);
     }
     // Capture warmth AFTER #ensureOpen (which may have RE-WARMED a reaped session): a stale warm replay
     // must fail LOUD with the operator-recapture signal on the reopen path too — not the generic "retry
@@ -399,12 +399,23 @@ export class GatewayDriveController implements DriveController {
     // out mid-challenge, the very failure this feature fixes.
     const snap = await this.#run((s) =>
       // #45 (codex r1): the PINNED single-shot also carries the shared per-call deadline, so a small
-      // BGW_CALL_BUDGET_MS bounds it too (else its nav + clearance could run past the expired budget).
-      s.core.navigate(url, { ...(this.#proxiedSession ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}), budgetDeadlineMs }),
+      // BGW_CALL_BUDGET_MS bounds it too (else its nav + clearance could run past the expired budget). r2: the
+      // configured proxied clearance applies (was the hardcoded const).
+      s.core.navigate(url, { ...(this.#proxiedSession ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs }),
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      const failure = this.#failure(snap);
+      // #45 (codex r2): a pinned single-shot navigate that hit the per-call deadline is a TIMEOUT, not the
+      // incidental block/nav class — and the warm re-capture remediation is wrong for a budget timeout. Classify
+      // + message it as a timeout when the deadline expired; otherwise the existing block/nav surfacing.
+      const budgetExceeded = performance.now() >= budgetDeadlineMs;
+      const failure = this.#failure(snap, { budgetExceeded });
+      if (budgetExceeded) {
+        throw attachFailure(
+          new Error(`navigation timed out (status=${snap.status ?? "n/a"}): the per-call budget (${this.#timeouts.callBudgetMs}ms) was exhausted`),
+          failure,
+        );
+      }
       if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null), failure);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
       throw attachFailure(
@@ -467,13 +478,17 @@ export class GatewayDriveController implements DriveController {
     if (this.#resolveProxyOverride() !== undefined && shouldEscalateDrive(direct)) {
       return this.#openHealthyAndNavigate(url, false, budgetDeadlineMs);
     }
+    // #45 (codex r2): a non-escalating direct failure that hit the per-call deadline is a TIMEOUT, not nav-failed.
+    const budgetExceeded = performance.now() >= budgetDeadlineMs;
     const dx = this.#escalationDiag({ proxyApplied: false, forced: false, attempts: 0, last: direct });
     throw new EscalationError(
-      `navigation failed (status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}): ` +
-        `the page was blocked or could not be reached` +
-        (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
+      budgetExceeded
+        ? `navigation timed out (status=${dx.lastStatus ?? "n/a"}): the per-call budget (${this.#timeouts.callBudgetMs}ms) was exhausted`
+        : `navigation failed (status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}): ` +
+            `the page was blocked or could not be reached` +
+            (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
       dx,
-      this.#failure(direct),
+      this.#failure(direct, { budgetExceeded }),
     );
   }
 
@@ -637,14 +652,24 @@ export class GatewayDriveController implements DriveController {
     // same-owner page FIRST so the edge WAF issues a clearance token into this live session — then the
     // target navigate carries it instead of hard-403'ing a logged-in-looking request to a deep page with
     // no clearance. Runs on the SAME sealed, exit-pinned session (R3) opened just above.
-    await this.#warmUpForTarget(url);
+    await this.#warmUpForTarget(url, budgetDeadlineMs);
     const snap = await this.#run((s) =>
-      // #45 (codex r1): the warm target navigate carries the shared per-call deadline too.
-      s.core.navigate(url, { ...(override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}), budgetDeadlineMs }),
+      // #45 (codex r1): the warm target navigate carries the shared per-call deadline too. r2: configured clearance.
+      s.core.navigate(url, { ...(override.proxy ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs }),
     );
     if (navFailed(snap)) {
       await this.#discardSession();
-      throw attachFailure(this.#warmError(url, snap.status ?? null), this.#failure(snap));
+      // #45 (codex r2): a warm navigate that hit the per-call deadline is a TIMEOUT — surface it as such and do
+      // NOT issue the stale-login/re-capture remediation (#warmError), which is the wrong fix for a budget timeout.
+      const budgetExceeded = performance.now() >= budgetDeadlineMs;
+      const failure = this.#failure(snap, { budgetExceeded });
+      if (budgetExceeded) {
+        throw attachFailure(
+          new Error(`warm navigation timed out (status=${snap.status ?? "n/a"}): the per-call budget (${this.#timeouts.callBudgetMs}ms) was exhausted`),
+          failure,
+        );
+      }
+      throw attachFailure(this.#warmError(url, snap.status ?? null), failure);
     }
     this.#pinned = true;
     return snap;
@@ -661,13 +686,13 @@ export class GatewayDriveController implements DriveController {
    * (never the raw "no active drive session"); a revoked entry still fails LOUD inside #ensureOpen. The
    * bound means a pathologically-reaping session can't loop — at most two reopens, two warm-ups.
    */
-  async #warmUpForTarget(url: string): Promise<void> {
-    await this.#runWarmup(url);
+  async #warmUpForTarget(url: string, budgetDeadlineMs: number): Promise<void> {
+    await this.#runWarmup(url, budgetDeadlineMs);
     if (this.#handle === undefined) {
       // A warm-up hop lost the session to a reap: reopen (re-pin R3) and warm the FRESH session once, so
       // it carries a clearance token before the deep target rather than regressing to deep-URL-first.
       await this.#ensureOpen();
-      await this.#runWarmup(url);
+      await this.#runWarmup(url, budgetDeadlineMs);
     }
     // Pathological double-loss: guarantee a live re-pinned handle for the target navigate (best-effort
     // warm-up is already done; the target navigate stays the authoritative gate).
@@ -694,7 +719,7 @@ export class GatewayDriveController implements DriveController {
    *    hammered), and NEVER discards the warm session. The target navigate stays the real gate, so a
    *    stale/blocked login still fails LOUD there — warm-up can only ever help, never mask staleness.
    */
-  async #runWarmup(targetUrl: string): Promise<void> {
+  async #runWarmup(targetUrl: string, budgetDeadlineMs: number): Promise<void> {
     const ownerHost = this.#warmHost;
     if (!ownerHost || !hostForcesProxy(ownerHost, this.#warmupHosts)) return; // feature off / host not opted in
     // Warm-up shares the target's ORIGIN — its scheme and port — so it hits the same server, but pins the
@@ -704,8 +729,10 @@ export class GatewayDriveController implements DriveController {
     const target = new URL(targetUrl);
     const portPart = target.port ? `:${target.port}` : "";
     // Same clearance posture the target uses — a proxied (bound/fresh-exit) warm session needs the
-    // escalated budget to clear an interstitial; a direct one keeps the default.
-    const clearance = this.#proxiedSession ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {};
+    // escalated budget to clear an interstitial; a direct one keeps the default. #45 (codex r2): each hop
+    // ALSO carries the shared per-call deadline, so multiple warm-up hops (+ a reap retry) can't each spend a
+    // full nav+clearance and re-create the stacking this patch prevents; and the configured clearance applies.
+    const clearance = { ...(this.#proxiedSession ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs };
     for (const path of this.#warmupPaths) {
       const warmupUrl: string = `${target.protocol}//${ownerHost}${portPart}${path}`;
       // Defense in depth on top of the boot-time path validation (parseWarmupPaths): never navigate a

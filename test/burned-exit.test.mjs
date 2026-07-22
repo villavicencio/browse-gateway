@@ -181,6 +181,21 @@ test("drive: the escalation loop honors the #43 call budget — a spent budget b
   assert.equal(opened.length, 1, "only the direct session opened; the budget stopped the re-roll loop");
 });
 
+test("drive: a budget-expired single-shot navigate classifies timeout, not nav-failed (codex r2)", async () => {
+  // Direct fails null-status and does NOT escalate (no proxy); with a spent budget the failure path must
+  // classify timeout (the deadline was the cause), not the incidental nav-failed class.
+  const { gateway } = makeDriveSeq([[{ status: null }]]);
+  const drive = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok", {
+    onDatacenterIp: true,
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 0 },
+  });
+  await assert.rejects(drive.navigate("https://example.com/"), (err) => {
+    assert.match(err.message, /timed out/i, "a budget-expired navigate reads as a timeout");
+    assert.equal(err.failure?.failureClass, "timeout", "classified timeout, not nav-failed");
+    return true;
+  });
+});
+
 test("drive: the escalation loop applies the configured BGW_PROXY_NAV_TIMEOUT_MS to each proxied open", async () => {
   const { gateway, opened } = makeDriveSeq([[{ status: 403, tree: "Forbidden" }], [{ status: null }], [{ status: null }], [{ status: null }]]);
   const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", {

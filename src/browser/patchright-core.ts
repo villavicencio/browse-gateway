@@ -1299,7 +1299,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // stage on a slow submit); for navigate() it is a ~0ms no-op (its goto already reached DCL, and it uses
     // its own goto-based domContentLoadedMs instead).
     const dcl0 = performance.now();
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    // #45 (codex r2): bound the DCL wait by the remaining per-call budget when one is set, so a pending DCL
+    // can't burn its full default past the deadline. No deadline (the action path) → the default wait, unchanged.
+    await page
+      .waitForLoadState("domcontentloaded", budgetDeadlineMs !== undefined ? { timeout: Math.max(1, budgetDeadlineMs - performance.now()) } : {})
+      .catch(() => {});
     const domContentLoadedMs = performance.now() - dcl0;
     // #42: clearancePollMs is the WALL-CLOCK of the poll loop, not the sleep-interval counter — each
     // pollSignal round-trip (title + innerText evaluate) costs real time in the capped container, so a
@@ -1333,6 +1337,13 @@ export class PatchrightBrowserCore implements BrowserCore {
       signal = await pollSignal(page);
     }
     const clearancePollMs = performance.now() - poll0;
+    // #45 (codex r2): do NOT START a CAPTCHA solve once the per-call budget is spent — the solver runs its own
+    // (up-to-~budget) timeout, which would let a budgeted drive call run ~2× its budget. Past the deadline,
+    // leave the page challenged (the caller's navFailed path surfaces it) rather than beginning a fresh solve.
+    // No deadline (the action path / a budget-less caller) → always attempt, unchanged.
+    if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) {
+      return { replay: false, domContentLoadedMs, clearancePollMs };
+    }
     // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
     // may still be blocking the flow. Auto-solve it transparently when a solver is configured. `replay`
     // is true when the caller should replay the triggering action to complete a submit-gated flow.
