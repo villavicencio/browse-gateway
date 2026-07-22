@@ -54,6 +54,11 @@ export interface RetrieveOutcome {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the (v1: no-op) solver. */
   captchaSolved: boolean;
+  /** A SILENT HOME-FALLBACK was detected (issue #48): the requested DEEP link (non-root path / query)
+   *  landed on the site's bare root. Omitted (never `false`) when not detected. On a SUCCESS it is surfaced
+   *  via the tool result's `structuredContent` (keeping the markdown text pure); on a FAILURE it also rides
+   *  the {@link diagnostics} envelope, rendered in the failure text. */
+  homeFallback?: boolean;
   /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
   proxyDiagnostic?: EscalationDiagnostics;
   /** Failure-evidence envelope (issue #39): finalUrl / title / status / redirect chain / console +
@@ -106,6 +111,9 @@ function formatSnapshot(snap: PageSnapshot): string {
   if (snap.cfHint) bits.push("cfHint: true");
   if (snap.pxHint) bits.push("pxHint: true");
   if (snap.ddHint) bits.push("ddHint: true");
+  // #48: a deep link that silently landed on the site's bare root — surfaced so an in-loop agent sees the
+  // homepage-fallback rather than mistaking it for the requested page. Non-fatal (the snapshot is returned).
+  if (snap.homeFallback) bits.push("homeFallback: true");
   // #42: surface the whole-verb wall-clock so a slow drive nav is legible even on SUCCESS (the failure
   // path already renders the full timing breakdown via the envelope). Compact — just the total.
   if (snap.timing?.totalMs != null) bits.push(`total: ${snap.timing.totalMs}ms`);
@@ -183,7 +191,14 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
             ],
           };
         }
-        return { content: [{ type: "text", text: result.markdown }] };
+        // #48: a SUCCESS-shaped silent home-fallback (a fat homepage handed back for a deep link) carries no
+        // failure envelope, so surface the flag via `structuredContent` — the MCP-native metadata channel —
+        // keeping the returned markdown PURE (no gateway chrome injected into page content). Omitted when not
+        // detected, so a clean success is byte-for-byte unchanged.
+        return {
+          content: [{ type: "text", text: result.markdown }],
+          ...(result.homeFallback ? { structuredContent: { homeFallback: true } } : {}),
+        };
       } catch (err) {
         // Gateway down / browser crash: a clean tool error, never a hang or a leaked secret. The message
         // may carry a raw target URL (e.g. "unsupported URL scheme: … (<url>)"), so sanitize any URL in it.

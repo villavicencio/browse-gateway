@@ -137,6 +137,16 @@ export interface RetrieveResult {
   proxyUsed: boolean;
   /** A CAPTCHA was detected and handed to the solver. */
   captchaSolved: boolean;
+  /**
+   * A SILENT HOME-FALLBACK was detected (issue #48): the requested DEEP link (non-root path / query)
+   * silently landed on the site's bare root, so the homepage — not the requested page — was rendered.
+   * Omitted (never `false`) when not detected ({@link isHomeFallback}). Orthogonal to {@link blocked} /
+   * {@link reason}: a fat homepage is a SUCCESS shape, and THIS is the only fallback signal that shape
+   * carries since {@link diagnostics} is failure-only; a fallback that ALSO lands thin keeps its
+   * {@link FailureClass} with this riding alongside as the "why" (so the #40 one-reason invariant holds).
+   * On a failed retrieve the same boolean is also folded into {@link diagnostics}, so the two can't disagree.
+   */
+  homeFallback?: boolean;
   /** Structured proxy-escalation diagnostics when escalation ran (issue #21); absent otherwise. */
   proxyDiagnostic?: EscalationDiagnostics;
   /**
@@ -303,6 +313,57 @@ export function isChromeErrorUrl(url: string | undefined): boolean {
  */
 export function isDeadExit(status: number | null, finalUrl: string | undefined): boolean {
   return status === null || isChromeErrorUrl(finalUrl);
+}
+
+/**
+ * A SILENT HOME-FALLBACK signal (#48): the caller requested a DEEP link (a non-root path or a query — a
+ * search / location / deep-content URL) but the navigation LANDED on the same site's bare root, silently
+ * dropping the deep path / query. This is the "deep link resolved to home / dropped its query" case the
+ * site-compat epic (#38) reports so a caller can tell a real zero-result from lost location/query state,
+ * instead of the homepage being handed back as if it were the requested page.
+ *
+ * A PURE derivation over signals BOTH verbs already carry (the requested URL + the landed finalUrl), no
+ * probe — mirrors {@link isDeadExit}. It is orthogonal EVIDENCE, never a {@link FailureClass}: a fat
+ * homepage is a SUCCESS shape, and a fallback that ALSO lands thin keeps its per-signal class with this
+ * riding alongside as the "why" — so the #40 one-reason invariant holds. Runs on the RAW urls BEFORE
+ * {@link sanitizeUrl} collapses the path (the redactor preserves the root-vs-deep distinction precisely so
+ * this can surface only a boolean).
+ *
+ * POSITIVE-SIGNAL-ONLY and conservative to avoid false-positives on ordinary redirects — it fires ONLY when
+ *   - both URLs are same-host http(s) (a cross-host landing — an auth / consent / geo interstitial — is NOT
+ *     a home-fallback of the requested site; it is governed by the nav policy, not this signal), AND
+ *   - the requested DEPTH was actually LOST: either the requested path was deep and the landing collapsed to
+ *     the bare root, OR a query-only deep link (root path + query) landed on the root with NONE of its query
+ *     keys surviving (the dropped-query case).
+ * A same-host deep→deep redirect, a trailing-slash / locale canonicalization to a deep equivalent, a query
+ * that was PRESERVED, or a legitimately root-only request never trips it. Unparseable URLs → false
+ * (fail-safe: assert nothing). www↔apex host normalization and hash-router (`/#/deep`) fallbacks are
+ * conservative false-negatives left as documented deferrals.
+ */
+export function isHomeFallback(requestedUrl: string | undefined, finalUrl: string | undefined): boolean {
+  if (requestedUrl === undefined || finalUrl === undefined) return false;
+  let req: URL;
+  let fin: URL;
+  try {
+    req = new URL(requestedUrl);
+    fin = new URL(finalUrl);
+  } catch {
+    return false; // fail-safe: never assert a fallback from an unparseable URL
+  }
+  const httpish = (u: URL): boolean => u.protocol === "http:" || u.protocol === "https:";
+  if (!httpish(req) || !httpish(fin)) return false;
+  if (req.host !== fin.host) return false; // a cross-host landing is a different case (policy-governed)
+  const reqDeepPath = req.pathname !== "" && req.pathname !== "/";
+  const finRootPath = fin.pathname === "" || fin.pathname === "/";
+  if (!finRootPath) return false; // landed somewhere real — not a home fallback
+  if (reqDeepPath) return true; // a deep path silently collapsed to root
+  // The requested path was already root, so only a QUERY could have carried the intent (a query-only deep
+  // link, e.g. `/?q=milk` or `/?store=123`). A fallback here = that query was dropped: the landing kept none
+  // of the requested query keys (an empty landing query, or a wholly different one such as campaign params).
+  if (req.search === "") return false; // root→root with no query was never a deep request
+  if (fin.search === "") return true; // the query was dropped entirely
+  const finKeys = new Set(fin.searchParams.keys());
+  return ![...req.searchParams.keys()].some((k) => finKeys.has(k));
 }
 
 /**
@@ -966,6 +1027,15 @@ export async function retrieve(
         : classifyFailure(signal)
     : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+  // #48: a SILENT HOME-FALLBACK — the requested DEEP link (non-root path / query) silently landed on the
+  // site's bare root, so the homepage was handed back instead of the requested page. A pure derivation
+  // (isHomeFallback) over the requested `url` and the landed render.diagnostics.finalUrl, on the RAW urls
+  // BEFORE redaction collapses the path. Orthogonal EVIDENCE, NOT a FailureClass (the #40 doctrine): it
+  // rides ALONGSIDE the per-signal class — a fallback that also lands thin still classifies real-zero-results
+  // / empty-shell, this boolean says WHY — so it never competes with `reason`/`failureClass`. Surfaced on the
+  // top-level result (so a SUCCESS-shaped fat-homepage fallback is legible where no envelope is built) AND,
+  // on a failure, folded into the evidence envelope from the SAME derivation so the two can't disagree.
+  const homeFallback = isHomeFallback(url, render.diagnostics?.finalUrl);
   // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
   // BOTH gate on a DETECTED active CAPTCHA (signal.captchaKind), NOT on failureClass==="captcha" — a page can
   // carry a genuine solvable widget while a higher-precedence WAF marker makes the primary class
@@ -1015,6 +1085,7 @@ export async function retrieve(
             timing,
             ...(solverEligible !== undefined ? { solverEligible } : {}),
             ...(captchaSolveReason ? { captchaSolveReason } : {}),
+            ...(homeFallback ? { homeFallback } : {}), // #48: same derivation as the top-level flag
           },
           secrets,
         )
@@ -1030,6 +1101,7 @@ export async function retrieve(
     proxyUsed,
     captchaSolved,
     timing,
+    ...(homeFallback ? { homeFallback } : {}), // #48: omit-when-false; carries the SUCCESS shape too
     ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
     ...(diagnostics ? { diagnostics } : {}),
   };

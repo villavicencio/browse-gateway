@@ -194,7 +194,14 @@ export interface FailureDiagnostics {
   captchaSolveReason?: CaptchaSolveReason;
   /** Slot for #44 (whether the failure was solver-eligible). Do NOT populate here. */
   solverEligible?: boolean;
-  /** Slot for #48 (a home-page fallback was used). Do NOT populate here. */
+  /** #48 SILENT HOME-FALLBACK — `true` when the requested DEEP link (non-root path / query) silently landed
+   *  on the site's bare root, so the homepage was rendered instead of the requested page. A boolean →
+   *  {@link redactFailureDiagnostics} passes it through UNTOUCHED (it can never be page-derived free text,
+   *  the same safety basis as {@link wafVendor}/{@link failureClass}). Attached at the REDACTION seam
+   *  (retrieve.ts), NOT via {@link buildFailureDiagnostics}: it is DERIVED from the requested-vs-final URL
+   *  (`isHomeFallback`) which the assembly seam has, and on a SUCCESS-shaped fallback (a fat homepage, no
+   *  envelope) the SAME boolean rides the top-level result instead. Orthogonal EVIDENCE, never a
+   *  {@link FailureClass}, so it can't disagree with the block reason (the #40 one-reason invariant). */
   homeFallback?: boolean;
 }
 
@@ -333,8 +340,8 @@ function stripSensitiveHeaders(s: string): string {
  *      folded continuations WITHIN an entry; a `key=value` continuation tail is swallowed — the boundary
  *      is a COLON-form next field only).
  * The `screenshotRef` (opaque base64 bytes) and the closed-vocabulary / numeric / boolean slots (wafVendor,
- * failureClass, the #44 captchaSolveReason union + solverEligible, and the all-numeric #42 {@link Timing})
- * pass through untouched.
+ * failureClass, the #44 captchaSolveReason union + solverEligible, the #48 homeFallback boolean, and the
+ * all-numeric #42 {@link Timing}) pass through untouched.
  * `secrets` is a structural store (`{ redactableValues(): readonly string[] }`) — passing the VALUE SET
  * (not an opaque redactor) keeps the secret pass single-pass so a value can't fragment across redactors.
  *

@@ -285,6 +285,17 @@ export interface PageSnapshot {
    */
   captchaSolveReason?: CaptchaSolveReason;
   /**
+   * A SILENT HOME-FALLBACK was detected on this navigation (issue #48): the requested DEEP link (non-root
+   * path / query) landed on the site's bare root, so the homepage — not the requested page — is shown.
+   * Omitted (never `false`) when not detected. Set by the drive CONTROLLER at the `navigate()` seam (which
+   * has the requested target), NOT by the core snapshot builder — a bare `snapshot()` / post-action snapshot
+   * has no requested target and never carries it. NON-FATAL: a homepage is a legitimately returnable
+   * snapshot (never a drive failure), so drive ANNOTATES and returns, letting the in-loop agent decide —
+   * the shared {@link import("../verbs/index.js").isHomeFallback} predicate keeps drive/retrieve detection
+   * from drifting (the parity invariant), while the disposition differs (retrieve surfaces it as an outcome).
+   */
+  homeFallback?: boolean;
+  /**
    * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
    * bounded console + network / optional screenshot. Assembled by the core on every navigate/snapshot;
    * the drive layer redacts and attaches it to a thrown failure (parity with retrieve). The RAW
