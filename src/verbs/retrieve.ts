@@ -827,15 +827,29 @@ export async function retrieve(
   const failureClass: FailureClass | undefined = failed ? classifyFailure(signal) : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
   // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
-  // solverEligible is the pure KIND property (is this kind solvable at all). The reason depends on whether a
-  // solver was SUPPLIED via the opts.solver seam: none → `not-configured` (the production case — retrieve
-  // wires no solver, so the actionable signal is that routing to the drive path could clear a solvable
-  // kind); a supplied solver that FAILED → its typed code; a supplied solver that completed (no typed
-  // failure) → omit, since claiming a failure reason would contradict the attempt. Both are secret-free
-  // (closed-vocab / boolean) and pass redaction untouched.
-  const solverEligible = signal.captchaKind ? isSolvableCaptchaKind(signal.captchaKind) : undefined;
+  // BOTH gate on a DETECTED active CAPTCHA (signal.captchaKind), NOT on failureClass==="captcha" — a page can
+  // carry a genuine solvable widget while a higher-precedence WAF marker makes the primary class
+  // anti-bot-block (e.g. a DataDome page serving reCAPTCHA); dropping the fields there would lose a real
+  // signal, and it would diverge from the drive path (which keys both off the snapshot's captchaKind). This
+  // is the #40 vendor-projection idea applied to eligibility: the class is WAF-first, the eligibility rides
+  // the detected widget (codex #44 r3). solverEligible is the pure KIND property; the reason: a supplied
+  // opts.solver that FAILED → its typed code; no solver → `not-configured` (the production case — retrieve
+  // wires none, so the actionable signal is that routing to the drive path could clear a solvable kind).
+  // Both are secret-free (closed-vocab / boolean) and pass redaction untouched.
+  //
+  // SCOPED RESIDUALS (documented, best-effort diagnostic — never gates behavior, the #40/#41/#42 line):
+  //  (a) opts.solver is a VESTIGIAL non-production seam (no production caller wires it — see the hook above;
+  //      and a stateless render has no live page to inject a token into). When a solver is supplied but the
+  //      final CAPTCHA render was reached via forceProxy/escalation — where the solve hook (direct-render
+  //      only) never ran — no attempt reason exists, so the reason is OMITTED rather than fabricated. In
+  //      production (no solver) this arm is unreachable: the reason is always `not-configured`.
+  //  (b) an explicit-render widget that `activeCaptchaKind` recognizes but the drive live-probe's
+  //      container-based `DETECT_LIVE_CAPTCHA_JS` cannot (drive path) yields solverEligible with no reason;
+  //      no accurate closed-vocab code exists for "detected but un-probeable", so it stays unset.
+  const captchaDetected = signal.captchaKind !== undefined;
+  const solverEligible = captchaDetected ? isSolvableCaptchaKind(signal.captchaKind as CaptchaKind) : undefined;
   const captchaSolveReason: CaptchaSolveReason | undefined =
-    failed && failureClass === "captcha" ? (opts.solver ? solveAttemptReason : "not-configured") : undefined;
+    failed && captchaDetected ? (solveAttemptReason ?? (opts.solver ? undefined : "not-configured")) : undefined;
   // #42: assemble ONE Timing — the whole-call totalMs over the final render's core stages — and use it for
   // BOTH the result field and (on a failure) the folded envelope, so they can never disagree (single
   // derivation). render.timing carries the surfaced render's domContentLoaded/clearancePoll/snapshot; its

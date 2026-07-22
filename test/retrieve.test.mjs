@@ -445,6 +445,22 @@ test("#44: retrieve with a SUPPLIED solver that FAILS reports the typed code, no
   assert.equal(r.diagnostics?.captchaSolveReason, "vendor-error", "the supplied solver's typed code is surfaced");
 });
 
+test("#44: retrieve preserves the CAPTCHA reason when a WAF marker takes class precedence (codex r3)", async () => {
+  // A DataDome page ALSO serving a reCAPTCHA: classifyFailure keeps anti-bot-block (WAF-first), but a real
+  // solvable widget is present — so solverEligible + captchaSolveReason must ride the DETECTED captcha, not
+  // the projected primary class (parity with the drive path; the eligibility fields gate on captchaKind).
+  const both = renderOf({
+    status: 403, title: "", text: "Access denied",
+    html: 'datadome captcha-delivery <div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://dd.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([both]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://dd.example/" });
+  assert.equal(r.diagnostics?.failureClass, "anti-bot-block", "the WAF marker wins the primary class");
+  assert.equal(r.diagnostics?.solverEligible, true, "the detected reCAPTCHA is solvable");
+  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured", "the reason is preserved despite the WAF class");
+});
+
 test("retrieve: a 200 PerimeterX press-&-hold served as a TOP-document interstitial (copy in html, not innerText) is blocked", async () => {
   // The live gateway repro (#24 follow-up), top-document form: PX serves the press-&-hold full-page
   // with a 200. The challenge copy reaches render.html (so extractMarkdown scrapes it) but NOT
