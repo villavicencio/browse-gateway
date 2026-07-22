@@ -259,9 +259,10 @@ export interface PageSnapshot {
   responseReceived?: boolean;
   /**
    * The navigation that produced this page was TRUNCATED by the nav timeout / per-call budget deadline
-   * WITHOUT landing real content (issue #66): the `goto` (or the clearance poll) was cut short — headers may
-   * have arrived first, pinning a `status` (200) — and the final page is still THIN and shows no block
-   * phrase. Without this flag that partial-200 reads as a healthy nav ({@link import("../verbs/index.js").navFailed}
+   * WITHOUT landing real content (issue #66): the `goto`, the bounded DCL wait (a committed document that
+   * never reached DOMContentLoaded — the residue a non-timeout goto abort leaves, codex r1), or the
+   * clearance poll was cut short — headers may have arrived first, pinning a `status` (200) — and the
+   * final page is still THIN and shows no block phrase. Without this flag that partial-200 reads as a healthy nav ({@link import("../verbs/index.js").navFailed}
    * sees a 200 + no block) and the drive controller PINS it as a success instead of a timeout. Set ONLY by
    * `navigate()` (never a post-action snapshot), and ONLY when the page did NOT reach substantial content —
    * a cleared CF page (goto deliberately throws, then the challenge reload lands a fat 200) stays a success,

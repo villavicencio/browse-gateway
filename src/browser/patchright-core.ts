@@ -409,9 +409,17 @@ interface SettleResult {
   clearancePollMs: number;
   captchaSolveMs?: number;
   /** #66: the clearance poll was BROKEN by the per-call budget deadline (not settled, not the clearance
-   *  timeout) — one of the two truncation cuts (with a timed-out goto) that can leave a partial page
-   *  looking healthy. False on the action path (no deadline) and on every settled/clearance-timeout exit. */
+   *  timeout) — one of the truncation cuts (with a timed-out goto / a timed-out DCL wait) that can leave a
+   *  partial page looking healthy. False on the action path (no deadline) and on every settled/clearance-
+   *  timeout exit. */
   deadlineCut: boolean;
+  /** #66 (codex r1): the bounded DCL wait itself TIMED OUT — a committed document (headers arrived, so a
+   *  status may be pinned) that did not reach DOMContentLoaded within the residual nav allowance / global
+   *  budget. This is the truncation cut a NON-timeout goto abort leaves behind: goto rejects (e.g. a
+   *  post-commit ERR_ABORTED), the swallowed DCL-wait timeout is the only evidence the page was cut short.
+   *  Resolves-immediately (false) when the current document already reached DCL — a fully-aborted nav that
+   *  stayed on the prior/blank document does not fire it. */
+  dclTimedOut: boolean;
 }
 
 /**
@@ -1036,12 +1044,14 @@ export class PatchrightBrowserCore implements BrowserCore {
       ...(settled.captchaSolveMs !== undefined ? { captchaSolveMs: settled.captchaSolveMs } : {}),
       ...(base.timing?.snapshotMs !== undefined ? { snapshotMs: base.timing.snapshotMs } : {}),
     });
-    // #66: a TRUNCATED nav — the goto was cut by its timeout (nav timeout / #45 budget clamp) or the
-    // clearance poll was cut by the deadline — that did NOT land real content must not read as a healthy
-    // nav: headers-before-DCL pins a 200 (#lastDocStatus), the page renders partially, and navFailed's
-    // status/phrase/thin-4xx arms all pass, so the controller would PIN it as a success. Derived on the
-    // FINAL snapshot (the latest evidence, so a page that finished landing during settle/snapshot is
-    // exempt), on the drive text surface (the aria tree — the same surface navFailed/isHardBlock read):
+    // #66: a TRUNCATED nav — the goto was cut by its timeout (nav timeout / #45 budget clamp), the bounded
+    // DCL wait timed out (codex r1: the residue a NON-timeout goto abort leaves — a committed document that
+    // never reached DCL within the residual allowance), or the clearance poll was cut by the deadline —
+    // that did NOT land real content must not read as a healthy nav: headers-before-DCL pins a 200
+    // (#lastDocStatus), the page renders partially, and navFailed's status/phrase/thin-4xx arms all pass,
+    // so the controller would PIN it as a success. Derived on the FINAL snapshot (the latest evidence, so a
+    // page that finished landing during settle/snapshot is exempt), on the drive text surface (the aria
+    // tree — the same surface navFailed/isHardBlock read):
     //  - thin (< MIN_CONTENT_LENGTH): a page with substantial content is a SUCCESS even after a timed-out
     //    goto — the cleared-CF reload (goto throws → #settle → fat 200) MUST stay a success (stealth-
     //    critical; the naive "goto threw ⇒ failed" precisely breaks that clearance path), and
@@ -1049,7 +1059,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     //    (anti-bot + vendor) — the truncation flag must not override that story with a bare `timeout`.
     const truncSig = { title: base.title, text: base.tree };
     const deadlineTruncated =
-      (gotoTimedOut || settled.deadlineCut) &&
+      (gotoTimedOut || settled.dclTimedOut || settled.deadlineCut) &&
       !isVisiblyBlocked(truncSig) &&
       truncSig.text.trim().length < MIN_CONTENT_LENGTH;
     return { ...base, ...(deadlineTruncated ? { deadlineTruncated: true } : {}), timing };
@@ -1372,7 +1382,12 @@ export class PatchrightBrowserCore implements BrowserCore {
     // enable. min of both, floored at 1 (Playwright treats 0 as infinite). No budget → just the stage bound.
     const dclRemaining = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
     const dclTimeout = Math.max(1, Math.min(dclBudgetMs ?? this.#resolved.navigationTimeoutMs, dclRemaining));
-    await page.waitForLoadState("domcontentloaded", { timeout: dclTimeout }).catch(() => {});
+    // #66 (codex r1): record the swallowed DCL-wait timeout — a committed-but-never-DCL'd document after a
+    // NON-timeout goto abort leaves this as the ONLY truncation evidence (gotoTimedOut is false there, and
+    // the poll below can settle immediately on the thin, unblocked transitional page). navigate() folds it
+    // into the deadlineTruncated derivation; the action path ignores it.
+    let dclTimedOut = false;
+    await page.waitForLoadState("domcontentloaded", { timeout: dclTimeout }).catch(() => { dclTimedOut = true; });
     const domContentLoadedMs = performance.now() - dcl0;
     // #42: clearancePollMs is the WALL-CLOCK of the poll loop, not the sleep-interval counter — each
     // pollSignal round-trip (title + innerText evaluate) costs real time in the capped container, so a
@@ -1418,7 +1433,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // leave the page challenged (the caller's navFailed path surfaces it) rather than beginning a fresh solve.
     // No deadline (the action path / a budget-less caller) → always attempt, unchanged.
     if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) {
-      return { replay: false, domContentLoadedMs, clearancePollMs, deadlineCut };
+      return { replay: false, domContentLoadedMs, clearancePollMs, deadlineCut, dclTimedOut };
     }
     // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
     // may still be blocking the flow. Auto-solve it transparently when a solver is configured. `replay`
@@ -1430,6 +1445,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       domContentLoadedMs,
       clearancePollMs,
       deadlineCut,
+      dclTimedOut,
       ...(solve.captchaSolveMs !== undefined ? { captchaSolveMs: solve.captchaSolveMs } : {}),
     };
   }
