@@ -20,8 +20,15 @@ import { parseHostSuffixList } from "../security/index.js";
  * through it now would be immediately churned. Its env-timeout consumption lands with #45.
  */
 export interface CallTimeouts {
-  /** Global per-call wall-clock budget (BGW_CALL_BUDGET_MS). The retrieve/drive escalation loop stops and
-   *  returns a decisive typed `timeout` failure once exceeded, rather than stacking attempts toward ~200s. */
+  /** Global per-call wall-clock budget (BGW_CALL_BUDGET_MS). The retrieve escalation loop stops re-rolling
+   *  and returns a decisive typed `timeout` once exceeded, and each attempt's nav + clearance are CLAMPED to
+   *  the remaining budget, so the dominant "why 200s" stacking (`attempts × (nav + clearance)`) is bounded.
+   *  SCOPED (documented #43 follow-up): this is not yet a HARD whole-operation ceiling — a session's launch /
+   *  guard-install / snapshot / teardown overhead and the direct attempt's own navigation happen inside
+   *  `withConsumerSession` / the core, outside these stage timeouts. Bounding those (and a hung launch — see
+   *  #54) needs a core-level deadline / cooperative cancellation (AbortSignal threaded gateway→core→browser),
+   *  a larger change than #43's stage-clamping. The env-overridable per-stage timeouts below are the complete,
+   *  direct lever for tightening each stage today. */
   callBudgetMs: number;
   /** Direct-attempt clearance budget (BGW_CLEARANCE_TIMEOUT_MS). */
   clearanceTimeoutMs: number;

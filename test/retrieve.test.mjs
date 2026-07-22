@@ -735,3 +735,21 @@ test("#43: proxyNavTimeoutMs override is applied to each proxied attempt's sessi
     assert.equal(c.coreOverrides?.navigationTimeoutMs, 7777, "the proxied session used the overridden nav timeout");
   }
 });
+
+test("#43: a forced-proxy request that exhausts the budget times out WITHOUT a direct fallback (codex r2)", async () => {
+  // forceProxy + a budget <= the min-attempt floor breaks before any proxied attempt. It must NOT fall
+  // through to a direct request (that defeats force-proxy and would claim proxyUsed with zero attempts).
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 0);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  const r = await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    forceProxy: true,
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 1000 },
+  });
+  assert.equal(r.diagnostics?.failureClass, "timeout", "budget exhaustion on a forced request is a decisive timeout");
+  assert.equal(calls.length, 0, "NO direct fallback render happened — force-proxy is honored");
+  assert.equal(r.proxyDiagnostic?.attempts, 0, "zero proxied attempts ran");
+});

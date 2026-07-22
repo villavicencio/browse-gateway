@@ -646,9 +646,10 @@ export async function retrieve(
   // global call budget. Defaults to the shipped values when the caller passes none, so behavior is unchanged.
   const timeouts = opts.timeouts ?? DEFAULT_CALL_TIMEOUTS;
   const renderOpts: RenderOptions = { clearedTextLength: MIN_CONTENT_LENGTH };
-  // #43: the DIRECT-attempt clearance budget is env-overridable (BGW_CLEARANCE_TIMEOUT_MS via
-  // timeouts.clearanceTimeoutMs); an explicit per-call opts.clearanceTimeoutMs still wins.
-  renderOpts.clearanceTimeoutMs = opts.clearanceTimeoutMs ?? timeouts.clearanceTimeoutMs;
+  // #43: the DIRECT-attempt clearance is env-overridable (BGW_CLEARANCE_TIMEOUT_MS) AND clamped to the
+  // global budget (codex r2) so a small budget bounds the direct clearance stage too — not just the
+  // escalation loop; an explicit per-call opts.clearanceTimeoutMs is respected but still capped by the budget.
+  renderOpts.clearanceTimeoutMs = Math.min(opts.clearanceTimeoutMs ?? timeouts.clearanceTimeoutMs, timeouts.callBudgetMs);
   const proxy = proxyFromSecrets(secrets);
   const escalation: EscalationContext = {
     onDatacenterIp: opts.escalation?.onDatacenterIp ?? false,
@@ -772,7 +773,15 @@ export async function retrieve(
   // render is assigned by here: non-forced did a direct render; forced implies a proxy so it ran >=1
   // proxied attempt. This guard satisfies the type-checker and the impossible forced-without-proxy case.
   if (render === undefined) {
-    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+    if (budgetExceeded) {
+      // #43 (codex r2): a FORCED request whose budget ran out before ANY proxied attempt must NOT fall back
+      // to a direct request — that defeats force-proxy and would claim proxyUsed with zero attempts. Surface
+      // a decisive timeout: a synthetic failed render (null status, no content) → isRetrieveFailure=true,
+      // and budgetExceeded → failureClass=timeout.
+      render = { url, status: null, title: "", text: "", html: "", clearanceWaitedMs: 0, diagnostics: { finalUrl: url, status: null } };
+    } else {
+      render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+    }
   }
   const extraction = extractMarkdown(render.html, url);
   const cfHint = hasCloudflareHint(render.html);
