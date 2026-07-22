@@ -80,8 +80,12 @@ export interface CaptchaChallenge {
 }
 
 export interface CaptchaSolver {
-  /** Solve the challenge and return the response token to inject into the page. */
-  solve(challenge: CaptchaChallenge): Promise<string>;
+  /** Solve the challenge and return the response token to inject into the page. `maxDurationMs` (#45) is the
+   *  caller's remaining per-call budget as a DURATION in ms (NOT an absolute timestamp — the caller and the
+   *  solver may keep different clocks, e.g. performance.now() vs Date.now(); a duration is clock-domain-free).
+   *  The solve must not run longer than it, even if the solver's own configured timeout is larger (the
+   *  effective bound is the MIN of the two). Omitted → the solver's own timeout governs. */
+  solve(challenge: CaptchaChallenge, maxDurationMs?: number): Promise<string>;
 }
 
 /**
@@ -277,16 +281,25 @@ export async function awaitSolvableCaptcha(
   detect: () => Promise<LiveCaptcha | null>,
   urlOf: () => string,
   wait: (ms: number) => Promise<void>,
-  opts: { pollMs: number; timeoutMs: number },
+  opts: { pollMs: number; timeoutMs: number; now?: () => number },
 ): Promise<CaptchaChallenge | null> {
+  // #45 (codex r6): when a clock is injected, bound by WALL-CLOCK so slow `detect()` CDP round-trips count
+  // against `timeoutMs` too — now that timeoutMs is derived from the remaining call budget, a slow detector
+  // must not let the loop run past it. No clock (pure unit callers) → the accumulated-sleep counter, unchanged.
+  const start = opts.now ? opts.now() : 0;
   let waited = 0;
   for (;;) {
     const live = await detect();
     const challenge = liveCaptchaToChallenge(live, urlOf());
     if (challenge) return challenge;
-    if (!liveCaptchaPendingRender(live) || waited >= opts.timeoutMs) return null;
-    await wait(opts.pollMs);
-    waited += opts.pollMs;
+    const elapsed = opts.now ? opts.now() - start : waited;
+    if (!liveCaptchaPendingRender(live) || elapsed >= opts.timeoutMs) return null;
+    // #45 (codex r5): clamp the final poll sleep to the remaining timeout so the render wait can't overshoot
+    // it by a full poll interval — when the caller bounds timeoutMs by the remaining call budget, that
+    // overshoot would deterministically breach the global budget. (elapsed < timeoutMs here, so sleepMs > 0.)
+    const sleepMs = Math.min(opts.pollMs, opts.timeoutMs - elapsed);
+    await wait(sleepMs);
+    waited += sleepMs;
   }
 }
 

@@ -740,7 +740,13 @@ export class PatchrightBrowserCore implements BrowserCore {
         const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
         status = resp ? resp.status() : null;
       } catch {
-        // Navigation may time out or be aborted by a challenge; assess whatever rendered.
+        // Navigation may time out or be aborted by a challenge; status stays null (a nav failure) so the
+        // success gate + isRetrieveFailure correctly treat a timed-out goto as a FAILURE — never a partial
+        // success (codex r10). SCOPED (documented #45 residual): a proxied exit that RESPONDED but timed out
+        // before DCL is recorded status-null, so isDeadExit may label it `burned-exit` rather than the site
+        // block. That is a DIAGNOSTIC imprecision only (the re-roll behavior is identical); attributing it
+        // precisely needs a response-receipt signal tracked SEPARATELY from the nav-failure status — a
+        // follow-up, deliberately not conflated with `status` (which the success gate reads). Assess whatever rendered.
       }
       const domContentLoadedMs = performance.now() - goto0;
 
@@ -955,12 +961,13 @@ export class PatchrightBrowserCore implements BrowserCore {
     // domContentLoadedMs = goto wall-clock (measured around the try so an aborted nav still records its
     // time-to-abort). Deliberately do NOT bind the goto response — status stays on #lastDocStatus (a CF
     // 403→200 reload makes goto's first response the wrong one; see the #lastDocStatus note above).
+    // #45: bound the goto by the shared per-call deadline (parity with render()), so a proxied drive attempt
+    // that starts near the budget can't run its full nav timeout past it. Floor 1ms — an already-passed
+    // deadline still makes a bounded (fast-failing) attempt. No deadline (action path) → the raw nav timeout.
+    const navTimeout = deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1);
     const goto0 = performance.now();
     try {
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: this.#resolved.navigationTimeoutMs,
-      });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
     } catch {
       // A challenge/redirect/dead-exit may abort the navigation; settle on whatever rendered. With no
       // main-frame response the listener leaves status null, so the drive layer treats it as a failed nav.
@@ -970,7 +977,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // once it clears via a full reload — wait for the real document to land content rather than the
     // blank inter-navigation moment. A page still blocked after the budget is surfaced by navFailed.
     // #settle returns its clearance-poll + captcha-solve wall-clock for the #42 timing breakdown.
-    const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
+    // #45 (codex r10): the goto already spent up to navTimeout on THIS nav — pass only the LEFTOVER stage
+    // allowance for #settle's DCL wait, so a goto that timed out before DCL can't re-charge a full navTimeout
+    // (which would double the per-attempt nav cost and starve the fresh-exit re-rolls). Floor 1ms.
+    const dclBudgetMs = Math.max(1, navTimeout - domContentLoadedMs);
+    const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs, opts.budgetDeadlineMs, dclBudgetMs);
     // #58: the CF/PX/DataDome vendor hints + the interactive-CAPTCHA widget KIND are now computed inside
     // #snapshotOf (on EVERY snapshot), so `base` already carries cfHint/pxHint/ddHint/captchaKind — the
     // navigate path no longer computes them (nor a second page.content()) here. They let drive's escalation
@@ -1284,6 +1295,14 @@ export class PatchrightBrowserCore implements BrowserCore {
     page: PatchrightPage,
     clearanceTimeoutMs: number = DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS,
     pollIntervalMs: number = DEFAULT_POLL_INTERVAL_MS,
+    // #45: the shared per-call deadline (absolute performance.now()). When set, the clearance poll below
+    // breaks at it (parity with render's deadline-bounded poll). Undefined for the action path / a
+    // budget-less caller → Infinity budget, poll behavior unchanged.
+    budgetDeadlineMs?: number,
+    // #45 (codex r10): the LEFTOVER navigation-stage allowance for the DCL wait — navigate() passes
+    // navTimeout minus the goto's elapsed, so a timed-out goto doesn't re-charge a full nav timeout here.
+    // Undefined (the action path, which has no prior goto) → the full stage navigation timeout.
+    dclBudgetMs?: number,
   ): Promise<SettleResult> {
     // Let any navigation the prior action triggered reach domcontentloaded, so its response status is
     // captured and the snapshot reflects the landed page (resolves immediately if nothing navigated).
@@ -1291,7 +1310,13 @@ export class PatchrightBrowserCore implements BrowserCore {
     // stage on a slow submit); for navigate() it is a ~0ms no-op (its goto already reached DCL, and it uses
     // its own goto-based domContentLoadedMs instead).
     const dcl0 = performance.now();
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    // #45 (codex r2/r9): bound the DCL wait by the STAGE navigation timeout AND (when set) the remaining
+    // per-call budget. A goto that already TIMED OUT before DCL must not let this second wait spend the whole
+    // remaining budget on the SAME slow exit — that would starve the fresh-exit re-rolls the budget exists to
+    // enable. min of both, floored at 1 (Playwright treats 0 as infinite). No budget → just the stage bound.
+    const dclRemaining = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
+    const dclTimeout = Math.max(1, Math.min(dclBudgetMs ?? this.#resolved.navigationTimeoutMs, dclRemaining));
+    await page.waitForLoadState("domcontentloaded", { timeout: dclTimeout }).catch(() => {});
     const domContentLoadedMs = performance.now() - dcl0;
     // #42: clearancePollMs is the WALL-CLOCK of the poll loop, not the sleep-interval counter — each
     // pollSignal round-trip (title + innerText evaluate) costs real time in the capped container, so a
@@ -1312,16 +1337,31 @@ export class PatchrightBrowserCore implements BrowserCore {
       // block. Bounded by the clearance budget, so a genuinely-thin cleared page still returns.
       const settled = sawBlock ? isCleared(signal, MIN_CONTENT_LENGTH) : !blocked;
       if (settled) break;
-      await page.waitForTimeout(pollIntervalMs);
-      waited += pollIntervalMs;
+      // #45: when a per-call deadline is set, clamp this sleep to the remaining GLOBAL budget so a small
+      // budget breaks the drive clearance poll early (parity with render's deadline-bounded poll). No deadline
+      // (the action path / a budget-less caller) → budgetLeft is Infinity, so the sleep is exactly the poll
+      // interval — BYTE-IDENTICAL to the prior behavior (the action path clearance timing is unchanged).
+      const budgetLeft = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
+      const sleepMs = Math.min(pollIntervalMs, budgetLeft);
+      if (sleepMs <= 0) break;
+      await page.waitForTimeout(sleepMs);
+      waited += sleepMs;
+      if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) break;
       signal = await pollSignal(page);
     }
     const clearancePollMs = performance.now() - poll0;
+    // #45 (codex r2): do NOT START a CAPTCHA solve once the per-call budget is spent — the solver runs its own
+    // (up-to-~budget) timeout, which would let a budgeted drive call run ~2× its budget. Past the deadline,
+    // leave the page challenged (the caller's navFailed path surfaces it) rather than beginning a fresh solve.
+    // No deadline (the action path / a budget-less caller) → always attempt, unchanged.
+    if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) {
+      return { replay: false, domContentLoadedMs, clearancePollMs };
+    }
     // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
     // may still be blocking the flow. Auto-solve it transparently when a solver is configured. `replay`
     // is true when the caller should replay the triggering action to complete a submit-gated flow.
     // #42: the solve wall-clock bubbles up from #trySolveCaptcha.
-    const solve = await this.#trySolveCaptcha(page);
+    const solve = await this.#trySolveCaptcha(page, budgetDeadlineMs);
     return {
       replay: solve.replay,
       domContentLoadedMs,
@@ -1348,8 +1388,13 @@ export class PatchrightBrowserCore implements BrowserCore {
    * whenever a solve was ATTEMPTED (a widget was found), including a solve that errored — so the drive
    * timing breakdown attributes the seconds a solve spent even when it ultimately failed.
    */
-  async #trySolveCaptcha(page: PatchrightPage): Promise<SolveResult> {
+  async #trySolveCaptcha(page: PatchrightPage, budgetDeadlineMs?: number): Promise<SolveResult> {
     if (!this.#solver) return { replay: false };
+    // #45 (codex r4): the remaining per-call budget bounds BOTH the widget-render poll AND the solve, so a
+    // CAPTCHA reached JUST BEFORE the deadline can't run its full render-timeout + solver-timeout past it
+    // (the earlier #settle guard only skips a solve already PAST the deadline). No deadline → the full budgets.
+    const renderTimeoutMs =
+      budgetDeadlineMs !== undefined ? Math.min(CAPTCHA_RENDER_TIMEOUT_MS, Math.max(0, budgetDeadlineMs - performance.now())) : CAPTCHA_RENDER_TIMEOUT_MS;
     // Resolve the widget, polling out its render race: navigate() resolves at domcontentloaded, but
     // the response field is injected by a later async script, so a one-shot detect sees the container
     // with no field yet and would skip forever (the next detect pass re-navigates and re-races).
@@ -1357,7 +1402,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       async () => (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null,
       () => page.url(),
       (ms) => page.waitForTimeout(ms).catch(() => {}),
-      { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: CAPTCHA_RENDER_TIMEOUT_MS },
+      { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: renderTimeoutMs, now: () => performance.now() }, // #45 (codex r6): wall-clock bound
     );
     if (!challenge) {
       // #44 (codex r2): a supported widget was detected but never became attemptable — preserve WHY (no
@@ -1375,9 +1420,13 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
     // #42: measure the solver wall-clock from here (a widget IS present, so a solve is being attempted).
     const solve0 = performance.now();
+    // #45 (codex r4/r5): cap the solve by the REMAINING call budget as a DURATION (not the absolute
+    // performance.now() deadline — the solver keeps its own clock, and mixing domains aborts every solve).
+    // Recomputed here (after the render poll), off `solve0`, so it reflects the budget left AT the solve.
+    const solveMaxMs = budgetDeadlineMs !== undefined ? Math.max(0, budgetDeadlineMs - solve0) : undefined;
     let token: string;
     try {
-      token = await this.#solver.solve(challenge);
+      token = await this.#solver.solve(challenge, solveMaxMs);
     } catch (err) {
       // Vendor error / timeout / budget: leave the page challenged rather than throw under the verb,
       // but emit a diagnostic so a left-challenged drive page has a WHY (parity with retrieve's

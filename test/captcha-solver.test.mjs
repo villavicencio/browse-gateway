@@ -85,6 +85,56 @@ test("never-ready → typed timeout, not a hang", async () => {
   await assert.rejects(solverWith(f, { timeoutMs: 30, pollMs: 5 }).solve(recaptcha), (e) => e.code === "timeout");
 });
 
+test("solve with a spent budget (maxDurationMs<=0) rejects WITHOUT charging the solve-window budget (#45 codex r8)", async () => {
+  // A deadline-edge call must reject before charging the sliding window, so it can't exhaust the window and
+  // fail a later legitimate solve with budget-exhausted.
+  const f = fakeFetch([
+    { body: { errorId: 0, taskId: "t8" } },
+    { body: { errorId: 0, status: "ready", solution: { gRecaptchaResponse: "TOKEN8" } } },
+  ]);
+  const s = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: URL_BASE, pollMs: 1, fetchImpl: f, budget: { maxSolves: 1, windowMs: 60_000 } });
+  await assert.rejects(s.solve(recaptcha, 0), (e) => e.code === "timeout"); // zero remaining → reject, no charge, no fetch
+  assert.equal(f.calls.length, 0, "no vendor request was made for the spent-budget edge call");
+  assert.equal(await s.solve(recaptcha), "TOKEN8", "the one-solve window is intact — a real solve still succeeds");
+});
+
+test("solve aborts a STALLED response body at the deadline, not just the request (#45 codex r7)", async () => {
+  // The service sends headers, then never sends the body. resp.json() must still be bounded by the deadline
+  // (the abort covers body consumption) — else solve() would hang past its duration contract.
+  const stall = async (_url, init) => ({
+    ok: true,
+    status: 200,
+    json: () =>
+      new Promise((_resolve, reject) => {
+        const fail = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        if (init.signal.aborted) fail();
+        else init.signal.addEventListener("abort", fail);
+      }),
+  });
+  const s = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: URL_BASE, timeoutMs: 40, pollMs: 5, fetchImpl: stall });
+  const t0 = Date.now();
+  await assert.rejects(s.solve(recaptcha), (e) => e.code === "timeout");
+  assert.ok(Date.now() - t0 < 2000, "the body read was bounded by the deadline (not hung)");
+});
+
+test("solve caps at the caller's remaining-budget DURATION in the solver's OWN clock domain (#45 codex r4/r5)", async () => {
+  // maxDurationMs is a DURATION, not an absolute timestamp, so the caller (performance.now) and the solver
+  // (Date.now) can keep different clocks without aborting the solve. Uses the DEFAULT Date.now clock so a
+  // regression to absolute-timestamp semantics (which mixes domains) would be caught. A CAPTCHA reached just
+  // before the per-call budget must not run the solver's full (up to callBudgetMs) timeout past it.
+  const f = fakeFetch([
+    { body: { errorId: 0, taskId: "t-r4" } },
+    { body: { errorId: 0, status: "processing" } }, // never ready → only the duration cap ends the poll
+  ]);
+  const s = solverWith(f, { timeoutMs: 10_000_000, pollMs: 5 }); // own timeout effectively unbounded
+  const t0 = Date.now();
+  await assert.rejects(s.solve(recaptcha, 60), (e) => e.code === "timeout"); // 60ms remaining-budget cap
+  const elapsed = Date.now() - t0;
+  // >= 40: it WAITED ~the 60ms cap (a domain-mixed absolute value would abort at ~0ms); < 3000: it did NOT
+  // run the solver's ~1e7ms own timeout (the caller's duration cap governed).
+  assert.ok(elapsed >= 40 && elapsed < 3000, `honored the ~60ms duration cap in its own clock domain (elapsed=${elapsed}ms)`);
+});
+
 test("missing siteKey → missing-sitekey (no fetch)", async () => {
   const f = fakeFetch([{ body: {} }]);
   await assert.rejects(solverWith(f).solve({ kind: "recaptcha", url: "https://x/" }), (e) => e.code === "missing-sitekey");

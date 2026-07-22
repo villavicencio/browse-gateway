@@ -196,7 +196,14 @@ test("controller: escalation throws when no proxied exit lands within the attemp
     [{ status: null, tree: "" }], //          proxied attempts: all dead (repeats for si>=1)
   ]);
   const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
-  await assert.rejects(c.navigate("https://example.com/"), /could not land a working proxied exit/);
+  // #45: every proxied exit died reaching the site (all dead-nav) → a BURNED-EXIT verdict (our pool died),
+  // distinct from the site blocking a live exit. Evidence on the diagnostics + a seam-level FailureClass.
+  await assert.rejects(c.navigate("https://example.com/"), (err) => {
+    assert.equal(err.name, "EscalationError");
+    assert.match(err.message, /burned exit/i, "all-dead exhaustion reads as a burned exit, not a generic exhaustion");
+    assert.equal(err.diagnostics.burnedExit, true);
+    return true;
+  });
   assert.equal(opened.length, 4, "one direct attempt + the full 3-attempt proxied budget");
 });
 

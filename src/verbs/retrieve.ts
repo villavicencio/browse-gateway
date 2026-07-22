@@ -292,6 +292,20 @@ export function isChromeErrorUrl(url: string | undefined): boolean {
 }
 
 /**
+ * A DEAD-EXIT signal (#45): the attempt produced NO real response from the site — a null status (no
+ * main-frame response captured) or a `chrome-error://` landing (reset socket / unreachable). This is the
+ * exit-health SUBSET of a nav failure: it means our proxied exit died before reaching the site, distinct
+ * from the site serving a live block on a reachable exit (a visible challenge or a 4xx/5xx hard block,
+ * where `status` is non-null and the URL is real). The escalation loops use it to tell a burned exit
+ * (re-roll the pool) apart from a site block (a fresh exit may still clear it) — a PURE derivation over
+ * signals BOTH verbs already carry (status + landed URL), no probe. Positive-signal-only: it is evidence
+ * FROM an attempt, never fabricated from an attempt's absence.
+ */
+export function isDeadExit(status: number | null, finalUrl: string | undefined): boolean {
+  return status === null || isChromeErrorUrl(finalUrl);
+}
+
+/**
  * The block {@link BlockReason} for a FAILED signal, accounting for a dead nav that {@link resolveBlockReason}
  * (which reads only title/text/status/hints) can't see: a `chrome-error://` final URL is `nav-failed` even
  * when the render inherited a stale non-null status (codex #41 r4/r5). The SINGLE reason derivation shared by
@@ -434,6 +448,14 @@ export interface EscalationDiagnostics {
   attemptMs?: number[];
   /** Residential-vs-datacenter exit verification (opt-in egress probe, U4); absent unless requested. */
   exitCheck?: EgressCheck;
+  /**
+   * #45: the escalation EXHAUSTED every proxied attempt without any exit reaching the site (all dead-nav) —
+   * our residential exits died, distinct from the site blocking a live exit. Orthogonal exit-health EVIDENCE
+   * (like {@link exitCheck}), never a behavior gate: the loop re-rolls the same way regardless. Present only
+   * on the proxied path; absent (undefined) when at least one exit reached the site, or the proxy was never
+   * engaged. Pairs with the seam-level `burned-exit` FailureClass on the failure envelope.
+   */
+  burnedExit?: boolean;
 }
 
 /** Build {@link EscalationDiagnostics} from the escalation tally and the last failed signal. */
@@ -446,6 +468,8 @@ export function escalationDiagnostics(opts: {
   /** Per proxied-attempt wall-clock ms (issue #42), 1:1 with `attempts`; omitted when empty. */
   attemptMs?: number[];
   exitCheck?: EscalationDiagnostics["exitCheck"];
+  /** #45: all proxied exits died without reaching the site (exit-health evidence). Omitted when false/undefined. */
+  burnedExit?: boolean;
 }): EscalationDiagnostics {
   return {
     proxyConfigured: opts.proxyConfigured,
@@ -454,6 +478,7 @@ export function escalationDiagnostics(opts: {
     attempts: opts.attempts,
     lastStatus: opts.last?.status ?? null,
     ...(opts.attemptMs && opts.attemptMs.length ? { attemptMs: opts.attemptMs } : {}),
+    ...(opts.burnedExit ? { burnedExit: true } : {}),
     // resolveFailureReason (not bare classifyBlock/resolveBlockReason) so the escalation-diagnostics reason
     // matches the failure-envelope class/vendor on a bare-CAPTCHA failure AND on a stale-status chrome-error
     // dead nav — one EscalationError can't carry two reasons (codex #40 r3 / #41 r5). captcha-awareness rides
@@ -661,6 +686,13 @@ export async function retrieve(
   };
 
   let budgetExceeded = false; // #43: set when the escalation loop hits the global call budget → typed timeout
+  // #45: set true once ANY proxied attempt reaches the site (a live response — a block/challenge, not a dead
+  // exit). If the loop EXHAUSTS with this still false, every exit died → a burned-exit (all-dead) verdict.
+  let sawLiveProxiedResponse = false;
+  // #45 (codex r8): the last proxied attempt that REACHED the site (a live block/challenge). On a mixed
+  // exhaustion (a live 403 then a dead exit), the site DID block us — classify on this live failure rather
+  // than the final dead render, so the reason/class stay site-attributed instead of degrading to nav-failed.
+  let lastLiveRender: RenderResult | undefined;
 
   let captchaSolved = false;
   let proxyUsed = false;
@@ -770,6 +802,13 @@ export async function retrieve(
       ) {
         break;
       }
+      // #45: this attempt FAILED (didn't break as cleared). If the exit REACHED the site (a live response —
+      // a visible/hard block, not a null/chrome-error dead nav), the failure is site-attributable, so this is
+      // NOT an all-exits-dead burn. Tracked across attempts; if the loop exhausts still-false, every exit died.
+      if (!isDeadExit(render.status, render.diagnostics?.finalUrl)) {
+        sawLiveProxiedResponse = true;
+        lastLiveRender = render; // #45 (codex r8): remember it — a later dead exit must not erase this site block
+      }
     }
   }
 
@@ -785,6 +824,13 @@ export async function retrieve(
     } else {
       render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
     }
+  }
+  // #45 (codex r8): on a MIXED proxied exhaustion — an earlier attempt REACHED the site (a live block) but the
+  // FINAL attempt died — classify on that live failure, not the dead final render, so the reason/class stay
+  // site-attributed (anti-bot-block / hard-block) instead of degrading to nav-failed. Skipped for a timeout
+  // (which overrides the class regardless) and when no live response was ever seen.
+  if (!budgetExceeded && lastLiveRender && (render.status === null || isChromeErrorUrl(render.diagnostics?.finalUrl))) {
+    render = lastLiveRender;
   }
   // #43 (codex r1/r6): flag a timeout whenever the WHOLE call consumed the budget — the escalation loop
   // exhausting attempts right at the deadline (r1) OR a direct-only render (no proxy / off-datacenter) that
@@ -862,10 +908,24 @@ export async function retrieve(
   // #43 (codex r7): re-check the budget AFTER the CPU-heavy extraction/scanning above — a huge blocked DOM can
   // finish parsing seconds over budget, and a timeout must win over the incidental block class it derives from.
   if (!budgetExceeded && overBudget()) budgetExceeded = true;
+  // #45: a proxied escalation that EXHAUSTED every attempt with a DEAD exit (all null-status/chrome-error —
+  // no exit ever reached the site) is a BURNED-EXIT: our residential pool died, distinct from the site
+  // blocking a live exit. Gated on `deadNav` so a successful clear (proxy broke the loop early) can never be
+  // mislabeled, and OUTRANKED by budgetExceeded (a timeout wins). Evidence + a nav-failed refinement — the
+  // loop already re-rolled all exits, so this changes labeling, NOT behavior.
+  // #45 (codex r7): REQUIRE the non-forced path. Escalation there fires only AFTER a direct attempt got a real
+  // response (a CF challenge / hard block via shouldEscalateToProxy) — positive evidence the TARGET is
+  // reachable, so all-proxied-dead is exit-attributable. The FORCED path SKIPS that direct check, so an
+  // off-allowlist/guard-aborted or DNS/TLS-dead target would produce the same all-null signal on HEALTHY exits
+  // — not a burn. Without reachability evidence we stay `nav-failed` (positive-signal-only, the #40 doctrine).
+  const burnedExit = proxyUsed && !forced && !budgetExceeded && deadNav && !sawLiveProxiedResponse;
   // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
   // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /
   // hard-block the last attempt happened to land on. The typed `timeout` failureClass carries the detail.
-  const reason: BlockReason | null = budgetExceeded ? null : blocked ? resolveFailureReason(signal) : null;
+  // #45 (codex r6): SAME for a burned-exit loop verdict — the surface prefers `reason`, so leaving it as the
+  // incidental `nav-failed` would contradict failureClass='burned-exit'. Null it so the surface advertises the
+  // burned-exit verdict (the exits died, not the target). `burned-exit` is a FailureClass, not a BlockReason.
+  const reason: BlockReason | null = budgetExceeded || burnedExit ? null : blocked ? resolveFailureReason(signal) : null;
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
   const proxyDiagnostic = proxyUsed
@@ -876,6 +936,7 @@ export async function retrieve(
         attempts: proxyAttempts,
         last: signal,
         attemptMs, // #42: per-attempt durations, 1:1 with attempts
+        burnedExit, // #45: all exits died without reaching the site (exit-health evidence)
       })
     : undefined;
   // Failure-evidence envelope (issue #39): surface it on ANY retrieve failure (blocked, empty-content,
@@ -892,10 +953,18 @@ export async function retrieve(
   // — formalizing the old MCP-layer `empty-content` fallback into the typed enum. Computed only on a
   // FAILURE, so the success shape is unchanged; attached at THIS redaction seam (like wafVendor), not via
   // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
-  // #43: a budget-exhausted escalation is a decisive `timeout` (the FailureClass reserved for this ticket in
-  // the #41 taxonomy), overriding the per-signal classification — the caller sees "bounded time ran out",
-  // not the incidental block class of whatever the last attempt happened to land on.
-  const failureClass: FailureClass | undefined = failed ? (budgetExceeded ? "timeout" : classifyFailure(signal)) : undefined;
+  // #43: a budget-exhausted escalation is a decisive `timeout`, overriding the per-signal classification — the
+  // caller sees "bounded time ran out", not the incidental block class of whatever the last attempt landed on.
+  // #45: else an all-exits-dead escalation is a `burned-exit` (a refinement of the nav-failed the dead final
+  // render would classify as) — "our exits died", not "target unreachable". Both are SEAM-level loop verdicts
+  // (the single-page classifier can't compare attempts); precedence timeout > burned-exit > per-signal class.
+  const failureClass: FailureClass | undefined = failed
+    ? budgetExceeded
+      ? "timeout"
+      : burnedExit
+        ? "burned-exit"
+        : classifyFailure(signal)
+    : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
   // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
   // BOTH gate on a DETECTED active CAPTCHA (signal.captchaKind), NOT on failureClass==="captcha" — a page can

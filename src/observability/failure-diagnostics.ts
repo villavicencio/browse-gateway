@@ -67,8 +67,13 @@ export type WafVendor =
  *                       block/shell, but STILL a no-content failure (isError:true), not a success.
  *   - `unsupported-browser` an unsupported-browser interstitial phrase.
  *   - `nav-failed`      no response captured (status===null) — off-allowlist/unreachable.
- *   - `burned-exit`     RESERVED for #45 (not produced by the #41 classifier).
- *   - `timeout`         RESERVED for #43 (not produced by the #41 classifier).
+ *   - `burned-exit`     (#45) a proxy escalation that EXHAUSTED every attempt without any exit reaching the
+ *                       site (all dead-nav) — our residential exits died, distinct from the site blocking a
+ *                       live exit. Emitted at the escalation SEAM (not by the single-page classifier, which
+ *                       can't compare attempts) as a refinement of `nav-failed`; carries NO WAF vendor.
+ *   - `timeout`         (#43) a call that exhausted the global wall-clock budget. Emitted at the retrieve /
+ *                       drive escalation SEAM (not by the single-page classifier), overriding the incidental
+ *                       block class of whatever the last attempt landed on.
  *   - `ok`              RESERVED — the #41 classifier only runs on FAILURES, so it never returns this;
  *                       held for a future success/home-fallback annotation.
  * On the RETRIEVE (outcome) path the classifier can produce the full vocabulary; on the interactive DRIVE
