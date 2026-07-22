@@ -125,14 +125,6 @@ export class SessionManager {
    * first await, removed in `acquire`'s finally. (Issue #50.)
    */
   readonly #launching = new Set<Promise<Session>>();
-  /**
-   * Best-effort reap continuations for launches that RESOLVED after their deadline (issue #54). A wedged
-   * launch that later fulfills yields a real, KILLABLE browser that `acquire()` already abandoned —
-   * `#reapLateLaunch` closes it (anchorless) so it isn't leaked. Tracked here so `shutdown()` drains them
-   * (bounded) rather than letting a late browser escape its drain. (Distinct from the never-returning
-   * half-spawn, and from counting a live late orphan against the running cap — both are #54 Part 2.)
-   */
-  readonly #launchReaps = new Set<Promise<void>>();
   /** Set once `shutdown()` begins; `acquire()` refuses from here on, so no replacement is admitted while
    *  shutdown drains in-flight teardowns and launches. (Issue #50.) */
   #shuttingDown = false;
@@ -290,20 +282,17 @@ export class SessionManager {
     }
     if (outcome.kind === "timeout") {
       // The deadline won and the reserved slot is released (acquire's `finally`). `launchP` is still pending;
-      // if it RESOLVES late with a real (killable) core, close it BEST-EFFORT so we don't leak a browser handle
-      // we trivially have — `#reapLateLaunch` mirrors the acquire⇄shutdown self-teardown (anchorless: an
-      // unconfirmed close goes to `#unconfirmed`, surfaced via `unconfirmedCount`, and the reaper retries it).
-      // Tracked in `#launchReaps` so `shutdown()` drains it (bounded) rather than letting a late browser escape.
-      // SCOPED to #54 Part 2 (orphan reaping, HOLD #4): COUNTING a late-resolve orphan against the RUNNING cap —
-      // and reaping the never-returning half-spawn that yields no core — is the holistic orphan-accounting the
-      // operator gated; a late-resolve here is exceptional (a launch that outran its own deadline) and prod's
-      // container namespace teardown is the ultimate backstop. A late REJECTION is absorbed by the `.then(onR)` arm.
-      const reap = launchP.then(
+      // if it RESOLVES late with a real (killable) core, close it BEST-EFFORT (fire-and-forget) so we don't
+      // leak a browser handle we trivially have — `#reapLateLaunch` is anchorless (an unconfirmed close goes to
+      // `#unconfirmed`, surfaced via `unconfirmedCount`, and the reaper retries it). A late REJECTION is
+      // swallowed so it can't surface as unhandled. Integrating a late reap into shutdown's no-orphan drain,
+      // counting a live late orphan against the RUNNING cap, and reaping the never-returning half-spawn (no core,
+      // no PID) are the holistic orphan-reaping deferred to #54 Part 2 (HOLD #4); prod's container namespace
+      // teardown is the ultimate backstop meanwhile.
+      void launchP.then(
         (lateCore) => this.#reapLateLaunch(lateCore),
-        () => {}, // swallow a late rejection (already handled above) so it can't surface as unhandled
+        () => {}, // swallow a late rejection (already handled by the race's `.then(onR)` arm) — never unhandled
       );
-      this.#launchReaps.add(reap);
-      void reap.finally(() => this.#launchReaps.delete(reap));
       throw new SessionManagerError(
         "CORE_LAUNCH",
         `browser core launch exceeded ${this.#launchDeadlineMs}ms deadline`,
@@ -483,26 +472,16 @@ export class SessionManager {
   async shutdown(): Promise<void> {
     this.#shuttingDown = true;
     this.stopReaper();
-    // AWAIT in-flight launches AND late-launch reaps so a launch racing shutdown self-tears-down rather than
-    // orphaning a browser — but BOUND that wait so a wedged launch can't hang shutdown (issue #54). A wedged
-    // `#launching` entry that only reaches its OWN deadline mid-shutdown SPAWNS a new `#launchReaps` entry, so
-    // a one-shot snapshot could return before that fresh reap runs (issue #54, codex r3). Re-drain in a loop
-    // until both sets are empty (each launch/reap settles at most once, so this converges) or the shared bound
-    // fires. A launch/reap still pending at the bound is harmless — `#shuttingDown` is set and prod's container
-    // namespace teardown is the ultimate backstop. NOT unref'd (issue #50): a foreground awaited timer; an
-    // unref'd one would let the loop empty mid-await and hang.
-    const launchDrain = deadlineTimer(this.#launchDeadlineMs);
-    let bound = false;
-    launchDrain.promise.then(() => {
-      bound = true;
-    });
-    while (!bound && (this.#launching.size > 0 || this.#launchReaps.size > 0)) {
-      await Promise.race([
-        Promise.allSettled([...this.#launching, ...this.#launchReaps]).then(() => {}),
-        launchDrain.promise,
-      ]);
-    }
-    launchDrain.clear();
+    // AWAIT in-flight launches to COMPLETION so a launch racing shutdown self-tears-down (registers→torn-down,
+    // or fails) rather than orphaning a browser — the #50 no-orphan guarantee. This needs NO separate shutdown
+    // timer: every `#launching` entry already settles within `#launchDeadlineMs` because `#launchAndRegister`
+    // races the factory launch against that deadline internally (a wedged-forever launch throws CORE_LAUNCH at
+    // the deadline), so `allSettled` cannot hang. Awaiting each entry to completion — NOT truncating at a
+    // shorter shutdown bound — is what lets a launch that resolved into a shutdown-orphan teardown finish its
+    // close→confirmed-kill instead of leaving detached Chrome behind when the caller `process.exit`s after
+    // shutdown (codex #54 r4). Late-resolve reaps are fire-and-forget best-effort; integrating them into this
+    // no-orphan drain is deferred to #54 Part 2 (HOLD #4).
+    await Promise.allSettled([...this.#launching]);
     const remaining = [...this.#sessions.values()].filter(
       (s) => !this.#closing.has(s.id) && !this.#unconfirmed.has(s),
     );
