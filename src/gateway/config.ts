@@ -6,6 +6,46 @@
 import type { BrowserCoreOptions } from "../browser/index.js";
 import { parseHostSuffixList } from "../security/index.js";
 
+/**
+ * Per-call time bounds (issue #43), all env-overridable with safe defaults so behavior is UNCHANGED when
+ * unset. Previously each was a hardcoded module constant with no deployment knob; `3 × (proxyNav +
+ * proxyClearance)` could stack toward ~200s, and an unsolvable-CAPTCHA solve ran its full deadline. The
+ * global `callBudgetMs` is the outer bound the escalation loop enforces regardless of the per-stage math.
+ *
+ * CONSUMED by the RETRIEVE path (the 3× proxy-escalation loop — the observed ~200s stacking source) and
+ * the CAPTCHA solver. SCOPED-OUT (documented #43 follow-up, coordinated with #45): the DRIVE path still
+ * reads the module-constant defaults. The drive path does NOT have retrieve's 3× re-roll loop — a stateful
+ * session can't swap its exit mid-flow (KTD-5), so it's a single escalation attempt bounded by one nav +
+ * clearance, not a stacking loop — and #45 restructures that exact drive escalation, so threading the budget
+ * through it now would be immediately churned. Its env-timeout consumption lands with #45.
+ */
+export interface CallTimeouts {
+  /** Global per-call wall-clock budget (BGW_CALL_BUDGET_MS). The retrieve/drive escalation loop stops and
+   *  returns a decisive typed `timeout` failure once exceeded, rather than stacking attempts toward ~200s. */
+  callBudgetMs: number;
+  /** Direct-attempt clearance budget (BGW_CLEARANCE_TIMEOUT_MS). */
+  clearanceTimeoutMs: number;
+  /** Proxied-attempt clearance budget (BGW_PROXY_CLEARANCE_TIMEOUT_MS) — raised: an interstitial clears
+   *  slower on a held residential exit. */
+  proxyClearanceTimeoutMs: number;
+  /** Per-proxied-attempt navigation timeout (BGW_PROXY_NAV_TIMEOUT_MS) — bounds a hung exit. */
+  proxyNavTimeoutMs: number;
+  /** Max proxied re-roll attempts (BGW_PROXY_MAX_ATTEMPTS). */
+  proxyMaxAttempts: number;
+  /** CAPTCHA solve deadline (BGW_CAPTCHA_SOLVE_TIMEOUT_MS). */
+  captchaSolveTimeoutMs: number;
+}
+
+/** The shipped defaults for {@link CallTimeouts} — the values that were hardcoded before #43. */
+export const DEFAULT_CALL_TIMEOUTS: CallTimeouts = {
+  callBudgetMs: 90_000,
+  clearanceTimeoutMs: 20_000,
+  proxyClearanceTimeoutMs: 45_000,
+  proxyNavTimeoutMs: 25_000,
+  proxyMaxAttempts: 3,
+  captchaSolveTimeoutMs: 120_000,
+};
+
 export interface GatewayConfig {
   /** Max concurrent browser sessions. Kept low by default — headful Chrome is heavy. */
   maxSessions: number;
@@ -13,12 +53,15 @@ export interface GatewayConfig {
   perConsumerMax: number;
   /** Browser-core options applied to every session (channel, sandbox, headless). */
   core: BrowserCoreOptions;
+  /** Env-overridable per-call time bounds (issue #43). */
+  timeouts: CallTimeouts;
 }
 
 export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   maxSessions: 2,
   perConsumerMax: 1,
   core: {}, // browser-core defaults: headful, real Chrome channel
+  timeouts: DEFAULT_CALL_TIMEOUTS,
 };
 
 function positiveIntOr(value: string | undefined, fallback: number): number {
@@ -69,5 +112,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     maxSessions: positiveIntOr(env.BGW_MAX_SESSIONS, DEFAULT_GATEWAY_CONFIG.maxSessions),
     perConsumerMax: positiveIntOr(env.BGW_PER_CONSUMER_MAX, DEFAULT_GATEWAY_CONFIG.perConsumerMax),
     core,
+    timeouts: loadCallTimeouts(env),
+  };
+}
+
+/** Read the env-overridable per-call time bounds (issue #43); each falls back to its shipped default via the
+ *  strict {@link positiveIntOr} parse (rejects hex/float/exponent), so behavior is unchanged when unset. */
+export function loadCallTimeouts(env: NodeJS.ProcessEnv = process.env): CallTimeouts {
+  const d = DEFAULT_CALL_TIMEOUTS;
+  return {
+    callBudgetMs: positiveIntOr(env.BGW_CALL_BUDGET_MS, d.callBudgetMs),
+    clearanceTimeoutMs: positiveIntOr(env.BGW_CLEARANCE_TIMEOUT_MS, d.clearanceTimeoutMs),
+    proxyClearanceTimeoutMs: positiveIntOr(env.BGW_PROXY_CLEARANCE_TIMEOUT_MS, d.proxyClearanceTimeoutMs),
+    proxyNavTimeoutMs: positiveIntOr(env.BGW_PROXY_NAV_TIMEOUT_MS, d.proxyNavTimeoutMs),
+    proxyMaxAttempts: positiveIntOr(env.BGW_PROXY_MAX_ATTEMPTS, d.proxyMaxAttempts),
+    captchaSolveTimeoutMs: positiveIntOr(env.BGW_CAPTCHA_SOLVE_TIMEOUT_MS, d.captchaSolveTimeoutMs),
   };
 }

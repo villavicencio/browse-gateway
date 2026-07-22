@@ -79,7 +79,7 @@ async function main(): Promise<void> {
         retrieve: async ({ url, forceProxy }) => {
           try {
             const forced = (forceProxy ?? false) || hostForcesProxy(new URL(url).hostname, forceProxyHosts);
-            return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix, forceProxy: forced });
+            return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix, forceProxy: forced, timeouts: config.timeouts });
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             throw new Error(redactSecrets(message, secrets)); // never leak BYO secret material (R9)

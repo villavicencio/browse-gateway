@@ -29,6 +29,7 @@ import { redactFailureDiagnostics, sanitizeUrlForError, assembleTiming } from ".
 import type { FailureDiagnostics, WafVendor, FailureClass, Timing } from "../observability/index.js";
 export type { WafVendor, FailureClass, Timing } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
+import { DEFAULT_CALL_TIMEOUTS, type CallTimeouts } from "../gateway/config.js";
 import { isHttpUrl } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
@@ -77,6 +78,10 @@ export interface RetrieveOptions {
   /** Force residential from the FIRST render (skip the direct attempt) for a known-hostile host
    *  (issue #21). The MCP layer resolves this from the {forceProxy} option + BGW_FORCE_PROXY_HOSTS. */
   forceProxy?: boolean;
+  /** Env-overridable per-call time bounds (issue #43): the global call budget + the proxy attempt/nav/
+   *  clearance timeouts. Defaults to {@link DEFAULT_CALL_TIMEOUTS} (the shipped values) when omitted, so
+   *  behavior is unchanged. http-main sources this from the gateway config. */
+  timeouts?: CallTimeouts;
 }
 
 /**
@@ -632,13 +637,20 @@ export async function retrieve(
   // instead of polling to the full clearance timeout (the kill-gate keeps the strong-content
   // bar). MIN, not 0, so a CF page mid-reload — challenge phrase gone but content not yet
   // painted — isn't mistaken for cleared.
+  // #43: env-overridable per-call time bounds (proxy attempts/nav/clearance + the direct clearance) plus the
+  // global call budget. Defaults to the shipped values when the caller passes none, so behavior is unchanged.
+  const timeouts = opts.timeouts ?? DEFAULT_CALL_TIMEOUTS;
   const renderOpts: RenderOptions = { clearedTextLength: MIN_CONTENT_LENGTH };
-  if (opts.clearanceTimeoutMs !== undefined) renderOpts.clearanceTimeoutMs = opts.clearanceTimeoutMs;
+  // #43: the DIRECT-attempt clearance budget is env-overridable (BGW_CLEARANCE_TIMEOUT_MS via
+  // timeouts.clearanceTimeoutMs); an explicit per-call opts.clearanceTimeoutMs still wins.
+  renderOpts.clearanceTimeoutMs = opts.clearanceTimeoutMs ?? timeouts.clearanceTimeoutMs;
   const proxy = proxyFromSecrets(secrets);
   const escalation: EscalationContext = {
     onDatacenterIp: opts.escalation?.onDatacenterIp ?? false,
     proxyAvailable: opts.escalation?.proxyAvailable ?? Boolean(proxy),
   };
+
+  let budgetExceeded = false; // #43: set when the escalation loop hits the global call budget → typed timeout
 
   let captchaSolved = false;
   let proxyUsed = false;
@@ -653,7 +665,7 @@ export async function retrieve(
   const forced = (opts.forceProxy ?? false) && Boolean(proxy) && escalation.onDatacenterIp;
   const proxiedRenderOpts: RenderOptions = {
     ...renderOpts,
-    clearanceTimeoutMs: opts.clearanceTimeoutMs ?? PROXY_CLEARANCE_TIMEOUT_MS,
+    clearanceTimeoutMs: opts.clearanceTimeoutMs ?? timeouts.proxyClearanceTimeoutMs,
   };
 
   // 1) Direct render through an authenticated, allowlist-guarded session — skipped when forcing proxy.
@@ -704,14 +716,23 @@ export async function retrieve(
     // was never handed to the solver). Clear it so a stale code can't ride the final envelope. (No production
     // caller wires opts.solver, so this is the vestigial-seam correctness case, not a prod path.)
     solveAttemptReason = undefined;
-    for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= timeouts.proxyMaxAttempts; attempt++) {
+      // #43: enforce the GLOBAL per-call budget BEFORE spending another proxied attempt (fresh session-open
+      // + up to proxyNav + proxyClearance). Stacking attempts is the dominant "why 200s" source, so this
+      // bounds the total wall-clock regardless of the per-attempt math and returns a decisive typed
+      // `timeout` failure instead of running to attempt exhaustion. The direct attempt already happened
+      // (its own clearance-bounded render); the budget covers the escalation tail.
+      if (performance.now() - t0 >= timeouts.callBudgetMs) {
+        budgetExceeded = true;
+        break;
+      }
       proxyAttempts = attempt;
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
       const attempt0 = performance.now();
       render = await gateway.withConsumerSession(
         token,
         (s) => s.core.render(url, proxiedRenderOpts),
-        { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: PROXY_NAV_TIMEOUT_MS },
+        { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: timeouts.proxyNavTimeoutMs },
       );
       attemptMs.push(performance.now() - attempt0);
       // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a dead exit that
@@ -831,7 +852,10 @@ export async function retrieve(
   // — formalizing the old MCP-layer `empty-content` fallback into the typed enum. Computed only on a
   // FAILURE, so the success shape is unchanged; attached at THIS redaction seam (like wafVendor), not via
   // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
-  const failureClass: FailureClass | undefined = failed ? classifyFailure(signal) : undefined;
+  // #43: a budget-exhausted escalation is a decisive `timeout` (the FailureClass reserved for this ticket in
+  // the #41 taxonomy), overriding the per-signal classification — the caller sees "bounded time ran out",
+  // not the incidental block class of whatever the last attempt happened to land on.
+  const failureClass: FailureClass | undefined = failed ? (budgetExceeded ? "timeout" : classifyFailure(signal)) : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
   // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
   // BOTH gate on a DETECTED active CAPTCHA (signal.captchaKind), NOT on failureClass==="captcha" — a page can
