@@ -751,3 +751,20 @@ test("#43: a forced-proxy request that exhausts the budget times out WITHOUT a d
   assert.equal(calls.length, 0, "NO direct fallback render happened — force-proxy is honored");
   assert.equal(r.proxyUsed, false, "no proxied attempt started, so residential routing is NOT claimed (codex r3)");
 });
+
+test("#43: a direct-only render that consumes the budget is classified timeout (codex r6)", async () => {
+  // No proxy configured → no escalation branch runs. A direct render that ran the budget out must still
+  // surface a decisive `timeout` (the post-render deadline check covers the direct path, not only the loop).
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 60);
+  const secrets = new SecretStore(() => ({})); // NO proxy
+  const r = await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 10 },
+  });
+  assert.equal(r.proxyUsed, false, "no proxy engaged");
+  assert.equal(calls.length, 1, "only the direct render ran");
+  assert.equal(r.diagnostics?.failureClass, "timeout", "direct-only budget exhaustion is a decisive timeout");
+  assert.equal(r.reason, null, "reason nulled so the MCP surfaces timeout");
+});

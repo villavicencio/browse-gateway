@@ -771,10 +771,6 @@ export async function retrieve(
         break;
       }
     }
-    // #43 (codex r1): also flag a timeout when the attempts exhausted right at the deadline (the clamped
-    // last attempt ran the budget out) rather than tripping the pre-attempt break — so a still-failing
-    // result that consumed the whole budget is classified `timeout`, not the incidental block class.
-    if (!budgetExceeded && performance.now() - t0 >= timeouts.callBudgetMs) budgetExceeded = true;
   }
 
   // render is assigned by here: non-forced did a direct render; forced implies a proxy so it ran >=1
@@ -790,6 +786,11 @@ export async function retrieve(
       render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
     }
   }
+  // #43 (codex r1/r6): flag a timeout whenever the WHOLE call consumed the budget — the escalation loop
+  // exhausting attempts right at the deadline (r1) OR a direct-only render (no proxy / off-datacenter) that
+  // ran the budget out (r6) — so a still-failing result that spent the budget is classified `timeout`, not
+  // the incidental block/nav class. Checked here after render is finalized, covering direct + proxied + fallback.
+  if (!budgetExceeded && performance.now() - t0 >= timeouts.callBudgetMs) budgetExceeded = true;
   const extraction = extractMarkdown(render.html, url);
   const cfHint = hasCloudflareHint(render.html);
   const pxHint = hasPerimeterXHint(render.html);

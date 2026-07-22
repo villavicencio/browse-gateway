@@ -754,11 +754,20 @@ export class PatchrightBrowserCore implements BrowserCore {
       // #43 (codex r5): the clearance poll gets whatever remains of the shared per-call deadline AFTER the
       // goto (subtract actual navigation time), so nav + clearance can't each spend the full budget. Unbudgeted
       // renders keep the raw clearanceTimeoutMs.
-      const clearanceBudget = deadlineBoundedTimeout(clearanceTimeoutMs, opts.budgetDeadlineMs, performance.now(), 0);
       let signal = await pollSignal(page);
       let waited = 0;
-      while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceBudget) {
-        await page.waitForTimeout(pollIntervalMs);
+      // #43 (codex r6): bound the poll by the WALL-CLOCK deadline, not only the synthetic `waited` counter — a
+      // pollSignal CDP read has real latency and pollIntervalMs may not divide the remaining budget, so the
+      // counter under-counts elapsed and the loop overruns. Break when the deadline passes and clamp the sleep
+      // so it can't overshoot. `waited` still tracks sleep-interval time for clearanceWaitedMs (kill-gate reads it).
+      while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceTimeoutMs) {
+        if (opts.budgetDeadlineMs !== undefined) {
+          const left = opts.budgetDeadlineMs - performance.now();
+          if (left <= 0) break;
+          await page.waitForTimeout(Math.min(pollIntervalMs, left));
+        } else {
+          await page.waitForTimeout(pollIntervalMs);
+        }
         waited += pollIntervalMs;
         signal = await pollSignal(page);
       }
