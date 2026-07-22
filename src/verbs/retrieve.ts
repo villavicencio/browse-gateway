@@ -295,7 +295,8 @@ export interface FailureSignal extends BlockSignal {
   /** The main-frame RESPONSE RECEIPT ({@link RenderResult.responseReceived}), carried so the seam-level
    *  {@link isDeadExit} burned-exit gate keys off "did the exit respond" rather than status===null (#67). A
    *  retrieve-populated field: retrieve sets it from render.responseReceived; drive keys exit-health off its
-   *  snapshot directly and leaves this unset (like frameworkRoot/networkFailed) until #66 wires the receipt. */
+   *  snapshot directly (whose receipt the core populates as of #66) and leaves this unset (like
+   *  frameworkRoot/networkFailed). */
   responseReceived?: boolean;
 }
 
@@ -318,8 +319,8 @@ export function isChromeErrorUrl(url: string | undefined): boolean {
  * A proxied exit that RESPONDED but timed out before DCL is recorded status-null yet responseReceived — the
  * receipt keeps that responded-but-slow exit from being mislabelled a dead exit (an over-firing `burned-exit`),
  * WITHOUT touching the `status`-driven success verdict (retrieve's `deadNav` / drive's `navFailed` stay on
- * status, per r10). The receipt is authoritative WHEN PRESENT; absent (a receipt-less fixture, the synthetic
- * budget-timeout render, or the drive snapshot until #66 wires it) it FALLS BACK to `status` presence — a
+ * status, per r10). The receipt is authoritative WHEN PRESENT; absent (a receipt-less fixture or the synthetic
+ * budget-timeout render — the drive snapshot carries it as of #66) it FALLS BACK to `status` presence — a
  * captured status implies a response — so exit-health labelling there is unchanged.
  */
 export function isDeadExit(

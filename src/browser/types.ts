@@ -251,11 +251,25 @@ export interface PageSnapshot {
    * Whether the MAIN-FRAME document RESPONSE was received on the navigation that produced this page (issue
    * #67) — the drive-side sibling of {@link RenderResult.responseReceived}, tracked SEPARATELY from
    * {@link status} so a responded-but-slow exit (status-null but a receipt) is not mislabelled a dead exit.
-   * NOT YET POPULATED on the drive path (navigate() sets it in the #66 follow-up); until then the drive
-   * exit-health check ({@link import("../verbs/index.js").isDeadExit}) falls back to `status` presence, so
-   * leaving it absent keeps drive labelling unchanged. Reserved here so #66 can wire it without a type change.
+   * Populated on every core snapshot as of #66 (mirroring `status`: the core's active-page response listener
+   * flips a receipt flag the snapshot reads), so the drive exit-health check
+   * ({@link import("../verbs/index.js").isDeadExit}) keys off the real receipt. Absent only on a hand-built
+   * fixture — isDeadExit then falls back to `status` presence, exactly like the retrieve side.
    */
   responseReceived?: boolean;
+  /**
+   * The navigation that produced this page was TRUNCATED by the nav timeout / per-call budget deadline
+   * WITHOUT landing real content (issue #66): the `goto`, the bounded DCL wait (a committed document that
+   * never reached DOMContentLoaded — the residue a non-timeout goto abort leaves, codex r1), or the
+   * clearance poll was cut short — headers may have arrived first, pinning a `status` (200) — and the
+   * final page is still THIN and shows no block phrase. Without this flag that partial-200 reads as a healthy nav ({@link import("../verbs/index.js").navFailed}
+   * sees a 200 + no block) and the drive controller PINS it as a success instead of a timeout. Set ONLY by
+   * `navigate()` (never a post-action snapshot), and ONLY when the page did NOT reach substantial content —
+   * a cleared CF page (goto deliberately throws, then the challenge reload lands a fat 200) stays a success,
+   * the stealth-critical constraint this gating exists for. navFailed treats it as a failure; the drive
+   * failure seam classifies it `timeout`.
+   */
+  deadlineTruncated?: boolean;
   /** Accessibility tree text with `[ref=eN]` annotations the drive verbs target. */
   tree: string;
   /**

@@ -79,6 +79,12 @@ test("navFailed: fails on null status, a 4xx+thin page, or a visible interstitia
   assert.equal(navFailed({ url: "chrome-error://chromewebdata/", title: "", tree: "", status: 200 }), true);
   assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 200 }), false);
   assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 403 }), false);
+  // #66: a core-marked DEADLINE-TRUNCATED nav is failed even though every other arm reads healthy — the
+  // headers-before-DCL partial-200 the truncated goto pinned must not be pinned as a success. navFailed
+  // TRUSTS the core's flag (the core only sets it on a thin, unblocked page — asserted with a fat tree
+  // here precisely to show the flag, not the content, decides).
+  assert.equal(navFailed({ url: "u", title: "t", tree: REAL, status: 200, deadlineTruncated: true }), true);
+  assert.equal(navFailed({ url: "u", title: "t", tree: "", status: 200, deadlineTruncated: true }), true);
 });
 
 test("shouldEscalateDrive: escalates on a CF challenge (visible OR vendor-hint) or a hard block; NOT a generic block or dead nav", () => {
@@ -125,13 +131,19 @@ function makeProxyGateway(sessionNavLists) {
           async navigate(url) {
             const out = navs[Math.min(ni, navs.length - 1)] ?? {};
             ni++;
-            // Preserve an explicit `status: null` (a dead exit); only fill in defaults when omitted.
+            const status = out.status === undefined ? 200 : out.status; // preserve an explicit null (a dead exit)
             return {
               url,
               title: "t",
               tree: out.tree === undefined ? REAL : out.tree,
-              status: out.status === undefined ? 200 : out.status,
+              status,
               cfHint: out.cfHint, // a scrubbed CF vendor-hint flag, undefined unless the spec sets it
+              // #67/#66: the main-frame response RECEIPT and the deadline-truncation flag, passed through
+              // only when the spec sets them (an omitting spec models a receipt-less fixture → status fallback).
+              ...(out.responseReceived !== undefined ? { responseReceived: out.responseReceived } : {}),
+              ...(out.deadlineTruncated ? { deadlineTruncated: true } : {}),
+              // A minimal #39 envelope so the seam-level failureClass is assertable on thrown failures.
+              diagnostics: { finalUrl: url, title: "t", status },
             };
           },
           async snapshot() { return { url: "u", title: "t", tree: REAL, status: 200 }; },
@@ -205,6 +217,74 @@ test("controller: escalation throws when no proxied exit lands within the attemp
     return true;
   });
   assert.equal(opened.length, 4, "one direct attempt + the full 3-attempt proxied budget");
+});
+
+test("controller: a deadline-truncated direct nav surfaces a timeout and is NOT escalated (#66)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  // The #66 bug shape: a budget/nav-timeout-cut goto whose headers arrived first — status 200, thin
+  // page, no block signal. Pre-#66 this PINNED as a success; now the core's deadlineTruncated flag
+  // fails it as a timeout. No CF signal → not escalated (a fresh exit doesn't fix a slow nav).
+  const { gateway, opened } = makeProxyGateway([[{ status: 200, tree: "", deadlineTruncated: true }]]);
+  const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
+  let caught;
+  try { await c.navigate("https://example.com/"); } catch (e) { caught = e; }
+  assert.ok(caught, "a truncated direct nav must throw, not pin the partial page");
+  assert.match(caught.message, /navigation timed out .*truncated by its timeout/i);
+  assert.equal(opened.length, 1, "not escalated — only the direct session was opened");
+  assert.equal(failureOf(caught)?.failureClass, "timeout", "the seam classifies a truncated nav as timeout");
+});
+
+test("controller: truncated proxied attempts are LIVE responses, not a burned exit (#66 receipt precision)", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  // Direct is hard-blocked, then every proxied attempt is deadline-truncated WITH the response receipt
+  // (headers arrived — the exit responded, then the nav was cut). Exhaustion must read as "could not land
+  // a working exit" (site/timeout story), NEVER the burned-exit (all-exits-dead) verdict — the receipt is
+  // exactly what tells a responded-but-slow exit from a dead one (#67 wired into drive by #66).
+  const { gateway, opened } = makeProxyGateway([
+    [{ status: 403, tree: "Forbidden" }], // direct: hard-blocked → escalate
+    [{ status: 200, tree: "", deadlineTruncated: true, responseReceived: true }], // proxied: all truncated-but-live
+  ]);
+  const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
+  let caught;
+  try { await c.navigate("https://example.com/"); } catch (e) { caught = e; }
+  assert.ok(caught, "exhausted escalation must throw");
+  assert.equal(caught.name, "EscalationError");
+  assert.doesNotMatch(caught.message, /burned exit/i, "a responded-but-truncated exit is not a burned exit");
+  assert.notEqual(caught.diagnostics.burnedExit, true, "no all-exits-dead evidence when every exit responded");
+  assert.equal(failureOf(caught)?.failureClass, "timeout", "the truncated final attempt classifies as timeout");
+  assert.equal(opened.length, 4, "one direct attempt + the full 3-attempt proxied budget");
+});
+
+test("controller: a responded-but-slow proxied exit (status null + receipt) is not a burned exit (#67 via #66)", async () => {
+  // The #67 precision, now reachable on drive because the core carries the receipt (#66): every proxied
+  // attempt RESPONDED (receipt true) but died before DCL (status null). navFailed still fails each attempt,
+  // but the exhaustion is NOT the all-exits-dead burned verdict — the exits reached the site.
+  const { gateway } = makeProxyGateway([
+    [{ status: 403, tree: "Forbidden" }], // direct: hard-blocked → escalate
+    [{ status: null, tree: "", responseReceived: true }], // proxied: responded, then died before DCL
+  ]);
+  const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
+  await assert.rejects(c.navigate("https://example.com/"), (err) => {
+    assert.equal(err.name, "EscalationError");
+    assert.doesNotMatch(err.message, /burned exit/i, "a responded exit must not read as burned");
+    assert.notEqual(err.diagnostics.burnedExit, true);
+    return true;
+  });
+});
+
+test("controller: a pinned session whose next nav is deadline-truncated surfaces a timeout and discards (#66)", async () => {
+  const { gateway, open } = makeProxyGateway([
+    [{ status: 200, tree: REAL }, { status: 200, tree: "", deadlineTruncated: true }], // pin, then truncated
+  ]);
+  const c = new GatewayDriveController(gateway, withProxy(), "tok", { onDatacenterIp: true });
+  const snap = await c.navigate("https://example.com/");
+  assert.equal(snap.status, 200, "first navigate pins the direct session");
+  await assert.rejects(
+    c.navigate("https://example.com/deep"),
+    /navigation timed out .*truncated by its timeout/i,
+    "the pinned single-shot surfaces the truncation as a timeout, not a generic block",
+  );
+  assert.equal(open.size, 0, "the truncated session was discarded (next navigate re-runs escalation)");
 });
 
 test("controller: a direct-only session (no proxy) surfaces a failed navigation as an error", async () => {
