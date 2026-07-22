@@ -167,6 +167,16 @@ export interface RenderResult {
   url: string;
   /** HTTP status of the main navigation response, or `null` if none was captured. */
   status: number | null;
+  /**
+   * Whether the MAIN-FRAME document RESPONSE was received during this render (issue #67) — a boolean receipt
+   * tracked SEPARATELY from {@link status}. A proxied exit that RESPONDED but then timed out BEFORE
+   * DOMContentLoaded records `status: null` (a nav failure — the success gate must still fail it, #45 r10) yet
+   * `responseReceived: true`. That separation lets {@link import("../verbs/index.js").isDeadExit} tell a
+   * responded-but-slow exit from a truly dead one WITHOUT touching the `status`-driven success verdict, so the
+   * all-proxied-dead `burned-exit` label can't over-fire on an exit that actually reached the site. Absent on a
+   * hand-built fixture / the synthetic budget-timeout render — {@link isDeadExit} then falls back to `status`.
+   */
+  responseReceived?: boolean;
   title: string;
   text: string;
   html: string;
@@ -237,6 +247,15 @@ export interface PageSnapshot {
    * `snapshot()`. The drive layer keys exit-health on this.
    */
   status?: number | null;
+  /**
+   * Whether the MAIN-FRAME document RESPONSE was received on the navigation that produced this page (issue
+   * #67) — the drive-side sibling of {@link RenderResult.responseReceived}, tracked SEPARATELY from
+   * {@link status} so a responded-but-slow exit (status-null but a receipt) is not mislabelled a dead exit.
+   * NOT YET POPULATED on the drive path (navigate() sets it in the #66 follow-up); until then the drive
+   * exit-health check ({@link import("../verbs/index.js").isDeadExit}) falls back to `status` presence, so
+   * leaving it absent keeps drive labelling unchanged. Reserved here so #66 can wire it without a type change.
+   */
+  responseReceived?: boolean;
   /** Accessibility tree text with `[ref=eN]` annotations the drive verbs target. */
   tree: string;
   /**

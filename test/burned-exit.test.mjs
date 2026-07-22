@@ -2,8 +2,9 @@
  * #45 — burned-exit vs site-block discrimination + the drive escalation budget bound.
  *
  * Two axes, kept orthogonal (the pre-code critique's load-bearing conclusion):
- *  - `isDeadExit` is a PURE derivation over signals BOTH verbs already carry (status + landed URL) — the
- *    shared predicate that keeps retrieve and drive at detection parity (no probe, no HTML).
+ *  - `isDeadExit` is a PURE derivation over signals BOTH verbs already carry (the main-frame response RECEIPT,
+ *    with a status-presence fallback until #66 wires the drive receipt, + the landed URL; #67) — the shared
+ *    predicate that keeps retrieve and drive at detection parity (no probe, no HTML).
  *  - A proxy escalation that EXHAUSTS every attempt with a dead exit (none reached the site) is a
  *    `burned-exit` — surfaced as orthogonal exit-health EVIDENCE (EscalationDiagnostics.burnedExit) + a
  *    seam-level `burned-exit` FailureClass (a refinement of nav-failed; NO WAF vendor). A block from a LIVE
@@ -23,12 +24,19 @@ const PROXY = () => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "
 
 // --- the shared pure predicate (the parity primitive) --------------------------------------------
 
-test("isDeadExit: a dead exit is null-status OR a chrome-error landing; a live response is neither", () => {
-  assert.equal(isDeadExit(null, undefined), true, "no response captured → dead");
-  assert.equal(isDeadExit(null, "https://site/"), true, "null status is dead regardless of URL");
-  assert.equal(isDeadExit(200, "chrome-error://chromewebdata/"), true, "chrome-error landing → dead (stale 200)");
-  assert.equal(isDeadExit(403, "https://site/"), false, "a real 403 is a LIVE site response, not a dead exit");
-  assert.equal(isDeadExit(200, "https://site/"), false, "a real 200 is live");
+test("isDeadExit: keys off the response RECEIPT; a responded-but-status-null exit is NOT dead (#67)", () => {
+  // Receipt absent (undefined) → fall back to `status` presence, so receipt-less fixtures / drive snapshots
+  // (until #66) keep the prior status-based exit-health behavior.
+  assert.equal(isDeadExit(undefined, null, undefined), true, "no receipt + no status → dead");
+  assert.equal(isDeadExit(undefined, null, "https://site/"), true, "no receipt + null status is dead regardless of URL");
+  assert.equal(isDeadExit(undefined, 200, "chrome-error://chromewebdata/"), true, "chrome-error landing → dead (stale 200)");
+  assert.equal(isDeadExit(undefined, 403, "https://site/"), false, "a real 403 is a LIVE site response, not a dead exit");
+  assert.equal(isDeadExit(undefined, 200, "https://site/"), false, "a real 200 is live");
+  // #67: the receipt is AUTHORITATIVE when present — a proxied exit that RESPONDED but timed out before DCL is
+  // recorded status-null yet responseReceived, so it must NOT be labelled a dead exit (the burned-exit over-fire).
+  assert.equal(isDeadExit(true, null, "https://site/"), false, "responded-but-status-null → NOT a dead exit");
+  assert.equal(isDeadExit(true, null, "chrome-error://chromewebdata/"), true, "a chrome-error landing is dead even with a receipt");
+  assert.equal(isDeadExit(false, null, "https://site/"), true, "an explicit no-response receipt → dead");
 });
 
 // --- retrieve: burned-exit on all-dead proxied exhaustion ----------------------------------------
@@ -88,6 +96,24 @@ test("retrieve: a LIVE block among the proxied attempts is site-attributed, NOT 
   // failure stays site-attributed (hard-block) rather than degrading to nav-failed on the last dead exit.
   assert.equal(r.diagnostics.failureClass, "hard-block", "reclassified on the live 403, not the dead final render");
   assert.equal(r.reason, "hard-block", "the surfaced reason is the site block, not nav-failed");
+});
+
+test("retrieve: all proxied exits RESPONDED-but-timed-out (status-null receipt) → NOT burned-exit (#67)", async () => {
+  // Every proxied exit got a main-frame response but timed out before DCL — status-null yet responseReceived.
+  // The receipt tells burned-exit apart from a truly dead pool: the exits REACHED the site, so the verdict is
+  // the per-signal nav-failed, NOT the misleading burned-exit (which would discard site-reachability). The
+  // success verdict is untouched (a status-null render still fails, r10). Re-roll behavior is identical.
+  const SLOW = { url: "u", status: null, responseReceived: true, title: "", text: "", html: "", clearanceWaitedMs: 0, diagnostics: { finalUrl: "u", status: null } };
+  const gateway = makeRenderSeq([CF_BLOCK, SLOW, SLOW, SLOW]);
+  const r = await retrieve(gateway, new SecretStore(PROXY), {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+  });
+  assert.equal(r.blocked, true, "a status-null render still fails the success gate (r10 invariant untouched)");
+  assert.equal(r.proxyDiagnostic.burnedExit, undefined, "the exits RESPONDED → not an all-exits-dead burn");
+  assert.equal(r.diagnostics.failureClass, "nav-failed", "labelled on the per-signal class, not burned-exit");
+  assert.equal(r.reason, "nav-failed", "the site-attributable reason survives instead of being nulled by burned-exit");
 });
 
 test("retrieve: a FORCED-proxy all-dead escalation is NOT burned-exit (no direct-reachability control) — codex r7", async () => {

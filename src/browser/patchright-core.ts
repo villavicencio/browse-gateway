@@ -728,6 +728,21 @@ export class PatchrightBrowserCore implements BrowserCore {
       // the Windows identity errors out rather than rendering as Linux. Non-listed host = no-op (native).
       if (this.#shouldPresentWindows(url)) await this.#applyWindowsToFreshPage(page);
       let status: number | null = null;
+      // #67: a SEPARATE main-frame RESPONSE RECEIPT — flips true once the main document's response is observed,
+      // even if the goto later TIMES OUT before DCL (so `status` stays null, per r10 below). Distinct from
+      // `status` (which the success gate reads): it lets isDeadExit tell a responded-but-slow proxied exit from
+      // a truly dead one WITHOUT relaxing the success verdict. Mirrors #ensureActivePage's #lastDocStatus
+      // listener (the drive path reuses this receipt in #66). Registered BEFORE goto so a fast response is caught.
+      let responseReceived = false;
+      page.on("response", (resp) => {
+        try {
+          if (resp.request().isNavigationRequest() && resp.frame() === page.mainFrame()) {
+            responseReceived = true;
+          }
+        } catch {
+          // a superseded/aborted response can throw on access — ignore; a real main-frame receipt still flips it
+        }
+      });
       // domContentLoadedMs = goto wall-clock (waitUntil:"domcontentloaded" resolves AT DCL). Measured around
       // the try so a goto that THROWS (timeout / challenge abort) still records its time-to-abort.
       const goto0 = performance.now();
@@ -742,11 +757,10 @@ export class PatchrightBrowserCore implements BrowserCore {
       } catch {
         // Navigation may time out or be aborted by a challenge; status stays null (a nav failure) so the
         // success gate + isRetrieveFailure correctly treat a timed-out goto as a FAILURE — never a partial
-        // success (codex r10). SCOPED (documented #45 residual): a proxied exit that RESPONDED but timed out
-        // before DCL is recorded status-null, so isDeadExit may label it `burned-exit` rather than the site
-        // block. That is a DIAGNOSTIC imprecision only (the re-roll behavior is identical); attributing it
-        // precisely needs a response-receipt signal tracked SEPARATELY from the nav-failure status — a
-        // follow-up, deliberately not conflated with `status` (which the success gate reads). Assess whatever rendered.
+        // success (codex r10). #67: the `responseReceived` listener above resolves the former #45 residual —
+        // a proxied exit that RESPONDED but timed out before DCL is now recorded status-null (still a failure)
+        // AND responseReceived=true, so isDeadExit no longer mislabels it `burned-exit`, WITHOUT this catch
+        // touching `status` (kept null so the success verdict is unchanged). Assess whatever rendered.
       }
       const domContentLoadedMs = performance.now() - goto0;
 
@@ -810,7 +824,7 @@ export class PatchrightBrowserCore implements BrowserCore {
         clearancePollMs,
         snapshotMs,
       });
-      return { url, status, ...final, clearanceWaitedMs: waited, diagnostics, timing };
+      return { url, status, responseReceived, ...final, clearanceWaitedMs: waited, diagnostics, timing };
     } finally {
       await page.close().catch(() => {});
     }
