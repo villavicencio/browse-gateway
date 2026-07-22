@@ -416,7 +416,7 @@ test("#44: retrieve surfaces solverEligible=true + not-configured on a solvable-
   assert.equal(r.diagnostics?.captchaSolveReason, "not-configured", "retrieve wires no solver");
 });
 
-test("#44: retrieve marks an UNSOLVABLE-kind CAPTCHA (Turnstile) solverEligible=false", async () => {
+test("#44: retrieve marks a Turnstile CAPTCHA solverEligible=true (the solver maps Turnstile too)", async () => {
   const ts = renderOf({
     status: 403, title: "Verify", text: "Please verify you are a human",
     html: '<div class="cf-turnstile" data-sitekey="0x4"></div>',
@@ -425,8 +425,24 @@ test("#44: retrieve marks an UNSOLVABLE-kind CAPTCHA (Turnstile) solverEligible=
   const { gateway } = makeFakeGateway([ts]);
   const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/" });
   assert.equal(r.diagnostics?.failureClass, "captcha");
-  assert.equal(r.diagnostics?.solverEligible, false, "Turnstile is not solvable by the reCAPTCHA-only solver");
-  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured");
+  assert.equal(r.diagnostics?.solverEligible, true, "Turnstile IS solvable by the configured solver");
+  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured", "retrieve wires no solver in production");
+});
+
+test("#44: retrieve with a SUPPLIED solver that FAILS reports the typed code, not `not-configured` (codex r1)", async () => {
+  // The public opts.solver seam: a supplied solver was invoked and threw — the envelope must reflect the
+  // typed failure, never the contradictory not-configured (which implies no solver was available).
+  const ren = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([ren]);
+  const solver = { async solve() { const e = new Error("service returned an error"); e.code = "vendor-error"; throw e; } };
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/", solver });
+  assert.equal(r.captchaSolved, false, "a failed solve leaves the page blocked, not solved");
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.captchaSolveReason, "vendor-error", "the supplied solver's typed code is surfaced");
 });
 
 test("retrieve: a 200 PerimeterX press-&-hold served as a TOP-document interstitial (copy in html, not innerText) is blocked", async () => {

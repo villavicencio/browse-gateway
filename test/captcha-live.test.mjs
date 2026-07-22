@@ -133,11 +133,11 @@ test("DETECT_LIVE_CAPTCHA_JS: an evaluatable script covering the three response 
 
 // --- #44: solver eligibility + solve-reason (pure derivation, unit-tested off the real core) ---------
 
-test("#44 isSolvableCaptchaKind: only reCAPTCHA v2 is solvable today", () => {
-  assert.equal(isSolvableCaptchaKind("recaptcha"), true);
-  for (const k of ["hcaptcha", "turnstile", "unknown"]) {
-    assert.equal(isSolvableCaptchaKind(k), false, `${k} is not solvable`);
+test("#44 isSolvableCaptchaKind: recaptcha/turnstile/hcaptcha are solvable; unknown is not", () => {
+  for (const k of ["recaptcha", "turnstile", "hcaptcha"]) {
+    assert.equal(isSolvableCaptchaKind(k), true, `${k} is solvable (the solver maps it to a task type)`);
   }
+  assert.equal(isSolvableCaptchaKind("unknown"), false);
 });
 
 test("#44 resolveCaptchaSolveReason: no CAPTCHA detected → undefined", () => {
@@ -159,9 +159,10 @@ test("#44 resolveCaptchaSolveReason: pre-attempt why-not when no attempt was mad
   // No solver wired → not-configured (whatever the kind).
   assert.equal(resolveCaptchaSolveReason({ captchaKind: "recaptcha", solverPresent: false }), "not-configured");
   assert.equal(resolveCaptchaSolveReason({ captchaKind: "turnstile", solverPresent: false }), "not-configured");
-  // Solver wired but the kind isn't solvable → unsupported-kind.
-  assert.equal(resolveCaptchaSolveReason({ captchaKind: "hcaptcha", solverPresent: true }), "unsupported-kind");
-  assert.equal(resolveCaptchaSolveReason({ captchaKind: "turnstile", solverPresent: true }), "unsupported-kind");
+  // Solver wired but the kind isn't solvable (only `unknown` is unsolvable) → unsupported-kind.
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "unknown", solverPresent: true }), "unsupported-kind");
   // Solver wired and the kind IS solvable, no attempt failure → undefined (a solve may have succeeded).
-  assert.equal(resolveCaptchaSolveReason({ captchaKind: "recaptcha", solverPresent: true }), undefined);
+  for (const k of ["recaptcha", "turnstile", "hcaptcha"]) {
+    assert.equal(resolveCaptchaSolveReason({ captchaKind: k, solverPresent: true }), undefined, `${k} solvable, no failure → undefined`);
+  }
 });

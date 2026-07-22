@@ -19,23 +19,37 @@ import { stripInertHtml } from "./detect.js";
 export type CaptchaKind = "recaptcha" | "hcaptcha" | "turnstile" | "unknown";
 
 /**
- * Whether the solver architecture can (in principle) solve this CAPTCHA kind (issue #44) — a pure property
- * of the kind, independent of whether a solver instance is wired or has budget. MUST stay in lockstep with
- * `verbs/captcha-solver.ts`'s `TASK_TYPE` map (the actual kind→task-type binding); that map lives in the
- * verbs layer, so this lower (browser) layer duplicates the single fact — only reCAPTCHA v2 is solvable
- * today (hCaptcha / Turnstile / PerimeterX / unknown are not). Adding a solvable vendor means updating BOTH.
- *
- * DEFERRED (issue #44, HOLD): finer eligibility for a Turnstile widget that co-fires with a Cloudflare hint.
- * #40 attributes such a page `cf-challenge` → `wafVendor=cloudflare` (WAF-first), which is a correct coarser
- * vendor but loses the `turnstile` KIND — and Turnstile is not solvable, so eligibility can read as if the
- * page were a generic CF block rather than an unsolvable widget. Promoting `turnstile` over `cf-challenge`
- * is BLOCKED on a captured CF *managed-challenge* fixture: without ground truth on whether the Under-Attack
- * interstitial itself carries a `cf-turnstile-response` / `class="cf-turnstile"` container, promoting it
- * risks mislabeling managed challenges. Capture the fixture, then decide precedence. (Codex #40 r8.)
+ * The CAPTCHA kinds the solver architecture can (in principle) solve (issue #44) — the SINGLE SOURCE for
+ * eligibility, kept here in the browser layer so both the core (`#snapshotOf`) and the verbs layer can read
+ * it without a verbs→browser→verbs cycle. It MUST match the kinds `verbs/captcha-solver.ts`'s `TASK_TYPE`
+ * maps to a task-type string (currently reCAPTCHA v2 / Turnstile / hCaptcha; `unknown` is not); a unit test
+ * (`captcha-solver.test`) locks the two together so eligibility can never contradict what the solver
+ * actually attempts. Adding/removing a solvable vendor means updating BOTH plus that test.
  */
+export const SOLVABLE_CAPTCHA_KINDS = ["recaptcha", "turnstile", "hcaptcha"] as const;
+
+/** Whether the solver architecture can (in principle) solve this kind — a pure property of the kind,
+ *  independent of whether a solver instance is wired or has budget.
+ *
+ *  DEFERRED (issue #44, HOLD): finer eligibility for a Turnstile widget that co-fires with a Cloudflare
+ *  hint. #40 attributes such a page `cf-challenge` → `wafVendor=cloudflare` (WAF-first) and can leave
+ *  `captchaKind` unset, so eligibility reads as a generic CF block rather than the (solvable) Turnstile
+ *  widget it is. Promoting `turnstile` over `cf-challenge` is BLOCKED on a captured CF *managed-challenge*
+ *  fixture: without ground truth on whether the Under-Attack interstitial itself carries a
+ *  `cf-turnstile-response` / `class="cf-turnstile"` container, promoting it risks mislabeling managed
+ *  challenges. Capture the fixture, then decide precedence. (Codex #40 r8.) */
 export function isSolvableCaptchaKind(kind: CaptchaKind): boolean {
-  return kind === "recaptcha";
+  return (SOLVABLE_CAPTCHA_KINDS as readonly string[]).includes(kind);
 }
+
+/**
+ * The closed vocabulary for {@link resolveCaptchaSolveReason} / the `captchaSolveReason` envelope slot
+ * (issue #44): the solver's typed error codes plus the allowlist-collapse fallback `error`. Typed as a
+ * UNION (not a bare string) so the envelope slot has the SAME closed-vocabulary safety basis as
+ * `wafVendor`/`failureClass` — the redactor passes it through untouched, which is safe ONLY because the
+ * value is one of these secret-free markers, never free text from a page or a solver message (R9, codex #44).
+ */
+export type CaptchaSolveReason = (typeof CAPTCHA_SOLVE_ERROR_CODES)[number] | "error";
 
 /**
  * Resolve the closed-vocabulary `captchaSolveReason` for a snapshot (issue #44) — pure, so the derivation
@@ -50,8 +64,8 @@ export function isSolvableCaptchaKind(kind: CaptchaKind): boolean {
 export function resolveCaptchaSolveReason(opts: {
   captchaKind: CaptchaKind | undefined;
   solverPresent: boolean;
-  attemptReason?: string;
-}): string | undefined {
+  attemptReason?: CaptchaSolveReason;
+}): CaptchaSolveReason | undefined {
   const { captchaKind, solverPresent, attemptReason } = opts;
   if (!captchaKind) return undefined;
   if (attemptReason) return attemptReason;

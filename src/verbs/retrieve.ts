@@ -34,8 +34,8 @@ import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
-import { detectCaptcha, isSolvableCaptchaKind } from "./captcha.js";
-import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
+import { detectCaptcha, isSolvableCaptchaKind, CAPTCHA_SOLVE_ERROR_CODES } from "./captcha.js";
+import type { CaptchaSolver, CaptchaKind, CaptchaSolveReason } from "./captcha.js";
 
 /**
  * Proxy-escalation retries (R7). A rotating residential proxy assigns a fresh exit IP per
@@ -669,11 +669,21 @@ export async function retrieve(
   //    stay that way: wiring one here would spend (and bill) a solve with no effect on the page.
   //    `captchaSolved` therefore stays false in production. (Removing `opts.solver` + `captchaSolved`
   //    outright is a follow-up — it changes retrieve's result contract + the mcp surface.)
+  let solveAttemptReason: CaptchaSolveReason | undefined;
   if (render && opts.solver) {
     const captcha = detectCaptcha(render, url);
     if (captcha) {
-      await opts.solver.solve(captcha);
-      captchaSolved = true;
+      try {
+        await opts.solver.solve(captcha);
+        captchaSolved = true;
+      } catch (err) {
+        // #44: a solve failure on the STATELESS retrieve path leaves the page challenged (there's no live
+        // page to inject a token into anyway). Capture the solver's typed code — allowlist-collapsed to the
+        // closed vocabulary, secret-free — instead of throwing, so the envelope reports WHY rather than the
+        // reason defaulting to a contradictory `not-configured` when a solver WAS supplied (codex #44 r1).
+        const raw = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
+        solveAttemptReason = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw) ? (raw as CaptchaSolveReason) : "error";
+      }
     }
   }
 
@@ -817,12 +827,15 @@ export async function retrieve(
   const failureClass: FailureClass | undefined = failed ? classifyFailure(signal) : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
   // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
-  // Production retrieve wires NO solver (its CF tier is cleared by proxy, not a solve), so a detected
-  // CAPTCHA block is always `not-configured` here — the actionable signal being that routing to the drive
-  // path (which HAS a solver) could clear it IFF the kind is solvable. solverEligible is the pure KIND
-  // property; both are secret-free (closed-vocab / boolean) and pass redaction untouched.
+  // solverEligible is the pure KIND property (is this kind solvable at all). The reason depends on whether a
+  // solver was SUPPLIED via the opts.solver seam: none → `not-configured` (the production case — retrieve
+  // wires no solver, so the actionable signal is that routing to the drive path could clear a solvable
+  // kind); a supplied solver that FAILED → its typed code; a supplied solver that completed (no typed
+  // failure) → omit, since claiming a failure reason would contradict the attempt. Both are secret-free
+  // (closed-vocab / boolean) and pass redaction untouched.
   const solverEligible = signal.captchaKind ? isSolvableCaptchaKind(signal.captchaKind) : undefined;
-  const captchaSolveReason = failed && failureClass === "captcha" ? "not-configured" : undefined;
+  const captchaSolveReason: CaptchaSolveReason | undefined =
+    failed && failureClass === "captcha" ? (opts.solver ? solveAttemptReason : "not-configured") : undefined;
   // #42: assemble ONE Timing — the whole-call totalMs over the final render's core stages — and use it for
   // BOTH the result field and (on a failure) the folded envelope, so they can never disagree (single
   // derivation). render.timing carries the surfaced render's domContentLoaded/clearancePoll/snapshot; its

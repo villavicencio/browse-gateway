@@ -18,6 +18,7 @@ import {
   resolveCaptchaSolveReason,
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
+  type CaptchaSolveReason,
   type LiveCaptcha,
 } from "./captcha.js";
 import {
@@ -391,7 +392,7 @@ async function snapshot(page: PatchrightPage): Promise<PageSignal> {
 interface SolveResult {
   replay: boolean;
   captchaSolveMs?: number;
-  solveReason?: string;
+  solveReason?: CaptchaSolveReason;
 }
 
 /** Result of {@link PatchrightBrowserCore.#settle}: the replay signal (as before) plus the #42 stage
@@ -514,7 +515,7 @@ export class PatchrightBrowserCore implements BrowserCore {
    * inherits a stale attempt's reason; a pre-attempt why-not (`not-configured` / `unsupported-kind`) is
    * derived in #snapshotOf instead when no attempt was made.
    */
-  #pendingSolveReason?: string;
+  #pendingSolveReason?: CaptchaSolveReason;
 
   private constructor(
     context: PatchrightContext,
@@ -1327,7 +1328,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       // generic "error" (never echoed) — then still route through errCode (redact + URL-strip +
       // truncate) as belt-and-suspenders. This fifth stderr sink can't leak a secret/URL (R9, audit #3).
       const raw = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
-      const code = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw) ? raw : "error";
+      const code: CaptchaSolveReason = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw)
+        ? (raw as CaptchaSolveReason)
+        : "error";
       process.stderr.write(`[browse-gateway] captcha solve failed (${errCode(code, this.#redact)}); page left challenged\n`);
       // #44: surface the typed code instead of DISCARDING it to stderr only. It's a closed-vocabulary,
       // secret-free marker (never the API key; a sitekey is public) — stashed for the next #snapshotOf to

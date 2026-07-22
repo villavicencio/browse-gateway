@@ -21,6 +21,9 @@
  * server.fail() separately.
  */
 import { redactSecrets } from "../security/secrets.js";
+// Type-only import (erased at compile — no runtime browser→observability→browser cycle): the closed
+// `captchaSolveReason` vocabulary is single-sourced in the browser layer next to the solver error codes.
+import type { CaptchaSolveReason } from "../browser/captcha.js";
 
 /**
  * The mitigation/CAPTCHA vendor attributed to a failure (issue #40) — a CLOSED vocabulary. Defined in
@@ -181,8 +184,9 @@ export interface FailureDiagnostics {
    *  Timing carried on the result, so envelope.timing and result.timing can never disagree. All-numeric →
    *  passes {@link redactFailureDiagnostics} untouched. */
   timing?: Timing;
-  /** Slot for #44 (why a CAPTCHA solve was/wasn't attempted). Do NOT populate here. */
-  captchaSolveReason?: string;
+  /** Slot for #44 (why a CAPTCHA solve was/wasn't attempted) — a CLOSED union, not free text, so the
+   *  redactor's untouched-passthrough is safe (parity with wafVendor/failureClass). Do NOT populate here. */
+  captchaSolveReason?: CaptchaSolveReason;
   /** Slot for #44 (whether the failure was solver-eligible). Do NOT populate here. */
   solverEligible?: boolean;
   /** Slot for #48 (a home-page fallback was used). Do NOT populate here. */
@@ -323,8 +327,9 @@ function stripSensitiveHeaders(s: string): string {
  *   3. cookie/set-cookie/authorization header stripping (quoted, JSON, `=`, and indented OR unindented
  *      folded continuations WITHIN an entry; a `key=value` continuation tail is swallowed — the boundary
  *      is a COLON-form next field only).
- * The `screenshotRef` (opaque base64 bytes) and the numeric/boolean slots (wafVendor, failureClass, and the
- * all-numeric #42 {@link Timing}) pass through untouched.
+ * The `screenshotRef` (opaque base64 bytes) and the closed-vocabulary / numeric / boolean slots (wafVendor,
+ * failureClass, the #44 captchaSolveReason union + solverEligible, and the all-numeric #42 {@link Timing})
+ * pass through untouched.
  * `secrets` is a structural store (`{ redactableValues(): readonly string[] }`) — passing the VALUE SET
  * (not an opaque redactor) keeps the secret pass single-pass so a value can't fragment across redactors.
  *

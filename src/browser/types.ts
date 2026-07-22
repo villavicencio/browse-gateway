@@ -11,7 +11,7 @@
 /** Which anti-bot family a target exercises — used to gate per-category in the kill-gate. */
 export type Category = "cloudflare" | "datadome";
 
-import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
+import type { CaptchaSolver, CaptchaKind, CaptchaSolveReason } from "./captcha.js";
 import type { FailureDiagnostics, Timing } from "../observability/index.js";
 
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
@@ -270,11 +270,12 @@ export interface PageSnapshot {
    * Why a CAPTCHA solve was not completed (issue #44), a closed-vocabulary code — the solver's typed error
    * from an actual attempt (`vendor-error` / `timeout` / `budget-exhausted` / `missing-sitekey`), or a
    * pre-attempt why-not (`not-configured` — no solver wired; `unsupported-kind` — the widget kind isn't
-   * solvable). Set only when a CAPTCHA was detected. No secret material (never the API key; a sitekey is
-   * public), so it passes {@link FailureDiagnostics} redaction untouched. Surfaced onto the failure envelope
-   * at the drive `#failure` seam, at parity with retrieve.
+   * solvable). A CLOSED union ({@link CaptchaSolveReason}), never free text — the same safety basis as
+   * {@link cfHint}/vendor: no secret material (never the API key; a sitekey is public), so it passes
+   * {@link FailureDiagnostics} redaction untouched. Set only when a CAPTCHA was detected. Surfaced onto the
+   * failure envelope at the drive `#failure` seam, at parity with retrieve.
    */
-  captchaSolveReason?: string;
+  captchaSolveReason?: CaptchaSolveReason;
   /**
    * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
    * bounded console + network / optional screenshot. Assembled by the core on every navigate/snapshot;
