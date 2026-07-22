@@ -85,6 +85,19 @@ test("never-ready → typed timeout, not a hang", async () => {
   await assert.rejects(solverWith(f, { timeoutMs: 30, pollMs: 5 }).solve(recaptcha), (e) => e.code === "timeout");
 });
 
+test("solve with a spent budget (maxDurationMs<=0) rejects WITHOUT charging the solve-window budget (#45 codex r8)", async () => {
+  // A deadline-edge call must reject before charging the sliding window, so it can't exhaust the window and
+  // fail a later legitimate solve with budget-exhausted.
+  const f = fakeFetch([
+    { body: { errorId: 0, taskId: "t8" } },
+    { body: { errorId: 0, status: "ready", solution: { gRecaptchaResponse: "TOKEN8" } } },
+  ]);
+  const s = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: URL_BASE, pollMs: 1, fetchImpl: f, budget: { maxSolves: 1, windowMs: 60_000 } });
+  await assert.rejects(s.solve(recaptcha, 0), (e) => e.code === "timeout"); // zero remaining → reject, no charge, no fetch
+  assert.equal(f.calls.length, 0, "no vendor request was made for the spent-budget edge call");
+  assert.equal(await s.solve(recaptcha), "TOKEN8", "the one-solve window is intact — a real solve still succeeds");
+});
+
 test("solve aborts a STALLED response body at the deadline, not just the request (#45 codex r7)", async () => {
   // The service sends headers, then never sends the body. resp.json() must still be bounded by the deadline
   // (the abort covers body consumption) — else solve() would hang past its duration contract.

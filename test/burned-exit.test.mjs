@@ -83,8 +83,11 @@ test("retrieve: a LIVE block among the proxied attempts is site-attributed, NOT 
     escalation: { onDatacenterIp: true },
   });
   assert.equal(r.blocked, true);
-  assert.notEqual(r.diagnostics.failureClass, "burned-exit", "a live site response is not a burned exit");
   assert.equal(r.proxyDiagnostic.burnedExit, undefined, "burnedExit omitted when an exit reached the site");
+  // #45 (codex r8): the live 403 (attempt 2) is retained and classified, NOT the dead final render — so the
+  // failure stays site-attributed (hard-block) rather than degrading to nav-failed on the last dead exit.
+  assert.equal(r.diagnostics.failureClass, "hard-block", "reclassified on the live 403, not the dead final render");
+  assert.equal(r.reason, "hard-block", "the surfaced reason is the site block, not nav-failed");
 });
 
 test("retrieve: a FORCED-proxy all-dead escalation is NOT burned-exit (no direct-reachability control) — codex r7", async () => {

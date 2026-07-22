@@ -107,6 +107,13 @@ export class HttpCaptchaSolver implements CaptchaSolver {
     if (!challenge.siteKey) {
       throw new CaptchaSolveError("missing-sitekey", `cannot solve ${challenge.kind}: no siteKey on the challenge`);
     }
+    // #45 (codex r8): reject a non-positive remaining budget BEFORE charging the sliding-window solve budget —
+    // else a deadline-edge call (maxDurationMs≈0, when detection consumed the last of the call budget) would
+    // spend a solve slot without ever making a vendor request, and a handful would exhaust the window and fail
+    // a later legitimate solve with `budget-exhausted`.
+    if (maxDurationMs !== undefined && maxDurationMs <= 0) {
+      throw new CaptchaSolveError("timeout", "no remaining call budget to attempt a solve");
+    }
     this.#chargeBudget();
 
     // #45 (codex r4/r5): cap the solve by the caller's remaining per-call budget when it is TIGHTER than the

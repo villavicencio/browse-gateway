@@ -689,6 +689,10 @@ export async function retrieve(
   // #45: set true once ANY proxied attempt reaches the site (a live response — a block/challenge, not a dead
   // exit). If the loop EXHAUSTS with this still false, every exit died → a burned-exit (all-dead) verdict.
   let sawLiveProxiedResponse = false;
+  // #45 (codex r8): the last proxied attempt that REACHED the site (a live block/challenge). On a mixed
+  // exhaustion (a live 403 then a dead exit), the site DID block us — classify on this live failure rather
+  // than the final dead render, so the reason/class stay site-attributed instead of degrading to nav-failed.
+  let lastLiveRender: RenderResult | undefined;
 
   let captchaSolved = false;
   let proxyUsed = false;
@@ -801,7 +805,10 @@ export async function retrieve(
       // #45: this attempt FAILED (didn't break as cleared). If the exit REACHED the site (a live response —
       // a visible/hard block, not a null/chrome-error dead nav), the failure is site-attributable, so this is
       // NOT an all-exits-dead burn. Tracked across attempts; if the loop exhausts still-false, every exit died.
-      if (!isDeadExit(render.status, render.diagnostics?.finalUrl)) sawLiveProxiedResponse = true;
+      if (!isDeadExit(render.status, render.diagnostics?.finalUrl)) {
+        sawLiveProxiedResponse = true;
+        lastLiveRender = render; // #45 (codex r8): remember it — a later dead exit must not erase this site block
+      }
     }
   }
 
@@ -817,6 +824,13 @@ export async function retrieve(
     } else {
       render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
     }
+  }
+  // #45 (codex r8): on a MIXED proxied exhaustion — an earlier attempt REACHED the site (a live block) but the
+  // FINAL attempt died — classify on that live failure, not the dead final render, so the reason/class stay
+  // site-attributed (anti-bot-block / hard-block) instead of degrading to nav-failed. Skipped for a timeout
+  // (which overrides the class regardless) and when no live response was ever seen.
+  if (!budgetExceeded && lastLiveRender && (render.status === null || isChromeErrorUrl(render.diagnostics?.finalUrl))) {
+    render = lastLiveRender;
   }
   // #43 (codex r1/r6): flag a timeout whenever the WHOLE call consumed the budget — the escalation loop
   // exhausting attempts right at the deadline (r1) OR a direct-only render (no proxy / off-datacenter) that

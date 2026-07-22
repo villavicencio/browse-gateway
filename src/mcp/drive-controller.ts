@@ -822,6 +822,9 @@ export class GatewayDriveController implements DriveController {
    */
   async #openHealthyAndNavigate(url: string, forced: boolean, budgetDeadlineMs: number): Promise<PageSnapshot> {
     let last: PageSnapshot | undefined;
+    // #45 (codex r8): the last attempt that REACHED the site (a live block). On a mixed exhaustion (a live 403
+    // then a dead exit) classify on this, not the dead final snapshot, so the reason/class stay site-attributed.
+    let lastLive: PageSnapshot | undefined;
     let attempts = 0;
     // #45: the drive twin of retrieve's #43 loop bound + burned-exit derivation.
     //  - budgetExceeded: the pre-attempt budget bail fired (a decisive `timeout`, outermost verdict).
@@ -876,7 +879,10 @@ export class GatewayDriveController implements DriveController {
       last = snap;
       // #45: this attempt FAILED. If the exit REACHED the site (a live block/challenge — not a null-status /
       // chrome-error dead nav), the failure is site-attributable, so NOT an all-exits-dead burn.
-      if (!isDeadExit(snap.status ?? null, snap.url)) sawLiveResponse = true;
+      if (!isDeadExit(snap.status ?? null, snap.url)) {
+        sawLiveResponse = true;
+        lastLive = snap; // #45 (codex r8): a later dead exit must not erase this site block from the class
+      }
       await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
       // #42: record AFTER teardown so a FAILED attempt's session close (grace + kill-confirm, up to ~15s of
       // caller-visible latency) counts toward its attemptMs — else ~45s of three wedged teardowns would sit in
@@ -897,6 +903,10 @@ export class GatewayDriveController implements DriveController {
     // exit-attributable. FORCED skips that check, so an off-allowlist/DNS-dead target would look identical on
     // HEALTHY exits; stay nav-failed without reachability evidence (positive-signal-only).
     const burnedExit = attempts > 0 && !forced && !budgetExceeded && !sawLiveResponse;
+    // #45 (codex r8): on a MIXED exhaustion (a live block then a dead exit) classify + surface the LAST LIVE
+    // failure, not the dead final `last`, so the reason/class/message stay site-attributed (not nav-failed).
+    // Only when NOT a timeout/burn (those override the class anyway) and the final snapshot is actually dead.
+    const failSnap = !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.status ?? null, last.url) ? lastLive : last;
     // #45: skip the opt-in egress probe when we bailed on budget — it is one more proxied request past an
     // already-exhausted deadline. On a real exit-exhaustion (not a budget bail) it still classifies the exit.
     // #45 (codex r3): run the opt-in egress probe ONLY when meaningful budget remains (it opens ANOTHER
@@ -907,7 +917,7 @@ export class GatewayDriveController implements DriveController {
       this.#verifyEgressEnabled && !budgetExceeded && budgetDeadlineMs - performance.now() > MIN_ATTEMPT_BUDGET_MS
         ? await this.#verifyEgress(budgetDeadlineMs)
         : undefined;
-    const dx = this.#escalationDiag({ proxyApplied: attempts > 0, forced, attempts, last, attemptMs, exitCheck, burnedExit });
+    const dx = this.#escalationDiag({ proxyApplied: attempts > 0, forced, attempts, last: failSnap, attemptMs, exitCheck, burnedExit });
     // Distinct headline per verdict so ops reads the real cause: a budget timeout, an all-exits-dead burn, or
     // a genuine per-exit exhaustion (site blocked every live exit). The typed FailureClass on #failure carries it.
     const headline = budgetExceeded
@@ -919,8 +929,8 @@ export class GatewayDriveController implements DriveController {
     // attempt that consumed the budget → `last` undefined) STILL surfaces failureClass=timeout, so the MCP
     // error-kind reads it as an in-band block (a completed-but-timed-out call), not an internal transport error.
     // finalUrl is the KNOWN target, redacted (params stripped) at this seam like every other #failure envelope.
-    const failure = last
-      ? this.#failure(last, { budgetExceeded, burnedExit })
+    const failure = failSnap
+      ? this.#failure(failSnap, { budgetExceeded, burnedExit })
       : budgetExceeded
         ? redactFailureDiagnostics({ finalUrl: url, status: null, failureClass: "timeout" }, this.#secrets)
         : undefined;
