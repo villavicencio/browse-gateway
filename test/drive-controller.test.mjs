@@ -777,3 +777,57 @@ test("controller: a bare reCAPTCHA navigate failure attributes the CAPTCHA kind 
   // #41: a bare active-CAPTCHA block on a drive navigate is classified captcha (class ↔ vendor agree).
   assert.equal(failureOf(caught)?.failureClass, "captcha", "the #41 envelope classifies it as a captcha block");
 });
+
+// --- #58: an ACTION that lands on a block attributes the vendor at parity with the navigate path -------
+// The core now computes cf/px/dd hints + captchaKind on EVERY snapshot (patchright-core #snapshotOf), so a
+// click/type that lands on a challenge — whose envelope is built from snapshot() via #actAndSnap → #failure,
+// NOT navigate() — carries the mitigation vendor. Before #58 a bare snapshot() carried no hints → wafVendor
+// 'none'. These lock the drive-controller wiring on the ACTION path (the real core populating the hints from
+// page.content() is proven by the in-container gate).
+
+test("#58: a DataDome ACTION failure (post-action block) attributes the vendor on the envelope", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makePostActionBlockGateway({
+    url: "https://dd.example/", title: "", tree: "Access denied", status: 403, ddHint: true,
+    diagnostics: { finalUrl: "https://dd.example/", title: "", status: 403 },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "an action landing on a DataDome block must throw");
+  assert.equal(failureOf(caught)?.wafVendor, "datadome", "the action-failure envelope carries the DataDome vendor");
+  assert.equal(failureOf(caught)?.failureClass, "anti-bot-block", "the envelope classifies the action block");
+});
+
+test("#58: a bare reCAPTCHA ACTION failure attributes the CAPTCHA kind on the envelope", async () => {
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makePostActionBlockGateway({
+    url: "https://cap.example/", title: "Verify", tree: "Please verify you are a human", status: 403,
+    captchaKind: "recaptcha", diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "an action landing on a CAPTCHA block must throw");
+  assert.equal(failureOf(caught)?.wafVendor, "recaptcha", "the action-failure envelope attributes the CAPTCHA widget kind");
+  assert.equal(failureOf(caught)?.failureClass, "captcha", "the envelope classifies it as a captcha block");
+});
+
+test("#58: a healthy-page action failure (no hints) attributes NO vendor — attribution-only, no false positive", async () => {
+  // Parity guard: #58 must not manufacture a vendor where there is no block. A locator-timeout on a healthy
+  // page yields a snapshot with no hints and status 200 → not navFailed → no failureClass, no wafVendor.
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makeActionThrowsGateway({
+    url: "https://ok.example/", title: "ok", tree: "form [ref=e1]", status: 200,
+    diagnostics: { finalUrl: "https://ok.example/", status: 200 },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "the throwing action propagates");
+  assert.equal(failureOf(caught)?.wafVendor, undefined, "a healthy-page action error carries NO vendor");
+  assert.equal(failureOf(caught)?.failureClass, undefined, "and NO failureClass");
+});
