@@ -71,6 +71,7 @@ test("retrieve: direct CF-block then all proxied exits DEAD → burned-exit evid
   assert.equal(r.proxyDiagnostic.burnedExit, true, "all exits died → burned-exit evidence");
   assert.equal(r.diagnostics.failureClass, "burned-exit", "seam-level burned-exit class");
   assert.equal(r.diagnostics.wafVendor, undefined, "a burned exit carries NO WAF vendor");
+  assert.equal(r.reason, null, "the burned-exit verdict nulls the incidental nav-failed reason (codex r6) so the MCP surface shows burned-exit");
 });
 
 test("retrieve: a LIVE block among the proxied attempts is site-attributed, NOT burned-exit", async () => {
@@ -160,21 +161,37 @@ test("drive: a LIVE hard-block on every proxied exit is site-attributed, NOT bur
   });
 });
 
-test("drive: the escalation loop honors the #43 call budget — a spent budget bails before any proxied attempt (timeout)", async () => {
+test("drive: an already-spent budget refuses at the queue boundary — NO session opened, typed timeout (codex r6)", async () => {
+  // budgetDeadlineMs is t0-relative (pre-serialize). A zero budget (or a call that waited out its budget in
+  // the serialized queue) is already expired at #navigate entry → refuse BEFORE opening/reusing a session or
+  // touching the persistent page. Surfaces failureClass=timeout so the MCP error-kind reads it in-band.
+  const { gateway, opened } = makeDriveSeq([[{ status: 403, tree: "Forbidden" }]]);
+  const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", {
+    onDatacenterIp: true,
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 0 },
+  });
+  await assert.rejects(drive.navigate("https://hostile.example/p/1"), (err) => {
+    assert.match(err.message, /budget|timed out/i, "surfaces the budget as the cause");
+    assert.equal(err.failure?.failureClass, "timeout", "a budget timeout is in-band (failureClass=timeout)");
+    return true;
+  });
+  assert.equal(opened.length, 0, "an expired budget refuses BEFORE opening any session or touching the page");
+});
+
+test("drive: the escalation loop bails on the #43 budget after the direct attempt (timeout, no proxied re-roll)", async () => {
+  // A small-but-nonzero budget passes the entry check, then the pre-attempt loop bail fires (< MIN_ATTEMPT_
+  // BUDGET_MS remains for a meaningful proxied attempt) → direct opened, zero proxied attempts, typed timeout.
   const { gateway, opened } = makeDriveSeq([[{ status: 403, tree: "Forbidden" }], [{ status: null }]]);
   const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", {
     onDatacenterIp: true,
-    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 0 }, // no budget → bail immediately
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 1000 }, // < MIN_ATTEMPT_BUDGET_MS (2000) → loop bails at attempt 1
   });
-
   await assert.rejects(drive.navigate("https://hostile.example/p/1"), (err) => {
     assert.equal(err.name, "EscalationError");
     assert.equal(err.diagnostics.attempts, 0, "no proxied attempt spent — the budget bounded the loop");
     assert.equal(err.diagnostics.proxyApplied, false);
     assert.equal(err.diagnostics.burnedExit, undefined, "a budget bail is a timeout, not a burn");
     assert.match(err.message, /budget/i, "surfaces the budget as the cause");
-    // A budget timeout with NO proxied snapshot still surfaces failureClass=timeout, so the MCP error-kind
-    // reads it as an in-band block, not an internal transport error (codex r1).
     assert.equal(err.failure?.failureClass, "timeout", "timeout envelope even when no attempt produced a snapshot");
     return true;
   });

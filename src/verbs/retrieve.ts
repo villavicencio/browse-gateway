@@ -905,7 +905,10 @@ export async function retrieve(
   // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
   // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /
   // hard-block the last attempt happened to land on. The typed `timeout` failureClass carries the detail.
-  const reason: BlockReason | null = budgetExceeded ? null : blocked ? resolveFailureReason(signal) : null;
+  // #45 (codex r6): SAME for a burned-exit loop verdict — the surface prefers `reason`, so leaving it as the
+  // incidental `nav-failed` would contradict failureClass='burned-exit'. Null it so the surface advertises the
+  // burned-exit verdict (the exits died, not the target). `burned-exit` is a FailureClass, not a BlockReason.
+  const reason: BlockReason | null = budgetExceeded || burnedExit ? null : blocked ? resolveFailureReason(signal) : null;
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
   const proxyDiagnostic = proxyUsed

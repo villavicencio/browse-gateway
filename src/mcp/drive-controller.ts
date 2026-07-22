@@ -32,7 +32,6 @@ import {
   parseExitOrg,
   isDeadExit,
   MIN_ATTEMPT_BUDGET_MS,
-  PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
 import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError, assembleTiming } from "../observability/index.js";
@@ -267,6 +266,9 @@ export class GatewayDriveController implements DriveController {
   async #verifyEgress(budgetDeadlineMs?: number): Promise<EgressCheck> {
     const override = this.#resolveProxyOverride();
     if (!override) return { kind: "unknown" };
+    // #45 (codex r6): the probe honors the configured proxied nav timeout too (proxyOverrideFor embeds the
+    // default) — so a tightly-configured drive doesn't spend the old 25s nav bound on this optional probe.
+    override.navigationTimeoutMs = this.#timeouts.proxyNavTimeoutMs;
     // A dedicated, constrained probe session: guarded to the diagnostics host ONLY (not the
     // consumer's allowlist), so a restrictive allowlist can't block egress verification and the probe
     // can reach nothing but the ip-info endpoint. Its own handle (the controller's session was already
@@ -276,8 +278,9 @@ export class GatewayDriveController implements DriveController {
       handle = await this.#gateway.openConsumerSession(this.#token, override, { diagnostics: true });
       const render = await this.#gateway.useConsumerSession(this.#token, handle, (s) =>
         // #45 (codex r3): bound this probe's render by the shared per-call deadline too when set, so an
-        // egress probe launched near the deadline can't spend a full nav + clearance past the budget.
-        s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS, ...(budgetDeadlineMs !== undefined ? { budgetDeadlineMs } : {}) }),
+        // egress probe launched near the deadline can't spend a full nav + clearance past the budget. r6: the
+        // configured proxied clearance applies (was the hardcoded const).
+        s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs, ...(budgetDeadlineMs !== undefined ? { budgetDeadlineMs } : {}) }),
       );
       const org = parseExitOrg(render.html);
       return { kind: classifyExitOrg(org), ...(org ? { org } : {}) };
@@ -366,6 +369,16 @@ export class GatewayDriveController implements DriveController {
       // value, so it must never be interpolated raw — a non-canonical spelling (`https:example.com`, no
       // `//`) would slip the after-the-fact regex net (issue #39 r5).
       throw new Error(`unsupported URL scheme: only http(s) is allowed (${sanitizeUrlForError(url)})`);
+    }
+    // #45 (codex r6): the budget deadline is t0-relative (pre-#serialize). A navigate that waited out its
+    // WHOLE budget in the serialized queue arrives here already expired — refuse it BEFORE opening/reusing a
+    // session, running warm-up, or touching the persistent page (the core's clamped-to-1ms timeout is not a
+    // refusal, and the session lifecycle around it is unbounded). Return a typed timeout immediately.
+    if (performance.now() >= budgetDeadlineMs) {
+      throw attachFailure(
+        new Error(`navigation timed out (status=n/a): the per-call budget (${this.#timeouts.callBudgetMs}ms) was exhausted in the queue before this navigate began`),
+        redactFailureDiagnostics({ finalUrl: url, status: null, failureClass: "timeout" }, this.#secrets),
+      );
     }
     // Force residential from the first request when the caller asks (forceProxy) or the host is on
     // the configured force-proxy list — for a known-hostile WAF the direct attempt only wastes a

@@ -332,7 +332,10 @@ test("retrieve: when every proxy exit fails (null status), the result is reporte
   assert.equal(r.proxyUsed, true);
   assert.equal(calls.length, 4, "direct + 3 dead-exit attempts");
   assert.equal(r.blocked, true, "a failed nav (null status) reports blocked, not empty success");
-  assert.equal(r.reason, "nav-failed", "every exit dead (null status) -> nav-failed");
+  // #45: every proxied exit dead → a BURNED-EXIT verdict (our pool died), which nulls the incidental
+  // nav-failed reason (like a timeout) so the MCP surface advertises burned-exit rather than nav-failed.
+  // (The failureClass=burned-exit envelope assertion lives in burned-exit.test.mjs with a diagnostics fake.)
+  assert.equal(r.reason, null, "burned-exit nulls the incidental nav-failed reason");
 });
 
 test("retrieve: a render that ended on chrome-error:// with a STALE 200 + error-text markdown is a nav failure, not content (codex #41 r4)", async () => {

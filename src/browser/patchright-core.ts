@@ -1389,7 +1389,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       async () => (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null,
       () => page.url(),
       (ms) => page.waitForTimeout(ms).catch(() => {}),
-      { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: renderTimeoutMs },
+      { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: renderTimeoutMs, now: () => performance.now() }, // #45 (codex r6): wall-clock bound
     );
     if (!challenge) {
       // #44 (codex r2): a supported widget was detected but never became attemptable — preserve WHY (no
