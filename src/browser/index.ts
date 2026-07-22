@@ -79,6 +79,9 @@ export {
 export {
   detectCaptcha,
   activeCaptchaKind,
+  isSolvableCaptchaKind,
+  resolveCaptchaSolveReason,
+  CAPTCHA_SOLVE_ERROR_CODES,
   NullCaptchaSolver,
   liveCaptchaToChallenge,
   liveCaptchaPendingRender,

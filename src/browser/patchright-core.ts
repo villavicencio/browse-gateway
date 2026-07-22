@@ -14,6 +14,8 @@ import {
   injectTokenJs,
   awaitSolvableCaptcha,
   activeCaptchaKind,
+  isSolvableCaptchaKind,
+  resolveCaptchaSolveReason,
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
   type LiveCaptcha,
@@ -383,10 +385,13 @@ async function snapshot(page: PatchrightPage): Promise<PageSignal> {
 }
 
 /** Result of {@link PatchrightBrowserCore.#trySolveCaptcha}: whether the caller must replay the triggering
- *  action, plus the #42 solve wall-clock (present only when a solve was actually attempted). */
+ *  action, plus the #42 solve wall-clock (present only when a solve was actually attempted) and — issue #44
+ *  — the solver's typed error code when an attempted solve FAILED (previously written to stderr and
+ *  discarded); absent when a solve succeeded or none was attempted. */
 interface SolveResult {
   replay: boolean;
   captchaSolveMs?: number;
+  solveReason?: string;
 }
 
 /** Result of {@link PatchrightBrowserCore.#settle}: the replay signal (as before) plus the #42 stage
@@ -501,6 +506,15 @@ export class PatchrightBrowserCore implements BrowserCore {
    * `navigate()` builds its own timing and ignores this, so it can never leak into a nav snapshot.
    */
   #pendingActionTiming?: { clearancePollMs: number; captchaSolveMs?: number; domContentLoadedMs?: number };
+  /**
+   * #44: the typed error code from the last ATTEMPTED captcha solve that FAILED (vendor-error / timeout /
+   * budget-exhausted / missing-sitekey), stashed by {@link #trySolveCaptcha} and consumed ONCE by the next
+   * {@link #snapshotOf} — the same cross-call bridge as {@link #pendingActionTiming} (the solve runs inside
+   * {@link #settle}, but the snapshot is a separate core call). Cleared on read, so a later snapshot never
+   * inherits a stale attempt's reason; a pre-attempt why-not (`not-configured` / `unsupported-kind`) is
+   * derived in #snapshotOf instead when no attempt was made.
+   */
+  #pendingSolveReason?: string;
 
   private constructor(
     context: PatchrightContext,
@@ -1315,7 +1329,12 @@ export class PatchrightBrowserCore implements BrowserCore {
       const raw = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
       const code = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw) ? raw : "error";
       process.stderr.write(`[browse-gateway] captcha solve failed (${errCode(code, this.#redact)}); page left challenged\n`);
-      return { replay: false, captchaSolveMs: performance.now() - solve0 };
+      // #44: surface the typed code instead of DISCARDING it to stderr only. It's a closed-vocabulary,
+      // secret-free marker (never the API key; a sitekey is public) — stashed for the next #snapshotOf to
+      // fold into the page snapshot, and returned so #settle can bubble it. `error` covers an unrecognized
+      // code from a custom solver (already allowlist-collapsed above), so nothing opaque escapes.
+      this.#pendingSolveReason = code;
+      return { replay: false, captchaSolveMs: performance.now() - solve0, solveReason: code };
     }
     const captchaSolveMs = performance.now() - solve0;
     if (!token) return { replay: false, captchaSolveMs };
@@ -1378,6 +1397,19 @@ export class PatchrightBrowserCore implements BrowserCore {
     // binds the kind to an ACTIVE widget container, so it can't mislabel a WAF block's vendor (codex #40 r3/r4).
     const html = String(await page.content().catch(() => ""));
     const captchaKind = activeCaptchaKind(html);
+    // #44: solver eligibility (a pure KIND property) + why a solve wasn't completed. captchaSolveReason
+    // prefers the stashed code from an ACTUAL failed attempt (#trySolveCaptcha ran in this op's #settle);
+    // else a pre-attempt why-not derived from the kind — `not-configured` (no solver wired) or
+    // `unsupported-kind` (the widget kind isn't solvable). Consume-once: clear the stash so a later bare
+    // snapshot() can't inherit a stale attempt's reason. Both are set only when a CAPTCHA is present.
+    const attemptReason = this.#pendingSolveReason;
+    this.#pendingSolveReason = undefined;
+    const solverEligible = captchaKind ? isSolvableCaptchaKind(captchaKind) : undefined;
+    const captchaSolveReason = resolveCaptchaSolveReason({
+      captchaKind,
+      solverPresent: this.#solver != null,
+      ...(attemptReason ? { attemptReason } : {}),
+    });
     // Assemble the failure-evidence envelope (issue #39) into EVERY snapshot — both navigate() and a
     // post-action snapshot() — so the drive layer can attach it to a thrown failure at parity with
     // retrieve. RAW here; the drive surfacing seam redacts before it reaches a caller. Screenshot is
@@ -1411,6 +1443,8 @@ export class PatchrightBrowserCore implements BrowserCore {
       pxHint: hasPerimeterXHint(html),
       ddHint: hasDataDomeHint(html),
       ...(captchaKind ? { captchaKind } : {}),
+      ...(solverEligible !== undefined ? { solverEligible } : {}),
+      ...(captchaSolveReason ? { captchaSolveReason } : {}),
     };
   }
 

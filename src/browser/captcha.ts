@@ -18,6 +18,47 @@ import { stripInertHtml } from "./detect.js";
 
 export type CaptchaKind = "recaptcha" | "hcaptcha" | "turnstile" | "unknown";
 
+/**
+ * Whether the solver architecture can (in principle) solve this CAPTCHA kind (issue #44) — a pure property
+ * of the kind, independent of whether a solver instance is wired or has budget. MUST stay in lockstep with
+ * `verbs/captcha-solver.ts`'s `TASK_TYPE` map (the actual kind→task-type binding); that map lives in the
+ * verbs layer, so this lower (browser) layer duplicates the single fact — only reCAPTCHA v2 is solvable
+ * today (hCaptcha / Turnstile / PerimeterX / unknown are not). Adding a solvable vendor means updating BOTH.
+ *
+ * DEFERRED (issue #44, HOLD): finer eligibility for a Turnstile widget that co-fires with a Cloudflare hint.
+ * #40 attributes such a page `cf-challenge` → `wafVendor=cloudflare` (WAF-first), which is a correct coarser
+ * vendor but loses the `turnstile` KIND — and Turnstile is not solvable, so eligibility can read as if the
+ * page were a generic CF block rather than an unsolvable widget. Promoting `turnstile` over `cf-challenge`
+ * is BLOCKED on a captured CF *managed-challenge* fixture: without ground truth on whether the Under-Attack
+ * interstitial itself carries a `cf-turnstile-response` / `class="cf-turnstile"` container, promoting it
+ * risks mislabeling managed challenges. Capture the fixture, then decide precedence. (Codex #40 r8.)
+ */
+export function isSolvableCaptchaKind(kind: CaptchaKind): boolean {
+  return kind === "recaptcha";
+}
+
+/**
+ * Resolve the closed-vocabulary `captchaSolveReason` for a snapshot (issue #44) — pure, so the derivation
+ * is unit-testable off the real browser core. Precedence:
+ *   - no CAPTCHA detected            → undefined (nothing to report);
+ *   - an actual attempt FAILED       → its typed code (`attemptReason`: vendor-error / timeout /
+ *                                      budget-exhausted / missing-sitekey / error), which wins;
+ *   - no solver wired                → `not-configured`;
+ *   - solver wired, kind unsolvable  → `unsupported-kind`;
+ *   - solver wired, kind solvable, no attempt-failure → undefined (a solve may have succeeded or not run).
+ */
+export function resolveCaptchaSolveReason(opts: {
+  captchaKind: CaptchaKind | undefined;
+  solverPresent: boolean;
+  attemptReason?: string;
+}): string | undefined {
+  const { captchaKind, solverPresent, attemptReason } = opts;
+  if (!captchaKind) return undefined;
+  if (attemptReason) return attemptReason;
+  if (!solverPresent) return "not-configured";
+  return isSolvableCaptchaKind(captchaKind) ? undefined : "unsupported-kind";
+}
+
 export interface CaptchaChallenge {
   kind: CaptchaKind;
   url: string;

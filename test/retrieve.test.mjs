@@ -399,6 +399,36 @@ test("retrieve: an interactive CAPTCHA block is reported with reason=captcha (mo
   assert.equal(r.reason, "captcha");
 });
 
+test("#44: retrieve surfaces solverEligible=true + not-configured on a solvable-kind (reCAPTCHA) CAPTCHA block", async () => {
+  // retrieve wires NO solver in production; the actionable signal is that this kind IS solvable, so routing
+  // to the drive path (which has a solver) could clear it — captchaSolveReason='not-configured' says WHY it
+  // wasn't attempted here. (renderOf must carry `diagnostics` for the #39 envelope to be assembled.)
+  const rc = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([rc]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/" });
+  assert.equal(r.reason, "captcha");
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.solverEligible, true, "reCAPTCHA v2 is a solvable kind");
+  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured", "retrieve wires no solver");
+});
+
+test("#44: retrieve marks an UNSOLVABLE-kind CAPTCHA (Turnstile) solverEligible=false", async () => {
+  const ts = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<div class="cf-turnstile" data-sitekey="0x4"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([ts]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/" });
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.solverEligible, false, "Turnstile is not solvable by the reCAPTCHA-only solver");
+  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured");
+});
+
 test("retrieve: a 200 PerimeterX press-&-hold served as a TOP-document interstitial (copy in html, not innerText) is blocked", async () => {
   // The live gateway repro (#24 follow-up), top-document form: PX serves the press-&-hold full-page
   // with a 200. The challenge copy reaches render.html (so extractMarkdown scrapes it) but NOT

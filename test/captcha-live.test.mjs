@@ -13,6 +13,9 @@ import {
   awaitSolvableCaptcha,
   injectTokenJs,
   DETECT_LIVE_CAPTCHA_JS,
+  isSolvableCaptchaKind,
+  resolveCaptchaSolveReason,
+  CAPTCHA_SOLVE_ERROR_CODES,
 } from "../dist/browser/index.js";
 
 const URL = "https://site.example/login";
@@ -126,4 +129,39 @@ test("DETECT_LIVE_CAPTCHA_JS: an evaluatable script covering the three response 
   for (const f of ["g-recaptcha-response", "cf-turnstile-response", "h-captcha-response", "data-sitekey"]) {
     assert.match(DETECT_LIVE_CAPTCHA_JS, new RegExp(f));
   }
+});
+
+// --- #44: solver eligibility + solve-reason (pure derivation, unit-tested off the real core) ---------
+
+test("#44 isSolvableCaptchaKind: only reCAPTCHA v2 is solvable today", () => {
+  assert.equal(isSolvableCaptchaKind("recaptcha"), true);
+  for (const k of ["hcaptcha", "turnstile", "unknown"]) {
+    assert.equal(isSolvableCaptchaKind(k), false, `${k} is not solvable`);
+  }
+});
+
+test("#44 resolveCaptchaSolveReason: no CAPTCHA detected → undefined", () => {
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: undefined, solverPresent: true }), undefined);
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: undefined, solverPresent: false, attemptReason: "timeout" }), undefined);
+});
+
+test("#44 resolveCaptchaSolveReason: an actual attempt failure code wins for EVERY code + `error`", () => {
+  // AC: each CAPTCHA_SOLVE_ERROR_CODES value is threaded out distinctly (was stderr-only), plus the
+  // allowlist-collapsed `error` for an unrecognized code from a custom solver.
+  for (const code of [...CAPTCHA_SOLVE_ERROR_CODES, "error"]) {
+    // attemptReason wins over the pre-attempt why-not regardless of solver presence / kind solvability.
+    assert.equal(resolveCaptchaSolveReason({ captchaKind: "recaptcha", solverPresent: true, attemptReason: code }), code);
+    assert.equal(resolveCaptchaSolveReason({ captchaKind: "hcaptcha", solverPresent: false, attemptReason: code }), code);
+  }
+});
+
+test("#44 resolveCaptchaSolveReason: pre-attempt why-not when no attempt was made", () => {
+  // No solver wired → not-configured (whatever the kind).
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "recaptcha", solverPresent: false }), "not-configured");
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "turnstile", solverPresent: false }), "not-configured");
+  // Solver wired but the kind isn't solvable → unsupported-kind.
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "hcaptcha", solverPresent: true }), "unsupported-kind");
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "turnstile", solverPresent: true }), "unsupported-kind");
+  // Solver wired and the kind IS solvable, no attempt failure → undefined (a solve may have succeeded).
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "recaptcha", solverPresent: true }), undefined);
 });

@@ -815,6 +815,26 @@ test("#58: a bare reCAPTCHA ACTION failure attributes the CAPTCHA kind on the en
   assert.equal(failureOf(caught)?.failureClass, "captcha", "the envelope classifies it as a captcha block");
 });
 
+test("#44: a drive CAPTCHA action failure folds solverEligible + captchaSolveReason into the envelope", async () => {
+  // The core computes these on the snapshot (#snapshotOf); the #failure seam folds them into the envelope
+  // (like failureClass/wafVendor/timing). Here: a reCAPTCHA that a wired solver attempted and hit a
+  // vendor-error — solverEligible=true (kind is solvable) + captchaSolveReason='vendor-error'.
+  const { failureOf } = await import("../dist/observability/index.js");
+  const { gateway } = makePostActionBlockGateway({
+    url: "https://cap.example/", title: "Verify", tree: "Please verify you are a human", status: 403,
+    captchaKind: "recaptcha", solverEligible: true, captchaSolveReason: "vendor-error",
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok");
+  await c.navigate("https://example.com/");
+  let caught;
+  try { await c.click({ target: "e1" }); } catch (e) { caught = e; }
+  assert.ok(caught, "an action landing on a CAPTCHA block must throw");
+  const env = failureOf(caught);
+  assert.equal(env?.solverEligible, true, "the envelope carries solver eligibility");
+  assert.equal(env?.captchaSolveReason, "vendor-error", "the envelope carries the typed solve reason");
+});
+
 test("#58: a healthy-page action failure (no hints) attributes NO vendor — attribution-only, no false positive", async () => {
   // Parity guard: #58 must not manufacture a vendor where there is no block. A locator-timeout on a healthy
   // page yields a snapshot with no hints and status 200 → not navFailed → no failureClass, no wafVendor.

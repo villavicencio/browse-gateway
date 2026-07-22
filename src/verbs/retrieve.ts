@@ -34,7 +34,7 @@ import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
-import { detectCaptcha } from "./captcha.js";
+import { detectCaptcha, isSolvableCaptchaKind } from "./captcha.js";
 import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
 
 /**
@@ -816,6 +816,13 @@ export async function retrieve(
   // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
   const failureClass: FailureClass | undefined = failed ? classifyFailure(signal) : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+  // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
+  // Production retrieve wires NO solver (its CF tier is cleared by proxy, not a solve), so a detected
+  // CAPTCHA block is always `not-configured` here — the actionable signal being that routing to the drive
+  // path (which HAS a solver) could clear it IFF the kind is solvable. solverEligible is the pure KIND
+  // property; both are secret-free (closed-vocab / boolean) and pass redaction untouched.
+  const solverEligible = signal.captchaKind ? isSolvableCaptchaKind(signal.captchaKind) : undefined;
+  const captchaSolveReason = failed && failureClass === "captcha" ? "not-configured" : undefined;
   // #42: assemble ONE Timing — the whole-call totalMs over the final render's core stages — and use it for
   // BOTH the result field and (on a failure) the folded envelope, so they can never disagree (single
   // derivation). render.timing carries the surfaced render's domContentLoaded/clearancePoll/snapshot; its
@@ -828,7 +835,14 @@ export async function retrieve(
   const diagnostics =
     failed && render.diagnostics
       ? redactFailureDiagnostics(
-          { ...render.diagnostics, ...(failureClass ? { failureClass } : {}), ...(wafVendor ? { wafVendor } : {}), timing },
+          {
+            ...render.diagnostics,
+            ...(failureClass ? { failureClass } : {}),
+            ...(wafVendor ? { wafVendor } : {}),
+            timing,
+            ...(solverEligible !== undefined ? { solverEligible } : {}),
+            ...(captchaSolveReason ? { captchaSolveReason } : {}),
+          },
           secrets,
         )
       : undefined;
