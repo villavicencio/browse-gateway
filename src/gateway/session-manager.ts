@@ -48,6 +48,19 @@ export const KILL_CONFIRM_MS = 5_000;
  */
 export const SHUTDOWN_RECONFIRM_TRIES = 3;
 
+/**
+ * Ceiling on how long a single browser-core factory launch (`chromium.launchPersistentContext` + any
+ * restore-state seed) may run before it's treated as WEDGED (an Xvfb wedge, a `launchPersistentContext`
+ * that never resolves) and failed as `CORE_LAUNCH`, releasing its reserved capacity slot (issue #54). A
+ * healthy cold headful launch resolves in single-digit seconds even on a busy host, so 2 min unambiguously
+ * means "stuck" — and bounding it is what stops a hung launch from pinning a `#reserved` slot toward a
+ * permanent `SESSION_LIMIT` (the reaper only scans `#sessions`, never reserved launches). Reaping any
+ * half-spawned Chromium orphaned under the still-pending launch is a separate spike (#54 Part 2 — it needs
+ * a spawn-side PID hook the post-resolve capture can't provide). Not env-overridable by design (ticket
+ * #43); `SessionManagerOptions.launchDeadlineMs` overrides it for tests.
+ */
+export const LAUNCH_DEADLINE_MS = 120_000;
+
 export type SessionManagerErrorCode = "SESSION_LIMIT" | "CORE_LAUNCH";
 
 export class SessionManagerError extends Error {
@@ -70,6 +83,9 @@ export interface SessionManagerOptions {
   closeGraceMs?: number;
   /** Force-kill death-confirmation deadline. Default {@link KILL_CONFIRM_MS}; overridable for tests. */
   killConfirmMs?: number;
+  /** Bounded deadline for a single core factory launch before it's failed as `CORE_LAUNCH` and its
+   *  reserved slot released (issue #54). Default {@link LAUNCH_DEADLINE_MS}; overridable for tests. */
+  launchDeadlineMs?: number;
 }
 
 export class SessionManager {
@@ -80,6 +96,7 @@ export class SessionManager {
   readonly #factory: CoreFactory;
   readonly #closeGraceMs: number;
   readonly #killConfirmMs: number;
+  readonly #launchDeadlineMs: number;
   /** Slots claimed by in-flight `acquire()` calls before their core finishes launching. */
   #reserved = 0;
   /** Per-consumer in-flight launch counts, so concurrent opens can't overshoot the per-consumer cap
@@ -120,6 +137,7 @@ export class SessionManager {
     this.#factory = opts.coreFactory ?? createBrowserCore;
     this.#closeGraceMs = opts.closeGraceMs ?? CLOSE_GRACE_MS;
     this.#killConfirmMs = opts.killConfirmMs ?? KILL_CONFIRM_MS;
+    this.#launchDeadlineMs = opts.launchDeadlineMs ?? LAUNCH_DEADLINE_MS;
   }
 
   /**
@@ -170,9 +188,11 @@ export class SessionManager {
    * Create a new session. Rejects with `SESSION_LIMIT` when the global ceiling is reached, when
    * `meta.consumerId` is set and that consumer is already at its per-consumer cap (so one consumer can't
    * hold open more than its share of drive sessions), or when the manager is shutting down. Rejects with
-   * `CORE_LAUNCH` when the browser fails to start. The global ceiling counts in-flight launches (reserved
-   * slots), so concurrent `acquire()` calls can't overshoot, and a launch failure never leaves a
-   * leaked/half-counted session.
+   * `CORE_LAUNCH` when the browser fails to start OR when the launch wedges past `#launchDeadlineMs` (issue
+   * #54) — either way the `finally` releases the reserved slot, so a hung launch never pins capacity toward
+   * a permanent `SESSION_LIMIT`. The global ceiling counts in-flight launches (reserved slots), so
+   * concurrent `acquire()` calls can't overshoot, and a launch failure never leaves a leaked/half-counted
+   * session.
    */
   async acquire(
     overrides?: BrowserCoreOptions,
@@ -218,8 +238,10 @@ export class SessionManager {
 
   /**
    * Launch a core and register its session — the awaited body of {@link acquire}, factored out so the
-   * launch is a single tracked promise in `#launching`. Re-checks `#shuttingDown` AFTER the (possibly
-   * slow) factory launch: if shutdown began while the core was launching, the just-launched browser is
+   * launch is a single tracked promise in `#launching`. The factory launch is raced against
+   * `#launchDeadlineMs` so a wedged `launchPersistentContext` fails as `CORE_LAUNCH` instead of pinning its
+   * reserved slot forever (issue #54). Re-checks `#shuttingDown` AFTER the (possibly slow) factory launch:
+   * if shutdown began while the core was launching, the just-launched browser is
    * torn down (close→confirmed-kill) and NEVER registered, so it can't outlive shutdown as an orphan.
    * The re-check and `#sessions.set` are synchronous-contiguous (no await between them), so an acquire
    * that observes "not shutting down" registers atomically before any concurrent shutdown could
@@ -230,12 +252,33 @@ export class SessionManager {
     meta?: { consumerId?: string },
   ): Promise<Session> {
     const coreOptions = overrides ? { ...this.#coreOptions, ...overrides } : this.#coreOptions;
-    let core: BrowserCore;
-    try {
-      core = await this.#factory(coreOptions);
-    } catch (cause) {
-      throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause });
+    // Bound the factory launch so a WEDGED `launchPersistentContext` (Xvfb wedge, a launch that never
+    // resolves) can't pin its reserved slot forever (issue #54). Attaching `.then(onF, onR)` to `launchP`
+    // handles its eventual rejection on BOTH arms, so an abandoned wedged launch that rejects late can't
+    // surface as an unhandled rejection. The reserved-slot release is NOT done here — `acquire`'s `finally`
+    // already decrements `#reserved`/`#reservedByConsumer` and drops the tracked `#launching` entry when
+    // THIS promise settles, so rejecting on the deadline is what frees the slot. A half-spawned Chromium
+    // orphaned under the still-pending launch is #54 Part 2 (needs a spawn-side PID hook).
+    const launchP = this.#factory(coreOptions);
+    const deadline = deadlineTimer(this.#launchDeadlineMs);
+    const outcome = await Promise.race([
+      launchP.then(
+        (c) => ({ kind: "launched" as const, core: c }),
+        (cause) => ({ kind: "failed" as const, cause }),
+      ),
+      deadline.promise.then(() => ({ kind: "timeout" as const })),
+    ]);
+    deadline.clear(); // don't leave the launch-deadline timer dangling on the common fast-launch path
+    if (outcome.kind === "failed") {
+      throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause: outcome.cause });
     }
+    if (outcome.kind === "timeout") {
+      throw new SessionManagerError(
+        "CORE_LAUNCH",
+        `browser core launch exceeded ${this.#launchDeadlineMs}ms deadline`,
+      );
+    }
+    const core = outcome.core;
     if (this.#shuttingDown) {
       // Never register once shutdown began. Tear down the orphan (close→confirmed-kill); if the kill
       // can't confirm, hand it to `#unconfirmed` so shutdown's drain reclaims it. It was never in
@@ -392,7 +435,19 @@ export class SessionManager {
   async shutdown(): Promise<void> {
     this.#shuttingDown = true;
     this.stopReaper();
-    await Promise.allSettled([...this.#launching]);
+    // AWAIT in-flight launches so a launch racing shutdown self-tears-down rather than orphaning a browser —
+    // but BOUND that wait so a wedged launch can't hang shutdown (issue #54). Each `#launching` entry already
+    // settles within `#launchDeadlineMs` (the acquire-side deadline above), and this race is the independent
+    // backstop: even a launch that somehow outlives its own deadline can't pin shutdown. A launch still
+    // pending when the bound fires is harmless — `#shuttingDown` is set, so when it eventually resolves the
+    // re-check in `#launchAndRegister` self-tears-down the orphan and never registers it. NOT unref'd (issue
+    // #50): this is a foreground awaited timer; an unref'd one would let the loop empty mid-await and hang.
+    const launchDrain = deadlineTimer(this.#launchDeadlineMs);
+    await Promise.race([
+      Promise.allSettled([...this.#launching]).then(() => {}),
+      launchDrain.promise,
+    ]);
+    launchDrain.clear();
     const remaining = [...this.#sessions.values()].filter(
       (s) => !this.#closing.has(s.id) && !this.#unconfirmed.has(s),
     );
@@ -418,4 +473,18 @@ export class SessionManager {
       );
     }
   }
+}
+
+/** A cancellable deadline: `promise` resolves after `ms`; `clear()` cancels the timer so the common path
+ *  (the launch resolves, or shutdown drains its launches) doesn't leave it dangling. NOT unref'd — like the
+ *  teardown grace timer (issue #50), this is a FOREGROUND awaited timer: it is the trigger that unblocks a
+ *  wedged launch and a shutdown waiting on one (issue #54), so it must keep the event loop alive until it
+ *  fires or is cleared; an unref'd timer would let the loop empty mid-await and the operation would hang
+ *  forever. It always fires or is cleared within one deadline window, so it never lingers. */
+function deadlineTimer(ms: number): { promise: Promise<void>; clear: () => void } {
+  let handle: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((resolve) => {
+    handle = setTimeout(resolve, ms);
+  });
+  return { promise, clear: () => clearTimeout(handle) };
 }

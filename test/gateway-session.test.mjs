@@ -747,3 +747,62 @@ test("reconfirm is single-flight: overlapping drains issue exactly one kill per 
   await Promise.all([r1, r2]);
   assert.equal(mgr.activeCount, 0, "the shared reconfirm reclaimed the slot");
 });
+
+// --- issue #54: acquire-side wedge — a never-settling factory launch must not pin its reserved slot -------
+
+test("acquire: a launch that never settles fails as CORE_LAUNCH and releases its reserved slot within the deadline (issue #54)", async () => {
+  const wedge = deferred(); // never resolved → the first factory launch hangs forever
+  let hang = true;
+  const factory = async () => {
+    if (hang) {
+      hang = false; // only the FIRST launch wedges; the recovery launch proceeds normally
+      await wedge.promise; // never settles within this test
+    }
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  // Tiny launch deadline so the wedge is failed near-instantly (real default is minutes).
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30 });
+
+  // The wedged launch must FAIL (not hang) — CORE_LAUNCH, surfaced within the deadline.
+  await assert.rejects(
+    mgr.acquire(),
+    (e) => e instanceof SessionManagerError && e.code === "CORE_LAUNCH",
+  );
+  assert.equal(mgr.activeCount, 0, "the wedged launch registered no session");
+
+  // The reserved slot was released by acquire's finally, so a fresh acquire is admitted despite
+  // maxSessions: 1 — proving the hung launch did NOT pin capacity toward a permanent SESSION_LIMIT.
+  const s = await mgr.acquire();
+  assert.equal(mgr.activeCount, 1, "reserved slot freed → a replacement acquire succeeds past the cap");
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 0);
+});
+
+test("shutdown: returns instead of hanging when an in-flight launch never settles (issue #54)", async () => {
+  const wedge = deferred(); // the launch wedges: the factory never resolves
+  const factory = async () => {
+    await wedge.promise;
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  const mgr = new SessionManager({
+    maxSessions: 1,
+    coreFactory: factory,
+    launchDeadlineMs: 30,
+    closeGraceMs: 30,
+    killConfirmMs: 30,
+  });
+
+  const acqP = mgr.acquire(); // enters #launchAndRegister and wedges on the factory
+  const acqRejects = assert.rejects(acqP, (e) => e.code === "CORE_LAUNCH"); // attach the handler now
+  await tick();
+
+  // shutdown() must not hang on the never-settling #launching entry: the bounded launch/allSettled wait
+  // lets it return. If either bound regressed, this await never resolves and the test times out.
+  let done = false;
+  await mgr.shutdown().then(() => {
+    done = true;
+  });
+  assert.equal(done, true, "shutdown completed despite the wedged in-flight launch");
+  assert.equal(mgr.activeCount, 0, "no session registered for the wedged launch");
+  await acqRejects; // the wedged acquire settled as CORE_LAUNCH, not left dangling
+});

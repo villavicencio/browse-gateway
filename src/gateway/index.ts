@@ -226,6 +226,7 @@ export {
   MAX_INFLIGHT_MS,
   CLOSE_GRACE_MS,
   KILL_CONFIRM_MS,
+  LAUNCH_DEADLINE_MS,
 } from "./session-manager.js";
 export type {
   CoreFactory,
