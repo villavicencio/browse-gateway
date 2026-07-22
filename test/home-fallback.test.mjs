@@ -51,6 +51,30 @@ test("isHomeFallback: conservative — ordinary redirects and root requests neve
   assert.equal(isHomeFallback("https://s.example/", "https://s.example/?utm=ad"), false, "root request → root (campaign param added) is not a lost deep link");
 });
 
+test("isHomeFallback: a tracking-only root request stripped to a clean root is NOT a fallback (codex review)", () => {
+  // A homepage requested with disposable campaign metadata, canonicalized to `/` — nothing was lost.
+  assert.equal(isHomeFallback("https://shop.example/?utm_source=email", "https://shop.example/"), false, "utm_* stripped → not a fallback");
+  assert.equal(isHomeFallback("https://shop.example/?gclid=abc123", "https://shop.example/"), false, "gclid stripped");
+  assert.equal(isHomeFallback("https://shop.example/?utm_source=email", "https://shop.example/?ref=home"), false, "tracking → tracking, no intent key present either side");
+  assert.equal(isHomeFallback("https://shop.example/?utm_source=email&q=milk", "https://shop.example/"), true, "a REAL intent key (q) alongside tracking, dropped → still a fallback");
+});
+
+test("isHomeFallback: an index-filename canonicalization is NOT a fallback (codex review)", () => {
+  assert.equal(isHomeFallback("https://s.example/index.html", "https://s.example/"), false, "/index.html → / is root-equivalent");
+  assert.equal(isHomeFallback("https://s.example/default.aspx", "https://s.example/"), false, "/default.aspx → /");
+  assert.equal(isHomeFallback("https://s.example/foo/index.html", "https://s.example/"), true, "/foo/index.html → / still lost the /foo depth");
+});
+
+test("isHomeFallback: a deep path whose intent-bearing query SURVIVED is depth-preserved, not a fallback (codex review)", () => {
+  assert.equal(isHomeFallback("https://s.example/search?q=milk", "https://s.example/?q=milk"), false, "/search?q=x → /?q=x endpoint move preserved the query intent");
+  assert.equal(isHomeFallback("https://s.example/search?q=milk", "https://s.example/"), true, "same deep search, query ALSO dropped → a fallback");
+  assert.equal(isHomeFallback("https://s.example/search?q=milk&utm_source=x", "https://s.example/?utm_source=x"), true, "only the TRACKING key survived, the intent key q was lost → a fallback");
+});
+
+test("isHomeFallback: hash-router (/#/deep) is a conservative false-negative (documented deferral)", () => {
+  assert.equal(isHomeFallback("https://s.example/#/deep", "https://s.example/"), false, "route lives in the fragment; pathname is '/' so depth is not seen (deferred)");
+});
+
 test("isHomeFallback: a cross-host landing is a DIFFERENT case (policy-governed), never a home-fallback", () => {
   assert.equal(isHomeFallback(DEEP, "https://login.example/"), false, "deep → other host root (auth/consent interstitial)");
   assert.equal(isHomeFallback("https://www.s.example/deep", "https://s.example/"), false, "www↔apex host mismatch is a conservative false-negative (deferred)");

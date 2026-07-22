@@ -201,7 +201,12 @@ export interface FailureDiagnostics {
    *  (retrieve.ts), NOT via {@link buildFailureDiagnostics}: it is DERIVED from the requested-vs-final URL
    *  (`isHomeFallback`) which the assembly seam has, and on a SUCCESS-shaped fallback (a fat homepage, no
    *  envelope) the SAME boolean rides the top-level result instead. Orthogonal EVIDENCE, never a
-   *  {@link FailureClass}, so it can't disagree with the block reason (the #40 one-reason invariant). */
+   *  {@link FailureClass}, so it can't disagree with the block reason (the #40 one-reason invariant).
+   *  ASYMMETRY (deliberate): only the RETRIEVE path populates this slot. The drive path surfaces a
+   *  home-fallback as a non-fatal `PageSnapshot.homeFallback` annotation on the returned SUCCESS snapshot
+   *  (a homepage is a returnable snapshot, never a drive failure); a drive nav that also FAILS throws before
+   *  the annotation seam and `#failure` is not passed the requested url, so a drive FAILURE envelope never
+   *  carries this — a documented scoped deferral (that rare corner's story is its block/nav class). */
   homeFallback?: boolean;
 }
 

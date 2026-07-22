@@ -332,13 +332,18 @@ export function isDeadExit(status: number | null, finalUrl: string | undefined):
  * POSITIVE-SIGNAL-ONLY and conservative to avoid false-positives on ordinary redirects — it fires ONLY when
  *   - both URLs are same-host http(s) (a cross-host landing — an auth / consent / geo interstitial — is NOT
  *     a home-fallback of the requested site; it is governed by the nav policy, not this signal), AND
- *   - the requested DEPTH was actually LOST: either the requested path was deep and the landing collapsed to
- *     the bare root, OR a query-only deep link (root path + query) landed on the root with NONE of its query
- *     keys surviving (the dropped-query case).
- * A same-host deep→deep redirect, a trailing-slash / locale canonicalization to a deep equivalent, a query
- * that was PRESERVED, or a legitimately root-only request never trips it. Unparseable URLs → false
- * (fail-safe: assert nothing). www↔apex host normalization and hash-router (`/#/deep`) fallbacks are
- * conservative false-negatives left as documented deferrals.
+ *   - the landing is the bare root, AND the requested INTENT was actually LOST — where "intent" is a deep
+ *     path OR an intent-bearing (non-{@link isTrackingParam tracking}) query key. A deep path that collapsed
+ *     to root fires UNLESS an intent-bearing query ALSO carried the request and SURVIVED intact (a
+ *     `/search?q=x` → `/?q=x` endpoint move preserved the intent); a query-only deep link fires only when
+ *     NONE of its intent keys survived (the dropped-query case).
+ * Deliberately does NOT fire on: a same-host deep→deep redirect; a trailing-slash / locale canonicalization
+ * to a deep equivalent; a tracking-only root request (`/?utm_source=…`, `/?gclid=…`) canonicalized to `/`
+ * (no location/query state was lost); an index-filename canonicalization (`/index.html` → `/`); a preserved
+ * query; or a legitimately root-only request. Unparseable URLs → false (fail-safe: assert nothing). KNOWN
+ * conservative false-NEGATIVES, left as documented deferrals: www↔apex host normalization; hash-router
+ * (`/#/deep`) fallbacks; and a query-only link whose key is retained but whose VALUE is dropped
+ * (`/?store=123` → `/?store=0`) — the survival test is key-presence-only, to avoid value-canonicalization FPs.
  */
 export function isHomeFallback(requestedUrl: string | undefined, finalUrl: string | undefined): boolean {
   if (requestedUrl === undefined || finalUrl === undefined) return false;
@@ -353,17 +358,45 @@ export function isHomeFallback(requestedUrl: string | undefined, finalUrl: strin
   const httpish = (u: URL): boolean => u.protocol === "http:" || u.protocol === "https:";
   if (!httpish(req) || !httpish(fin)) return false;
   if (req.host !== fin.host) return false; // a cross-host landing is a different case (policy-governed)
-  const reqDeepPath = req.pathname !== "" && req.pathname !== "/";
-  const finRootPath = fin.pathname === "" || fin.pathname === "/";
-  if (!finRootPath) return false; // landed somewhere real — not a home fallback
-  if (reqDeepPath) return true; // a deep path silently collapsed to root
-  // The requested path was already root, so only a QUERY could have carried the intent (a query-only deep
-  // link, e.g. `/?q=milk` or `/?store=123`). A fallback here = that query was dropped: the landing kept none
-  // of the requested query keys (an empty landing query, or a wholly different one such as campaign params).
-  if (req.search === "") return false; // root→root with no query was never a deep request
-  if (fin.search === "") return true; // the query was dropped entirely
+  const isRootPath = (p: string): boolean => p === "" || p === "/";
+  if (!isRootPath(fin.pathname)) return false; // landed somewhere real — not a home fallback
+  // The requested INTENT: a real deep path (an index-filename canonicalization like /index.html → / is NOT
+  // deep), and/or intent-bearing query keys (tracking/campaign params carry no location state — a homepage
+  // requested with a utm/gclid tag that canonicalizes to a clean root lost nothing).
+  const reqDeepPath = !isRootPath(req.pathname) && !isIndexFilenamePath(req.pathname);
+  const reqIntentKeys = [...req.searchParams.keys()].filter((k) => !isTrackingParam(k));
+  if (!reqDeepPath && reqIntentKeys.length === 0) return false; // the caller asked for the homepage
   const finKeys = new Set(fin.searchParams.keys());
-  return ![...req.searchParams.keys()].some((k) => finKeys.has(k));
+  if (reqDeepPath) {
+    // A deep path collapsed to root — a fallback UNLESS an intent-bearing query ALSO carried the request and
+    // survived intact (the query, not the path, was the addressable state, and it was preserved).
+    const allIntentKeysSurvived = reqIntentKeys.length > 0 && reqIntentKeys.every((k) => finKeys.has(k));
+    return !allIntentKeysSurvived;
+  }
+  // Query-only intent (root/index path + intent keys): a fallback iff NONE of the intent keys survived.
+  return !reqIntentKeys.some((k) => finKeys.has(k));
+}
+
+/** Well-known tracking / campaign / click-id query keys — disposable metadata that carries NO location or
+ *  search state, so a homepage requested with one and canonicalized to a clean root is not a lost deep link
+ *  (issue #48, codex review). Any `utm_*` key plus this closed set; matched case-insensitively. Biased to
+ *  OVER-include (a mislabel here yields a safe false-NEGATIVE — a missed fallback — never a false alarm). */
+const TRACKING_PARAMS = new Set([
+  "gclid", "gclsrc", "gbraid", "wbraid", "dclid", "fbclid", "msclkid", "yclid", "ttclid", "twclid",
+  "igshid", "mc_cid", "mc_eid", "_ga", "_gl", "ref", "ref_src", "ref_url", "referrer", "source",
+  "campaign", "cmpid", "cmp", "mkt_tok", "s_kwcid", "_hsenc", "_hsmi", "vero_id", "oly_anon_id",
+]);
+function isTrackingParam(key: string): boolean {
+  const k = key.toLowerCase();
+  return k.startsWith("utm_") || TRACKING_PARAMS.has(k);
+}
+
+/** A single index-filename path (`/index.html`, `/default.aspx`, `/home`) that a site canonicalizes to `/`
+ *  — root-equivalent, so requesting it and landing on `/` is not a lost deep link (issue #48, codex review).
+ *  Only a SOLE segment counts: `/foo/index.html` → `/` still lost the `/foo` depth. */
+const INDEX_FILENAMES = new Set(["index.html", "index.htm", "index.php", "default.aspx", "default.asp", "home"]);
+function isIndexFilenamePath(pathname: string): boolean {
+  return INDEX_FILENAMES.has(pathname.replace(/^\//, "").toLowerCase());
 }
 
 /**
