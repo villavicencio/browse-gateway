@@ -410,6 +410,18 @@ interface SettleResult {
   captchaSolveMs?: number;
 }
 
+/**
+ * Clamp a stage timeout to a shared per-call deadline (issue #43): the smaller of the raw timeout and the
+ * time left until `deadlineMs` (an absolute `performance.now()` value), floored at `floorMs`. render() applies
+ * it to the goto (floor 1 — Playwright treats a 0 timeout as INFINITE) and the clearance poll (floor 0 —
+ * clearance is a while-loop, so 0 just skips the wait). Pure, so the budget arithmetic is unit-tested off the
+ * real browser. Passing `deadlineMs === undefined` returns the raw timeout unchanged (unbudgeted render).
+ */
+export function deadlineBoundedTimeout(rawTimeoutMs: number, deadlineMs: number | undefined, now: number, floorMs: number): number {
+  if (deadlineMs === undefined) return rawTimeoutMs;
+  return Math.max(floorMs, Math.min(rawTimeoutMs, deadlineMs - now));
+}
+
 export class PatchrightBrowserCore implements BrowserCore {
   readonly kind = "patchright";
   readonly #context: PatchrightContext;
@@ -719,11 +731,13 @@ export class PatchrightBrowserCore implements BrowserCore {
       // domContentLoadedMs = goto wall-clock (waitUntil:"domcontentloaded" resolves AT DCL). Measured around
       // the try so a goto that THROWS (timeout / challenge abort) still records its time-to-abort.
       const goto0 = performance.now();
+      // #43 (codex r5): when a shared per-call deadline is passed, clamp the goto timeout to what remains of
+      // it, so navigation + the clearance poll below share ONE budget instead of each independently consuming
+      // the full `remaining` (which let a 20s allowance run ~40s). Gated on the option, so unbudgeted renders
+      // (the kill-gate, drive) are unchanged. max(1) avoids a 0 timeout — Playwright treats 0 as infinite.
+      const navTimeout = deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1);
       try {
-        const resp = await page.goto(url, {
-          waitUntil: "domcontentloaded",
-          timeout: this.#resolved.navigationTimeoutMs,
-        });
+        const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
         status = resp ? resp.status() : null;
       } catch {
         // Navigation may time out or be aborted by a challenge; assess whatever rendered.
@@ -737,9 +751,13 @@ export class PatchrightBrowserCore implements BrowserCore {
       // #42: clearancePollMs is the WALL-CLOCK of this loop (each pollSignal round-trip costs real time in
       // the capped container), distinct from `waited` (the sleep-interval counter the kill-gate reads).
       const poll0 = performance.now();
+      // #43 (codex r5): the clearance poll gets whatever remains of the shared per-call deadline AFTER the
+      // goto (subtract actual navigation time), so nav + clearance can't each spend the full budget. Unbudgeted
+      // renders keep the raw clearanceTimeoutMs.
+      const clearanceBudget = deadlineBoundedTimeout(clearanceTimeoutMs, opts.budgetDeadlineMs, performance.now(), 0);
       let signal = await pollSignal(page);
       let waited = 0;
-      while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceTimeoutMs) {
+      while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceBudget) {
         await page.waitForTimeout(pollIntervalMs);
         waited += pollIntervalMs;
         signal = await pollSignal(page);

@@ -212,6 +212,14 @@ export interface RenderOptions {
    * clearance timeout.
    */
   clearedTextLength?: number;
+  /**
+   * Absolute `performance.now()` deadline for this render's navigation + clearance (issue #43). When set,
+   * the core clamps BOTH the goto timeout and the clearance-poll bound to what remains of it — so the two
+   * sequential stages share ONE budget rather than each independently consuming the caller's remaining
+   * allowance (which let a proxied attempt run ~2× its budget). `retrieve` passes `renderStart + callBudget`;
+   * unset = unbounded (the kill-gate / drive path are unchanged).
+   */
+  budgetDeadlineMs?: number;
 }
 
 /**

@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadCallTimeouts, DEFAULT_CALL_TIMEOUTS } from "../dist/gateway/index.js";
+import { deadlineBoundedTimeout } from "../dist/browser/index.js";
 
 test("#43 loadCallTimeouts: an empty env yields exactly the shipped defaults", () => {
   assert.deepEqual(loadCallTimeouts({}), DEFAULT_CALL_TIMEOUTS);
@@ -38,4 +39,16 @@ test("#43 loadCallTimeouts: a malformed/zero/negative override falls back to the
   const t = loadCallTimeouts({ BGW_PROXY_MAX_ATTEMPTS: "5", BGW_PROXY_NAV_TIMEOUT_MS: "nope" });
   assert.equal(t.proxyMaxAttempts, 5);
   assert.equal(t.proxyNavTimeoutMs, DEFAULT_CALL_TIMEOUTS.proxyNavTimeoutMs);
+});
+
+test("#43 deadlineBoundedTimeout: clamps a stage to the remaining time until the shared deadline (codex r5)", () => {
+  // Unbudgeted (no deadline) → raw timeout unchanged.
+  assert.equal(deadlineBoundedTimeout(25000, undefined, 1000, 1), 25000);
+  // Plenty of time left → the raw timeout wins (it's the smaller bound).
+  assert.equal(deadlineBoundedTimeout(25000, 100000, 1000, 1), 25000); // 99000 left, cap 25000
+  // Near the deadline → clamped to the remainder (this is the fix: nav+clearance can't each take the full budget).
+  assert.equal(deadlineBoundedTimeout(45000, 5000, 4000, 0), 1000); // only 1000ms left
+  // Past the deadline → the floor (nav floors at 1 to avoid Playwright's 0=infinite; clearance floors at 0).
+  assert.equal(deadlineBoundedTimeout(45000, 5000, 6000, 1), 1);
+  assert.equal(deadlineBoundedTimeout(45000, 5000, 6000, 0), 0);
 });

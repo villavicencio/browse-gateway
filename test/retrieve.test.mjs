@@ -662,11 +662,10 @@ function makeSlowGateway(result, delayMs) {
   return { gateway, calls };
 }
 
-test("#43: a proxied attempt clamps each stage to the budget WITHOUT starving clearance (codex r4)", async () => {
-  // With a 20s budget (< the 25s proxyNav default), a nav-first split would reserve all 20s for nav and leave
-  // clearanceBudget=0 — skipping challenge polling and failing a call with plenty of wall-clock left. Each
-  // stage is instead clamped to the remaining budget INDEPENDENTLY, so clearance (the work stage) keeps its
-  // full ~20s while nav keeps its fail-fast cap.
+test("#43: every render carries the shared per-call budget deadline (codex r5 — core bounds nav+clearance)", async () => {
+  // retrieve delegates the true nav+clearance bound to the core by passing ONE absolute deadline on each
+  // render (direct + proxied); the core clamps the goto + clearance poll to it (unit-tested via
+  // deadlineBoundedTimeout). Here we assert the wiring: the deadline is present and ~budget in the future.
   const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
   const { gateway, calls } = makeSlowGateway(block, 0);
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
@@ -674,12 +673,14 @@ test("#43: a proxied attempt clamps each stage to the budget WITHOUT starving cl
     token: "t",
     url: "https://hard.example/",
     escalation: { onDatacenterIp: true },
-    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 20000, proxyMaxAttempts: 1 },
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 30000, proxyMaxAttempts: 1 },
   });
-  const proxied = calls[1];
-  assert.ok(proxied.renderOpts?.clearanceTimeoutMs >= 15000, `clearance NOT starved (got ${proxied.renderOpts?.clearanceTimeoutMs})`);
-  assert.ok(proxied.renderOpts?.clearanceTimeoutMs < DEFAULT_CALL_TIMEOUTS.proxyClearanceTimeoutMs, "still clamped below the 45s default");
-  assert.ok(proxied.coreOverrides?.navigationTimeoutMs <= DEFAULT_CALL_TIMEOUTS.proxyNavTimeoutMs, "nav within its fail-fast cap");
+  for (const c of calls) {
+    assert.equal(typeof c.renderOpts?.budgetDeadlineMs, "number", "each render gets an absolute budget deadline");
+    assert.ok(c.renderOpts.budgetDeadlineMs > performance.now(), "the deadline is in the future");
+  }
+  // The proxied render keeps the RAW proxy clearance (45s) — the core clamps it to the deadline, not retrieve.
+  assert.equal(calls[1].renderOpts?.clearanceTimeoutMs, DEFAULT_CALL_TIMEOUTS.proxyClearanceTimeoutMs);
 });
 
 test("#43: the escalation loop stops at the global call budget with a typed timeout failure", async () => {

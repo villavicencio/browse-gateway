@@ -646,10 +646,14 @@ export async function retrieve(
   // global call budget. Defaults to the shipped values when the caller passes none, so behavior is unchanged.
   const timeouts = opts.timeouts ?? DEFAULT_CALL_TIMEOUTS;
   const renderOpts: RenderOptions = { clearedTextLength: MIN_CONTENT_LENGTH };
-  // #43: the DIRECT-attempt clearance is env-overridable (BGW_CLEARANCE_TIMEOUT_MS) AND clamped to the
-  // global budget (codex r2) so a small budget bounds the direct clearance stage too — not just the
-  // escalation loop; an explicit per-call opts.clearanceTimeoutMs is respected but still capped by the budget.
-  renderOpts.clearanceTimeoutMs = Math.min(opts.clearanceTimeoutMs ?? timeouts.clearanceTimeoutMs, timeouts.callBudgetMs);
+  // #43: the DIRECT-attempt clearance is env-overridable (BGW_CLEARANCE_TIMEOUT_MS).
+  renderOpts.clearanceTimeoutMs = opts.clearanceTimeoutMs ?? timeouts.clearanceTimeoutMs;
+  // #43 (codex r5): a single shared per-call DEADLINE (this render's start + the budget) bounds every render's
+  // navigation + clearance INSIDE the core, so the two sequential stages share ONE budget instead of each
+  // independently consuming the remaining allowance (which let a proxied attempt run ~2× its budget). Absolute
+  // (t0-relative), so the direct attempt AND each proxied attempt are bounded, later ones getting less as the
+  // deadline nears — a true nav+clearance ceiling without retrieve clamping the stages itself.
+  renderOpts.budgetDeadlineMs = t0 + timeouts.callBudgetMs;
   const proxy = proxyFromSecrets(secrets);
   const escalation: EscalationContext = {
     onDatacenterIp: opts.escalation?.onDatacenterIp ?? false,
@@ -724,17 +728,13 @@ export async function retrieve(
     for (let attempt = 1; attempt <= timeouts.proxyMaxAttempts; attempt++) {
       // #43: make callBudgetMs a TRUE outer wall-clock bound (codex r1). A pre-attempt check alone doesn't
       // bound it — an in-flight attempt (up to proxyNav + proxyClearance ≈ 70s on defaults) could start just
-      // under the deadline and finish far past it. So (a) stop once too little budget remains for a
-      // meaningful attempt (a decisive timeout), and (b) CLAMP each stage to the remaining budget so the loop
-      // can't stack. Each stage is capped at `remaining` INDEPENDENTLY — NOT nav-first-then-rest (codex r4):
-      // a nav-first split starved clearance when remaining < proxyNav (nav rarely uses its full budget, but
-      // reserving it left clearanceBudget=0), skipping challenge polling and failing calls that had plenty of
-      // wall-clock left. Clearance is the WORK stage, so it keeps its full share up to the budget; nav keeps
-      // its fail-fast cap. RESIDUAL (documented follow-up): a pathologically-slow nav + a full clearance
-      // could still sum past `remaining` by up to one attempt — a tight per-attempt bound needs a single
-      // core-level deadline allocating nav+clearance dynamically (the AbortSignal follow-up, same as the
-      // whole-op ceiling), not two static stage timeouts. clearanceTimeoutMs=0 is a no-op poll (a while-loop,
-      // not a Playwright timeout), so a fully-consumed clearance skips the wait rather than hanging.
+      // under the deadline and finish far past it. So: stop once too little budget remains for a meaningful
+      // attempt (a decisive timeout), and let the shared per-call DEADLINE on `proxiedRenderOpts` bound each
+      // attempt's nav + clearance INSIDE the core (codex r5) — the two sequential stages share one budget, so
+      // the loop can't stack toward ~200s. RESIDUAL (documented follow-up): the session's launch / guard /
+      // snapshot / teardown overhead around `render()` — and a HUNG launch (#54) — still fall outside the
+      // deadline; a hard whole-operation ceiling needs cooperative cancellation (AbortSignal) around the whole
+      // session attempt, a larger change than #43.
       const remaining = timeouts.callBudgetMs - (performance.now() - t0);
       if (remaining <= MIN_ATTEMPT_BUDGET_MS) {
         budgetExceeded = true;
@@ -747,12 +747,10 @@ export async function retrieve(
       proxyAttempts = attempt;
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
       const attempt0 = performance.now();
-      const navBudget = Math.min(timeouts.proxyNavTimeoutMs, remaining);
-      const clearanceBudget = Math.min(proxiedRenderOpts.clearanceTimeoutMs ?? timeouts.proxyClearanceTimeoutMs, remaining);
       render = await gateway.withConsumerSession(
         token,
-        (s) => s.core.render(url, { ...proxiedRenderOpts, clearanceTimeoutMs: clearanceBudget }),
-        { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: navBudget },
+        (s) => s.core.render(url, proxiedRenderOpts),
+        { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: timeouts.proxyNavTimeoutMs },
       );
       attemptMs.push(performance.now() - attempt0);
       // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a dead exit that
