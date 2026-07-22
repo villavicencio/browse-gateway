@@ -1385,9 +1385,14 @@ export class PatchrightBrowserCore implements BrowserCore {
     // #66 (codex r1): record the swallowed DCL-wait timeout — a committed-but-never-DCL'd document after a
     // NON-timeout goto abort leaves this as the ONLY truncation evidence (gotoTimedOut is false there, and
     // the poll below can settle immediately on the thin, unblocked transitional page). navigate() folds it
-    // into the deadlineTruncated derivation; the action path ignores it.
+    // into the deadlineTruncated derivation; the action path ignores it. r2: TIMEOUT rejections only (the
+    // same discrimination as the goto catch) — a page-close/frame-detach rejection is a session failure,
+    // not a truncation, and must keep its own story (null status / a thrown snapshot), never a retryable
+    // `timeout`. Still swallowed either way (parity with the pre-#66 catch).
     let dclTimedOut = false;
-    await page.waitForLoadState("domcontentloaded", { timeout: dclTimeout }).catch(() => { dclTimedOut = true; });
+    await page.waitForLoadState("domcontentloaded", { timeout: dclTimeout }).catch((err) => {
+      dclTimedOut = err instanceof Error && err.name === "TimeoutError";
+    });
     const domContentLoadedMs = performance.now() - dcl0;
     // #42: clearancePollMs is the WALL-CLOCK of the poll loop, not the sleep-interval counter — each
     // pollSignal round-trip (title + innerText evaluate) costs real time in the capped container, so a
