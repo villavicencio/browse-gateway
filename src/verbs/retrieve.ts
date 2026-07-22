@@ -670,9 +670,11 @@ export async function retrieve(
   //    `captchaSolved` therefore stays false in production. (Removing `opts.solver` + `captchaSolved`
   //    outright is a follow-up — it changes retrieve's result contract + the mcp surface.)
   let solveAttemptReason: CaptchaSolveReason | undefined;
+  let solveAttemptKind: CaptchaKind | undefined;
   if (render && opts.solver) {
     const captcha = detectCaptcha(render, url);
     if (captcha) {
+      solveAttemptKind = captcha.kind; // bind the reason to the kind actually attempted (codex #44 r5)
       try {
         await opts.solver.solve(captcha);
         captchaSolved = true;
@@ -853,8 +855,14 @@ export async function retrieve(
   //      no accurate closed-vocab code exists for "detected but un-probeable", so it stays unset.
   const captchaDetected = signal.captchaKind !== undefined;
   const solverEligible = captchaDetected ? isSolvableCaptchaKind(signal.captchaKind as CaptchaKind) : undefined;
+  // Adopt the solve's typed failure ONLY when the kind it attempted matches the finally-CLASSIFIED widget
+  // (codex #44 r5): detectCaptcha (solve) and activeCaptchaKind (classification) can disagree on a page with
+  // a preloaded library beside a different active widget, which would otherwise attach kind-A's failure to a
+  // kind-B envelope.
+  const attemptReason =
+    solveAttemptReason !== undefined && solveAttemptKind === signal.captchaKind ? solveAttemptReason : undefined;
   const captchaSolveReason: CaptchaSolveReason | undefined =
-    failed && captchaDetected ? (solveAttemptReason ?? (opts.solver ? undefined : "not-configured")) : undefined;
+    failed && captchaDetected ? (attemptReason ?? (opts.solver ? undefined : "not-configured")) : undefined;
   // #42: assemble ONE Timing — the whole-call totalMs over the final render's core stages — and use it for
   // BOTH the result field and (on a failure) the folded envelope, so they can never disagree (single
   // derivation). render.timing carries the surfaced render's domContentLoaded/clearancePoll/snapshot; its

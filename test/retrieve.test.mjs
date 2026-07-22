@@ -445,6 +445,24 @@ test("#44: retrieve with a SUPPLIED solver that FAILS reports the typed code, no
   assert.equal(r.diagnostics?.captchaSolveReason, "vendor-error", "the supplied solver's typed code is surfaced");
 });
 
+test("#44: a solve failure on a DIFFERENT kind than the classified widget is NOT attached (codex r5)", async () => {
+  // detectCaptcha matches the preloaded hCaptcha LIBRARY (so the solve attempts hcaptcha), but
+  // activeCaptchaKind classifies the ACTIVE g-recaptcha container. The hcaptcha failure must NOT ride a
+  // reCAPTCHA envelope — the reason attaches only when the attempted kind matches the classified widget.
+  const mixed = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<script src="https://hcaptcha.com/1/api.js"></script><div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([mixed]);
+  const solver = { async solve() { const e = new Error("boom"); e.code = "vendor-error"; throw e; } };
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/", solver });
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.solverEligible, true, "the classified reCAPTCHA is solvable");
+  assert.notEqual(r.diagnostics?.captchaSolveReason, "vendor-error", "the hCaptcha-attempt failure must not attach to the reCAPTCHA envelope");
+  assert.equal(r.diagnostics?.captchaSolveReason, undefined, "kind mismatch → reason dropped");
+});
+
 test("#44: a stale direct-render solve reason is NOT attached after escalation replaces the render (codex r4)", async () => {
   // opts.solver FAILS on the DIRECT captcha render, then escalation replaces `render` with proxied ones. The
   // direct render's code must NOT ride the final envelope — it never described the surfaced (proxied) page.

@@ -20,6 +20,7 @@ import {
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
   type CaptchaSolveReason,
+  type CaptchaKind,
   type LiveCaptcha,
 } from "./captcha.js";
 import {
@@ -515,8 +516,12 @@ export class PatchrightBrowserCore implements BrowserCore {
    * {@link #settle}, but the snapshot is a separate core call). Cleared on read, so a later snapshot never
    * inherits a stale attempt's reason; a pre-attempt why-not (`not-configured` / `unsupported-kind`) is
    * derived in #snapshotOf instead when no attempt was made.
+   *
+   * The attempted widget's KIND rides with the reason (codex #44 r5): the page can navigate/rotate its
+   * CAPTCHA while a solve is pending, so #snapshotOf only adopts the reason when the stashed kind still
+   * matches the kind in the FINAL HTML — otherwise it would report challenge A's failure against challenge B.
    */
-  #pendingSolveReason?: CaptchaSolveReason;
+  #pendingSolveOutcome?: { reason: CaptchaSolveReason; kind: CaptchaKind };
 
   private constructor(
     context: PatchrightContext,
@@ -1322,7 +1327,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       // classifies it; an already-solved / solvable-now / absent widget yields undefined (no failure).
       const live = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
       const reason = preAttemptSolveReason(live);
-      if (reason) this.#pendingSolveReason = reason;
+      if (reason && live) this.#pendingSolveOutcome = { reason, kind: live.kind };
       return { replay: false, ...(reason ? { solveReason: reason } : {}) };
     }
     // #42: measure the solver wall-clock from here (a widget IS present, so a solve is being attempted).
@@ -1343,10 +1348,11 @@ export class PatchrightBrowserCore implements BrowserCore {
         : "error";
       process.stderr.write(`[browse-gateway] captcha solve failed (${errCode(code, this.#redact)}); page left challenged\n`);
       // #44: surface the typed code instead of DISCARDING it to stderr only. It's a closed-vocabulary,
-      // secret-free marker (never the API key; a sitekey is public) — stashed for the next #snapshotOf to
-      // fold into the page snapshot, and returned so #settle can bubble it. `error` covers an unrecognized
-      // code from a custom solver (already allowlist-collapsed above), so nothing opaque escapes.
-      this.#pendingSolveReason = code;
+      // secret-free marker (never the API key; a sitekey is public) — stashed WITH the attempted challenge's
+      // kind (codex r5) so the next #snapshotOf adopts it only if the final HTML still shows that kind (a page
+      // can rotate its CAPTCHA mid-solve), and returned so #settle can bubble it. `error` covers an
+      // unrecognized code from a custom solver (already allowlist-collapsed above), so nothing opaque escapes.
+      this.#pendingSolveOutcome = { reason: code, kind: challenge.kind };
       return { replay: false, captchaSolveMs: performance.now() - solve0, solveReason: code };
     }
     const captchaSolveMs = performance.now() - solve0;
@@ -1415,8 +1421,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // else a pre-attempt why-not derived from the kind — `not-configured` (no solver wired) or
     // `unsupported-kind` (the widget kind isn't solvable). Consume-once: clear the stash so a later bare
     // snapshot() can't inherit a stale attempt's reason. Both are set only when a CAPTCHA is present.
-    const attemptReason = this.#pendingSolveReason;
-    this.#pendingSolveReason = undefined;
+    // The stashed reason is adopted ONLY when its attempted kind still matches the kind in THIS final HTML
+    // (codex r5) — a page that rotated its CAPTCHA mid-solve must not report challenge A's failure on B.
+    const solveOutcome = this.#pendingSolveOutcome;
+    this.#pendingSolveOutcome = undefined;
+    const attemptReason = solveOutcome && solveOutcome.kind === captchaKind ? solveOutcome.reason : undefined;
     const solverEligible = captchaKind ? isSolvableCaptchaKind(captchaKind) : undefined;
     const captchaSolveReason = resolveCaptchaSolveReason({
       captchaKind,
