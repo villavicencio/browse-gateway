@@ -789,8 +789,11 @@ export async function retrieve(
   // #43 (codex r1/r6): flag a timeout whenever the WHOLE call consumed the budget — the escalation loop
   // exhausting attempts right at the deadline (r1) OR a direct-only render (no proxy / off-datacenter) that
   // ran the budget out (r6) — so a still-failing result that spent the budget is classified `timeout`, not
-  // the incidental block/nav class. Checked here after render is finalized, covering direct + proxied + fallback.
-  if (!budgetExceeded && performance.now() - t0 >= timeouts.callBudgetMs) budgetExceeded = true;
+  // the incidental block/nav class. Covers direct + proxied + fallback. RE-checked once more AFTER the
+  // CPU-heavy extraction below (codex r7), since parsing/scanning a multi-MB blocked DOM can itself push a
+  // just-under-deadline render over budget.
+  const overBudget = (): boolean => performance.now() - t0 >= timeouts.callBudgetMs;
+  if (!budgetExceeded && overBudget()) budgetExceeded = true;
   const extraction = extractMarkdown(render.html, url);
   const cfHint = hasCloudflareHint(render.html);
   const pxHint = hasPerimeterXHint(render.html);
@@ -856,6 +859,9 @@ export async function retrieve(
   // attributes only when the block is otherwise generic (so a WAF page that merely preloads a captcha
   // library isn't mislabeled; codex #40 r2). Surfaced so a caller sees WHY a page failed rather than a
   // silent "blocked". `null` when the page is not blocked.
+  // #43 (codex r7): re-check the budget AFTER the CPU-heavy extraction/scanning above — a huge blocked DOM can
+  // finish parsing seconds over budget, and a timeout must win over the incidental block class it derives from.
+  if (!budgetExceeded && overBudget()) budgetExceeded = true;
   // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
   // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /
   // hard-block the last attempt happened to land on. The typed `timeout` failureClass carries the detail.

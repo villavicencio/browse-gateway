@@ -20,15 +20,18 @@ import { parseHostSuffixList } from "../security/index.js";
  * through it now would be immediately churned. Its env-timeout consumption lands with #45.
  */
 export interface CallTimeouts {
-  /** Global per-call wall-clock budget (BGW_CALL_BUDGET_MS). The retrieve escalation loop stops re-rolling
-   *  and returns a decisive typed `timeout` once exceeded, and each attempt's nav + clearance are CLAMPED to
-   *  the remaining budget, so the dominant "why 200s" stacking (`attempts × (nav + clearance)`) is bounded.
-   *  SCOPED (documented #43 follow-up): this is not yet a HARD whole-operation ceiling — a session's launch /
-   *  guard-install / snapshot / teardown overhead and the direct attempt's own navigation happen inside
-   *  `withConsumerSession` / the core, outside these stage timeouts. Bounding those (and a hung launch — see
-   *  #54) needs a core-level deadline / cooperative cancellation (AbortSignal threaded gateway→core→browser),
-   *  a larger change than #43's stage-clamping. The env-overridable per-stage timeouts below are the complete,
-   *  direct lever for tightening each stage today. */
+  /** Global per-call wall-clock budget (BGW_CALL_BUDGET_MS). The retrieve escalation loop stops re-rolling and
+   *  returns a decisive typed `timeout` once exceeded; the budget rides into the core as ONE absolute deadline
+   *  per render, which bounds the goto AND the clearance poll (a wall-clock loop, sleep-clamped) to it — so the
+   *  dominant "why 200s" stacking (`attempts × (nav + clearance)`) is bounded on every attempt (direct +
+   *  proxied), and a budget-exhausted still-failing result classifies `timeout`.
+   *  SCOPED (documented #43 follow-up): NOT a perfect whole-operation ceiling. Individual unbounded steps —
+   *  a `pollSignal` CDP round-trip, the final snapshot, `extractMarkdown` on a multi-MB DOM, and a session's
+   *  launch / guard-install / teardown (and a HUNG launch — #54) — each run their OWN duration, so a call can
+   *  finish modestly past the budget. Cancelling an in-flight CDP call / CPU parse to hit an exact ceiling
+   *  needs cooperative cancellation (a top-level Promise.race / AbortSignal threaded gateway→core→browser), a
+   *  larger change than #43's deadline-clamping. The env-overridable per-stage timeouts below are the direct
+   *  lever for tightening each stage today. */
   callBudgetMs: number;
   /** Direct-attempt clearance budget (BGW_CLEARANCE_TIMEOUT_MS). */
   clearanceTimeoutMs: number;

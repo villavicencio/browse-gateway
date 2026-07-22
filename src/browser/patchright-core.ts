@@ -756,19 +756,20 @@ export class PatchrightBrowserCore implements BrowserCore {
       // renders keep the raw clearanceTimeoutMs.
       let signal = await pollSignal(page);
       let waited = 0;
-      // #43 (codex r6): bound the poll by the WALL-CLOCK deadline, not only the synthetic `waited` counter — a
-      // pollSignal CDP read has real latency and pollIntervalMs may not divide the remaining budget, so the
-      // counter under-counts elapsed and the loop overruns. Break when the deadline passes and clamp the sleep
-      // so it can't overshoot. `waited` still tracks sleep-interval time for clearanceWaitedMs (kill-gate reads it).
+      // #43 (codex r6/r7): bound the poll by WALL-CLOCK, not just the synthetic `waited` counter. Each sleep is
+      // the smaller of the poll interval, the remaining STAGE budget (clearanceTimeoutMs − waited — so a small
+      // BGW_CLEARANCE_TIMEOUT_MS isn't overshot by ~a poll interval), and the remaining GLOBAL budget; `waited`
+      // accrues the ACTUAL sleep. After sleeping, skip the next pollSignal if the deadline passed — its
+      // title()/evaluate() CDP calls are themselves unbounded. RESIDUAL (documented): pollSignal / snapshot /
+      // extraction each still run their OWN (bounded-but-nonzero) duration past the deadline; a hard ceiling
+      // that cancels an in-flight CDP call needs a top-level Promise.race / AbortSignal (the whole-op follow-up).
       while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceTimeoutMs) {
-        if (opts.budgetDeadlineMs !== undefined) {
-          const left = opts.budgetDeadlineMs - performance.now();
-          if (left <= 0) break;
-          await page.waitForTimeout(Math.min(pollIntervalMs, left));
-        } else {
-          await page.waitForTimeout(pollIntervalMs);
-        }
-        waited += pollIntervalMs;
+        const budgetLeft = opts.budgetDeadlineMs !== undefined ? opts.budgetDeadlineMs - performance.now() : Infinity;
+        const sleepMs = Math.min(pollIntervalMs, clearanceTimeoutMs - waited, budgetLeft);
+        if (sleepMs <= 0) break;
+        await page.waitForTimeout(sleepMs);
+        waited += sleepMs;
+        if (opts.budgetDeadlineMs !== undefined && performance.now() >= opts.budgetDeadlineMs) break;
         signal = await pollSignal(page);
       }
       const clearancePollMs = performance.now() - poll0;
