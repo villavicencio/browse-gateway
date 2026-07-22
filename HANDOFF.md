@@ -1,105 +1,119 @@
-# HANDOFF — 2026-07-22, early afternoon
+# HANDOFF — 2026-07-22, afternoon
 
-Session arc: `/pickup` → built **#48 (silent home-fallback detector)** end-to-end (understand-workflow →
-implement → 4-round Codex loop → merge) → **ran the batched in-container gate → deployed to prod**. #48 is
-now **live**. colima stopped at session end. Tree clean, no open PRs, main == prod.
+Session arc: `/pickup` → operator asked **"what can you work on simultaneously off the remaining list?"** →
+ran a **parallelization-analysis workflow** (scope every open work-item + conflict matrix) → executed the
+**first simultaneous batch (wave 1) end-to-end** in parallel worktrees: **#21 closed**, **#67 merged**,
+**#54 Part 1 merged** (5-round Codex loop). Both merged fixes are **on main but NOT deployed** — operator
+chose to stop before the gate/deploy. Tree clean, no open PRs, main == `32c7cf4`. colima still stopped.
 
-## What We Built
+## What We Built (wave 1 — all landed)
 
-- **#48 — silent home-fallback detector — MERGED (`1ce789c`, PR #68) + GATED + DEPLOYED (prod `sha256:edb1e576`).**
-  A deep link (non-root path / query) that silently lands on the site's **bare root** is flagged so a caller
-  can tell a real zero-result from lost location/query state. A 6-reader understand-workflow found #48 was
-  *pre-wired* (reserved `FailureDiagnostics.homeFallback` slot, reserved `'ok'` FailureClass, `sanitizeUrl`
-  preserving root-vs-deep).
-  - **One shared pure predicate** `isHomeFallback(requestedUrl, finalUrl)` beside `isDeadExit`. Fires iff:
-    same-host (via `canonicalizeHost`), landing is a **bare root** (root path, no fragment, no intent-bearing
-    non-tracking query), AND the request carried intent now gone (deep path — index files root-equivalent —
-    or a non-tracking query key). Positive-signal-only, on RAW urls pre-redaction.
-  - **Orthogonal EVIDENCE, not a FailureClass** (preserves the #40 one-reason invariant). **One derivation,
-    three carriers:** top-level `RetrieveResult.homeFallback` (the SUCCESS shape — a fat homepage has no
-    envelope) + the pre-declared `FailureDiagnostics.homeFallback` slot on failures + a non-fatal
-    `PageSnapshot.homeFallback` drive annotation (shared detector, differentiated disposition — a homepage is
-    a returnable snapshot, never a drive failure). MCP success surfaces it via `structuredContent` (markdown
-    stays pure). Files: `verbs/retrieve.ts` (predicate+seam+field), `verbs/index.ts`,
-    `observability/failure-diagnostics.ts`, `browser/types.ts`, `mcp/drive-controller.ts`, `mcp/server.ts`.
-  - **778 tests, 0 TS errors** (`test/home-fallback.test.mjs` 18 + 5 `mcp-surface.test.mjs` client-boundary).
-    Learning: `docs/solutions/architecture-patterns/derived-evidence-boolean-carries-both-success-and-failure-shapes.md`.
-  - **HELD (operator HOLD #2):** the location-context primitive (postal/store pre-seed + selected-store in
-    snapshot) — NOT built. Issue #48 left OPEN with a status comment; only the detector half shipped.
+- **#21 — verify-and-close. CLOSED as shipped.** A verify pass confirmed all six ACs (egress-verify probe,
+  structured EscalationDiagnostics/proxyDiagnostic, `BGW_FORCE_PROXY_HOSTS`+`{forceProxy}`, 8-char IPRoyal
+  sticky-id, secret redaction, tests) are implemented + deployed (PR #23 + #24/#25/#37). The commenter's
+  "hold-served vs 403-pre-challenge" reason-split is **already realized** as `perimeterx-challenge` vs
+  `hard-block` (distinct union members, pxHint-before-hard-block precedence, tested) — not re-implemented.
+  Close-out comment posted; no code change.
 
-- **Gated + deployed #48.** Full batched in-container gate on the #48 amd64 image PASS (see Gotchas for the
-  exact commands): validate-stealth (CF 1/1 udemy, DataDome 1/1 seloger via IPRoyal ATTEMPTS=1/REQUIRED=1;
-  webrtc/webgl/secret-leak/negative-control) + validate-drive + failure-envelope + retrieve + call-budget.
-  Deploy `deploy-http.yml` run `29952128663`: on-host validate-http gate → pre-swap smoke → swap → verify OK,
-  no rollback.
+- **#67 — receipt-key `isDeadExit` — MERGED (`e27497b`, PR #69), Codex-clean in 1 round.** Diagnostic-only
+  label precision (a #45 residual). `render()` (patchright-core.ts) now registers a `page.on("response")`
+  main-frame receipt (`responseReceived`) BEFORE goto, tracked **separately from `status`**. `isDeadExit` is
+  re-keyed `(responseReceived, status, finalUrl)` — a proxied exit that RESPONDED but timed out before DCL is
+  status-null yet `responseReceived`, so `burnedExit` no longer over-fires and discards the site's WAF
+  attribution. **Hard constraint honored:** `status` is never reassigned in the catch; the success-gate
+  `deadNav`/`navFailed` stay status-keyed (the #45 r10 lock). Files: `browser/patchright-core.ts`,
+  `browser/types.ts` (RenderResult + PageSnapshot `responseReceived?`), `verbs/retrieve.ts`,
+  `mcp/drive-controller.ts`, `test/burned-exit.test.mjs`. **779 tests, 0 TS errors.**
 
-- **Prior this session (all deployed, detail in [[site-compat-hardening-epic]] memory + git):** gated+deployed
-  the overnight #42-batch (#47/#58/#44/#43, prod `2258db74`) and reshaped/merged/gated/deployed #45
-  (burned-exit + bounded drive loop, prod `0aa02c94`, 11-round Codex loop).
+- **#54 PART 1 — bound the acquire-side launch — MERGED (`32c7cf4`, PR #70), Codex-clean after 4 fix rounds.**
+  A never-resolving `launchPersistentContext` used to pin its `#reserved` slot forever (the reaper only scans
+  `#sessions`). Now `#launchAndRegister` races the factory launch against `LAUNCH_DEADLINE_MS` (120s, not
+  env-overridable per #43; test override `launchDeadlineMs`); on timeout it fails `CORE_LAUNCH` and acquire's
+  existing `finally` releases the slot (no double-decrement). A **late-resolving** core is closed best-effort
+  (fire-and-forget, anchorless — an unconfirmed close → `#unconfirmed` + reaper retry). A synchronously-throwing
+  factory is normalized to `CORE_LAUNCH`. Files: `gateway/session-manager.ts`, `gateway/index.ts`
+  (export `LAUNCH_DEADLINE_MS`), `test/gateway-session.test.mjs` (+ regression tests). **783 tests, 0 TS errors.**
+  - **#54 stays OPEN for Part 2 (operator HOLD #4):** reaping the never-returning half-spawned Chromium (no
+    core → no PID for #50's post-resolve capture; the userDataDir-sweep needs a gateway-owned `mkdtemp` dir),
+    AND **counting a live late-resolve orphan against the running capacity cap** (registering it can push
+    `activeCount` above `maxSessions` when a replacement took the freed slot — needs Part 2's holistic reaping
+    model, not a Part-1 special-case). Both scoped OUT of Part 1 as the orchestrator's deliberate line.
 
 ## Decisions Made
 
-- **#48 complete surface over envelope-only (you chose via AskUserQuestion).** A fat-homepage fallback is a
-  SUCCESS shape with no failure envelope, so the pre-declared slot alone would miss it → added the top-level
-  `RetrieveResult.homeFallback` (+ `PageSnapshot.homeFallback` for drive) as the success-shaped carrier.
-- **home-fallback is derived EVIDENCE, never a FailureClass** — preserves #40 one-reason; mirrors burned-exit's
-  evidence half, skips its class half. No WAF vendor, never nulls the reason. **Do not relitigate.**
-- **Shared detector, differentiated disposition** — retrieve surfaces an outcome flag; drive annotates the
-  returned snapshot and returns (a homepage is returnable). Same allowed asymmetry as the content-family classes.
-- **No config knob** — ships always-on like #40/#41/#42/#45 (a pure derived diagnostic, nothing to tune).
-- **Deploy `latest` verified == the #48 digest** before dispatch (a prior handoff-doc push also ran CI/build-image,
-  so I confirmed `imagetools inspect latest` == `sha256:edb1e576` == the `1ce789c` tag, not the earlier commit).
+- **Answered "what can run simultaneously" with a real conflict matrix, not a guess.** A workflow scoped each
+  open work-item's file footprint. **One HARD conflict: #66↔#67** (same patchright-core goto try/catch + a
+  near-identical new PageSnapshot field + a circular dep) → serialize, **#67 first** (its receipt is the
+  unified signal #66 reuses). Everything else is soft (shared hot files, disjoint regions). **Waves:** W1 =
+  {#67, #54, #21}; W2 = {#66, #53}; W3 = {#48}. Ready-now (no HOLD): #67, #66, #21. HOLD-gated: #48 (#2),
+  #53 (#3), #54 (#4).
+- **Ran wave 1 in 3 parallel isolated worktrees** (Workflow `isolation: 'worktree'`, node_modules symlinked
+  from the primary), then reviewed each diff myself + drove the Codex loop per branch + merged. Worked well.
+- **#54 late-orphan accounting → Part 2, not chased in Part 1.** Codex rounds r2/r3 pulled in opposite
+  directions (count-it vs don't-exceed-cap); the root is that the late-orphan's capacity accounting IS the
+  orphan-reaping surface HOLD #4 gates. Drew the scope line there (per the codex-loop SOP: fix in-scope,
+  document scoped-out) rather than a 6th round.
+- **Stopped before gate/deploy (operator choice).** Both fixes merged-but-undeployed by design.
 
-## What Didn't Work
+## What the Codex loop caught on #54 (5 rounds — all genuine, each round SIMPLIFIED the code)
 
-- **My own test data used a bare `?utm=ad`** — `utm` (bare) is NOT a tracking key (real ones are `utm_source`,
-  `utm_medium`, …), so under the corrected stricter predicate a non-tracking landed query correctly means
-  "not a bare root". Two tests failed; fixed the data to `utm_source=ad`. (The logic was right; the fixture was wrong.)
-- **The URL predicate is a false-positive treadmill** — each of the 4 Codex rounds surfaced a genuine new URL
-  edge (tracking params → index files → landed hash-router fragments → path→query moves + trailing-dot host).
-  The round-3 **reformulation to "landing is a bare root ∧ request carried intent now gone"** was more principled
-  and subsumed several ad-hoc branches — that's what finally converged it. Lesson: for URL heuristics, find the
-  invariant, don't accrete special-cases.
+- **r1:** a late-resolving launch leaked an untracked browser (my own pre-flag); a SYNC-throwing factory
+  rejected raw instead of `CORE_LAUNCH` (call moved outside the `try`). Fixed both.
+- **r2:** my `git add -A` tracked the machine-local `node_modules` **symlink** (`.gitignore`'s `node_modules/`
+  with a trailing slash does NOT match a symlink). Untracked it. **Lesson: stage specific paths in worktrees,
+  never `add -A`.**
+- **r3:** r2's "register the late core in `#sessions` to count it" pushed `activeCount` ABOVE `maxSessions`
+  when a replacement had taken the freed slot → reverted to anchorless best-effort; the accounting → Part 2.
+  Also a shutdown drain race.
+- **r4 (the real find):** my shutdown-side `launchDrain` bound could truncate a shutdown-orphan teardown that
+  had ALREADY started (a launch resolving near the bound), so `process.exit(0)` left detached Chrome alive.
+  Root: the bound was **redundant** — `#launchAndRegister`'s internal deadline already bounds every
+  `#launching` entry. Removed it; shutdown now awaits launches to completion (bounded internally, no truncation).
+- **r5: clean.**
 
 ## What's Next
 
-1. **Continue the spine: `#53 → #54`.** **#53** conservative authed-MCP status slice (operator HOLD #3 — auth
-   posture). **#54** slot-release + orphan-Chromium reap (operator HOLD #4). Both are HOLDs — need your sign-off
-   before starting.
-2. **#48 location-context primitive** (operator HOLD #2) — the held second half of #48; #48 stays OPEN for it.
-3. **#45 follow-ups (filed, deferred):** **#66** — a budget-truncated drive `goto` (headers before DCL) can pin
-   a partial-200 as *success* not *timeout*; naive fix breaks CF-clearance, needs a `deadlineTruncated` snapshot
-   signal gate-validated against the real CF path. **#67** — a responded-but-slow-DCL exit records status-null →
-   burned-exit may over-fire (diagnostic-only); needs response-receipt tracked separately from `status`.
-4. **Older tracked:** #44 Turnstile precedence (HOLD #1); 3 gate-hardening follow-ups (#58 drive-action vendor
-   assertion, #44 fake-solver+fixture, #47 `/health` into validate-http). #48 minor deferrals (www↔apex,
-   requested hash-router links, query value-drop, drive-failure envelope slot) — documented in the solution doc.
+1. **Gate + deploy the wave-1 batch (pending, operator-paused).** Prod is still on #48 `sha256:edb1e576`; main
+   has #67+#54 undeployed. Run the **batched in-container gate** (recipe below) on the built amd64 image, then
+   `gh workflow run deploy-http.yml -f image_tag=latest`. Optionally fold in **#66** first so it's one gate/deploy.
+2. **Wave 2 — #66 (READY, now unblocked).** #67's receipt is merged, so #66 (budget-truncated drive `goto`
+   pinning a partial-200 as success) can reuse it: in `patchright-core` `navigate()`/`#ensureActivePage`, add a
+   `#lastMainFrameResponseReceived` boolean alongside `#lastDocStatus` and set `responseReceived` on the
+   navigate() PageSnapshot — the two drive `isDeadExit` call sites then pick up the real receipt automatically
+   (they use a `status` fallback today). Add a `deadlineTruncated` snapshot signal so a goto-threw-but-not-
+   isCleared render maps to the timeout FailureClass; **must be gate-validated against the real CF 403→200 path**
+   (naive "force status null on any goto-throw" is forbidden — CF clearance relies on goto throwing then settling).
+3. **HOLD-gated (need operator sign-off before starting):**
+   - **#54 Part 2** (HOLD #4) — orphan reap + late-orphan cap accounting (see above).
+   - **#53** (HOLD #3) — health surface to `obscura status`; the auth-posture fork is the HOLD (all consumers
+     are peers today; exposing pool internals on `/health` means any consumer token sees degradation counters).
+   - **#48 location primitive** (HOLD #2) — the design decision (reusable primitive vs per-site scraper) IS
+     the HOLD; there's no site-agnostic "selected store" DOM signal.
+   - **#44** Turnstile precedence (HOLD #1).
 
 ## Gotchas & Watch-outs
 
-- **Prod state:** `sha256:edb1e576022f…` (git `1ce789c` = #48). Rollback anchor: `sha256:0aa02c94…`
-  (git `7fba0b9` = #45). main == prod (nothing undeployed). Deploy run `29952128663`.
-- **colima is STOPPED** (`colima start` — or the standard `colima start --vm-type vz --vz-rosetta` — before the
-  next gate). The gate env-file is ephemeral (session scratchpad, gone); regenerate from `.env.spike`.
-- **EXACT batched-gate recipe (reconstructed + run this session — reuse it, don't rediscover):**
-  1. CI `build-image` (on main push) builds+pushes `ghcr.io/villavicencio/browse-gateway:latest` (amd64).
-     Verify `latest` == the intended commit: `docker buildx imagetools inspect …:latest --format '{{.Manifest.Digest}}'`
-     vs `…:<shortsha>` (a concurrent handoff-doc push can also move `latest`). `gh auth token | docker login ghcr.io -u <user> --password-stdin` if inspect 403s.
-  2. `docker pull --platform linux/amd64 …@sha256:<digest>`.
-  3. `set -a; . ./.env.spike; set +a` then run each leg in-container: `docker run --rm --init --platform
-     linux/amd64 --shm-size 1gb -e BGW_ATTEMPTS=1 -e BGW_REQUIRED=1 -e BGW_NO_SANDBOX=1 -e BGW_CHANNEL=chrome
-     -e BGW_PROXY_URL="$SPIKE_PROXY_URL" -e BGW_PROXY_USERNAME="$SPIKE_PROXY_USERNAME" -e
-     BGW_PROXY_PASSWORD="$SPIKE_PROXY_PASSWORD" <img> node scripts/validate-stealth.mjs`. The image ENTRYPOINT
-     provisions Xvfb then execs the command (default CMD IS validate-stealth); `--init` reaps Chrome. Free stack:
-     swap the final arg for `scripts/validate-{drive,failure-envelope,retrieve,call-budget}.mjs` (default target
-     udemy CF, clears from the Mac's residential IP with no proxy spend). **Stream `run_in_background:true`, NO
-     `| tail`** (xvfb/pipe buffering — a wedged container shows nothing). `BGW_ATTEMPTS=1` alone false-fails; it
-     NEEDS `BGW_REQUIRED=1` too.
-  4. Deploy: `gh workflow run deploy-http.yml -f image_tag=latest` (resolves latest→digest, tailnet, on-host
-     validate-http gate → pre-swap smoke → swap → verify → rollback-on-failure). Watch the run to `completed`.
-- **Codex runner:** `codex exec review --base main`, `run_in_background:true`; strip rmcp/models_manager noise,
-  parse the final `codex` text block. Commit and launch codex in SEPARATE calls (chaining `commit && codex` in
-  one backgrounded call risks the task being killed).
-- **A `homeFallback`/`wafVendor`/`failureClass`/`timing`/`burnedExit` value can be occasionally-imprecise** on
-  exotic/slow-DCL/teardown/URL edges — all are **diagnostics, never behavior/security decisions**.
+- **Prod state:** `sha256:edb1e576…` (git `1ce789c` = #48). **main is AHEAD of prod** by #67+#54 (undeployed).
+  Rollback anchor: `sha256:0aa02c94…` (git `7fba0b9` = #45). Last prod deploy run: `29952128663`.
+- **colima is STOPPED** — `colima start --vm-type vz --vz-rosetta` before the gate. Gate env-file is ephemeral;
+  regenerate from `.env.spike`.
+- **EXACT batched-gate recipe (unchanged — reuse, don't rediscover):** CI `build-image` on main push builds+pushes
+  `…:latest` (amd64) — verify `latest` == intended commit via `docker buildx imagetools inspect …:latest
+  --format '{{.Manifest.Digest}}'`. Pull `@sha256:<digest>`. `set -a; . ./.env.spike; set +a`, then per-leg:
+  `docker run --rm --init --platform linux/amd64 --shm-size 1gb -e BGW_ATTEMPTS=1 -e BGW_REQUIRED=1
+  -e BGW_NO_SANDBOX=1 -e BGW_CHANNEL=chrome -e BGW_PROXY_URL/USERNAME/PASSWORD="$SPIKE_*" <img>
+  node scripts/validate-{stealth,drive,failure-envelope,retrieve,call-budget}.mjs`. Stream
+  `run_in_background:true`, **NO `| tail`** (xvfb/pipe buffering wedges silently). `BGW_ATTEMPTS=1` alone
+  false-FAILS — needs `BGW_REQUIRED=1`. Free legs (drive/failure-envelope/retrieve/call-budget) hit udemy CF
+  from the Mac's residential IP, no proxy spend.
+- **Codex runner:** `codex exec -C <dir> review --base main` (the `-C/--cd` flag goes on `codex exec`, NOT on
+  the `review` subcommand — `review -C` errors). `run_in_background:true`; strip rmcp/models_manager noise;
+  parse the final `codex` text block. Commit and launch codex in SEPARATE calls. Codex's sandbox EPERMs the
+  HTTP `listen` tests — those "failures" in its output are NOT real (verify locally).
+- **Parallel-worktree hygiene:** symlink node_modules from the primary (`ln -sfn <primary>/node_modules
+  ./node_modules`); typecheck via `npx tsc -p <wt>/tsconfig.json`; **stage specific paths, never `git add -A`**
+  (it tracks the node_modules symlink — `.gitignore`'s `node_modules/` misses it). Committed branches persist
+  after `git worktree remove`.
 - **`git pull --ff-only origin main`** before the next branch. **Public repo** — never commit fleet codenames.
+- A `homeFallback`/`responseReceived`/`wafVendor`/`failureClass`/`burnedExit` value can be occasionally-imprecise
+  on exotic/slow-DCL/URL edges — all are **diagnostics, never behavior/security decisions**.
