@@ -264,7 +264,7 @@ export class GatewayDriveController implements DriveController {
    * (blocked endpoint, dead exit, unparseable body) yields { kind: "unknown" } and never masks the
    * escalation error. Costs one extra proxied request, so it is off unless BGW_DIAG_VERIFY_EGRESS=1.
    */
-  async #verifyEgress(): Promise<EgressCheck> {
+  async #verifyEgress(budgetDeadlineMs?: number): Promise<EgressCheck> {
     const override = this.#resolveProxyOverride();
     if (!override) return { kind: "unknown" };
     // A dedicated, constrained probe session: guarded to the diagnostics host ONLY (not the
@@ -275,7 +275,9 @@ export class GatewayDriveController implements DriveController {
     try {
       handle = await this.#gateway.openConsumerSession(this.#token, override, { diagnostics: true });
       const render = await this.#gateway.useConsumerSession(this.#token, handle, (s) =>
-        s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS }),
+        // #45 (codex r3): bound this probe's render by the shared per-call deadline too when set, so an
+        // egress probe launched near the deadline can't spend a full nav + clearance past the budget.
+        s.core.render(EXIT_INFO_URL, { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS, ...(budgetDeadlineMs !== undefined ? { budgetDeadlineMs } : {}) }),
       );
       const org = parseExitOrg(render.html);
       return { kind: classifyExitOrg(org), ...(org ? { org } : {}) };
@@ -348,10 +350,15 @@ export class GatewayDriveController implements DriveController {
 
   async navigate(url: string, opts: { forceProxy?: boolean } = {}): Promise<PageSnapshot> {
     const t0 = performance.now(); // BEFORE #serialize — totalMs includes any queue wait (#42)
-    return this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts)));
+    // #45 (codex r3): the per-call budget deadline is t0-relative (BEFORE #serialize), so serialized queue
+    // wait counts against it exactly as #timedSnap counts it in totalMs — else a navigate queued behind a
+    // full-budget verb would receive a FRESH callBudgetMs and the caller-visible time could reach multiples
+    // of the bound. Threaded into #navigate (not recomputed there) so the whole verb shares ONE deadline.
+    const budgetDeadlineMs = t0 + this.#timeouts.callBudgetMs;
+    return this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts, budgetDeadlineMs)));
   }
 
-  async #navigate(url: string, opts: { forceProxy?: boolean }): Promise<PageSnapshot> {
+  async #navigate(url: string, opts: { forceProxy?: boolean }, budgetDeadlineMs: number): Promise<PageSnapshot> {
     // Scheme allowlist (R14-adjacent): only http(s), rejected before any session/navigation —
     // mirrors retrieve(), so a non-http target can't slip past the host-based guard.
     if (!isHttpUrl(url)) {
@@ -364,11 +371,9 @@ export class GatewayDriveController implements DriveController {
     // the configured force-proxy list — for a known-hostile WAF the direct attempt only wastes a
     // round-trip and trips reputation (issue #21).
     const forced = (opts.forceProxy ?? false) || hostForcesProxy(new URL(url).hostname, this.#forceProxyHosts);
-    // #45: the whole-navigate wall-clock budget (#43), absolute from HERE (post-serialize, so the queue wait
-    // #timedSnap folds into totalMs is excluded) — it covers the direct attempt AND the cold escalation loop,
-    // the drive twin of retrieve's t0-relative budgetDeadlineMs. The PINNED single-shot below does not need it
-    // (one navigate, already bounded by its nav+clearance timeout — not the ~200s re-roll stacking source).
-    const budgetDeadlineMs = performance.now() + this.#timeouts.callBudgetMs;
+    // #45: the whole-navigate wall-clock budget (#43) is `budgetDeadlineMs` (t0-relative, passed from the
+    // public navigate so serialized queue wait counts against it) — it covers the direct attempt, the cold
+    // escalation loop, and the pinned/warm single-shots (all thread it into core.navigate).
     // First navigate of a session: try direct, escalate to a proxied exit only on a block.
     if (!this.#pinned) {
       return this.#firstNavigate(url, forced, budgetDeadlineMs);
@@ -877,7 +882,14 @@ export class GatewayDriveController implements DriveController {
     const burnedExit = attempts > 0 && !budgetExceeded && !sawLiveResponse;
     // #45: skip the opt-in egress probe when we bailed on budget — it is one more proxied request past an
     // already-exhausted deadline. On a real exit-exhaustion (not a budget bail) it still classifies the exit.
-    const exitCheck = this.#verifyEgressEnabled && !budgetExceeded ? await this.#verifyEgress() : undefined;
+    // #45 (codex r3): run the opt-in egress probe ONLY when meaningful budget remains (it opens ANOTHER
+    // proxied session + render), and bound that render by the shared deadline — else a probe launched just
+    // under the deadline could overrun the call budget. The burned/site verdict is already computed above, so
+    // a bounded probe only adds exit-org evidence; it never re-labels the (correct) burned-exit verdict.
+    const exitCheck =
+      this.#verifyEgressEnabled && !budgetExceeded && budgetDeadlineMs - performance.now() > MIN_ATTEMPT_BUDGET_MS
+        ? await this.#verifyEgress(budgetDeadlineMs)
+        : undefined;
     const dx = this.#escalationDiag({ proxyApplied: attempts > 0, forced, attempts, last, attemptMs, exitCheck, burnedExit });
     // Distinct headline per verdict so ops reads the real cause: a budget timeout, an all-exits-dead burn, or
     // a genuine per-exit exhaustion (site blocked every live exit). The typed FailureClass on #failure carries it.
