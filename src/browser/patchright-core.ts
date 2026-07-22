@@ -523,6 +523,14 @@ export class PatchrightBrowserCore implements BrowserCore {
    * still matches the FINAL snapshot's widget — kind always, plus siteKey + url when known (the solve-failure
    * path, which has a full challenge identity; the give-up path carries only the kind of the current widget).
    * Otherwise it would report challenge A's failure against challenge B (even a same-kind one at a new key).
+   *
+   * SCOPED RESIDUAL (documented, best-effort DIAGNOSTIC — never gates behavior, the #40/#41/#42 line; codex
+   * #44 r8): the reason↔widget binding across a rotation is not airtight. DOM reads are inherently async, so
+   * a same-kind rotation in a sub-read window can still slip an old reason onto a new widget; the snapshot's
+   * siteKey comes from {@link firstSiteKey} (the first raw `data-sitekey`), which on a MULTI-WIDGET page can
+   * differ from the active widget's key; and the give-up path is kind-only (a full compare would false-drop a
+   * legitimate `missing-sitekey`, siteKey=""). All cases mislead a READER of an exotic SPA/multi-widget
+   * failure envelope, nothing more — the value is a diagnostic, consumed by no control path.
    */
   #pendingSolveOutcome?: { reason: CaptchaSolveReason; kind: CaptchaKind; siteKey?: string; url?: string };
 
@@ -1330,6 +1338,10 @@ export class PatchrightBrowserCore implements BrowserCore {
       // classifies it; an already-solved / solvable-now / absent widget yields undefined (no failure).
       const live = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
       const reason = preAttemptSolveReason(live);
+      // Kind-only identity here (not full): this reason is read from the CURRENT widget synchronously (no
+      // pending async solve to outlive a rotation), and a `missing-sitekey` outcome carries siteKey="" — for
+      // which a full siteKey compare in #snapshotOf would false-DROP a legitimate no-key reason. See the
+      // documented reason-attribution residual on the #pendingSolveOutcome field (codex #44 r8).
       if (reason && live) this.#pendingSolveOutcome = { reason, kind: live.kind };
       return { replay: false, ...(reason ? { solveReason: reason } : {}) };
     }
