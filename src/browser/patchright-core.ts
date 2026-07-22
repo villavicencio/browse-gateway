@@ -911,17 +911,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // blank inter-navigation moment. A page still blocked after the budget is surfaced by navFailed.
     // #settle returns its clearance-poll + captcha-solve wall-clock for the #42 timing breakdown.
     const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
-    // Carry the CF/PX/DataDome vendor-hint signals (the HTML half of retrieve's detection) as scrubbed
-    // booleans, plus the interactive-CAPTCHA widget KIND (issue #40) — so drive's escalation recognizes a
-    // CF interstitial with no visible CF phrase AND its failure envelope can attribute the mitigation
-    // vendor, including a bare reCAPTCHA/hCaptcha/Turnstile page that carries no CF/PX/DD marker (parity
-    // with retrieve). Computed only here in navigate() (not in a pure snapshot()) — the drive surface has
-    // no HTML otherwise; detectCaptcha reuses the html already captured, no extra page call.
-    const html = String(await page.content().catch(() => ""));
-    // Only an ACTIVE widget (its container class) counts — activeCaptchaKind ignores a merely-loaded
-    // captcha library and binds the kind to the widget, so it can't mislabel a WAF block's vendor or
-    // cross-label from a co-present library (codex #40 r3/r4).
-    const captchaKind = activeCaptchaKind(html);
+    // #58: the CF/PX/DataDome vendor hints + the interactive-CAPTCHA widget KIND are now computed inside
+    // #snapshotOf (on EVERY snapshot), so `base` already carries cfHint/pxHint/ddHint/captchaKind — the
+    // navigate path no longer computes them (nor a second page.content()) here. They let drive's escalation
+    // recognize a CF interstitial with no visible CF phrase AND let the failure envelope attribute the
+    // mitigation vendor, at parity with retrieve.
     const base = await this.#snapshotOf(page);
     // #42: assemble the per-nav Timing — the whole core-navigate wall-clock plus the goto / clearance /
     // captcha-solve / snapshot stages — as a FIRST-CLASS field (independent of the failure-only envelope;
@@ -936,14 +930,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       ...(settled.captchaSolveMs !== undefined ? { captchaSolveMs: settled.captchaSolveMs } : {}),
       ...(base.timing?.snapshotMs !== undefined ? { snapshotMs: base.timing.snapshotMs } : {}),
     });
-    return {
-      ...base,
-      cfHint: hasCloudflareHint(html),
-      pxHint: hasPerimeterXHint(html),
-      ddHint: hasDataDomeHint(html),
-      ...(captchaKind ? { captchaKind } : {}),
-      timing,
-    };
+    return { ...base, timing };
   }
 
   async snapshot(): Promise<PageSnapshot> {
@@ -1382,6 +1369,15 @@ export class PatchrightBrowserCore implements BrowserCore {
     const title = await page.title().catch(() => "");
     const status = this.#lastDocStatus ?? null;
     const finalUrl = page.url();
+    // #58: compute the CF/PX/DataDome vendor-hint booleans + the active-CAPTCHA widget KIND on EVERY
+    // snapshot — not just navigate() — so a drive ACTION-failure envelope (built from a bare snapshot() via
+    // #actAndSnap → #failure) attributes the mitigation vendor at parity with the navigate path and
+    // retrieve. `page.content()` serializes the TOP document (the same HTML source navigate() used; a bare
+    // reCAPTCHA/hCaptcha/Turnstile page carries its widget class there). This adds ONE DOM serialization per
+    // action snapshot — the accepted #58 tradeoff (previously only navigate() paid it). activeCaptchaKind
+    // binds the kind to an ACTIVE widget container, so it can't mislabel a WAF block's vendor (codex #40 r3/r4).
+    const html = String(await page.content().catch(() => ""));
+    const captchaKind = activeCaptchaKind(html);
     // Assemble the failure-evidence envelope (issue #39) into EVERY snapshot — both navigate() and a
     // post-action snapshot() — so the drive layer can attach it to a thrown failure at parity with
     // retrieve. RAW here; the drive surfacing seam redacts before it reaches a caller. Screenshot is
@@ -1404,7 +1400,18 @@ export class PatchrightBrowserCore implements BrowserCore {
     const pending = this.#pendingActionTiming;
     this.#pendingActionTiming = undefined;
     const timing = assembleTiming({ totalMs: snapshotMs, snapshotMs, ...pending });
-    return { url: finalUrl, title, tree, status, diagnostics, timing };
+    return {
+      url: finalUrl,
+      title,
+      tree,
+      status,
+      diagnostics,
+      timing,
+      cfHint: hasCloudflareHint(html),
+      pxHint: hasPerimeterXHint(html),
+      ddHint: hasDataDomeHint(html),
+      ...(captchaKind ? { captchaKind } : {}),
+    };
   }
 
   /**
