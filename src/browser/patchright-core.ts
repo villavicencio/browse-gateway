@@ -1407,9 +1407,13 @@ export class PatchrightBrowserCore implements BrowserCore {
     }
     // #42: measure the solver wall-clock from here (a widget IS present, so a solve is being attempted).
     const solve0 = performance.now();
+    // #45 (codex r4/r5): cap the solve by the REMAINING call budget as a DURATION (not the absolute
+    // performance.now() deadline — the solver keeps its own clock, and mixing domains aborts every solve).
+    // Recomputed here (after the render poll), off `solve0`, so it reflects the budget left AT the solve.
+    const solveMaxMs = budgetDeadlineMs !== undefined ? Math.max(0, budgetDeadlineMs - solve0) : undefined;
     let token: string;
     try {
-      token = await this.#solver.solve(challenge, budgetDeadlineMs); // #45 (codex r4): cap by the remaining call budget
+      token = await this.#solver.solve(challenge, solveMaxMs);
     } catch (err) {
       // Vendor error / timeout / budget: leave the page challenged rather than throw under the verb,
       // but emit a diagnostic so a left-challenged drive page has a WHY (parity with retrieve's

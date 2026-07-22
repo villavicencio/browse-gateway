@@ -85,18 +85,22 @@ test("never-ready → typed timeout, not a hang", async () => {
   await assert.rejects(solverWith(f, { timeoutMs: 30, pollMs: 5 }).solve(recaptcha), (e) => e.code === "timeout");
 });
 
-test("solve caps at the caller deadline when tighter than its own timeout (#45 codex r4)", async () => {
-  // A CAPTCHA reached just before the drive/render per-call budget deadline must not run the solver's full
-  // (up to callBudgetMs) timeout past it — solve honors the MIN of its own deadline and the caller's.
-  let t = 0;
-  const now = () => (t += 10); // each clock read advances 10ms
+test("solve caps at the caller's remaining-budget DURATION in the solver's OWN clock domain (#45 codex r4/r5)", async () => {
+  // maxDurationMs is a DURATION, not an absolute timestamp, so the caller (performance.now) and the solver
+  // (Date.now) can keep different clocks without aborting the solve. Uses the DEFAULT Date.now clock so a
+  // regression to absolute-timestamp semantics (which mixes domains) would be caught. A CAPTCHA reached just
+  // before the per-call budget must not run the solver's full (up to callBudgetMs) timeout past it.
   const f = fakeFetch([
     { body: { errorId: 0, taskId: "t-r4" } },
-    { body: { errorId: 0, status: "processing" } }, // never ready → only a deadline can end the poll
+    { body: { errorId: 0, status: "processing" } }, // never ready → only the duration cap ends the poll
   ]);
-  const s = solverWith(f, { timeoutMs: 10_000_000, pollMs: 1, now }); // own timeout effectively unbounded
-  await assert.rejects(s.solve(recaptcha, 200), (e) => e.code === "timeout"); // a tight caller deadline of 200
-  assert.ok(f.calls.length < 50, `the caller deadline bounded the poll to ${f.calls.length} calls, not the ~1e6 the own timeout allows`);
+  const s = solverWith(f, { timeoutMs: 10_000_000, pollMs: 5 }); // own timeout effectively unbounded
+  const t0 = Date.now();
+  await assert.rejects(s.solve(recaptcha, 60), (e) => e.code === "timeout"); // 60ms remaining-budget cap
+  const elapsed = Date.now() - t0;
+  // >= 40: it WAITED ~the 60ms cap (a domain-mixed absolute value would abort at ~0ms); < 3000: it did NOT
+  // run the solver's ~1e7ms own timeout (the caller's duration cap governed).
+  assert.ok(elapsed >= 40 && elapsed < 3000, `honored the ~60ms duration cap in its own clock domain (elapsed=${elapsed}ms)`);
 });
 
 test("missing siteKey → missing-sitekey (no fetch)", async () => {
