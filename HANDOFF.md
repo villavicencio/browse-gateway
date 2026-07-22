@@ -1,21 +1,24 @@
 # HANDOFF — 2026-07-22, midday
 
-**Latest (this session): #48 silent-home-fallback detector — PR #68 OPEN, Codex-clean, awaiting your
-review + gate + deploy.** Branch `feat/48-silent-home-fallback-detector`. Drove the Claude↔Codex loop to
-convergence (4 rounds — each surfaced a genuine new URL false-positive/negative, all fixed; clean on r4)
-plus a parallel 3-lens adversarial workflow that independently corroborated the headline finding + a
-test-coverage gap. **778 tests pass, 0 TS errors.** NOT merged, NOT deployed — merge/gate/deploy are your
-call (deploy needs the batched in-container stealth gate). Detail below under "What We Built".
+**Latest (this session): #48 silent-home-fallback detector — MERGED + GATED + DEPLOYED. Live in prod.**
+Merged PR #68 (squash `1ce789c`), Codex-clean (4 rounds — each surfaced a genuine new URL FP/FN, all fixed;
+clean on r4) + a parallel 3-lens adversarial workflow. **778 tests, 0 TS errors.** Ran the full batched
+in-container gate on the #48 amd64 image (`sha256:edb1e576`): **validate-stealth PASS** (CF 1/1 udemy,
+DataDome 1/1 seloger, via IPRoyal ATTEMPTS=1/REQUIRED=1; webrtc/webgl/secret-leak/negative-control all
+PASS) + validate-drive + failure-envelope + retrieve + call-budget all PASS. Deployed via
+`deploy-http.yml` (run `29952128663`): on-host validate-http gate PASS → pre-swap smoke PASS → swap →
+**verify OK (running, restarts=0, dnsRebind=true, /mcp=401)**, no rollback.
 
-**Prod is UNCHANGED: `sha256:0aa02c94…` (git `7fba0b9` = #45).** #48 is additive legibility (a derived
-diagnostic, never a behavior/security gate), so no prod risk while it waits.
+**PROD → `sha256:edb1e576022f…` (git `1ce789c` = #48).** Rollback anchor: `sha256:0aa02c94…` (git
+`7fba0b9` = #45). main == prod (nothing undeployed). #48 is additive legibility (a derived diagnostic,
+never a behavior/security gate).
 
 _Prior context (still true):_ the earlier part of this session gated+deployed the overnight #42-batch and
 reshaped/implemented/merged/gated/deployed #45 — both live in prod.
 
 ## What We Built
 
-- **#48 — silent home-fallback detector — PR #68 (NOT merged/deployed).** A deep link (non-root path /
+- **#48 — silent home-fallback detector — MERGED (`1ce789c`) + GATED + DEPLOYED (prod `sha256:edb1e576`).** A deep link (non-root path /
   query) that silently lands on the site's **bare root** is flagged so a caller can tell a real zero-result
   from lost location/query state. Design (grounded by a 6-reader understand-workflow that found #48 was
   *pre-wired*: a reserved `FailureDiagnostics.homeFallback` slot, a reserved `'ok'` FailureClass, and
@@ -89,11 +92,10 @@ reshaped/implemented/merged/gated/deployed #45 — both live in prod.
 
 ## What's Next
 
-1. **Review + merge + gate + deploy #48 (PR #68).** Codex-clean, 778 tests green, additive-legibility (no
-   prod risk). Merge (squash), then the batched in-container stealth gate (~$10 IPRoyal PAYG leg at
-   ATTEMPTS=1/REQUIRED=1) before `gh workflow run deploy-http.yml -f image_tag=latest`. Then **continue the
-   spine: `#53 → #54`.** **#53** conservative authed-MCP slice (HOLD #3). **#54** slot-release + orphan-reap
-   (HOLD #4). (#48's location-primitive half stays operator HOLD #2 — not built.)
+1. **#48 DONE (merged+gated+deployed).** **Continue the spine: `#53 → #54`.** **#53** conservative authed-MCP
+   slice (HOLD #3). **#54** slot-release + orphan-reap (HOLD #4). (#48's location-primitive half stays operator
+   HOLD #2 — not built; other #48 deferrals — www↔apex, hash-router requested links, query value-drop, the
+   drive-failure envelope slot — are documented in the PR/solution doc.)
 2. **#45 follow-ups (filed, deferred):**
    - **#66 (r11):** a budget-truncated drive `goto` (headers before DCL) can pin a partial-200 as *success*
      not *timeout*. A naive fix breaks CF-clearance (same goto-throw → `#lastDocStatus` path) — needs a
@@ -106,8 +108,8 @@ reshaped/implemented/merged/gated/deployed #45 — both live in prod.
 
 ## Gotchas & Watch-outs
 
-- **Prod state:** `sha256:0aa02c9477…` (git `7fba0b9` = #45). Rollback anchor: the #42-batch
-  `sha256:2258db74…` (git `487e338`). main == prod (nothing undeployed).
+- **Prod state:** `sha256:edb1e576022f…` (git `1ce789c` = #48). Rollback anchor: `sha256:0aa02c94…`
+  (git `7fba0b9` = #45). main == prod (nothing undeployed). Deploy run `29952128663`.
 - **colima is still running** — `colima stop` to free the VM. The gate env-file lives in the session
   scratchpad (`gate.env`, `SPIKE_PROXY_*`→`BGW_PROXY_*` mapping); regenerate from `.env.spike` if gone.
 - **Codex-loop reality:** threading a per-call budget through a stateful multi-path controller *cascades*
