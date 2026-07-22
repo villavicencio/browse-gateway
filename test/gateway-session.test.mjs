@@ -747,3 +747,160 @@ test("reconfirm is single-flight: overlapping drains issue exactly one kill per 
   await Promise.all([r1, r2]);
   assert.equal(mgr.activeCount, 0, "the shared reconfirm reclaimed the slot");
 });
+
+// --- issue #54: acquire-side wedge — a never-settling factory launch must not pin its reserved slot -------
+
+test("acquire: a launch that never settles fails as CORE_LAUNCH and releases its reserved slot within the deadline (issue #54)", async () => {
+  const wedge = deferred(); // never resolved → the first factory launch hangs forever
+  let hang = true;
+  const factory = async () => {
+    if (hang) {
+      hang = false; // only the FIRST launch wedges; the recovery launch proceeds normally
+      await wedge.promise; // never settles within this test
+    }
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  // Tiny launch deadline so the wedge is failed near-instantly (real default is minutes).
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30 });
+
+  // The wedged launch must FAIL (not hang) — CORE_LAUNCH, surfaced within the deadline.
+  await assert.rejects(
+    mgr.acquire(),
+    (e) => e instanceof SessionManagerError && e.code === "CORE_LAUNCH",
+  );
+  assert.equal(mgr.activeCount, 0, "the wedged launch registered no session");
+
+  // The reserved slot was released by acquire's finally, so a fresh acquire is admitted despite
+  // maxSessions: 1 — proving the hung launch did NOT pin capacity toward a permanent SESSION_LIMIT.
+  const s = await mgr.acquire();
+  assert.equal(mgr.activeCount, 1, "reserved slot freed → a replacement acquire succeeds past the cap");
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 0);
+});
+
+test("shutdown: returns instead of hanging when an in-flight launch never settles (issue #54)", async () => {
+  const wedge = deferred(); // the launch wedges: the factory never resolves
+  const factory = async () => {
+    await wedge.promise;
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  const mgr = new SessionManager({
+    maxSessions: 1,
+    coreFactory: factory,
+    launchDeadlineMs: 30,
+    closeGraceMs: 30,
+    killConfirmMs: 30,
+  });
+
+  const acqP = mgr.acquire(); // enters #launchAndRegister and wedges on the factory
+  const acqRejects = assert.rejects(acqP, (e) => e.code === "CORE_LAUNCH"); // attach the handler now
+  await tick();
+
+  // shutdown() must not hang on the never-settling #launching entry: the bounded launch/allSettled wait
+  // lets it return. If either bound regressed, this await never resolves and the test times out.
+  let done = false;
+  await mgr.shutdown().then(() => {
+    done = true;
+  });
+  assert.equal(done, true, "shutdown completed despite the wedged in-flight launch");
+  assert.equal(mgr.activeCount, 0, "no session registered for the wedged launch");
+  await acqRejects; // the wedged acquire settled as CORE_LAUNCH, not left dangling
+});
+
+test("acquire: a factory that throws SYNCHRONOUSLY surfaces CORE_LAUNCH and frees the slot (issue #54, codex r1)", async () => {
+  // A custom factory (or a sync guard) that throws BEFORE returning its promise must be normalized to the
+  // documented CORE_LAUNCH — the bounded-launch race only sees the async-rejection arm, so the synchronous
+  // throw needs its own guard. It must also release the reserved slot (via acquire's finally).
+  let first = true;
+  const factory = () => {
+    if (first) {
+      first = false;
+      throw new Error("synchronous launch boom"); // throws BEFORE returning a promise
+    }
+    return Promise.resolve(makeControllableCore({ closeMode: "resolve" }));
+  };
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory });
+
+  await assert.rejects(
+    mgr.acquire(),
+    (e) => e instanceof SessionManagerError && e.code === "CORE_LAUNCH",
+  );
+  assert.equal(mgr.activeCount, 0, "the sync-throwing launch registered no session");
+
+  // The reserved slot was released, so a working acquire is admitted under maxSessions: 1.
+  const s = await mgr.acquire();
+  assert.equal(mgr.activeCount, 1, "reserved slot freed after the sync throw → a replacement acquire succeeds");
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 0);
+});
+
+test("acquire: a launch that RESOLVES after the deadline is torn down, not leaked (cap-safe) (issue #54, codex r1)", async () => {
+  const gate = deferred(); // holds the first launch open until AFTER the deadline has fired
+  const late = makeControllableCore({ closeMode: "resolve" }); // the core the wedged launch eventually returns
+  let first = true;
+  const factory = async () => {
+    if (first) {
+      first = false;
+      await gate.promise; // resolves LATE — after acquire already rejected on the deadline
+      return late;
+    }
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  const mgr = new SessionManager({
+    maxSessions: 1,
+    coreFactory: factory,
+    launchDeadlineMs: 30,
+    closeGraceMs: 30,
+    killConfirmMs: 30,
+  });
+
+  await assert.rejects(
+    mgr.acquire(),
+    (e) => e instanceof SessionManagerError && e.code === "CORE_LAUNCH",
+  );
+  assert.equal(late.closed, false, "the late core hasn't resolved yet");
+
+  // Let the wedged launch resolve LATE with a real core. It must be confirmably torn down, never leaked.
+  gate.resolve();
+  for (let i = 0; i < 50 && !late.closed; i++) await tick();
+  assert.equal(late.closed, true, "the late-resolving core was closed (not leaked)");
+
+  // Capacity is intact: the reserved slot was freed AND the (confirmed-dead) late core consumed no slot, so a
+  // fresh acquire is admitted under maxSessions: 1 (the late core did NOT pin capacity toward SESSION_LIMIT).
+  const s = await mgr.acquire();
+  assert.equal(mgr.activeCount, 1, "a replacement acquire succeeds — the confirmed-dead late core didn't pin capacity");
+  await mgr.release(s.id);
+  assert.equal(mgr.activeCount, 0);
+});
+
+test("acquire: a late-resolving core whose death CANNOT be confirmed is RETAINED as unconfirmed, not leaked (issue #54)", async () => {
+  const gate = deferred();
+  // close rejects AND no force-kill PID → teardown can't confirm death → retained as a possibly-alive zombie.
+  const late = makeControllableCore({ closeMode: "reject", forceKillAvailable: false });
+  let first = true;
+  const factory = async () => {
+    if (first) {
+      first = false;
+      await gate.promise; // resolves LATE with a core that can't be confirmed dead
+      return late;
+    }
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  const mgr = new SessionManager({
+    maxSessions: 1,
+    coreFactory: factory,
+    launchDeadlineMs: 30,
+    closeGraceMs: 20,
+    killConfirmMs: 20,
+  });
+
+  await assert.rejects(mgr.acquire(), (e) => e instanceof SessionManagerError && e.code === "CORE_LAUNCH");
+
+  gate.resolve(); // the wedged launch resolves LATE with a core that can't be confirmed dead
+  for (let i = 0; i < 50 && mgr.unconfirmedCount === 0; i++) await tick();
+  // The late browser is not silently leaked: a best-effort SIGKILL was sent and it is RETAINED as unconfirmed
+  // (surfaced via unconfirmedCount) for the reaper's reconfirm loop, mirroring the shutdown-orphan degrade.
+  // COUNTING a still-alive late orphan against the RUNNING cap is deferred to #54 Part 2 (orphan reaping, HOLD #4).
+  assert.equal(mgr.unconfirmedCount, 1, "the unconfirmable late core is retained (never erased), not leaked");
+  assert.equal(late.killCalls > 0, true, "a best-effort force-kill was attempted on the late orphan");
+});
