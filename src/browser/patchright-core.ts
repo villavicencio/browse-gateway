@@ -1320,12 +1320,12 @@ export class PatchrightBrowserCore implements BrowserCore {
       // block. Bounded by the clearance budget, so a genuinely-thin cleared page still returns.
       const settled = sawBlock ? isCleared(signal, MIN_CONTENT_LENGTH) : !blocked;
       if (settled) break;
-      // #45: clamp each sleep to the SMALLER of the poll interval, the remaining clearance budget, and the
-      // remaining GLOBAL per-call budget — so a small budget breaks the drive clearance poll early (parity
-      // with render's deadline-bounded poll). No deadline → budgetLeft is Infinity, so the sleep is the poll
-      // interval (or the residual clearance budget), preserving the prior behavior for the action path.
+      // #45: when a per-call deadline is set, clamp this sleep to the remaining GLOBAL budget so a small
+      // budget breaks the drive clearance poll early (parity with render's deadline-bounded poll). No deadline
+      // (the action path / a budget-less caller) → budgetLeft is Infinity, so the sleep is exactly the poll
+      // interval — BYTE-IDENTICAL to the prior behavior (the action path clearance timing is unchanged).
       const budgetLeft = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
-      const sleepMs = Math.min(pollIntervalMs, clearanceTimeoutMs - waited, budgetLeft);
+      const sleepMs = Math.min(pollIntervalMs, budgetLeft);
       if (sleepMs <= 0) break;
       await page.waitForTimeout(sleepMs);
       waited += sleepMs;

@@ -297,9 +297,13 @@ test("controller: sticky escalation mints a FRESH held exit per proxied attempt 
   for (const pw of proxiedPw) assert.match(pw, /^pwd_s-[0-9a-f]+$/, "sticky suffix applied per proxied open");
   assert.equal(new Set(proxiedPw).size, 2, "each proxied attempt minted its own sticky session");
   assert.equal(navOpts.length, 3, "1 direct + 2 proxied navigates fired (direct proves it ran)");
-  assert.equal(navOpts[0], undefined, "direct navigate passes no opts → keeps the default clearance");
+  // #45: the direct navigate keeps the DEFAULT clearance (no escalated clearanceTimeoutMs) but IS now bounded
+  // by the shared per-call budget deadline (so a small BGW_CALL_BUDGET_MS bounds the direct attempt too).
+  assert.equal(navOpts[0]?.clearanceTimeoutMs, undefined, "direct navigate keeps the default clearance");
+  assert.equal(typeof navOpts[0]?.budgetDeadlineMs, "number", "#45: the direct navigate carries the per-call deadline");
   for (const o of navOpts.slice(1)) {
     assert.equal(o?.clearanceTimeoutMs, PROXY_CLEARANCE_TIMEOUT_MS, "escalated clearance on proxied navigates");
+    assert.equal(typeof o?.budgetDeadlineMs, "number", "#45: proxied navigates carry the per-call deadline");
   }
 });
 

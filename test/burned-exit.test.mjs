@@ -173,7 +173,21 @@ test("drive: the escalation loop honors the #43 call budget — a spent budget b
     assert.equal(err.diagnostics.proxyApplied, false);
     assert.equal(err.diagnostics.burnedExit, undefined, "a budget bail is a timeout, not a burn");
     assert.match(err.message, /budget/i, "surfaces the budget as the cause");
+    // A budget timeout with NO proxied snapshot still surfaces failureClass=timeout, so the MCP error-kind
+    // reads it as an in-band block, not an internal transport error (codex r1).
+    assert.equal(err.failure?.failureClass, "timeout", "timeout envelope even when no attempt produced a snapshot");
     return true;
   });
   assert.equal(opened.length, 1, "only the direct session opened; the budget stopped the re-roll loop");
+});
+
+test("drive: the escalation loop applies the configured BGW_PROXY_NAV_TIMEOUT_MS to each proxied open", async () => {
+  const { gateway, opened } = makeDriveSeq([[{ status: 403, tree: "Forbidden" }], [{ status: null }], [{ status: null }], [{ status: null }]]);
+  const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", {
+    onDatacenterIp: true,
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, proxyNavTimeoutMs: 1234 },
+  });
+  await assert.rejects(drive.navigate("https://hostile.example/p/1"), () => true);
+  // opened[0] is the direct session (no override); opened[1..] are the proxied attempts.
+  assert.equal(opened[1].overrides.navigationTimeoutMs, 1234, "proxied opens use the configured nav timeout, not the hardcoded default");
 });

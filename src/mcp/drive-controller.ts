@@ -398,7 +398,9 @@ export class GatewayDriveController implements DriveController {
     // re-hit the CF interstitial — which needs the escalated clearance budget. The default would time
     // out mid-challenge, the very failure this feature fixes.
     const snap = await this.#run((s) =>
-      s.core.navigate(url, this.#proxiedSession ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}),
+      // #45 (codex r1): the PINNED single-shot also carries the shared per-call deadline, so a small
+      // BGW_CALL_BUDGET_MS bounds it too (else its nav + clearance could run past the expired budget).
+      s.core.navigate(url, { ...(this.#proxiedSession ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}), budgetDeadlineMs }),
     );
     if (navFailed(snap)) {
       await this.#discardSession();
@@ -433,7 +435,7 @@ export class GatewayDriveController implements DriveController {
     const warm = this.#buildWarmOverride(new URL(url).hostname);
     if (warm) {
       await this.#discardSession(); // drop any pre-opened (open()'d) cold session before opening warm
-      return this.#openWarmAndNavigate(url, warm);
+      return this.#openWarmAndNavigate(url, warm, budgetDeadlineMs);
     }
     // Force-proxy: skip the direct attempt entirely and go residential from the first request.
     if (forced) {
@@ -452,7 +454,7 @@ export class GatewayDriveController implements DriveController {
       return this.#openHealthyAndNavigate(url, true, budgetDeadlineMs);
     }
     if (!this.#handle) await this.#openSession(undefined); // reuse a pre-opened (direct) session if any
-    const direct = await this.#run((s) => s.core.navigate(url));
+    const direct = await this.#run((s) => s.core.navigate(url, { budgetDeadlineMs })); // #45 (codex r1): bound the direct attempt too
     if (!navFailed(direct)) {
       this.#pinned = true; // direct works → commit it (no residential GB spent)
       return direct;
@@ -629,7 +631,7 @@ export class GatewayDriveController implements DriveController {
    * actionable error rather than silently falling back to a cold (unauthenticated) session, which
    * would mask the staleness. On success the session is pinned.
    */
-  async #openWarmAndNavigate(url: string, override: BrowserCoreOptions): Promise<PageSnapshot> {
+  async #openWarmAndNavigate(url: string, override: BrowserCoreOptions, budgetDeadlineMs: number): Promise<PageSnapshot> {
     await this.#openSessionWarm(override);
     // Warm-up navigation (PerimeterX deep-URL-first fix): on an opted-in owner host, navigate a shallow
     // same-owner page FIRST so the edge WAF issues a clearance token into this live session — then the
@@ -637,7 +639,8 @@ export class GatewayDriveController implements DriveController {
     // no clearance. Runs on the SAME sealed, exit-pinned session (R3) opened just above.
     await this.#warmUpForTarget(url);
     const snap = await this.#run((s) =>
-      s.core.navigate(url, override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}),
+      // #45 (codex r1): the warm target navigate carries the shared per-call deadline too.
+      s.core.navigate(url, { ...(override.proxy ? { clearanceTimeoutMs: PROXY_CLEARANCE_TIMEOUT_MS } : {}), budgetDeadlineMs }),
     );
     if (navFailed(snap)) {
       await this.#discardSession();
@@ -803,6 +806,10 @@ export class GatewayDriveController implements DriveController {
           `proxy escalation unavailable for ${sanitizeUrlForError(url)}: residential proxy configuration was removed mid-retry`,
         );
       }
+      // #45 (codex r1): apply the env-overridable proxied nav timeout — proxyOverrideFor embeds the hardcoded
+      // default, so without this BGW_PROXY_NAV_TIMEOUT_MS was silently ignored on drive (parity with retrieve,
+      // which passes navigationTimeoutMs per attempt). The override is a fresh object per resolve — safe to set.
+      override.navigationTimeoutMs = this.#timeouts.proxyNavTimeoutMs;
       attempts = attempt;
       const attempt0 = performance.now();
       await this.#openSession(override);
@@ -831,6 +838,12 @@ export class GatewayDriveController implements DriveController {
       // totalMs but in no attemptMs entry. Exactly one push per iteration keeps attemptMs 1:1 with `attempts`.
       attemptMs.push(performance.now() - attempt0);
     }
+    // #45 (codex r1): re-check the deadline AFTER the final attempt — the last allowed attempt can START with
+    // budget remaining but RETURN past the deadline (no next iteration to set budgetExceeded). A timeout must
+    // win over the incidental burned/site verdict AND skip the egress probe below. Mirrors retrieve's post-loop
+    // overBudget re-check. (RESIDUAL, documented #43 follow-up: the attempt's own teardown around the deadline
+    // still runs its duration; a hard ceiling needs cooperative cancellation, out of #45's scope.)
+    if (!budgetExceeded && performance.now() >= budgetDeadlineMs) budgetExceeded = true;
     // #45: an escalation that EXHAUSTED every attempt with a DEAD exit (none reached the site) is a burned
     // exit — our residential pool died. Gated on `attempts > 0` (a budget bail before any attempt is a timeout,
     // not a burn) and outranked by budgetExceeded. Diagnostic + a nav-failed refinement; behavior is unchanged.
@@ -846,13 +859,22 @@ export class GatewayDriveController implements DriveController {
       : burnedExit
         ? `all ${attempts} proxied exit(s) died reaching ${sanitizeUrlForError(url)} (burned exits — none got a response)`
         : `could not land a working proxied exit for ${sanitizeUrlForError(url)} after ${attempts} attempts`;
+    // #45 (codex r1): a budget timeout that bailed BEFORE any proxied snapshot (a forced request or a direct
+    // attempt that consumed the budget → `last` undefined) STILL surfaces failureClass=timeout, so the MCP
+    // error-kind reads it as an in-band block (a completed-but-timed-out call), not an internal transport error.
+    // finalUrl is the KNOWN target, redacted (params stripped) at this seam like every other #failure envelope.
+    const failure = last
+      ? this.#failure(last, { budgetExceeded, burnedExit })
+      : budgetExceeded
+        ? redactFailureDiagnostics({ finalUrl: url, status: null, failureClass: "timeout" }, this.#secrets)
+        : undefined;
     throw new EscalationError(
       // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
       `${headline} (last status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}` +
         (exitCheck ? `, exit=${exitCheck.kind}` : "") +
         `)`,
       dx,
-      this.#failure(last, { budgetExceeded, burnedExit }),
+      failure,
     );
   }
 
