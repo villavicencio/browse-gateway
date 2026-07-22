@@ -33,12 +33,12 @@ const ROOT = "https://store.example/"; // the bare homepage it silently fell bac
 test("isHomeFallback: a deep path collapsed to the same-host root FIRES", () => {
   assert.equal(isHomeFallback(DEEP, ROOT), true, "deep path + query → bare root");
   assert.equal(isHomeFallback("https://s.example/a/b/c", "https://s.example/"), true, "deep multi-segment → root");
-  assert.equal(isHomeFallback("https://s.example/deep", "https://s.example/?utm=ad"), true, "landed root path, campaign query is ignored when the PATH carried the depth");
+  assert.equal(isHomeFallback("https://s.example/deep", "https://s.example/?utm_source=ad"), true, "landed root path, TRACKING query is ignored when the PATH carried the depth");
 });
 
 test("isHomeFallback: a query-only deep link FIRES only when the query was DROPPED", () => {
   assert.equal(isHomeFallback("https://s.example/?store=123", "https://s.example/"), true, "query dropped entirely");
-  assert.equal(isHomeFallback("https://s.example/?store=123", "https://s.example/?utm=ad"), true, "wholly different landing query → dropped");
+  assert.equal(isHomeFallback("https://s.example/?store=123", "https://s.example/?utm_source=ad"), true, "landing carries only a tracking param → the store intent was dropped");
   assert.equal(isHomeFallback("https://s.example/?store=123", "https://s.example/?store=123"), false, "same query preserved → NOT a fallback");
   assert.equal(isHomeFallback("https://s.example/?store=123&x=1", "https://s.example/?store=123"), false, "a requested key survived → NOT a fallback");
 });
@@ -79,6 +79,17 @@ test("isHomeFallback: a deep path canonicalized into a LANDED fragment (hash rou
   // The landed pathname is '/' but the deep state is preserved in the fragment — not a bare root.
   assert.equal(isHomeFallback("https://s.example/products/123", "https://s.example/#/products/123"), false, "path → hash-route preserved the state");
   assert.equal(isHomeFallback("https://s.example/search?q=milk", "https://s.example/#/search?q=milk"), false, "query intent preserved in the fragment route");
+});
+
+test("isHomeFallback: a path→query canonicalization that PRESERVES state in the landed query is NOT a fallback (codex r3)", () => {
+  assert.equal(isHomeFallback("https://s.example/search/milk", "https://s.example/?q=milk"), false, "/search/milk → /?q=milk kept the search state in the landed query");
+  assert.equal(isHomeFallback("https://s.example/search/milk", "https://s.example/"), true, "same deep path, landed BARE (no query) → a fallback");
+  assert.equal(isHomeFallback("https://s.example/search?q=milk&utm_source=x", "https://s.example/?utm_source=x"), true, "only a TRACKING key survived on the landing → the intent was lost");
+});
+
+test("isHomeFallback: hosts are compared via canonicalizeHost (trailing-dot FQDN equivalence) (codex r3)", () => {
+  assert.equal(isHomeFallback("https://shop.example./search", "https://shop.example/"), true, "trailing-dot FQDN is the same host — the fallback is not spuriously suppressed");
+  assert.equal(isHomeFallback("https://SHOP.example/search", "https://shop.example/"), true, "case-insensitive host match");
 });
 
 test("isHomeFallback: a cross-host landing is a DIFFERENT case (policy-governed), never a home-fallback", () => {

@@ -30,7 +30,7 @@ import type { FailureDiagnostics, WafVendor, FailureClass, Timing } from "../obs
 export type { WafVendor, FailureClass, Timing } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
 import { DEFAULT_CALL_TIMEOUTS, type CallTimeouts } from "../gateway/config.js";
-import { isHttpUrl } from "../security/index.js";
+import { isHttpUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
@@ -330,22 +330,23 @@ export function isDeadExit(status: number | null, finalUrl: string | undefined):
  * this can surface only a boolean).
  *
  * POSITIVE-SIGNAL-ONLY and conservative to avoid false-positives on ordinary redirects — it fires ONLY when
- *   - both URLs are same-host http(s) (a cross-host landing — an auth / consent / geo interstitial — is NOT
- *     a home-fallback of the requested site; it is governed by the nav policy, not this signal), AND
- *   - the landing is the bare root, AND the requested INTENT was actually LOST — where "intent" is a deep
- *     path OR an intent-bearing (non-{@link isTrackingParam tracking}) query key. A deep path that collapsed
- *     to root fires UNLESS an intent-bearing query ALSO carried the request and SURVIVED intact (a
- *     `/search?q=x` → `/?q=x` endpoint move preserved the intent); a query-only deep link fires only when
- *     NONE of its intent keys survived (the dropped-query case).
+ *   - both URLs are same-host http(s), hosts compared via the shared {@link canonicalizeHost} contract
+ *     (trailing-dot FQDN / case normalized). A cross-host landing — an auth / consent / geo interstitial —
+ *     is NOT a home-fallback of the requested site; it is governed by the nav policy, not this signal. AND
+ *   - the landing is a BARE root — a root path, NO fragment, and NO intent-bearing (non-{@link isTrackingParam
+ *     tracking}) query. A fragment (hash-router route `/#/products/123`) or a non-tracking landed query (a
+ *     `/search/milk` → `/?q=milk` path→query canonicalization) means the requested state may be PRESERVED in
+ *     the landing, so it is not a bare homepage. AND
+ *   - the REQUEST carried intent that is now gone — a real deep path (an index-filename `/index.html` is
+ *     root-equivalent, not deep) OR an intent-bearing query key (both are necessarily lost, since the bare
+ *     landing carries neither).
  * Deliberately does NOT fire on: a same-host deep→deep redirect; a trailing-slash / locale canonicalization
- * to a deep equivalent; a tracking-only root request (`/?utm_source=…`, `/?gclid=…`) canonicalized to `/`
- * (no location/query state was lost); an index-filename canonicalization (`/index.html` → `/`); a landing
- * whose deep state was preserved in a FRAGMENT (a hash-router route, `/products/123` → `/#/products/123`,
- * where the landed pathname is `/` but the fragment carries the state); a preserved query; or a legitimately
- * root-only request. Unparseable URLs → false (fail-safe: assert nothing). KNOWN
- * conservative false-NEGATIVES, left as documented deferrals: www↔apex host normalization; hash-router
- * (`/#/deep`) fallbacks; and a query-only link whose key is retained but whose VALUE is dropped
- * (`/?store=123` → `/?store=0`) — the survival test is key-presence-only, to avoid value-canonicalization FPs.
+ * to a deep equivalent; a tracking-only root request (`/?utm_source=…`, `/?gclid=…`) canonicalized to `/`;
+ * an index-filename canonicalization; a landing that preserved the state in a fragment or a query. Unparseable
+ * URLs → false (fail-safe: assert nothing). KNOWN conservative false-NEGATIVES, left as documented deferrals:
+ * www↔apex host normalization; a requested hash-router link (`/#/deep` → `/`, depth lives in the fragment,
+ * unseen); and a query-only link whose key is retained but whose VALUE is dropped (`/?store=123` →
+ * `/?store=0`) — the bare-landing test is key-presence-only, to avoid value-canonicalization FPs.
  */
 export function isHomeFallback(requestedUrl: string | undefined, finalUrl: string | undefined): boolean {
   if (requestedUrl === undefined || finalUrl === undefined) return false;
@@ -359,28 +360,19 @@ export function isHomeFallback(requestedUrl: string | undefined, finalUrl: strin
   }
   const httpish = (u: URL): boolean => u.protocol === "http:" || u.protocol === "https:";
   if (!httpish(req) || !httpish(fin)) return false;
-  if (req.host !== fin.host) return false; // a cross-host landing is a different case (policy-governed)
+  // Same host (a cross-host landing is a different, policy-governed case), via the shared canonicalizeHost
+  // contract so a trailing-dot FQDN / case difference doesn't spuriously suppress the signal.
+  if (canonicalizeHost(req.hostname) !== canonicalizeHost(fin.hostname)) return false;
   const isRootPath = (p: string): boolean => p === "" || p === "/";
-  if (!isRootPath(fin.pathname)) return false; // landed somewhere real — not a home fallback
-  // The landing carries a FRAGMENT (e.g. a hash-router route `/#/products/123`, where a deep path was
-  // canonicalized into the fragment and the state is preserved) — a root pathname alone doesn't make it a
-  // BARE root, so we can't confidently assert a fallback (positive-signal-only). Safe false-negative.
-  if (fin.hash !== "") return false;
-  // The requested INTENT: a real deep path (an index-filename canonicalization like /index.html → / is NOT
-  // deep), and/or intent-bearing query keys (tracking/campaign params carry no location state — a homepage
-  // requested with a utm/gclid tag that canonicalizes to a clean root lost nothing).
+  const intentKeys = (u: URL): string[] => [...u.searchParams.keys()].filter((k) => !isTrackingParam(k));
+  // The landing must be a BARE root: a root path, NO fragment (a hash route preserves deep state), and NO
+  // intent-bearing query (a path→query canonicalization keeps the state in the landed query). Any of those
+  // means the requested state may be preserved there — not a silent home-fallback (positive-signal-only).
+  if (!isRootPath(fin.pathname) || fin.hash !== "" || intentKeys(fin).length > 0) return false;
+  // The landing is bare. Fire iff the REQUEST actually carried intent that is now gone — a real deep path (an
+  // index-filename like /index.html is root-equivalent, not deep) OR an intent-bearing query key.
   const reqDeepPath = !isRootPath(req.pathname) && !isIndexFilenamePath(req.pathname);
-  const reqIntentKeys = [...req.searchParams.keys()].filter((k) => !isTrackingParam(k));
-  if (!reqDeepPath && reqIntentKeys.length === 0) return false; // the caller asked for the homepage
-  const finKeys = new Set(fin.searchParams.keys());
-  if (reqDeepPath) {
-    // A deep path collapsed to root — a fallback UNLESS an intent-bearing query ALSO carried the request and
-    // survived intact (the query, not the path, was the addressable state, and it was preserved).
-    const allIntentKeysSurvived = reqIntentKeys.length > 0 && reqIntentKeys.every((k) => finKeys.has(k));
-    return !allIntentKeysSurvived;
-  }
-  // Query-only intent (root/index path + intent keys): a fallback iff NONE of the intent keys survived.
-  return !reqIntentKeys.some((k) => finKeys.has(k));
+  return reqDeepPath || intentKeys(req).length > 0;
 }
 
 /** Well-known tracking / campaign / click-id query keys — disposable metadata that carries NO location or
