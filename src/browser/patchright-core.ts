@@ -728,6 +728,20 @@ export class PatchrightBrowserCore implements BrowserCore {
       // the Windows identity errors out rather than rendering as Linux. Non-listed host = no-op (native).
       if (this.#shouldPresentWindows(url)) await this.#applyWindowsToFreshPage(page);
       let status: number | null = null;
+      // #45 (codex r9): page.goto() returns the response ONLY when it RESOLVES (reaches DCL). A goto that TIMES
+      // OUT after the server already responded would otherwise leave status null — which isDeadExit misreads as
+      // a dead exit (a false burned-exit that discards the site's block attribution). Capture the main-frame
+      // navigation response via a listener too (mirrors navigate's #lastDocStatus), so a live-but-slow exit is
+      // attributed to the site. Removed right after the goto — the clearance poll classifies on `status`.
+      let observedNavStatus: number | null = null;
+      const onNavResponse = (resp: { request(): { isNavigationRequest(): boolean }; frame(): unknown; status(): number }) => {
+        try {
+          if (resp.request().isNavigationRequest() && resp.frame() === page.mainFrame()) observedNavStatus = resp.status();
+        } catch {
+          // a superseded/aborted response can throw on access — ignore; the goto/next response updates status
+        }
+      };
+      page.on("response", onNavResponse);
       // domContentLoadedMs = goto wall-clock (waitUntil:"domcontentloaded" resolves AT DCL). Measured around
       // the try so a goto that THROWS (timeout / challenge abort) still records its time-to-abort.
       const goto0 = performance.now();
@@ -738,9 +752,14 @@ export class PatchrightBrowserCore implements BrowserCore {
       const navTimeout = deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1);
       try {
         const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
-        status = resp ? resp.status() : null;
+        status = resp ? resp.status() : observedNavStatus;
       } catch {
-        // Navigation may time out or be aborted by a challenge; assess whatever rendered.
+        // Navigation timed out / was aborted by a challenge — but the exit may have RESPONDED before DCL; fall
+        // back to the observed main-frame response so a slow-but-live exit isn't misread as a dead exit. Assess
+        // whatever rendered.
+        status = observedNavStatus;
+      } finally {
+        page.off("response", onNavResponse);
       }
       const domContentLoadedMs = performance.now() - goto0;
 
@@ -1299,11 +1318,13 @@ export class PatchrightBrowserCore implements BrowserCore {
     // stage on a slow submit); for navigate() it is a ~0ms no-op (its goto already reached DCL, and it uses
     // its own goto-based domContentLoadedMs instead).
     const dcl0 = performance.now();
-    // #45 (codex r2): bound the DCL wait by the remaining per-call budget when one is set, so a pending DCL
-    // can't burn its full default past the deadline. No deadline (the action path) → the default wait, unchanged.
-    await page
-      .waitForLoadState("domcontentloaded", budgetDeadlineMs !== undefined ? { timeout: Math.max(1, budgetDeadlineMs - performance.now()) } : {})
-      .catch(() => {});
+    // #45 (codex r2/r9): bound the DCL wait by the STAGE navigation timeout AND (when set) the remaining
+    // per-call budget. A goto that already TIMED OUT before DCL must not let this second wait spend the whole
+    // remaining budget on the SAME slow exit — that would starve the fresh-exit re-rolls the budget exists to
+    // enable. min of both, floored at 1 (Playwright treats 0 as infinite). No budget → just the stage bound.
+    const dclRemaining = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
+    const dclTimeout = Math.max(1, Math.min(this.#resolved.navigationTimeoutMs, dclRemaining));
+    await page.waitForLoadState("domcontentloaded", { timeout: dclTimeout }).catch(() => {});
     const domContentLoadedMs = performance.now() - dcl0;
     // #42: clearancePollMs is the WALL-CLOCK of the poll loop, not the sleep-interval counter — each
     // pollSignal round-trip (title + innerText evaluate) costs real time in the capped container, so a
