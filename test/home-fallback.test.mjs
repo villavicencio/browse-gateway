@@ -75,6 +75,12 @@ test("isHomeFallback: hash-router (/#/deep) is a conservative false-negative (do
   assert.equal(isHomeFallback("https://s.example/#/deep", "https://s.example/"), false, "route lives in the fragment; pathname is '/' so depth is not seen (deferred)");
 });
 
+test("isHomeFallback: a deep path canonicalized into a LANDED fragment (hash route) is NOT a fallback (codex r2)", () => {
+  // The landed pathname is '/' but the deep state is preserved in the fragment — not a bare root.
+  assert.equal(isHomeFallback("https://s.example/products/123", "https://s.example/#/products/123"), false, "path → hash-route preserved the state");
+  assert.equal(isHomeFallback("https://s.example/search?q=milk", "https://s.example/#/search?q=milk"), false, "query intent preserved in the fragment route");
+});
+
 test("isHomeFallback: a cross-host landing is a DIFFERENT case (policy-governed), never a home-fallback", () => {
   assert.equal(isHomeFallback(DEEP, "https://login.example/"), false, "deep → other host root (auth/consent interstitial)");
   assert.equal(isHomeFallback("https://www.s.example/deep", "https://s.example/"), false, "www↔apex host mismatch is a conservative false-negative (deferred)");

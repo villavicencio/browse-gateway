@@ -339,8 +339,10 @@ export function isDeadExit(status: number | null, finalUrl: string | undefined):
  *     NONE of its intent keys survived (the dropped-query case).
  * Deliberately does NOT fire on: a same-host deep→deep redirect; a trailing-slash / locale canonicalization
  * to a deep equivalent; a tracking-only root request (`/?utm_source=…`, `/?gclid=…`) canonicalized to `/`
- * (no location/query state was lost); an index-filename canonicalization (`/index.html` → `/`); a preserved
- * query; or a legitimately root-only request. Unparseable URLs → false (fail-safe: assert nothing). KNOWN
+ * (no location/query state was lost); an index-filename canonicalization (`/index.html` → `/`); a landing
+ * whose deep state was preserved in a FRAGMENT (a hash-router route, `/products/123` → `/#/products/123`,
+ * where the landed pathname is `/` but the fragment carries the state); a preserved query; or a legitimately
+ * root-only request. Unparseable URLs → false (fail-safe: assert nothing). KNOWN
  * conservative false-NEGATIVES, left as documented deferrals: www↔apex host normalization; hash-router
  * (`/#/deep`) fallbacks; and a query-only link whose key is retained but whose VALUE is dropped
  * (`/?store=123` → `/?store=0`) — the survival test is key-presence-only, to avoid value-canonicalization FPs.
@@ -360,6 +362,10 @@ export function isHomeFallback(requestedUrl: string | undefined, finalUrl: strin
   if (req.host !== fin.host) return false; // a cross-host landing is a different case (policy-governed)
   const isRootPath = (p: string): boolean => p === "" || p === "/";
   if (!isRootPath(fin.pathname)) return false; // landed somewhere real — not a home fallback
+  // The landing carries a FRAGMENT (e.g. a hash-router route `/#/products/123`, where a deep path was
+  // canonicalized into the fragment and the state is preserved) — a root pathname alone doesn't make it a
+  // BARE root, so we can't confidently assert a fallback (positive-signal-only). Safe false-negative.
+  if (fin.hash !== "") return false;
   // The requested INTENT: a real deep path (an index-filename canonicalization like /index.html → / is NOT
   // deep), and/or intent-bearing query keys (tracking/campaign params carry no location state — a homepage
   // requested with a utm/gclid tag that canonicalizes to a clean root lost nothing).
