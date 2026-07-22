@@ -1,95 +1,82 @@
-# HANDOFF — 2026-07-22, pre-dawn (overnight autonomous run)
+# HANDOFF — 2026-07-22 (morning: batched gate + deploy DONE)
 
-Operator asked **"how much can we work through autonomously through the night?"** → I ran an 8-ticket
-feasibility workflow, presented an ordered spine, got **"go ahead and start once the plan is ready,"** and
-worked the spine autonomously. **Four tickets shipped to main** (the plan's conservative target), each driven
-through the full implement → unit-test → Claude↔Codex adversarial-review loop → merge. **~20 Codex rounds
-total; every finding verified, not blind-accepted.**
+The morning job is **complete**. The overnight #47/#58/#44/#43 batch was gated in-container and
+**deployed to prod**. A serious coverage gap on #43 (the wall-clock bound was never observed on a real
+browser) was closed with a new gate before the deploy, per the operator's call.
 
-## What shipped tonight — 4 tickets MERGED to main, **NONE deployed**
+## ✅ Shipped this session
 
-| # | PR | squash | Codex rounds | Summary |
-|---|----|--------|--------------|---------|
-| **#47** | #61 | `523b350` | 3 | Client-breaker affordances: authed session-independent `GET /health` (mirrors the SDK Host/DNS-rebind check) + `_meta` error-kind (`in-band` vs `internal`, from the real failure verdict) + `browser_close` idempotentHint. |
-| **#58** | #62 | `1389976` | 1 | Drive **action**-failure envelopes attribute the WAF vendor — moved cf/px/dd hint + captchaKind into `#snapshotOf` (was navigate-only). |
-| **#44** | #63 | `71066947` | **8** | CAPTCHA solver eligibility + typed `captchaSolveReason` on retrieve+drive envelopes. |
-| **#43** | #64 | `c9d8aba9` | **7** | Bounded per-call wall-clock: global `BGW_CALL_BUDGET_MS` + 6 env-overridable timeouts. |
+**Prod now runs `sha256:2258db74…f54e79b` (git `487e338`).** Rollback anchor: **#42 `sha256:6e9ca1e76a18`**.
+Deploy run `29925612591` — gate→swap→verify green, no rollback, 29s.
 
-**742 unit tests on main** (was 703). 0 TS errors. All CI green.
+The deployed image = the 4 overnight tickets (#47 breaker affordances, #58 drive-action WAF vendor, #44
+CAPTCHA solver eligibility/reason, #43 bounded per-call wall-clock) + one **test-only** gate script
+(`487e338`, no `src/` change — byte-identical runtime to what was gated).
 
-## ⚠️ CRITICAL: not deployed — batched gate + deploy is the morning job
+### The gate that ran (consolidated, in-container, colima vz+rosetta amd64 `browse-gateway:gate`)
+- **FREE legs (residential IP, no proxy spend):** `validate-failure-envelope`, `validate-retrieve`,
+  `validate-drive` — all PASS (only benign notes: httpbin.org down; udemy CF cleared without proxy).
+- **PAID leg (IPRoyal proxy, ATTEMPTS=1/REQUIRED=1 to spare the ~$10 PAYG):** `validate-stealth` PASS —
+  CF 1/1 + DataDome 1/1 + webrtc/webgl/secret-leak/negative-control. Stealth kill-gate holds on the new image.
+- Env-file: `.env.spike` with `SPIKE_PROXY_*`→`BGW_PROXY_*`, staged in the session scratchpad (never the repo).
 
-Per the approved plan, I banked everything on main and **deployed nothing** (each prod deploy burns the
-hard-capped ~$10 IPRoyal PAYG stealth gate — per-ticket deploys are the anti-pattern). All 4 have
-**gate-territory** aspects proven only on a real browser:
-- #47 the `/health` route's real behavior; #58 the real `page.content()` hint population; #44 `#trySolveCaptcha`
-  threading + the identity re-check; #43 the real-browser clearance-poll **wall-clock** bound.
+### The #43 gap that was closed first
+A 4-agent **coverage-audit workflow** found the pre-chosen gate **asserts none of the 4 tickets' new fields** —
+it runs the new code without crashing but never checks the new behavior. Three gaps are moderate + unit-test-
+covered; **#43 was serious**: the wall-clock bound was never *observed* firing on a real browser (the existing
+validators run `retrieve()` with the 90s default vs fast-clearing targets, so the bound never bites). A
+regression would ship 200s+ calls holding scarce sessions → starvation on the 2-session gateway. Operator chose
+**"close #43 first, then deploy."**
 
-**Do one consolidated in-container gate run, then one deploy:**
-```
-colima start --vm-type vz --vz-rosetta --cpu 4 --memory 8 --disk 30
-# build --platform linux/amd64 (Dockerfile hardcodes the amd64 Chrome .deb), then:
-#   validate-failure-envelope + validate-stealth (+ validate-retrieve / validate-drive)
-gh workflow run deploy-http.yml -f image_tag=latest    # ci.yml already built+pushed GHCR latest from main
-```
-**Prod still runs #42 `sha256:6e9ca1e76a18`** (rollback anchor #41 `sha256:3c9c6e84`). `.env.spike` is
-SPIKE-format (strip `export `, map `SPIKE_PROXY_*`→`BGW_PROXY_*` for a docker `--env-file`). Keep stealth
-smokes to ATTEMPTS=1/REQUIRED=1 to spare the $10 burn.
+**New gate `scripts/validate-call-budget.mjs`** (committed `487e338`, both legs PASS in-container):
+- **Leg A** — `core.render()` with `clearedTextLength` set unreachable so `isCleared` is always false; the
+  clearance poll can then exit ONLY at the clearance timeout or the shared `budgetDeadlineMs` break. A render
+  returning at ~budget (`wall=12.3s`) instead of ~clearance (~35s) proves the codex-r5 deadline cut a real,
+  running poll. No proxy. (Gotcha found + fixed live: a 5s budget was too tight — udemy's goto under Rosetta
+  ate it before the poll slept; needs budget=12s/clearance=30s so the poll has headroom past the goto.)
+- **Leg B** — a forced-proxy retrieve with `callBudgetMs=500` bails before opening any proxied session
+  (`retrieve.ts:778-784`), asserting `blocked=true / failureClass='timeout' / reason=null / proxyUsed=false`,
+  **no proxy request billed**.
 
-## 4 operator HOLDs (each ticket's autonomous slice already shipped; these are your calls)
+## What's next
 
-1. **#44 Turnstile precedence** — when Cloudflare + Turnstile markers co-fire, should `captchaKind=turnstile`
-   win over `cf-challenge`? Needs a captured **real CF managed-challenge fixture** + your precedence call.
-2. **#48 location primitive** — is there a generic cross-site "a store/location is selected" signal worth a
-   snapshot primitive, or keep per-site/deferred? (#48's detector half ships without it.)
-3. **#53 auth posture** — should `obscura status`'s health read move to an authed path to consume the new
-   internals surface? (#47 pre-settled the HTTP-vs-MCP fork; a conservative authed default is the plan.)
-4. **#54 orphan-reap** — `/proc` process-group sweep vs launch-side child capture vs accept-as-residual (like
-   #50's restore-cleanup)?
+### Gate-hardening follow-ups (3, accepted as tracked — operator declined the +#58 option this morning)
+All moderate + already unit-test-covered; add when convenient so the real-browser gate asserts the new fields:
+1. **#58** — add a drive-ACTION vendor assertion to `validate-failure-envelope` (mirror the existing navigate
+   CF check on a real click/type that lands on a challenge; degrade-to-note on clear/IP-block).
+2. **#44** — add a fake-solver + served-CAPTCHA-fixture leg asserting `captchaSolveReason` / `solverEligible`.
+3. **#47** — add `GET /health` (200/401/403-Host) + `_meta` error-kind assertions to `validate-http`, and fold
+   `validate-http` into the batched gate (it's HTTP-wrapper, deterministic — not real-browser territory).
 
-## #43 follow-ups (documented in code, not bugs)
-
-- **Whole-operation hard ceiling** — the budget bounds the dominant sinks (nav + the wall-clock clearance
-  poll) on every attempt, but a `pollSignal`/snapshot/`extractMarkdown`/session-lifecycle step can each run
-  its own duration past the deadline (and a hung launch — #54). An exact ceiling needs cooperative
-  cancellation (top-level `Promise.race` / AbortSignal gateway→core→browser). **Coordinate with #54.**
-- **Drive-path env-timeout consumption** — the drive path still reads the module-constant defaults. It has no
-  3× re-roll loop (a stateful session can't swap its exit mid-flow, KTD-5), so it doesn't stack toward 200s.
-  **Coordinate with #45**, which restructures the drive escalation loop.
-
-## What Didn't Work (dead-ends the review loop exposed — don't relitigate)
-
-- **#44: "only reCAPTCHA is solvable" was WRONG.** The ticket (and my first pass) claimed it; the solver's
-  `TASK_TYPE` actually maps **reCAPTCHA v2 + Turnstile + hCaptcha**. Codex r1 caught the contradictory
-  eligibility. Fix: single-sourced `SOLVABLE_CAPTCHA_KINDS`, **drift-locked to `solverTaskTypeFor` by a test**.
-  Lesson: verify the solver map, not the ticket's prose.
-- **#43: you cannot make the budget a true wall-clock bound by clamping per-stage timeouts.** Nav-first-then-
-  rest starved clearance (r4); min-each-stage didn't bound the sum (r5). Both failed. The working fix is a
-  **shared core-level deadline** passed into `render()` (`budgetDeadlineMs`) that bounds goto + the wall-clock
-  clearance poll together. A *perfect* ceiling (unbounded pollSignal/CPU/lifecycle) needs a top-level
-  `Promise.race`/AbortSignal — **explicitly ruled OUT of #43's scope** (documented follow-up, coord #54).
-- **Background-Codex mechanics:** a raw `&` gives no completion notification (use `run_in_background: true`);
-  chaining `git commit && codex exec review` in one backgrounded call got the task **killed** — run the commit
-  foreground, launch Codex as its own backgrounded call.
-
-## What's next — remaining spine
-
-`#45 → #48 → #53 → #54`.
+### Remaining ticket spine: `#45 → #48 → #53 → #54`
 - **#45** (burned-exit vs site-block + safe re-roll) is **MED-risk** and rewrites the escalation loop on both
-  verbs — **run the pre-code critique first** (`dv:critique` / a 5-lens panel), per the plan.
+  verbs — **run the pre-code critique first** (`dv:critique` / a 5-lens panel), per the plan. Coordinates with
+  #43's documented drive-path env-timeout follow-up.
 - **#48** ships the silent-home-fallback **detector** cleanly (HOLD #2 is only the location primitive).
-- **#53** conservative authed-MCP slice (HOLD #3 is the posture confirm).
-- **#54** slot-release + shutdown-tolerance slice (HOLD #4 is the orphan reap).
+- **#53** conservative authed-MCP slice (HOLD #3 is the posture confirm; #47 pre-settled the HTTP-vs-MCP fork).
+- **#54** slot-release + shutdown-tolerance slice (HOLD #4 is the orphan reap; coordinates with #43's
+  whole-operation-ceiling / hung-launch follow-up).
+
+### 4 operator HOLDs still open (your calls; none block the spine's autonomous slices)
+1. **#44 Turnstile precedence** — when CF + Turnstile markers co-fire, should `captchaKind=turnstile` win over
+   `cf-challenge`? Needs a captured real CF managed-challenge fixture.
+2. **#48 location primitive** — is a generic cross-site "a store/location is selected" snapshot primitive worth
+   it, or keep per-site/deferred?
+3. **#53 auth posture** — should `obscura status`'s health read move to an authed path consuming #47's internals?
+4. **#54 orphan-reap** — `/proc` process-group sweep vs launch-side child capture vs accept-as-residual?
 
 ## Gotchas / watch-outs
-
-- **Codex runner:** `codex exec review --base main`, and **use `run_in_background: true`** — a raw `&` gives
-  no completion notification (I did this 3× out of habit). Background codex runs got **killed mid-flight
-  twice** with no verdict — just relaunch cleanly (the commit is already safe).
-- **Deploy/CI status:** single read-only `gh` checks or one `gh run watch <id>` (backgrounded). **No poll
-  loops** — the auto-mode classifier blocks them.
+- **colima is still running** (started this session for the gate). `colima stop` to free the VM when done.
+- **Deploy = GH Actions dispatch, not a local push:** `gh workflow run deploy-http.yml -f image_tag=latest`
+  pulls GHCR `latest` (CI builds it from main) and deploys over Tailscale with an on-host
+  validate-http gate + auto-rollback. That on-host gate is a *basic HTTP liveness check* — it will NOT catch a
+  subtle behavior regression (e.g. the #43 bound), which is why the in-container gate matters.
+- **The gate deploys what CI built, not your local image.** Commit-to-main → CI rebuilds `latest` → deploy. A
+  test-only script (like the #43 gate) changes the image digest but not the runtime; provenance stays clean
+  (deployed digest maps to a known git SHA).
+- **Codex runner:** `codex exec review --base main` with `run_in_background:true` (a raw `&` gives no
+  completion notification; background codex got killed mid-flight twice overnight — just relaunch).
 - **`git pull --ff-only origin main`** before the next branch (local main goes stale after each GitHub merge).
-- **Public repo** — never commit fleet codenames (Codex caught one leak in #47 r2; scrub source AND squash
-  history before pushing).
-- A `wafVendor` / `failureClass` / `timing` / `captchaSolveReason` value can be occasionally-imprecise on
-  exotic/teardown/rotation edges — all are **diagnostics, never behavior/security decisions**.
+- **Public repo** — never commit fleet codenames (scrub source AND squash history before pushing).
+- A `wafVendor`/`failureClass`/`timing`/`captchaSolveReason` value can be occasionally-imprecise on exotic/
+  teardown/rotation edges — all are **diagnostics, never behavior/security decisions**.
