@@ -688,19 +688,21 @@ test("#43: a proxied attempt's nav+clearance are CLAMPED to the remaining budget
 });
 
 test("#43: the escalation loop stops at the global call budget with a typed timeout failure", async () => {
-  // The direct render (~25ms) already blows a 10ms budget, so the loop stops BEFORE spending a proxied
-  // attempt and the failure is the decisive `timeout` class, not the incidental cf-challenge of the block.
+  // Slow (500ms) renders + a 2.6s budget: the direct render + ONE proxied attempt run (proxyUsed=true), then
+  // the remaining budget drops below the min-attempt floor and the loop stops short of proxyMaxAttempts, with
+  // the decisive `timeout` class (and reason=null so the MCP advertises timeout, not the cf-challenge block).
   const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
-  const { gateway } = makeSlowGateway(block, 25);
+  const { gateway } = makeSlowGateway(block, 500);
   const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
   const r = await retrieve(gateway, secrets, {
     token: "t",
     url: "https://hard.example/",
     escalation: { onDatacenterIp: true },
-    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 10, proxyMaxAttempts: 5 },
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 2600, proxyMaxAttempts: 5 },
   });
-  assert.equal(r.proxyUsed, true, "escalation engaged");
+  assert.equal(r.proxyUsed, true, "at least one proxied attempt actually ran");
   assert.equal(r.diagnostics?.failureClass, "timeout", "budget exhaustion is a typed timeout, not the block class");
+  assert.equal(r.reason, null, "reason is null on a timeout so the MCP surfaces `timeout`, not cf-challenge");
   assert.ok((r.proxyDiagnostic?.attempts ?? 99) < 5, "the budget cut the loop short of proxyMaxAttempts");
 });
 
@@ -751,5 +753,5 @@ test("#43: a forced-proxy request that exhausts the budget times out WITHOUT a d
   });
   assert.equal(r.diagnostics?.failureClass, "timeout", "budget exhaustion on a forced request is a decisive timeout");
   assert.equal(calls.length, 0, "NO direct fallback render happened — force-proxy is honored");
-  assert.equal(r.proxyDiagnostic?.attempts, 0, "zero proxied attempts ran");
+  assert.equal(r.proxyUsed, false, "no proxied attempt started, so residential routing is NOT claimed (codex r3)");
 });

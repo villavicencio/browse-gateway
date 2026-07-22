@@ -716,7 +716,6 @@ export async function retrieve(
   //    budget is raised on proxied attempts: an interstitial clears in ~22s on a held exit, over
   //    the 20s default (probe, 2026-06-09).
   if (proxy && (forced || (render !== undefined && shouldEscalateToProxy(render, render.status, escalation)))) {
-    proxyUsed = true;
     // #44 (codex r4): the solve hook above ran on the DIRECT render; escalation now REPLACES `render` with a
     // proxied one, so any direct-render solve reason is STALE — it does not describe the surfaced page (which
     // was never handed to the solver). Clear it so a stale code can't ride the final envelope. (No production
@@ -735,6 +734,10 @@ export async function retrieve(
         budgetExceeded = true;
         break;
       }
+      // #43 (codex r3): mark the proxy used only once an attempt ACTUALLY starts — so a budget that breaks
+      // before any proxied session opens doesn't claim residential routing (proxyUsed / proxyApplied) with
+      // zero attempts.
+      proxyUsed = true;
       proxyAttempts = attempt;
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
       const attempt0 = performance.now();
@@ -848,7 +851,10 @@ export async function retrieve(
   // attributes only when the block is otherwise generic (so a WAF page that merely preloads a captcha
   // library isn't mislabeled; codex #40 r2). Surfaced so a caller sees WHY a page failed rather than a
   // silent "blocked". `null` when the page is not blocked.
-  const reason: BlockReason | null = blocked ? resolveFailureReason(signal) : null;
+  // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
+  // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /
+  // hard-block the last attempt happened to land on. The typed `timeout` failureClass carries the detail.
+  const reason: BlockReason | null = budgetExceeded ? null : blocked ? resolveFailureReason(signal) : null;
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
   const proxyDiagnostic = proxyUsed

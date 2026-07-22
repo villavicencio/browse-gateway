@@ -56,7 +56,8 @@ async function main(): Promise<void> {
   // solver is shared across the consumer's drive sessions; render() (retrieve) never invokes it.
   config.core.solver = httpCaptchaSolverFromSecrets(secrets, process.env.BGW_CAPTCHA_API_URL, {
     budget: DEFAULT_CAPTCHA_BUDGET,
-    timeoutMs: config.timeouts.captchaSolveTimeoutMs, // #43: env-overridable solve deadline (stdio path, codex r1)
+    // #43: env-overridable + CLAMPED to the global call budget so a stalled solve can't run past it (codex r3).
+    timeoutMs: Math.min(config.timeouts.captchaSolveTimeoutMs, config.timeouts.callBudgetMs),
   });
   // R9: the browser core's own stderr diagnostics (errCode) scrub the known-secret set via this store —
   // not just URL-strip — so a bare proxy password can't surface in a core diagnostic line (audit #3).
