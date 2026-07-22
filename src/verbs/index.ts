@@ -16,5 +16,5 @@ export { assistedLogin, coreLoginDriver, DEFAULT_FIELD_TIMEOUT_MS, DEFAULT_FIELD
 export type { LoginRecipe, LoginCredentials, LoginDriver, AssistedLoginOptions, AssistedLoginResult } from "./assisted-login.js";
 export { detectCaptcha, NullCaptchaSolver } from "./captcha.js";
 export type { CaptchaChallenge, CaptchaKind, CaptchaSolver } from "./captcha.js";
-export { HttpCaptchaSolver, CaptchaSolveError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "./captcha-solver.js";
+export { HttpCaptchaSolver, CaptchaSolveError, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET, solverTaskTypeFor } from "./captcha-solver.js";
 export type { HttpCaptchaSolverConfig, CaptchaSolveErrorCode } from "./captcha-solver.js";

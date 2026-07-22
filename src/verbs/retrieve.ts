@@ -34,8 +34,8 @@ import type { SecretStore } from "../security/index.js";
 import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
-import { detectCaptcha } from "./captcha.js";
-import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
+import { detectCaptcha, isSolvableCaptchaKind, CAPTCHA_SOLVE_ERROR_CODES } from "./captcha.js";
+import type { CaptchaSolver, CaptchaKind, CaptchaSolveReason } from "./captcha.js";
 
 /**
  * Proxy-escalation retries (R7). A rotating residential proxy assigns a fresh exit IP per
@@ -669,11 +669,23 @@ export async function retrieve(
   //    stay that way: wiring one here would spend (and bill) a solve with no effect on the page.
   //    `captchaSolved` therefore stays false in production. (Removing `opts.solver` + `captchaSolved`
   //    outright is a follow-up — it changes retrieve's result contract + the mcp surface.)
+  let solveAttemptReason: CaptchaSolveReason | undefined;
+  let solveAttemptKind: CaptchaKind | undefined;
   if (render && opts.solver) {
     const captcha = detectCaptcha(render, url);
     if (captcha) {
-      await opts.solver.solve(captcha);
-      captchaSolved = true;
+      solveAttemptKind = captcha.kind; // bind the reason to the kind actually attempted (codex #44 r5)
+      try {
+        await opts.solver.solve(captcha);
+        captchaSolved = true;
+      } catch (err) {
+        // #44: a solve failure on the STATELESS retrieve path leaves the page challenged (there's no live
+        // page to inject a token into anyway). Capture the solver's typed code — allowlist-collapsed to the
+        // closed vocabulary, secret-free — instead of throwing, so the envelope reports WHY rather than the
+        // reason defaulting to a contradictory `not-configured` when a solver WAS supplied (codex #44 r1).
+        const raw = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
+        solveAttemptReason = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw) ? (raw as CaptchaSolveReason) : "error";
+      }
     }
   }
 
@@ -687,6 +699,11 @@ export async function retrieve(
   //    the 20s default (probe, 2026-06-09).
   if (proxy && (forced || (render !== undefined && shouldEscalateToProxy(render, render.status, escalation)))) {
     proxyUsed = true;
+    // #44 (codex r4): the solve hook above ran on the DIRECT render; escalation now REPLACES `render` with a
+    // proxied one, so any direct-render solve reason is STALE — it does not describe the surfaced page (which
+    // was never handed to the solver). Clear it so a stale code can't ride the final envelope. (No production
+    // caller wires opts.solver, so this is the vestigial-seam correctness case, not a prod path.)
+    solveAttemptReason = undefined;
     for (let attempt = 1; attempt <= PROXY_MAX_ATTEMPTS; attempt++) {
       proxyAttempts = attempt;
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
@@ -816,6 +833,36 @@ export async function retrieve(
   // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
   const failureClass: FailureClass | undefined = failed ? classifyFailure(signal) : undefined;
   const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+  // #44: CAPTCHA solver eligibility + why-not on the retrieve failure envelope, at parity with drive.
+  // BOTH gate on a DETECTED active CAPTCHA (signal.captchaKind), NOT on failureClass==="captcha" — a page can
+  // carry a genuine solvable widget while a higher-precedence WAF marker makes the primary class
+  // anti-bot-block (e.g. a DataDome page serving reCAPTCHA); dropping the fields there would lose a real
+  // signal, and it would diverge from the drive path (which keys both off the snapshot's captchaKind). This
+  // is the #40 vendor-projection idea applied to eligibility: the class is WAF-first, the eligibility rides
+  // the detected widget (codex #44 r3). solverEligible is the pure KIND property; the reason: a supplied
+  // opts.solver that FAILED → its typed code; no solver → `not-configured` (the production case — retrieve
+  // wires none, so the actionable signal is that routing to the drive path could clear a solvable kind).
+  // Both are secret-free (closed-vocab / boolean) and pass redaction untouched.
+  //
+  // SCOPED RESIDUALS (documented, best-effort diagnostic — never gates behavior, the #40/#41/#42 line):
+  //  (a) opts.solver is a VESTIGIAL non-production seam (no production caller wires it — see the hook above;
+  //      and a stateless render has no live page to inject a token into). When a solver is supplied but the
+  //      final CAPTCHA render was reached via forceProxy/escalation — where the solve hook (direct-render
+  //      only) never ran — no attempt reason exists, so the reason is OMITTED rather than fabricated. In
+  //      production (no solver) this arm is unreachable: the reason is always `not-configured`.
+  //  (b) an explicit-render widget that `activeCaptchaKind` recognizes but the drive live-probe's
+  //      container-based `DETECT_LIVE_CAPTCHA_JS` cannot (drive path) yields solverEligible with no reason;
+  //      no accurate closed-vocab code exists for "detected but un-probeable", so it stays unset.
+  const captchaDetected = signal.captchaKind !== undefined;
+  const solverEligible = captchaDetected ? isSolvableCaptchaKind(signal.captchaKind as CaptchaKind) : undefined;
+  // Adopt the solve's typed failure ONLY when the kind it attempted matches the finally-CLASSIFIED widget
+  // (codex #44 r5): detectCaptcha (solve) and activeCaptchaKind (classification) can disagree on a page with
+  // a preloaded library beside a different active widget, which would otherwise attach kind-A's failure to a
+  // kind-B envelope.
+  const attemptReason =
+    solveAttemptReason !== undefined && solveAttemptKind === signal.captchaKind ? solveAttemptReason : undefined;
+  const captchaSolveReason: CaptchaSolveReason | undefined =
+    failed && captchaDetected ? (attemptReason ?? (opts.solver ? undefined : "not-configured")) : undefined;
   // #42: assemble ONE Timing — the whole-call totalMs over the final render's core stages — and use it for
   // BOTH the result field and (on a failure) the folded envelope, so they can never disagree (single
   // derivation). render.timing carries the surfaced render's domContentLoaded/clearancePoll/snapshot; its
@@ -828,7 +875,14 @@ export async function retrieve(
   const diagnostics =
     failed && render.diagnostics
       ? redactFailureDiagnostics(
-          { ...render.diagnostics, ...(failureClass ? { failureClass } : {}), ...(wafVendor ? { wafVendor } : {}), timing },
+          {
+            ...render.diagnostics,
+            ...(failureClass ? { failureClass } : {}),
+            ...(wafVendor ? { wafVendor } : {}),
+            timing,
+            ...(solverEligible !== undefined ? { solverEligible } : {}),
+            ...(captchaSolveReason ? { captchaSolveReason } : {}),
+          },
           secrets,
         )
       : undefined;

@@ -13,6 +13,11 @@ import {
   awaitSolvableCaptcha,
   injectTokenJs,
   DETECT_LIVE_CAPTCHA_JS,
+  isSolvableCaptchaKind,
+  resolveCaptchaSolveReason,
+  preAttemptSolveReason,
+  firstSiteKey,
+  CAPTCHA_SOLVE_ERROR_CODES,
 } from "../dist/browser/index.js";
 
 const URL = "https://site.example/login";
@@ -126,4 +131,58 @@ test("DETECT_LIVE_CAPTCHA_JS: an evaluatable script covering the three response 
   for (const f of ["g-recaptcha-response", "cf-turnstile-response", "h-captcha-response", "data-sitekey"]) {
     assert.match(DETECT_LIVE_CAPTCHA_JS, new RegExp(f));
   }
+});
+
+// --- #44: solver eligibility + solve-reason (pure derivation, unit-tested off the real core) ---------
+
+test("#44 isSolvableCaptchaKind: recaptcha/turnstile/hcaptcha are solvable; unknown is not", () => {
+  for (const k of ["recaptcha", "turnstile", "hcaptcha"]) {
+    assert.equal(isSolvableCaptchaKind(k), true, `${k} is solvable (the solver maps it to a task type)`);
+  }
+  assert.equal(isSolvableCaptchaKind("unknown"), false);
+});
+
+test("#44 resolveCaptchaSolveReason: no CAPTCHA detected → undefined", () => {
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: undefined, solverPresent: true }), undefined);
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: undefined, solverPresent: false, attemptReason: "timeout" }), undefined);
+});
+
+test("#44 resolveCaptchaSolveReason: an actual attempt failure code wins for EVERY code + `error`", () => {
+  // AC: each CAPTCHA_SOLVE_ERROR_CODES value is threaded out distinctly (was stderr-only), plus the
+  // allowlist-collapsed `error` for an unrecognized code from a custom solver.
+  for (const code of [...CAPTCHA_SOLVE_ERROR_CODES, "error"]) {
+    // attemptReason wins over the pre-attempt why-not regardless of solver presence / kind solvability.
+    assert.equal(resolveCaptchaSolveReason({ captchaKind: "recaptcha", solverPresent: true, attemptReason: code }), code);
+    assert.equal(resolveCaptchaSolveReason({ captchaKind: "hcaptcha", solverPresent: false, attemptReason: code }), code);
+  }
+});
+
+test("#44 resolveCaptchaSolveReason: pre-attempt why-not when no attempt was made", () => {
+  // No solver wired → not-configured (whatever the kind).
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "recaptcha", solverPresent: false }), "not-configured");
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "turnstile", solverPresent: false }), "not-configured");
+  // Solver wired but the kind isn't solvable (only `unknown` is unsolvable) → unsupported-kind.
+  assert.equal(resolveCaptchaSolveReason({ captchaKind: "unknown", solverPresent: true }), "unsupported-kind");
+  // Solver wired and the kind IS solvable, no attempt failure → undefined (a solve may have succeeded).
+  for (const k of ["recaptcha", "turnstile", "hcaptcha"]) {
+    assert.equal(resolveCaptchaSolveReason({ captchaKind: k, solverPresent: true }), undefined, `${k} solvable, no failure → undefined`);
+  }
+});
+
+test("#44 preAttemptSolveReason: a detected-but-unattemptable widget reports WHY (codex r2)", () => {
+  // No live widget / already-solved / solvable-now → not a pre-attempt failure.
+  assert.equal(preAttemptSolveReason(null), undefined);
+  assert.equal(preAttemptSolveReason({ kind: "recaptcha", siteKey: "k", respLen: 5 }), undefined, "already solved");
+  assert.equal(preAttemptSolveReason({ kind: "recaptcha", siteKey: "k", respLen: 0 }), undefined, "solvable-now (race)");
+  // No sitekey to solve against → missing-sitekey (whatever the render state).
+  assert.equal(preAttemptSolveReason({ kind: "hcaptcha", siteKey: "", respLen: -1 }), "missing-sitekey");
+  assert.equal(preAttemptSolveReason({ kind: "hcaptcha", siteKey: "", respLen: 0 }), "missing-sitekey");
+  // Sitekey present but the response field never rendered within the budget → timeout.
+  assert.equal(preAttemptSolveReason({ kind: "turnstile", siteKey: "0x4", respLen: -1 }), "timeout");
+});
+
+test("#44 firstSiteKey: extracts the first data-sitekey for the same-kind-rotation identity check (codex r7)", () => {
+  assert.equal(firstSiteKey('<div class="g-recaptcha" data-sitekey="sk-1"></div>'), "sk-1");
+  assert.equal(firstSiteKey('<div data-sitekey="a"></div><div data-sitekey="b"></div>'), "a");
+  assert.equal(firstSiteKey("<div>no captcha here</div>"), undefined);
 });

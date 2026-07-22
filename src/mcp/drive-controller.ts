@@ -226,6 +226,12 @@ export class GatewayDriveController implements DriveController {
       ...(failureClass ? { failureClass } : {}),
       ...(wafVendor ? { wafVendor } : {}),
       ...(snap.timing ? { timing: snap.timing } : {}),
+      // #44: fold the core-computed solver eligibility + solve reason into the envelope at this seam (like
+      // failureClass/wafVendor/timing), so a drive failure on a CAPTCHA page reports WHY the solve didn't
+      // complete and whether the kind is solvable at all. Both are secret-free (closed-vocab / boolean) →
+      // redaction passes them through untouched. Present only when the snapshot detected a CAPTCHA.
+      ...(snap.solverEligible !== undefined ? { solverEligible: snap.solverEligible } : {}),
+      ...(snap.captchaSolveReason ? { captchaSolveReason: snap.captchaSolveReason } : {}),
     };
     return redactFailureDiagnostics(diag, this.#secrets);
   }

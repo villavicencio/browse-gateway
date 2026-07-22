@@ -14,8 +14,14 @@ import {
   injectTokenJs,
   awaitSolvableCaptcha,
   activeCaptchaKind,
+  isSolvableCaptchaKind,
+  resolveCaptchaSolveReason,
+  preAttemptSolveReason,
+  firstSiteKey,
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
+  type CaptchaSolveReason,
+  type CaptchaKind,
   type LiveCaptcha,
 } from "./captcha.js";
 import {
@@ -383,10 +389,13 @@ async function snapshot(page: PatchrightPage): Promise<PageSignal> {
 }
 
 /** Result of {@link PatchrightBrowserCore.#trySolveCaptcha}: whether the caller must replay the triggering
- *  action, plus the #42 solve wall-clock (present only when a solve was actually attempted). */
+ *  action, plus the #42 solve wall-clock (present only when a solve was actually attempted) and — issue #44
+ *  — the solver's typed error code when an attempted solve FAILED (previously written to stderr and
+ *  discarded); absent when a solve succeeded or none was attempted. */
 interface SolveResult {
   replay: boolean;
   captchaSolveMs?: number;
+  solveReason?: CaptchaSolveReason;
 }
 
 /** Result of {@link PatchrightBrowserCore.#settle}: the replay signal (as before) plus the #42 stage
@@ -501,6 +510,29 @@ export class PatchrightBrowserCore implements BrowserCore {
    * `navigate()` builds its own timing and ignores this, so it can never leak into a nav snapshot.
    */
   #pendingActionTiming?: { clearancePollMs: number; captchaSolveMs?: number; domContentLoadedMs?: number };
+  /**
+   * #44: the typed error code from the last ATTEMPTED captcha solve that FAILED (vendor-error / timeout /
+   * budget-exhausted / missing-sitekey), stashed by {@link #trySolveCaptcha} and consumed ONCE by the next
+   * {@link #snapshotOf} — the same cross-call bridge as {@link #pendingActionTiming} (the solve runs inside
+   * {@link #settle}, but the snapshot is a separate core call). Cleared on read, so a later snapshot never
+   * inherits a stale attempt's reason; a pre-attempt why-not (`not-configured` / `unsupported-kind`) is
+   * derived in #snapshotOf instead when no attempt was made.
+   *
+   * The attempted widget's IDENTITY rides with the reason (codex #44 r5/r6/r7): the page can navigate/rotate
+   * its CAPTCHA while a solve is pending, so #snapshotOf adopts the reason only when the stashed identity
+   * still matches the FINAL snapshot's widget — kind always, plus siteKey + url when known (the solve-failure
+   * path, which has a full challenge identity; the give-up path carries only the kind of the current widget).
+   * Otherwise it would report challenge A's failure against challenge B (even a same-kind one at a new key).
+   *
+   * SCOPED RESIDUAL (documented, best-effort DIAGNOSTIC — never gates behavior, the #40/#41/#42 line; codex
+   * #44 r8): the reason↔widget binding across a rotation is not airtight. DOM reads are inherently async, so
+   * a same-kind rotation in a sub-read window can still slip an old reason onto a new widget; the snapshot's
+   * siteKey comes from {@link firstSiteKey} (the first raw `data-sitekey`), which on a MULTI-WIDGET page can
+   * differ from the active widget's key; and the give-up path is kind-only (a full compare would false-drop a
+   * legitimate `missing-sitekey`, siteKey=""). All cases mislead a READER of an exotic SPA/multi-widget
+   * failure envelope, nothing more — the value is a diagnostic, consumed by no control path.
+   */
+  #pendingSolveOutcome?: { reason: CaptchaSolveReason; kind: CaptchaKind; siteKey?: string; url?: string };
 
   private constructor(
     context: PatchrightContext,
@@ -1299,7 +1331,20 @@ export class PatchrightBrowserCore implements BrowserCore {
       (ms) => page.waitForTimeout(ms).catch(() => {}),
       { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: CAPTCHA_RENDER_TIMEOUT_MS },
     );
-    if (!challenge) return { replay: false };
+    if (!challenge) {
+      // #44 (codex r2): a supported widget was detected but never became attemptable — preserve WHY (no
+      // sitekey / the response field never rendered within the budget) instead of dropping it, so the
+      // envelope's why-not isn't silently omitted while solverEligible stays true. One final live read
+      // classifies it; an already-solved / solvable-now / absent widget yields undefined (no failure).
+      const live = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
+      const reason = preAttemptSolveReason(live);
+      // Kind-only identity here (not full): this reason is read from the CURRENT widget synchronously (no
+      // pending async solve to outlive a rotation), and a `missing-sitekey` outcome carries siteKey="" — for
+      // which a full siteKey compare in #snapshotOf would false-DROP a legitimate no-key reason. See the
+      // documented reason-attribution residual on the #pendingSolveOutcome field (codex #44 r8).
+      if (reason && live) this.#pendingSolveOutcome = { reason, kind: live.kind };
+      return { replay: false, ...(reason ? { solveReason: reason } : {}) };
+    }
     // #42: measure the solver wall-clock from here (a widget IS present, so a solve is being attempted).
     const solve0 = performance.now();
     let token: string;
@@ -1313,9 +1358,25 @@ export class PatchrightBrowserCore implements BrowserCore {
       // generic "error" (never echoed) — then still route through errCode (redact + URL-strip +
       // truncate) as belt-and-suspenders. This fifth stderr sink can't leak a secret/URL (R9, audit #3).
       const raw = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
-      const code = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw) ? raw : "error";
+      const code: CaptchaSolveReason = (CAPTCHA_SOLVE_ERROR_CODES as readonly string[]).includes(raw)
+        ? (raw as CaptchaSolveReason)
+        : "error";
       process.stderr.write(`[browse-gateway] captcha solve failed (${errCode(code, this.#redact)}); page left challenged\n`);
-      return { replay: false, captchaSolveMs: performance.now() - solve0 };
+      // #44: surface the typed code instead of DISCARDING it to stderr only. It's a closed-vocabulary,
+      // secret-free marker (never the API key; a sitekey is public) — returned so #settle can bubble it, and
+      // stashed for the next #snapshotOf. `error` covers an unrecognized code (already allowlist-collapsed).
+      // Attribute the failure ONLY if the page still shows the SAME challenge we attempted (codex r5/r6): a
+      // pending solve can outlive a rotation to a DIFFERENT widget — even a same-kind one at a new siteKey/URL
+      // — so revalidate the FULL identity (kind + siteKey + url) here, exactly as the successful-token branch
+      // below does, before stashing. #snapshotOf then re-checks the kind against the final HTML as a second
+      // guard (a rotation between this read and the snapshot).
+      const after = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
+      if (after && after.kind === challenge.kind && after.siteKey === challenge.siteKey && page.url() === challenge.url) {
+        // Carry the FULL identity (codex r7) so #snapshotOf can re-reject a same-kind rotation that happens
+        // in the gap between this read and the snapshot's HTML capture.
+        this.#pendingSolveOutcome = { reason: code, kind: challenge.kind, ...(challenge.siteKey ? { siteKey: challenge.siteKey } : {}), url: challenge.url };
+      }
+      return { replay: false, captchaSolveMs: performance.now() - solve0, solveReason: code };
     }
     const captchaSolveMs = performance.now() - solve0;
     if (!token) return { replay: false, captchaSolveMs };
@@ -1378,6 +1439,30 @@ export class PatchrightBrowserCore implements BrowserCore {
     // binds the kind to an ACTIVE widget container, so it can't mislabel a WAF block's vendor (codex #40 r3/r4).
     const html = String(await page.content().catch(() => ""));
     const captchaKind = activeCaptchaKind(html);
+    // #44: solver eligibility (a pure KIND property) + why a solve wasn't completed. captchaSolveReason
+    // prefers the stashed code from an ACTUAL failed attempt (#trySolveCaptcha ran in this op's #settle);
+    // else a pre-attempt why-not derived from the kind — `not-configured` (no solver wired) or
+    // `unsupported-kind` (the widget kind isn't solvable). Consume-once: clear the stash so a later bare
+    // snapshot() can't inherit a stale attempt's reason. Both are set only when a CAPTCHA is present.
+    // The stashed reason is adopted ONLY when its attempted IDENTITY still matches THIS final snapshot's
+    // widget (codex r5/r6/r7) — a page that rotated its CAPTCHA mid-solve must not report challenge A's
+    // failure on B. Kind always; plus siteKey + url when the stash carried them (the solve-failure path) so a
+    // same-kind rotation to a new key/URL in the gap before this HTML capture is also rejected. Compared
+    // against the captured `html` + `finalUrl` (this snapshot's moment), so the check is accurate for it.
+    const solveOutcome = this.#pendingSolveOutcome;
+    this.#pendingSolveOutcome = undefined;
+    const identityMatches =
+      solveOutcome != null &&
+      solveOutcome.kind === captchaKind &&
+      (solveOutcome.url === undefined || solveOutcome.url === finalUrl) &&
+      (solveOutcome.siteKey === undefined || solveOutcome.siteKey === firstSiteKey(html));
+    const attemptReason = identityMatches ? solveOutcome.reason : undefined;
+    const solverEligible = captchaKind ? isSolvableCaptchaKind(captchaKind) : undefined;
+    const captchaSolveReason = resolveCaptchaSolveReason({
+      captchaKind,
+      solverPresent: this.#solver != null,
+      ...(attemptReason ? { attemptReason } : {}),
+    });
     // Assemble the failure-evidence envelope (issue #39) into EVERY snapshot — both navigate() and a
     // post-action snapshot() — so the drive layer can attach it to a thrown failure at parity with
     // retrieve. RAW here; the drive surfacing seam redacts before it reaches a caller. Screenshot is
@@ -1411,6 +1496,8 @@ export class PatchrightBrowserCore implements BrowserCore {
       pxHint: hasPerimeterXHint(html),
       ddHint: hasDataDomeHint(html),
       ...(captchaKind ? { captchaKind } : {}),
+      ...(solverEligible !== undefined ? { solverEligible } : {}),
+      ...(captchaSolveReason ? { captchaSolveReason } : {}),
     };
   }
 

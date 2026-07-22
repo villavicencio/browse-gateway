@@ -399,6 +399,106 @@ test("retrieve: an interactive CAPTCHA block is reported with reason=captcha (mo
   assert.equal(r.reason, "captcha");
 });
 
+test("#44: retrieve surfaces solverEligible=true + not-configured on a solvable-kind (reCAPTCHA) CAPTCHA block", async () => {
+  // retrieve wires NO solver in production; the actionable signal is that this kind IS solvable, so routing
+  // to the drive path (which has a solver) could clear it — captchaSolveReason='not-configured' says WHY it
+  // wasn't attempted here. (renderOf must carry `diagnostics` for the #39 envelope to be assembled.)
+  const rc = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([rc]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/" });
+  assert.equal(r.reason, "captcha");
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.solverEligible, true, "reCAPTCHA v2 is a solvable kind");
+  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured", "retrieve wires no solver");
+});
+
+test("#44: retrieve marks a Turnstile CAPTCHA solverEligible=true (the solver maps Turnstile too)", async () => {
+  const ts = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<div class="cf-turnstile" data-sitekey="0x4"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([ts]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/" });
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.solverEligible, true, "Turnstile IS solvable by the configured solver");
+  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured", "retrieve wires no solver in production");
+});
+
+test("#44: retrieve with a SUPPLIED solver that FAILS reports the typed code, not `not-configured` (codex r1)", async () => {
+  // The public opts.solver seam: a supplied solver was invoked and threw — the envelope must reflect the
+  // typed failure, never the contradictory not-configured (which implies no solver was available).
+  const ren = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([ren]);
+  const solver = { async solve() { const e = new Error("service returned an error"); e.code = "vendor-error"; throw e; } };
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/", solver });
+  assert.equal(r.captchaSolved, false, "a failed solve leaves the page blocked, not solved");
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.captchaSolveReason, "vendor-error", "the supplied solver's typed code is surfaced");
+});
+
+test("#44: a solve failure on a DIFFERENT kind than the classified widget is NOT attached (codex r5)", async () => {
+  // detectCaptcha matches the preloaded hCaptcha LIBRARY (so the solve attempts hcaptcha), but
+  // activeCaptchaKind classifies the ACTIVE g-recaptcha container. The hcaptcha failure must NOT ride a
+  // reCAPTCHA envelope — the reason attaches only when the attempted kind matches the classified widget.
+  const mixed = renderOf({
+    status: 403, title: "Verify", text: "Please verify you are a human",
+    html: '<script src="https://hcaptcha.com/1/api.js"></script><div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://cap.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([mixed]);
+  const solver = { async solve() { const e = new Error("boom"); e.code = "vendor-error"; throw e; } };
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://cap.example/", solver });
+  assert.equal(r.diagnostics?.failureClass, "captcha");
+  assert.equal(r.diagnostics?.solverEligible, true, "the classified reCAPTCHA is solvable");
+  assert.notEqual(r.diagnostics?.captchaSolveReason, "vendor-error", "the hCaptcha-attempt failure must not attach to the reCAPTCHA envelope");
+  assert.equal(r.diagnostics?.captchaSolveReason, undefined, "kind mismatch → reason dropped");
+});
+
+test("#44: a stale direct-render solve reason is NOT attached after escalation replaces the render (codex r4)", async () => {
+  // opts.solver FAILS on the DIRECT captcha render, then escalation replaces `render` with proxied ones. The
+  // direct render's code must NOT ride the final envelope — it never described the surfaced (proxied) page.
+  const capBlock = () => renderOf({
+    status: 403, title: "", text: "Forbidden",
+    html: '<div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://hard.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([capBlock(), capBlock(), capBlock(), capBlock()]);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  let solveCalls = 0;
+  const solver = { async solve() { solveCalls++; const e = new Error("vendor boom"); e.code = "vendor-error"; throw e; } };
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true }, solver });
+  assert.equal(r.proxyUsed, true, "escalation ran (the direct hard-block escalated)");
+  assert.equal(solveCalls, 1, "the solve was attempted once, on the direct render only");
+  assert.equal(r.diagnostics?.solverEligible, true, "the final render still carries a solvable widget");
+  assert.notEqual(r.diagnostics?.captchaSolveReason, "vendor-error", "the STALE direct-render code must not ride the final envelope");
+  assert.equal(r.diagnostics?.captchaSolveReason, undefined, "no solve was attempted on the surfaced render → omitted");
+});
+
+test("#44: retrieve preserves the CAPTCHA reason when a WAF marker takes class precedence (codex r3)", async () => {
+  // A DataDome page ALSO serving a reCAPTCHA: classifyFailure keeps anti-bot-block (WAF-first), but a real
+  // solvable widget is present — so solverEligible + captchaSolveReason must ride the DETECTED captcha, not
+  // the projected primary class (parity with the drive path; the eligibility fields gate on captchaKind).
+  const both = renderOf({
+    status: 403, title: "", text: "Access denied",
+    html: 'datadome captcha-delivery <div class="g-recaptcha" data-sitekey="sk-1"></div>',
+    diagnostics: { finalUrl: "https://dd.example/", status: 403 },
+  });
+  const { gateway } = makeFakeGateway([both]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://dd.example/" });
+  assert.equal(r.diagnostics?.failureClass, "anti-bot-block", "the WAF marker wins the primary class");
+  assert.equal(r.diagnostics?.solverEligible, true, "the detected reCAPTCHA is solvable");
+  assert.equal(r.diagnostics?.captchaSolveReason, "not-configured", "the reason is preserved despite the WAF class");
+});
+
 test("retrieve: a 200 PerimeterX press-&-hold served as a TOP-document interstitial (copy in html, not innerText) is blocked", async () => {
   // The live gateway repro (#24 follow-up), top-document form: PX serves the press-&-hold full-page
   // with a 200. The challenge copy reaches render.html (so extractMarkdown scrapes it) but NOT

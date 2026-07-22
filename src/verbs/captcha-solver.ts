@@ -28,6 +28,13 @@ const TASK_TYPE: Record<CaptchaKind, string | undefined> = {
   unknown: undefined,
 };
 
+/** The task type this solver maps a kind to, or undefined if it can't solve it (issue #44). The single
+ *  source of truth for solve support — `browser/captcha.isSolvableCaptchaKind` mirrors it (it can't import
+ *  from this verbs layer), and a unit test asserts the two never diverge. */
+export function solverTaskTypeFor(kind: CaptchaKind): string | undefined {
+  return TASK_TYPE[kind];
+}
+
 // The known, non-secret solver error codes live with the CaptchaSolver contract (browser/captcha) so the
 // browser core can allowlist them without a verbs->browser->verbs import cycle.
 export type CaptchaSolveErrorCode = (typeof CAPTCHA_SOLVE_ERROR_CODES)[number];

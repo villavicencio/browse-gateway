@@ -10,7 +10,9 @@ import {
   HttpCaptchaSolver,
   CaptchaSolveError,
   httpCaptchaSolverFromSecrets,
+  solverTaskTypeFor,
 } from "../dist/verbs/index.js";
+import { isSolvableCaptchaKind } from "../dist/browser/index.js";
 import { SecretStore } from "../dist/security/index.js";
 
 const KEY = "secret-key-abcdef3210";
@@ -194,4 +196,16 @@ test("vendor-error message never contains the API key (R9, createTask branch)", 
     assert.ok(!e.message.includes(KEY), "vendor-error message must not contain the API key");
     return true;
   });
+});
+
+test("#44: isSolvableCaptchaKind agrees with the solver's TASK_TYPE for every kind (no drift)", () => {
+  // The eligibility fact (browser/captcha) MUST match what the solver actually maps to a task type
+  // (verbs/captcha-solver) — the browser layer can't import the map, so this locks the two (codex #44 r1).
+  for (const kind of ["recaptcha", "turnstile", "hcaptcha", "unknown"]) {
+    assert.equal(
+      isSolvableCaptchaKind(kind),
+      solverTaskTypeFor(kind) !== undefined,
+      `eligibility for ${kind} must equal (TASK_TYPE[${kind}] is defined)`,
+    );
+  }
 });

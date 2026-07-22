@@ -11,7 +11,7 @@
 /** Which anti-bot family a target exercises — used to gate per-category in the kill-gate. */
 export type Category = "cloudflare" | "datadome";
 
-import type { CaptchaSolver, CaptchaKind } from "./captcha.js";
+import type { CaptchaSolver, CaptchaKind, CaptchaSolveReason } from "./captcha.js";
 import type { FailureDiagnostics, Timing } from "../observability/index.js";
 
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
@@ -234,8 +234,8 @@ export interface PageSnapshot {
   /**
    * Scrubbed Cloudflare-hint flag: `true` when the page's HTML carried a CF challenge marker
    * (`challenge-platform` etc.). The HTML half of retrieve's CF detection, surfaced as a boolean so
-   * no page content is carried. Set on `navigate()`; absent on a pure `snapshot()`. Lets drive's
-   * escalation recognize a CF interstitial that shows no visible CF phrase, matching retrieve.
+   * no page content is carried. Computed on EVERY snapshot as of issue #58 (previously navigate-only). Lets
+   * drive's escalation recognize a CF interstitial that shows no visible CF phrase, matching retrieve.
    */
   cfHint?: boolean;
   /**
@@ -248,17 +248,34 @@ export interface PageSnapshot {
    * Scrubbed DataDome-hint flag: `true` when the page's HTML carried a DataDome marker (`datadome`,
    * `captcha-delivery`, `dd_cookie`). The DataDome sibling of {@link cfHint}/{@link pxHint} (issue #40),
    * surfaced as a boolean so the drive layer can attribute a DataDome block without carrying page
-   * content. Set on `navigate()`; absent on a pure `snapshot()`.
+   * content. Computed on EVERY snapshot as of issue #58 (previously navigate-only).
    */
   ddHint?: boolean;
   /**
    * The interactive CAPTCHA widget kind ({@link CaptchaKind}: recaptcha/hcaptcha/turnstile) detected in
-   * the page HTML at `navigate()`, or absent when none. Carried so the drive failure envelope can
-   * attribute a bare CAPTCHA page's vendor at parity with retrieve (issue #40) — a widget with a visible
-   * verify phrase but no CF/PX/DD marker would otherwise classify as generic `blocked` with no vendor.
-   * Set on `navigate()`; absent on a pure `snapshot()` (so a post-action CAPTCHA is not attributed).
+   * the page HTML, or absent when none. Carried so the drive failure envelope can attribute a bare CAPTCHA
+   * page's vendor at parity with retrieve (issue #40) — a widget with a visible verify phrase but no
+   * CF/PX/DD marker would otherwise classify as generic `blocked` with no vendor. Computed on EVERY
+   * snapshot as of issue #58 (previously navigate-only), so a post-action CAPTCHA is attributed too.
    */
   captchaKind?: CaptchaKind;
+  /**
+   * Whether the configured CAPTCHA solver's architecture supports the detected {@link captchaKind} (issue
+   * #44) — a pure property of the KIND (currently reCAPTCHA v2 only; hCaptcha/Turnstile/PerimeterX are not),
+   * independent of whether a solver is wired or has budget. Set only when {@link captchaKind} is present.
+   * Lets a caller (and #43's fast-terminal path) skip waiting on an unsolvable challenge.
+   */
+  solverEligible?: boolean;
+  /**
+   * Why a CAPTCHA solve was not completed (issue #44), a closed-vocabulary code — the solver's typed error
+   * from an actual attempt (`vendor-error` / `timeout` / `budget-exhausted` / `missing-sitekey`), or a
+   * pre-attempt why-not (`not-configured` — no solver wired; `unsupported-kind` — the widget kind isn't
+   * solvable). A CLOSED union ({@link CaptchaSolveReason}), never free text — the same safety basis as
+   * {@link cfHint}/vendor: no secret material (never the API key; a sitekey is public), so it passes
+   * {@link FailureDiagnostics} redaction untouched. Set only when a CAPTCHA was detected. Surfaced onto the
+   * failure envelope at the drive `#failure` seam, at parity with retrieve.
+   */
+  captchaSolveReason?: CaptchaSolveReason;
   /**
    * Failure-evidence envelope (issue #39): finalUrl (post-redirect) / title / status / redirect chain /
    * bounded console + network / optional screenshot. Assembled by the core on every navigate/snapshot;

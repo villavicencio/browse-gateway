@@ -18,6 +18,61 @@ import { stripInertHtml } from "./detect.js";
 
 export type CaptchaKind = "recaptcha" | "hcaptcha" | "turnstile" | "unknown";
 
+/**
+ * The CAPTCHA kinds the solver architecture can (in principle) solve (issue #44) — the SINGLE SOURCE for
+ * eligibility, kept here in the browser layer so both the core (`#snapshotOf`) and the verbs layer can read
+ * it without a verbs→browser→verbs cycle. It MUST match the kinds `verbs/captcha-solver.ts`'s `TASK_TYPE`
+ * maps to a task-type string (currently reCAPTCHA v2 / Turnstile / hCaptcha; `unknown` is not); a unit test
+ * (`captcha-solver.test`) locks the two together so eligibility can never contradict what the solver
+ * actually attempts. Adding/removing a solvable vendor means updating BOTH plus that test.
+ */
+export const SOLVABLE_CAPTCHA_KINDS = ["recaptcha", "turnstile", "hcaptcha"] as const;
+
+/** Whether the solver architecture can (in principle) solve this kind — a pure property of the kind,
+ *  independent of whether a solver instance is wired or has budget.
+ *
+ *  DEFERRED (issue #44, HOLD): finer eligibility for a Turnstile widget that co-fires with a Cloudflare
+ *  hint. #40 attributes such a page `cf-challenge` → `wafVendor=cloudflare` (WAF-first) and can leave
+ *  `captchaKind` unset, so eligibility reads as a generic CF block rather than the (solvable) Turnstile
+ *  widget it is. Promoting `turnstile` over `cf-challenge` is BLOCKED on a captured CF *managed-challenge*
+ *  fixture: without ground truth on whether the Under-Attack interstitial itself carries a
+ *  `cf-turnstile-response` / `class="cf-turnstile"` container, promoting it risks mislabeling managed
+ *  challenges. Capture the fixture, then decide precedence. (Codex #40 r8.) */
+export function isSolvableCaptchaKind(kind: CaptchaKind): boolean {
+  return (SOLVABLE_CAPTCHA_KINDS as readonly string[]).includes(kind);
+}
+
+/**
+ * The closed vocabulary for {@link resolveCaptchaSolveReason} / the `captchaSolveReason` envelope slot
+ * (issue #44): the solver's typed error codes plus the allowlist-collapse fallback `error`. Typed as a
+ * UNION (not a bare string) so the envelope slot has the SAME closed-vocabulary safety basis as
+ * `wafVendor`/`failureClass` — the redactor passes it through untouched, which is safe ONLY because the
+ * value is one of these secret-free markers, never free text from a page or a solver message (R9, codex #44).
+ */
+export type CaptchaSolveReason = (typeof CAPTCHA_SOLVE_ERROR_CODES)[number] | "error";
+
+/**
+ * Resolve the closed-vocabulary `captchaSolveReason` for a snapshot (issue #44) — pure, so the derivation
+ * is unit-testable off the real browser core. Precedence:
+ *   - no CAPTCHA detected            → undefined (nothing to report);
+ *   - an actual attempt FAILED       → its typed code (`attemptReason`: vendor-error / timeout /
+ *                                      budget-exhausted / missing-sitekey / error), which wins;
+ *   - no solver wired                → `not-configured`;
+ *   - solver wired, kind unsolvable  → `unsupported-kind`;
+ *   - solver wired, kind solvable, no attempt-failure → undefined (a solve may have succeeded or not run).
+ */
+export function resolveCaptchaSolveReason(opts: {
+  captchaKind: CaptchaKind | undefined;
+  solverPresent: boolean;
+  attemptReason?: CaptchaSolveReason;
+}): CaptchaSolveReason | undefined {
+  const { captchaKind, solverPresent, attemptReason } = opts;
+  if (!captchaKind) return undefined;
+  if (attemptReason) return attemptReason;
+  if (!solverPresent) return "not-configured";
+  return isSolvableCaptchaKind(captchaKind) ? undefined : "unsupported-kind";
+}
+
 export interface CaptchaChallenge {
   kind: CaptchaKind;
   url: string;
@@ -51,6 +106,13 @@ export class NullCaptchaSolver implements CaptchaSolver {
 }
 
 const SITE_KEY = /data-sitekey=["']([^"']+)["']/i;
+
+/** The first `data-sitekey` value in the HTML, or undefined if none (issue #44) — used to compare a stashed
+ *  solve outcome's attempted site key against the widget in the final snapshot HTML, so a same-kind CAPTCHA
+ *  rotation doesn't misattribute the reason. Best-effort on a multi-widget page (it reads the FIRST key). */
+export function firstSiteKey(html: string): string | undefined {
+  return SITE_KEY.exec(html)?.[1];
+}
 
 /** Identify an interactive CAPTCHA widget in the rendered HTML, or null if none (pure, HTML-based). */
 export function detectCaptcha(signal: PageSignal, url: string): CaptchaChallenge | null {
@@ -129,6 +191,21 @@ const WIDGET_EVIDENCE: readonly { kind: Exclude<CaptchaKind, "unknown">; res: re
 export function activeCaptchaKind(html: string): CaptchaKind | undefined {
   const live = stripInertHtml(html);
   return WIDGET_EVIDENCE.find(({ res }) => res.some((re) => re.test(live)))?.kind;
+}
+
+/**
+ * The pre-attempt why-not for a supported CAPTCHA widget that was DETECTED but never became attemptable
+ * (issue #44, codex r2) — classified from the final live-DOM read after {@link awaitSolvableCaptcha} gave
+ * up, so the failure envelope reports WHY instead of omitting it while `solverEligible` is true. Pure +
+ * unit-testable. `missing-sitekey` (no key to solve against) or `timeout` (the response field never
+ * rendered within the render budget). An already-solved widget (`respLen > 0`), a solvable-now widget
+ * (`respLen === 0` with a sitekey — a render race the poll just missed), or no live widget → undefined:
+ * none of those is a pre-attempt failure to report.
+ */
+export function preAttemptSolveReason(live: LiveCaptcha | null): CaptchaSolveReason | undefined {
+  if (!live) return undefined;
+  if (!live.siteKey) return "missing-sitekey";
+  return live.respLen < 0 ? "timeout" : undefined;
 }
 
 /** A live, in-DOM CAPTCHA widget read off the active page (drive path). */
