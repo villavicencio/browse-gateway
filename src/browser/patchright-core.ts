@@ -408,6 +408,10 @@ interface SettleResult {
   domContentLoadedMs: number;
   clearancePollMs: number;
   captchaSolveMs?: number;
+  /** #66: the clearance poll was BROKEN by the per-call budget deadline (not settled, not the clearance
+   *  timeout) — one of the two truncation cuts (with a timed-out goto) that can leave a partial page
+   *  looking healthy. False on the action path (no deadline) and on every settled/clearance-timeout exit. */
+  deadlineCut: boolean;
 }
 
 /**
@@ -502,6 +506,15 @@ export class PatchrightBrowserCore implements BrowserCore {
    * detectable, not only a visible challenge phrase. `undefined` until the first navigation.
    */
   #lastDocStatus?: number | null;
+  /**
+   * Whether the active page's last navigation received its MAIN-FRAME document response (issue #66) — the
+   * drive-side twin of render()'s local `responseReceived` receipt (#67), kept current by the SAME response
+   * listener that maintains {@link #lastDocStatus} and reset at the same points, so the two can never drift.
+   * Distinct from `#lastDocStatus` because a goto that times out AFTER headers arrive leaves status null-reset
+   * → listener-set, while a goto that times out BEFORE any response leaves this false — the receipt
+   * {@link import("../verbs/index.js").isDeadExit} keys exit-health on.
+   */
+  #lastMainFrameResponseReceived = false;
   /**
    * Failure-evidence ring buffers (issue #39), each capped at {@link FAILURE_DIAGNOSTICS_CAP} so an
    * abusive page can never grow them unbounded (oldest dropped). `#redirectChain` accumulates each
@@ -969,6 +982,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // page as a hard block (4xx + thin tree), so proxied escalation discarded a working exit and
     // eventually reported "could not land a working proxied exit (403)".
     this.#lastDocStatus = null;
+    this.#lastMainFrameResponseReceived = false; // #66: fresh receipt per nav, same lifecycle as status
     // A new navigation begins here: clear the evidence buffers so this nav's failure envelope reflects
     // only this goto onward (the active page's console/requestfailed listeners persist across navs).
     this.#resetEvidence();
@@ -980,11 +994,18 @@ export class PatchrightBrowserCore implements BrowserCore {
     // deadline still makes a bounded (fast-failing) attempt. No deadline (action path) → the raw nav timeout.
     const navTimeout = deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1);
     const goto0 = performance.now();
+    // #66: remember whether the goto was cut by its TIMEOUT (the nav timeout, or the #45 budget clamp above
+    // — both surface as the driver's TimeoutError). A non-timeout abort (a challenge/redirect abort — the
+    // CF-clearance path DELIBERATELY relies on goto throwing, then #settle polling the reload) is NOT a cut.
+    let gotoTimedOut = false;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
-    } catch {
+    } catch (err) {
       // A challenge/redirect/dead-exit may abort the navigation; settle on whatever rendered. With no
       // main-frame response the listener leaves status null, so the drive layer treats it as a failed nav.
+      // #66: with a response but no DCL (headers-before-DCL truncation) the listener pins a status — the
+      // deadlineTruncated derivation below keeps that partial page from reading as a healthy nav.
+      gotoTimedOut = err instanceof Error && err.name === "TimeoutError";
     }
     const domContentLoadedMs = performance.now() - goto0;
     // Give a client-side challenge (Cloudflare et al.) time to auto-solve, like render() does, and —
@@ -1015,7 +1036,23 @@ export class PatchrightBrowserCore implements BrowserCore {
       ...(settled.captchaSolveMs !== undefined ? { captchaSolveMs: settled.captchaSolveMs } : {}),
       ...(base.timing?.snapshotMs !== undefined ? { snapshotMs: base.timing.snapshotMs } : {}),
     });
-    return { ...base, timing };
+    // #66: a TRUNCATED nav — the goto was cut by its timeout (nav timeout / #45 budget clamp) or the
+    // clearance poll was cut by the deadline — that did NOT land real content must not read as a healthy
+    // nav: headers-before-DCL pins a 200 (#lastDocStatus), the page renders partially, and navFailed's
+    // status/phrase/thin-4xx arms all pass, so the controller would PIN it as a success. Derived on the
+    // FINAL snapshot (the latest evidence, so a page that finished landing during settle/snapshot is
+    // exempt), on the drive text surface (the aria tree — the same surface navFailed/isHardBlock read):
+    //  - thin (< MIN_CONTENT_LENGTH): a page with substantial content is a SUCCESS even after a timed-out
+    //    goto — the cleared-CF reload (goto throws → #settle → fat 200) MUST stay a success (stealth-
+    //    critical; the naive "goto threw ⇒ failed" precisely breaks that clearance path), and
+    //  - not visibly blocked: a still-showing interstitial is already navFailed with a RICHER class
+    //    (anti-bot + vendor) — the truncation flag must not override that story with a bare `timeout`.
+    const truncSig = { title: base.title, text: base.tree };
+    const deadlineTruncated =
+      (gotoTimedOut || settled.deadlineCut) &&
+      !isVisiblyBlocked(truncSig) &&
+      truncSig.text.trim().length < MIN_CONTENT_LENGTH;
+    return { ...base, ...(deadlineTruncated ? { deadlineTruncated: true } : {}), timing };
   }
 
   async snapshot(): Promise<PageSnapshot> {
@@ -1109,6 +1146,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     await this.#activePage?.close().catch(() => {});
     this.#activePage = undefined;
     this.#lastDocStatus = undefined;
+    this.#lastMainFrameResponseReceived = false; // #66: receipt resets with status
     this.#resetOsPresentation(); // next active page starts native again
   }
 
@@ -1214,6 +1252,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     if (!this.#activePage) {
       const page = await this.#context.newPage();
       this.#lastDocStatus = undefined;
+      this.#lastMainFrameResponseReceived = false; // #66: receipt resets with status (fresh page, no nav yet)
       this.#resetOsPresentation(); // a fresh page starts native; its OS mode is decided on the first nav
       // A fresh active page ⇒ fresh evidence: clear the buffers and install the console / pageerror /
       // requestfailed collectors that feed the drive path's failure envelope (issue #39).
@@ -1235,6 +1274,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       page.on("response", (resp) => {
         try {
           if (resp.request().isNavigationRequest() && resp.frame() === page.mainFrame()) {
+            // #66: flip the receipt FIRST — if resp.status() throws on a superseded response, the receipt
+            // ("the exit responded") is still true, which is exactly what isDeadExit needs to know.
+            this.#lastMainFrameResponseReceived = true;
             this.#lastDocStatus = resp.status();
           }
         } catch {
@@ -1339,6 +1381,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     let signal = await pollSignal(page);
     let waited = 0;
     let sawBlock = false;
+    let deadlineCut = false; // #66: set when the poll loop below is broken by the budget deadline
     while (waited < clearanceTimeoutMs) {
       const blocked = isVisiblyBlocked(signal);
       if (blocked) sawBlock = true;
@@ -1357,10 +1400,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       // interval — BYTE-IDENTICAL to the prior behavior (the action path clearance timing is unchanged).
       const budgetLeft = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
       const sleepMs = Math.min(pollIntervalMs, budgetLeft);
-      if (sleepMs <= 0) break;
+      if (sleepMs <= 0) {
+        deadlineCut = true; // sleepMs <= 0 ⇔ budgetLeft <= 0 (the poll interval is positive)
+        break;
+      }
       await page.waitForTimeout(sleepMs);
       waited += sleepMs;
-      if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) break;
+      if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) {
+        deadlineCut = true;
+        break;
+      }
       signal = await pollSignal(page);
     }
     const clearancePollMs = performance.now() - poll0;
@@ -1369,7 +1418,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // leave the page challenged (the caller's navFailed path surfaces it) rather than beginning a fresh solve.
     // No deadline (the action path / a budget-less caller) → always attempt, unchanged.
     if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) {
-      return { replay: false, domContentLoadedMs, clearancePollMs };
+      return { replay: false, domContentLoadedMs, clearancePollMs, deadlineCut };
     }
     // After client-side challenges settle, an INTERACTIVE captcha (reCAPTCHA/Turnstile/hCaptcha)
     // may still be blocking the flow. Auto-solve it transparently when a solver is configured. `replay`
@@ -1380,6 +1429,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       replay: solve.replay,
       domContentLoadedMs,
       clearancePollMs,
+      deadlineCut,
       ...(solve.captchaSolveMs !== undefined ? { captchaSolveMs: solve.captchaSolveMs } : {}),
     };
   }
@@ -1581,6 +1631,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       title,
       tree,
       status,
+      // #66: the main-frame response RECEIPT, mirroring `status` (same listener, same resets) — so drive's
+      // isDeadExit keys exit-health off "did the exit respond" instead of its status-presence fallback.
+      responseReceived: this.#lastMainFrameResponseReceived,
       diagnostics,
       timing,
       cfHint: hasCloudflareHint(html),

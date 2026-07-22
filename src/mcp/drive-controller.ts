@@ -232,12 +232,19 @@ export class GatewayDriveController implements DriveController {
     // like retrieve's seam — budget-exhausted ⇒ `timeout`, else all-exits-dead ⇒ `burned-exit` (a refinement
     // of the nav-failed the dead final snapshot classifies as). Both carry no WAF vendor. Other #failure
     // callers pass no opts → the per-signal classification, unchanged.
+    // #66: a core-marked DEADLINE-TRUNCATED nav is a `timeout` too — snapshot-level evidence (the nav was
+    // cut with only a partial page landed), below the loop verdicts: budget-exhausted is the same story
+    // told at the loop level, and burned-exit (no exit responded at all) can't coexist with a truncated
+    // partial page as the loop's verdict. classifyFailure would read the thin-200 as a content class,
+    // which is wrong for a page the deadline cut short.
     const failureClass: FailureClass | undefined = navFailed(snap)
       ? opts?.budgetExceeded
         ? "timeout"
         : opts?.burnedExit
           ? "burned-exit"
-          : classifyFailure(signal)
+          : snap.deadlineTruncated
+            ? "timeout"
+            : classifyFailure(signal)
       : undefined;
     const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
     // #42: fold the snapshot's first-class per-stage Timing into the envelope at THIS surface seam (like
@@ -444,6 +451,14 @@ export class GatewayDriveController implements DriveController {
           failure,
         );
       }
+      // #66: a deadline-truncated nav is a TIMEOUT story — surface it as one, BEFORE the warm remediation
+      // (re-capture is the wrong fix for a slow nav; a retry may simply land it) and the generic block message.
+      if (snap.deadlineTruncated) {
+        throw attachFailure(
+          new Error(`navigation timed out (status=${snap.status ?? "n/a"}): the navigation was truncated by its timeout before the page finished loading — retry navigate`),
+          failure,
+        );
+      }
       if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null), failure);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
       throw attachFailure(
@@ -507,14 +522,17 @@ export class GatewayDriveController implements DriveController {
       return this.#openHealthyAndNavigate(url, false, budgetDeadlineMs);
     }
     // #45 (codex r2): a non-escalating direct failure that hit the per-call deadline is a TIMEOUT, not nav-failed.
+    // #66: same for a deadline-truncated direct nav — the message matches the seam's `timeout` class.
     const budgetExceeded = performance.now() >= budgetDeadlineMs;
     const dx = this.#escalationDiag({ proxyApplied: false, forced: false, attempts: 0, last: direct });
     throw new EscalationError(
       budgetExceeded
         ? `navigation timed out (status=${dx.lastStatus ?? "n/a"}): the per-call budget (${this.#timeouts.callBudgetMs}ms) was exhausted`
-        : `navigation failed (status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}): ` +
-            `the page was blocked or could not be reached` +
-            (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
+        : direct.deadlineTruncated
+          ? `navigation timed out (status=${dx.lastStatus ?? "n/a"}): the navigation was truncated by its timeout before the page finished loading — retry navigate`
+          : `navigation failed (status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}): ` +
+              `the page was blocked or could not be reached` +
+              (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
       dx,
       this.#failure(direct, { budgetExceeded }),
     );
@@ -694,6 +712,14 @@ export class GatewayDriveController implements DriveController {
       if (budgetExceeded) {
         throw attachFailure(
           new Error(`warm navigation timed out (status=${snap.status ?? "n/a"}): the per-call budget (${this.#timeouts.callBudgetMs}ms) was exhausted`),
+          failure,
+        );
+      }
+      // #66: a deadline-truncated warm nav is a TIMEOUT too — the stale-login/re-capture remediation
+      // (#warmError) is the wrong (and alarming) fix for a nav its own timeout cut short.
+      if (snap.deadlineTruncated) {
+        throw attachFailure(
+          new Error(`warm navigation timed out (status=${snap.status ?? "n/a"}): the navigation was truncated by its timeout before the page finished loading — retry navigate`),
           failure,
         );
       }
@@ -889,10 +915,10 @@ export class GatewayDriveController implements DriveController {
       last = snap;
       // #45: this attempt FAILED. If the exit REACHED the site (a live block/challenge — not a null-status /
       // chrome-error dead nav), the failure is site-attributable, so NOT an all-exits-dead burn.
-      // #67: isDeadExit now keys off the main-frame response RECEIPT. The drive snapshot does not carry one
-      // until #66 wires it, so snap.responseReceived is undefined and isDeadExit FALLS BACK to `status` presence
-      // — drive exit-health labelling is unchanged here; #66 populates snap.responseReceived to gain the
-      // responded-but-slow precision retrieve now has.
+      // #67/#66: isDeadExit keys off the main-frame response RECEIPT, which the core now populates on every
+      // drive snapshot — so a responded-but-truncated proxied attempt (deadlineTruncated, or status-null with
+      // a receipt) counts as a LIVE response, not a burned exit (the same precision retrieve has). The
+      // `status`-presence fallback remains only for receipt-less fixtures.
       if (!isDeadExit(snap.responseReceived, snap.status ?? null, snap.url)) {
         sawLiveResponse = true;
         lastLive = snap; // #45 (codex r8): a later dead exit must not erase this site block from the class
@@ -923,7 +949,7 @@ export class GatewayDriveController implements DriveController {
     const failSnap =
     !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.responseReceived, last.status ?? null, last.url)
       ? lastLive
-      : last; // #67: receipt-keyed dead check (status fallback until #66 wires the drive receipt)
+      : last; // #67/#66: receipt-keyed dead check (the core now carries the receipt; status fallback for fixtures)
     // #45: skip the opt-in egress probe when we bailed on budget — it is one more proxied request past an
     // already-exhausted deadline. On a real exit-exhaustion (not a budget bail) it still classifies the exit.
     // #45 (codex r3): run the opt-in egress probe ONLY when meaningful budget remains (it opens ANOTHER

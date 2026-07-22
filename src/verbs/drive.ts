@@ -120,7 +120,10 @@ export function proxyOverrideForFresh(
  * Chrome error page (`chrome-error://…` — a dead exit / reset socket / unreachable host that
  * produced no response, so the snapshot can inherit a stale status), a still-visible anti-bot
  * interstitial (a CF/WAF challenge that did NOT clear within navigate()'s poll — a 200, non-thin page
- * that is nonetheless blocked), or a hard block (4xx/5xx + thin page). Drives the failed-nav decision
+ * that is nonetheless blocked), a hard block (4xx/5xx + thin page), or a nav the core marked
+ * DEADLINE-TRUNCATED (issue #66: a budget/nav-timeout-cut goto whose headers arrived first pins a
+ * partial 200 that every other arm here reads as healthy — the core sets the flag only when the page
+ * is thin and unblocked, so a cleared-CF fat 200 never carries it). Drives the failed-nav decision
  * on the first navigate, the pinned/direct restart error, and the post-action block check. A real
  * page that returns a 4xx but renders full content (rare) is NOT failed — mirrors retrieve's
  * isHardBlock nuance.
@@ -129,6 +132,7 @@ export function navFailed(snap: PageSnapshot): boolean {
   const status = snap.status ?? null;
   return (
     status === null ||
+    snap.deadlineTruncated === true ||
     snap.url.startsWith("chrome-error://") ||
     isVisiblyBlocked({ title: snap.title, text: snap.tree }) ||
     isHardBlock({ text: snap.tree }, status)
