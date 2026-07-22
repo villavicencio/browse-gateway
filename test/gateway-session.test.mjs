@@ -865,10 +865,43 @@ test("acquire: a launch that RESOLVES after the deadline is torn down, not leake
   for (let i = 0; i < 50 && !late.closed; i++) await tick();
   assert.equal(late.closed, true, "the late-resolving core was closed (not leaked)");
 
-  // Capacity is intact: the reserved slot was freed AND the late core consumed no slot, so a fresh acquire
-  // is admitted under maxSessions: 1 (the late core did NOT pin capacity toward SESSION_LIMIT).
+  // Capacity is intact: the reserved slot was freed AND the (confirmed-dead) late core consumed no slot, so a
+  // fresh acquire is admitted under maxSessions: 1 (the late core did NOT pin capacity toward SESSION_LIMIT).
   const s = await mgr.acquire();
-  assert.equal(mgr.activeCount, 1, "a replacement acquire succeeds — the late core didn't pin capacity");
+  assert.equal(mgr.activeCount, 1, "a replacement acquire succeeds — the confirmed-dead late core didn't pin capacity");
   await mgr.release(s.id);
   assert.equal(mgr.activeCount, 0);
+});
+
+test("acquire: a late-resolving core whose death CANNOT be confirmed stays COUNTED against capacity (issue #54, codex r2)", async () => {
+  const gate = deferred();
+  // close rejects AND no force-kill PID → teardown can't confirm death → a counted zombie, still possibly alive.
+  const late = makeControllableCore({ closeMode: "reject", forceKillAvailable: false });
+  let first = true;
+  const factory = async () => {
+    if (first) {
+      first = false;
+      await gate.promise; // resolves LATE with a core that can't be confirmed dead
+      return late;
+    }
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  const mgr = new SessionManager({
+    maxSessions: 1,
+    coreFactory: factory,
+    launchDeadlineMs: 30,
+    closeGraceMs: 20,
+    killConfirmMs: 20,
+  });
+
+  await assert.rejects(mgr.acquire(), (e) => e instanceof SessionManagerError && e.code === "CORE_LAUNCH");
+
+  gate.resolve();
+  for (let i = 0; i < 50 && mgr.unconfirmedCount === 0; i++) await tick();
+  assert.equal(mgr.unconfirmedCount, 1, "the unconfirmable late core is retained as unconfirmed (never erased)");
+  assert.equal(mgr.activeCount, 1, "and it OCCUPIES a capacity slot — acquire counts it (cap-safe)");
+
+  // maxSessions: 1 is now full — a replacement MUST be refused while the late browser may still be alive,
+  // rather than being admitted past the cap (the codex r2 accounting gap).
+  await assert.rejects(mgr.acquire(), (e) => e instanceof SessionManagerError && e.code === "SESSION_LIMIT");
 });

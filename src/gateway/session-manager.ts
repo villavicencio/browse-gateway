@@ -125,6 +125,13 @@ export class SessionManager {
    * first await, removed in `acquire`'s finally. (Issue #50.)
    */
   readonly #launching = new Set<Promise<Session>>();
+  /**
+   * Reap continuations for launches that RESOLVED after their deadline (issue #54). A wedged launch that
+   * later fulfills yields a real, KILLABLE browser that `acquire()` already abandoned — `#reapLateLaunch`
+   * tears it down through the counted lifecycle. Tracked here so `shutdown()` awaits them (bounded) rather
+   * than letting a late browser escape its drain. (Distinct from the never-returning half-spawn — #54 Part 2.)
+   */
+  readonly #launchReaps = new Set<Promise<void>>();
   /** Set once `shutdown()` begins; `acquire()` refuses from here on, so no replacement is admitted while
    *  shutdown drains in-flight teardowns and launches. (Issue #50.) */
   #shuttingDown = false;
@@ -283,20 +290,17 @@ export class SessionManager {
     if (outcome.kind === "timeout") {
       // The deadline won, but `launchP` is still pending. If it RESOLVES late with a real core, that browser
       // is untracked — never registered, never reaped — so it would leak AND let a later acquire exceed
-      // `maxSessions`. Attach a best-effort confirmable teardown to the late fulfillment (issue #54, codex r1);
-      // this is the KILLABLE late-resolve case, distinct from #54 Part 2's half-spawned orphan that never
-      // returns a core. A late REJECTION is already absorbed by the race's `.then(onR)` arm above.
-      void launchP.then(
-        async (lateCore) => {
-          const orphan = new Session(lateCore);
-          try {
-            await orphan.teardown(this.#closeGraceMs, this.#killConfirmMs);
-          } catch {
-            this.#unconfirmed.add(orphan); // kill couldn't confirm → the reaper / shutdown drain reclaims it
-          }
-        },
+      // `maxSessions`. Reap it through the COUNTED lifecycle (issue #54, codex r1/r2): `#reapLateLaunch`
+      // registers the late core so it occupies a capacity slot and an unconfirmed force-kill stays counted +
+      // reaper-retried. This is the KILLABLE late-resolve case, distinct from #54 Part 2's half-spawned orphan
+      // that never returns a core. Tracked in `#launchReaps` so `shutdown()` awaits it (bounded) instead of
+      // letting a late browser escape its drain; a late REJECTION is absorbed by the race's `.then(onR)` arm.
+      const reap = launchP.then(
+        (lateCore) => this.#reapLateLaunch(lateCore),
         () => {}, // swallow a late rejection (already handled above) so it can't surface as unhandled
       );
+      this.#launchReaps.add(reap);
+      void reap.finally(() => this.#launchReaps.delete(reap));
       throw new SessionManagerError(
         "CORE_LAUNCH",
         `browser core launch exceeded ${this.#launchDeadlineMs}ms deadline`,
@@ -345,6 +349,33 @@ export class SessionManager {
    * teardown could false-confirm a post-SIGKILL close). The returned promise NEVER rejects (both
    * resolution arms only mutate maps), so a fire-and-forget reap and an awaited release are both safe.
    */
+  /**
+   * Reap a core from a launch that RESOLVED after its deadline (issue #54, codex r2). While the manager is
+   * running, register it so it OCCUPIES a capacity slot — a replacement `acquire()` can't overshoot
+   * `maxSessions` while this late browser may be alive — then tear it down through the counted-until-confirmed
+   * path (`#beginTeardown`), so an unconfirmed force-kill stays counted and the running reaper's reconfirm loop
+   * keeps retrying it. Register-then-teardown is synchronous-contiguous (no await between the `#shuttingDown`
+   * check and the `#sessions.set`), so a shutdown beginning here is atomic w.r.t. this registration — the same
+   * guarantee the acquire register path relies on. If shutdown has already begun, `#sessions` is drained/owned
+   * by `shutdown()`, so mirror the acquire⇄shutdown self-teardown: an anchorless best-effort teardown that
+   * hands an unconfirmed orphan to `#unconfirmed` (a best-effort SIGKILL was sent — the same documented degrade
+   * as any shutdown-time unconfirmed teardown; the container namespace teardown is the ultimate backstop).
+   */
+  async #reapLateLaunch(core: BrowserCore): Promise<void> {
+    if (this.#shuttingDown) {
+      const orphan = new Session(core);
+      try {
+        await orphan.teardown(this.#closeGraceMs, this.#killConfirmMs);
+      } catch {
+        this.#unconfirmed.add(orphan);
+      }
+      return;
+    }
+    const orphan = new Session(core);
+    this.#sessions.set(orphan.id, orphan); // counted (cap-safe) until `#beginTeardown` confirms death
+    await this.#beginTeardown(orphan);
+  }
+
   #beginTeardown(session: Session): Promise<void> {
     const existing = this.#closing.get(session.id);
     if (existing) return existing;
@@ -459,16 +490,18 @@ export class SessionManager {
   async shutdown(): Promise<void> {
     this.#shuttingDown = true;
     this.stopReaper();
-    // AWAIT in-flight launches so a launch racing shutdown self-tears-down rather than orphaning a browser —
-    // but BOUND that wait so a wedged launch can't hang shutdown (issue #54). Each `#launching` entry already
-    // settles within `#launchDeadlineMs` (the acquire-side deadline above), and this race is the independent
-    // backstop: even a launch that somehow outlives its own deadline can't pin shutdown. A launch still
-    // pending when the bound fires is harmless — `#shuttingDown` is set, so when it eventually resolves the
-    // re-check in `#launchAndRegister` self-tears-down the orphan and never registers it. NOT unref'd (issue
-    // #50): this is a foreground awaited timer; an unref'd one would let the loop empty mid-await and hang.
+    // AWAIT in-flight launches AND late-launch reaps so a launch racing shutdown self-tears-down rather than
+    // orphaning a browser — but BOUND that wait so a wedged launch can't hang shutdown (issue #54). Each
+    // `#launching` entry settles within `#launchDeadlineMs` (the acquire-side deadline above), and a
+    // `#launchReaps` entry is a late-resolve teardown (issue #54, codex r2) — awaiting them here keeps a late
+    // browser inside shutdown's lifecycle instead of being reaped after the drain has finished. This race is
+    // the independent backstop: a launch/reap still pending when the bound fires is harmless — `#shuttingDown`
+    // is set, so `#launchAndRegister`'s re-check and `#reapLateLaunch`'s shutting-down branch self-tear-down
+    // the orphan (best-effort). NOT unref'd (issue #50): a foreground awaited timer; an unref'd one would let
+    // the loop empty mid-await and hang.
     const launchDrain = deadlineTimer(this.#launchDeadlineMs);
     await Promise.race([
-      Promise.allSettled([...this.#launching]).then(() => {}),
+      Promise.allSettled([...this.#launching, ...this.#launchReaps]).then(() => {}),
       launchDrain.promise,
     ]);
     launchDrain.clear();
