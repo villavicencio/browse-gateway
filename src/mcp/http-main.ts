@@ -69,6 +69,7 @@ async function main(): Promise<void> {
         warmupPaths,
         log,
         verifyEgress,
+        timeouts: config.timeouts, // #45: the drive escalation loop now consumes the #43 per-call budget
         vault,
         consumerId: consumer.id,
         allowlist: consumer.allowlist,

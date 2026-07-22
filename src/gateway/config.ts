@@ -12,12 +12,14 @@ import { parseHostSuffixList } from "../security/index.js";
  * proxyClearance)` could stack toward ~200s, and an unsolvable-CAPTCHA solve ran its full deadline. The
  * global `callBudgetMs` is the outer bound the escalation loop enforces regardless of the per-stage math.
  *
- * CONSUMED by the RETRIEVE path (the 3× proxy-escalation loop — the observed ~200s stacking source) and
- * the CAPTCHA solver. SCOPED-OUT (documented #43 follow-up, coordinated with #45): the DRIVE path still
- * reads the module-constant defaults. The drive path does NOT have retrieve's 3× re-roll loop — a stateful
- * session can't swap its exit mid-flow (KTD-5), so it's a single escalation attempt bounded by one nav +
- * clearance, not a stacking loop — and #45 restructures that exact drive escalation, so threading the budget
- * through it now would be immediately churned. Its env-timeout consumption lands with #45.
+ * CONSUMED by the RETRIEVE path (its 3× proxy-escalation loop) and, as of #45, the DRIVE path (its COLD
+ * first-navigate escalation `#openHealthyAndNavigate` — a real up-to-3× fresh-exit re-roll loop that was
+ * ALSO a ~200-255s stacking source, previously bounded only by the idle reaper) plus the CAPTCHA solver.
+ * The drive whole-navigate budget rides into the core as ONE absolute `budgetDeadlineMs` (bounding the goto
+ * + the clearance poll of each proxied attempt) with a pre-attempt bail once too little budget remains — the
+ * same shape as retrieve. KTD-5 still holds: a PINNED (post-first-navigate) session never re-rolls its exit
+ * mid-flow; the budget just bounds that single navigate. The env-overridable per-stage timeouts below apply
+ * to both verbs.
  */
 export interface CallTimeouts {
   /** Global per-call wall-clock budget (BGW_CALL_BUDGET_MS). The retrieve escalation loop stops re-rolling and

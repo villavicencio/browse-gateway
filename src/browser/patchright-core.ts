@@ -959,7 +959,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     try {
       await page.goto(url, {
         waitUntil: "domcontentloaded",
-        timeout: this.#resolved.navigationTimeoutMs,
+        // #45: bound the goto by the shared per-call deadline too (parity with render()), so a proxied drive
+        // attempt that starts near the budget can't run its full nav timeout past it. Floor 1ms — an already-
+        // passed deadline still makes a bounded (fast-failing) attempt, never a zero/negative timeout. No
+        // deadline passed (the action path, a budget-less caller) → the raw navigationTimeoutMs, unchanged.
+        timeout: deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1),
       });
     } catch {
       // A challenge/redirect/dead-exit may abort the navigation; settle on whatever rendered. With no
@@ -970,7 +974,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // once it clears via a full reload — wait for the real document to land content rather than the
     // blank inter-navigation moment. A page still blocked after the budget is surfaced by navFailed.
     // #settle returns its clearance-poll + captcha-solve wall-clock for the #42 timing breakdown.
-    const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs);
+    const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs, opts.budgetDeadlineMs);
     // #58: the CF/PX/DataDome vendor hints + the interactive-CAPTCHA widget KIND are now computed inside
     // #snapshotOf (on EVERY snapshot), so `base` already carries cfHint/pxHint/ddHint/captchaKind — the
     // navigate path no longer computes them (nor a second page.content()) here. They let drive's escalation
@@ -1284,6 +1288,10 @@ export class PatchrightBrowserCore implements BrowserCore {
     page: PatchrightPage,
     clearanceTimeoutMs: number = DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS,
     pollIntervalMs: number = DEFAULT_POLL_INTERVAL_MS,
+    // #45: the shared per-call deadline (absolute performance.now()). When set, the clearance poll below
+    // breaks at it (parity with render's deadline-bounded poll). Undefined for the action path / a
+    // budget-less caller → Infinity budget, poll behavior unchanged.
+    budgetDeadlineMs?: number,
   ): Promise<SettleResult> {
     // Let any navigation the prior action triggered reach domcontentloaded, so its response status is
     // captured and the snapshot reflects the landed page (resolves immediately if nothing navigated).
@@ -1312,8 +1320,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       // block. Bounded by the clearance budget, so a genuinely-thin cleared page still returns.
       const settled = sawBlock ? isCleared(signal, MIN_CONTENT_LENGTH) : !blocked;
       if (settled) break;
-      await page.waitForTimeout(pollIntervalMs);
-      waited += pollIntervalMs;
+      // #45: clamp each sleep to the SMALLER of the poll interval, the remaining clearance budget, and the
+      // remaining GLOBAL per-call budget — so a small budget breaks the drive clearance poll early (parity
+      // with render's deadline-bounded poll). No deadline → budgetLeft is Infinity, so the sleep is the poll
+      // interval (or the residual clearance budget), preserving the prior behavior for the action path.
+      const budgetLeft = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
+      const sleepMs = Math.min(pollIntervalMs, clearanceTimeoutMs - waited, budgetLeft);
+      if (sleepMs <= 0) break;
+      await page.waitForTimeout(sleepMs);
+      waited += sleepMs;
+      if (budgetDeadlineMs !== undefined && performance.now() >= budgetDeadlineMs) break;
       signal = await pollSignal(page);
     }
     const clearancePollMs = performance.now() - poll0;

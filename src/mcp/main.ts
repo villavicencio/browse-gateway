@@ -92,6 +92,7 @@ async function main(): Promise<void> {
     warmupPaths,
     log,
     verifyEgress,
+    timeouts: config.timeouts, // #45: the drive escalation loop now consumes the #43 per-call budget
     // U9 warm-open: a navigate to an approved host with a stored login opens a logged-in session
     // (vault dormant → null → cold-only). The allowlist here is the same scope the gateway guard clamps to.
     vault,
