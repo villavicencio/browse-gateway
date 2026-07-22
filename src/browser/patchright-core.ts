@@ -16,6 +16,7 @@ import {
   activeCaptchaKind,
   isSolvableCaptchaKind,
   resolveCaptchaSolveReason,
+  preAttemptSolveReason,
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
   type CaptchaSolveReason,
@@ -1314,7 +1315,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       (ms) => page.waitForTimeout(ms).catch(() => {}),
       { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: CAPTCHA_RENDER_TIMEOUT_MS },
     );
-    if (!challenge) return { replay: false };
+    if (!challenge) {
+      // #44 (codex r2): a supported widget was detected but never became attemptable — preserve WHY (no
+      // sitekey / the response field never rendered within the budget) instead of dropping it, so the
+      // envelope's why-not isn't silently omitted while solverEligible stays true. One final live read
+      // classifies it; an already-solved / solvable-now / absent widget yields undefined (no failure).
+      const live = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
+      const reason = preAttemptSolveReason(live);
+      if (reason) this.#pendingSolveReason = reason;
+      return { replay: false, ...(reason ? { solveReason: reason } : {}) };
+    }
     // #42: measure the solver wall-clock from here (a widget IS present, so a solve is being attempted).
     const solve0 = performance.now();
     let token: string;

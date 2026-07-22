@@ -186,6 +186,21 @@ export function activeCaptchaKind(html: string): CaptchaKind | undefined {
   return WIDGET_EVIDENCE.find(({ res }) => res.some((re) => re.test(live)))?.kind;
 }
 
+/**
+ * The pre-attempt why-not for a supported CAPTCHA widget that was DETECTED but never became attemptable
+ * (issue #44, codex r2) — classified from the final live-DOM read after {@link awaitSolvableCaptcha} gave
+ * up, so the failure envelope reports WHY instead of omitting it while `solverEligible` is true. Pure +
+ * unit-testable. `missing-sitekey` (no key to solve against) or `timeout` (the response field never
+ * rendered within the render budget). An already-solved widget (`respLen > 0`), a solvable-now widget
+ * (`respLen === 0` with a sitekey — a render race the poll just missed), or no live widget → undefined:
+ * none of those is a pre-attempt failure to report.
+ */
+export function preAttemptSolveReason(live: LiveCaptcha | null): CaptchaSolveReason | undefined {
+  if (!live) return undefined;
+  if (!live.siteKey) return "missing-sitekey";
+  return live.respLen < 0 ? "timeout" : undefined;
+}
+
 /** A live, in-DOM CAPTCHA widget read off the active page (drive path). */
 export interface LiveCaptcha {
   kind: Exclude<CaptchaKind, "unknown">;

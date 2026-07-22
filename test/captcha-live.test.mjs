@@ -15,6 +15,7 @@ import {
   DETECT_LIVE_CAPTCHA_JS,
   isSolvableCaptchaKind,
   resolveCaptchaSolveReason,
+  preAttemptSolveReason,
   CAPTCHA_SOLVE_ERROR_CODES,
 } from "../dist/browser/index.js";
 
@@ -165,4 +166,16 @@ test("#44 resolveCaptchaSolveReason: pre-attempt why-not when no attempt was mad
   for (const k of ["recaptcha", "turnstile", "hcaptcha"]) {
     assert.equal(resolveCaptchaSolveReason({ captchaKind: k, solverPresent: true }), undefined, `${k} solvable, no failure → undefined`);
   }
+});
+
+test("#44 preAttemptSolveReason: a detected-but-unattemptable widget reports WHY (codex r2)", () => {
+  // No live widget / already-solved / solvable-now → not a pre-attempt failure.
+  assert.equal(preAttemptSolveReason(null), undefined);
+  assert.equal(preAttemptSolveReason({ kind: "recaptcha", siteKey: "k", respLen: 5 }), undefined, "already solved");
+  assert.equal(preAttemptSolveReason({ kind: "recaptcha", siteKey: "k", respLen: 0 }), undefined, "solvable-now (race)");
+  // No sitekey to solve against → missing-sitekey (whatever the render state).
+  assert.equal(preAttemptSolveReason({ kind: "hcaptcha", siteKey: "", respLen: -1 }), "missing-sitekey");
+  assert.equal(preAttemptSolveReason({ kind: "hcaptcha", siteKey: "", respLen: 0 }), "missing-sitekey");
+  // Sitekey present but the response field never rendered within the budget → timeout.
+  assert.equal(preAttemptSolveReason({ kind: "turnstile", siteKey: "0x4", respLen: -1 }), "timeout");
 });
