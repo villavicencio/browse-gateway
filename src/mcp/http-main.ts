@@ -90,6 +90,9 @@ async function main(): Promise<void> {
     },
     allowedHosts,
     allowedOrigins,
+    // Liveness/health for a client-side breaker (issue #47): a cheap, browser-session-free signal.
+    // Minimal today; issue #53 folds in the gateway's pool-degradation counters (gateway.sessions).
+    health: () => ({ status: "ok" as const }),
     log,
   });
   handler.startReaper(MCP_SESSION_REAPER_INTERVAL_MS);

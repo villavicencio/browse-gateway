@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createHttpHandler, createGatewayMcpServer, awaitBounded } from "../dist/mcp/index.js";
@@ -375,6 +375,89 @@ test("HTTP: closeAll bounds MULTIPLE hung disposes under ONE deadline, not N× (
     assert.ok(elapsed < 200 * (N - 1), `closeAll bounded under ONE deadline, not compounded (elapsed ${elapsed}ms for ${N} hung sessions)`);
   } finally {
     for (const cl of clients) await cl.close().catch(() => {});
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+// --- #47: liveness/health route -------------------------------------------------------------
+
+test("#47: GET /health returns a fast authed liveness signal and opens NO session", async () => {
+  const { deps } = makeDeps(); // no `health` dep → exercises the bare `{status:"ok"}` fallback
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const res = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer tok-alice" } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await res.json(), { status: "ok" });
+    assert.equal(handler.sessionCount(), 0, "liveness must not open an MCP/browser session");
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("#47: GET /health is authed — a bad or absent bearer is 401, never a liveness leak", async () => {
+  const { deps } = makeDeps();
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const bad = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer nope" } });
+    assert.equal(bad.status, 401);
+    const none = await fetch(new URL("/health", url.origin));
+    assert.equal(none.status, 401);
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("#47: the injected health producer body passes through verbatim (the #53 enrichment seam)", async () => {
+  const { deps } = makeDeps({ health: () => ({ status: "ok", forceKillAvailable: true, unconfirmedCount: 0 }) });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const res = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer tok-bob" } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { status: "ok", forceKillAvailable: true, unconfirmedCount: 0 });
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+// A raw GET so the Host header can be set explicitly (fetch/undici forbids overriding Host).
+function rawGet(port, path, headers) {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers }, (res) => {
+      let body = "";
+      res.on("data", (c) => (body += c));
+      res.on("end", () => resolve({ status: res.statusCode, body }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("#47: GET /health applies the DNS-rebind Host guard — valid bearer + disallowed Host is 403 (codex r2)", async () => {
+  // The Host allowlist is load-bearing (the transport enforces it on MCP routes; /health bypasses the
+  // transport, so it must apply the SAME check). Auth alone is NOT the gate — a valid bearer with a
+  // rebind Host must still be refused, especially before #53 exposes pool internals here.
+  const { deps } = makeDeps({ allowedHosts: ["gw.allowed:8080"] });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const ok = await rawGet(url.port, "/health", { Host: "gw.allowed:8080", Authorization: "Bearer tok-alice" });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(JSON.parse(ok.body), { status: "ok" });
+
+    const rebind = await rawGet(url.port, "/health", { Host: "evil.rebind:8080", Authorization: "Bearer tok-alice" });
+    assert.equal(rebind.status, 403, "a valid bearer must not bypass the Host allowlist");
+
+    const missingHost = await rawGet(url.port, "/health", { Host: "", Authorization: "Bearer tok-alice" });
+    assert.equal(missingHost.status, 403, "an absent Host is refused when the allowlist is configured");
+  } finally {
     await new Promise((r) => server.close(r));
     server.closeAllConnections?.();
   }
