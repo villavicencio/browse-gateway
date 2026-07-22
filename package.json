@@ -24,6 +24,7 @@
     "validate:redirect-guard": "npm run build && node scripts/validate-redirect-guard.mjs",
     "validate:failure-envelope": "npm run build && node scripts/validate-failure-envelope.mjs",
     "validate:teardown": "npm run build && node scripts/validate-teardown.mjs",
+    "validate:call-budget": "npm run build && node scripts/validate-call-budget.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
