@@ -17,6 +17,7 @@ import {
   isSolvableCaptchaKind,
   resolveCaptchaSolveReason,
   preAttemptSolveReason,
+  firstSiteKey,
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolver,
   type CaptchaSolveReason,
@@ -517,11 +518,13 @@ export class PatchrightBrowserCore implements BrowserCore {
    * inherits a stale attempt's reason; a pre-attempt why-not (`not-configured` / `unsupported-kind`) is
    * derived in #snapshotOf instead when no attempt was made.
    *
-   * The attempted widget's KIND rides with the reason (codex #44 r5): the page can navigate/rotate its
-   * CAPTCHA while a solve is pending, so #snapshotOf only adopts the reason when the stashed kind still
-   * matches the kind in the FINAL HTML — otherwise it would report challenge A's failure against challenge B.
+   * The attempted widget's IDENTITY rides with the reason (codex #44 r5/r6/r7): the page can navigate/rotate
+   * its CAPTCHA while a solve is pending, so #snapshotOf adopts the reason only when the stashed identity
+   * still matches the FINAL snapshot's widget — kind always, plus siteKey + url when known (the solve-failure
+   * path, which has a full challenge identity; the give-up path carries only the kind of the current widget).
+   * Otherwise it would report challenge A's failure against challenge B (even a same-kind one at a new key).
    */
-  #pendingSolveOutcome?: { reason: CaptchaSolveReason; kind: CaptchaKind };
+  #pendingSolveOutcome?: { reason: CaptchaSolveReason; kind: CaptchaKind; siteKey?: string; url?: string };
 
   private constructor(
     context: PatchrightContext,
@@ -1357,7 +1360,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       // guard (a rotation between this read and the snapshot).
       const after = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
       if (after && after.kind === challenge.kind && after.siteKey === challenge.siteKey && page.url() === challenge.url) {
-        this.#pendingSolveOutcome = { reason: code, kind: challenge.kind };
+        // Carry the FULL identity (codex r7) so #snapshotOf can re-reject a same-kind rotation that happens
+        // in the gap between this read and the snapshot's HTML capture.
+        this.#pendingSolveOutcome = { reason: code, kind: challenge.kind, ...(challenge.siteKey ? { siteKey: challenge.siteKey } : {}), url: challenge.url };
       }
       return { replay: false, captchaSolveMs: performance.now() - solve0, solveReason: code };
     }
@@ -1427,11 +1432,19 @@ export class PatchrightBrowserCore implements BrowserCore {
     // else a pre-attempt why-not derived from the kind — `not-configured` (no solver wired) or
     // `unsupported-kind` (the widget kind isn't solvable). Consume-once: clear the stash so a later bare
     // snapshot() can't inherit a stale attempt's reason. Both are set only when a CAPTCHA is present.
-    // The stashed reason is adopted ONLY when its attempted kind still matches the kind in THIS final HTML
-    // (codex r5) — a page that rotated its CAPTCHA mid-solve must not report challenge A's failure on B.
+    // The stashed reason is adopted ONLY when its attempted IDENTITY still matches THIS final snapshot's
+    // widget (codex r5/r6/r7) — a page that rotated its CAPTCHA mid-solve must not report challenge A's
+    // failure on B. Kind always; plus siteKey + url when the stash carried them (the solve-failure path) so a
+    // same-kind rotation to a new key/URL in the gap before this HTML capture is also rejected. Compared
+    // against the captured `html` + `finalUrl` (this snapshot's moment), so the check is accurate for it.
     const solveOutcome = this.#pendingSolveOutcome;
     this.#pendingSolveOutcome = undefined;
-    const attemptReason = solveOutcome && solveOutcome.kind === captchaKind ? solveOutcome.reason : undefined;
+    const identityMatches =
+      solveOutcome != null &&
+      solveOutcome.kind === captchaKind &&
+      (solveOutcome.url === undefined || solveOutcome.url === finalUrl) &&
+      (solveOutcome.siteKey === undefined || solveOutcome.siteKey === firstSiteKey(html));
+    const attemptReason = identityMatches ? solveOutcome.reason : undefined;
     const solverEligible = captchaKind ? isSolvableCaptchaKind(captchaKind) : undefined;
     const captchaSolveReason = resolveCaptchaSolveReason({
       captchaKind,

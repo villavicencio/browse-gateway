@@ -82,6 +82,7 @@ export {
   isSolvableCaptchaKind,
   resolveCaptchaSolveReason,
   preAttemptSolveReason,
+  firstSiteKey,
   SOLVABLE_CAPTCHA_KINDS,
   CAPTCHA_SOLVE_ERROR_CODES,
   type CaptchaSolveReason,

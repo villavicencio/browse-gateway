@@ -107,6 +107,13 @@ export class NullCaptchaSolver implements CaptchaSolver {
 
 const SITE_KEY = /data-sitekey=["']([^"']+)["']/i;
 
+/** The first `data-sitekey` value in the HTML, or undefined if none (issue #44) — used to compare a stashed
+ *  solve outcome's attempted site key against the widget in the final snapshot HTML, so a same-kind CAPTCHA
+ *  rotation doesn't misattribute the reason. Best-effort on a multi-widget page (it reads the FIRST key). */
+export function firstSiteKey(html: string): string | undefined {
+  return SITE_KEY.exec(html)?.[1];
+}
+
 /** Identify an interactive CAPTCHA widget in the rendered HTML, or null if none (pure, HTML-based). */
 export function detectCaptcha(signal: PageSignal, url: string): CaptchaChallenge | null {
   const html = signal.html;

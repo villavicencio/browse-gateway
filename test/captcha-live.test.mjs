@@ -16,6 +16,7 @@ import {
   isSolvableCaptchaKind,
   resolveCaptchaSolveReason,
   preAttemptSolveReason,
+  firstSiteKey,
   CAPTCHA_SOLVE_ERROR_CODES,
 } from "../dist/browser/index.js";
 
@@ -178,4 +179,10 @@ test("#44 preAttemptSolveReason: a detected-but-unattemptable widget reports WHY
   assert.equal(preAttemptSolveReason({ kind: "hcaptcha", siteKey: "", respLen: 0 }), "missing-sitekey");
   // Sitekey present but the response field never rendered within the budget → timeout.
   assert.equal(preAttemptSolveReason({ kind: "turnstile", siteKey: "0x4", respLen: -1 }), "timeout");
+});
+
+test("#44 firstSiteKey: extracts the first data-sitekey for the same-kind-rotation identity check (codex r7)", () => {
+  assert.equal(firstSiteKey('<div class="g-recaptcha" data-sitekey="sk-1"></div>'), "sk-1");
+  assert.equal(firstSiteKey('<div data-sitekey="a"></div><div data-sitekey="b"></div>'), "a");
+  assert.equal(firstSiteKey("<div>no captcha here</div>"), undefined);
 });
