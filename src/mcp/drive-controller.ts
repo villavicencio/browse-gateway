@@ -889,7 +889,11 @@ export class GatewayDriveController implements DriveController {
       last = snap;
       // #45: this attempt FAILED. If the exit REACHED the site (a live block/challenge — not a null-status /
       // chrome-error dead nav), the failure is site-attributable, so NOT an all-exits-dead burn.
-      if (!isDeadExit(snap.status ?? null, snap.url)) {
+      // #67: isDeadExit now keys off the main-frame response RECEIPT. The drive snapshot does not carry one
+      // until #66 wires it, so snap.responseReceived is undefined and isDeadExit FALLS BACK to `status` presence
+      // — drive exit-health labelling is unchanged here; #66 populates snap.responseReceived to gain the
+      // responded-but-slow precision retrieve now has.
+      if (!isDeadExit(snap.responseReceived, snap.status ?? null, snap.url)) {
         sawLiveResponse = true;
         lastLive = snap; // #45 (codex r8): a later dead exit must not erase this site block from the class
       }
@@ -916,7 +920,10 @@ export class GatewayDriveController implements DriveController {
     // #45 (codex r8): on a MIXED exhaustion (a live block then a dead exit) classify + surface the LAST LIVE
     // failure, not the dead final `last`, so the reason/class/message stay site-attributed (not nav-failed).
     // Only when NOT a timeout/burn (those override the class anyway) and the final snapshot is actually dead.
-    const failSnap = !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.status ?? null, last.url) ? lastLive : last;
+    const failSnap =
+    !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.responseReceived, last.status ?? null, last.url)
+      ? lastLive
+      : last; // #67: receipt-keyed dead check (status fallback until #66 wires the drive receipt)
     // #45: skip the opt-in egress probe when we bailed on budget — it is one more proxied request past an
     // already-exhausted deadline. On a real exit-exhaustion (not a budget bail) it still classifies the exit.
     // #45 (codex r3): run the opt-in egress probe ONLY when meaningful budget remains (it opens ANOTHER

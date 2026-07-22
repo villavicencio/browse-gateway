@@ -292,6 +292,11 @@ export interface FailureSignal extends BlockSignal {
    *  that reached a `chrome-error://` page while inheriting a STALE non-null status (which defeats the
    *  status===null nav-failed test). retrieve passes render.diagnostics.finalUrl; drive the snapshot url. */
   finalUrl?: string;
+  /** The main-frame RESPONSE RECEIPT ({@link RenderResult.responseReceived}), carried so the seam-level
+   *  {@link isDeadExit} burned-exit gate keys off "did the exit respond" rather than status===null (#67). A
+   *  retrieve-populated field: retrieve sets it from render.responseReceived; drive keys exit-health off its
+   *  snapshot directly and leaves this unset (like frameworkRoot/networkFailed) until #66 wires the receipt. */
+  responseReceived?: boolean;
 }
 
 /** True when a URL is a Chrome error page (`chrome-error://…`) — a dead nav (reset socket / unreachable
@@ -302,17 +307,28 @@ export function isChromeErrorUrl(url: string | undefined): boolean {
 }
 
 /**
- * A DEAD-EXIT signal (#45): the attempt produced NO real response from the site — a null status (no
- * main-frame response captured) or a `chrome-error://` landing (reset socket / unreachable). This is the
- * exit-health SUBSET of a nav failure: it means our proxied exit died before reaching the site, distinct
- * from the site serving a live block on a reachable exit (a visible challenge or a 4xx/5xx hard block,
- * where `status` is non-null and the URL is real). The escalation loops use it to tell a burned exit
- * (re-roll the pool) apart from a site block (a fresh exit may still clear it) — a PURE derivation over
- * signals BOTH verbs already carry (status + landed URL), no probe. Positive-signal-only: it is evidence
- * FROM an attempt, never fabricated from an attempt's absence.
+ * A DEAD-EXIT signal (#45, re-keyed #67): the attempt produced NO real response from the site — the
+ * main-frame response was never received, or the render landed on a `chrome-error://` page (reset socket /
+ * unreachable). This is the exit-health SUBSET of a nav failure: our proxied exit died before reaching the
+ * site, distinct from the site serving a live block on a reachable exit (a visible challenge or a 4xx/5xx hard
+ * block). The escalation loops use it to tell a burned exit (re-roll the pool) apart from a site block (a fresh
+ * exit may still clear it). Positive-signal-only: evidence FROM an attempt, never fabricated from its absence.
+ *
+ * #67: keyed on the main-frame RESPONSE RECEIPT ({@link RenderResult.responseReceived}), NOT `status === null`.
+ * A proxied exit that RESPONDED but timed out before DCL is recorded status-null yet responseReceived — the
+ * receipt keeps that responded-but-slow exit from being mislabelled a dead exit (an over-firing `burned-exit`),
+ * WITHOUT touching the `status`-driven success verdict (retrieve's `deadNav` / drive's `navFailed` stay on
+ * status, per r10). The receipt is authoritative WHEN PRESENT; absent (a receipt-less fixture, the synthetic
+ * budget-timeout render, or the drive snapshot until #66 wires it) it FALLS BACK to `status` presence — a
+ * captured status implies a response — so exit-health labelling there is unchanged.
  */
-export function isDeadExit(status: number | null, finalUrl: string | undefined): boolean {
-  return status === null || isChromeErrorUrl(finalUrl);
+export function isDeadExit(
+  responseReceived: boolean | undefined,
+  status: number | null | undefined,
+  finalUrl: string | undefined,
+): boolean {
+  const responded = responseReceived ?? typeof status === "number";
+  return !responded || isChromeErrorUrl(finalUrl);
 }
 
 /**
@@ -895,9 +911,10 @@ export async function retrieve(
         break;
       }
       // #45: this attempt FAILED (didn't break as cleared). If the exit REACHED the site (a live response —
-      // a visible/hard block, not a null/chrome-error dead nav), the failure is site-attributable, so this is
-      // NOT an all-exits-dead burn. Tracked across attempts; if the loop exhausts still-false, every exit died.
-      if (!isDeadExit(render.status, render.diagnostics?.finalUrl)) {
+      // a visible/hard block, OR — #67 — a response that arrived but timed out before DCL, not a null/chrome-error
+      // dead nav), the failure is site-attributable, so this is NOT an all-exits-dead burn. Tracked across
+      // attempts; if the loop exhausts still-false, every exit died.
+      if (!isDeadExit(render.responseReceived, render.status, render.diagnostics?.finalUrl)) {
         sawLiveProxiedResponse = true;
         lastLiveRender = render; // #45 (codex r8): remember it — a later dead exit must not erase this site block
       }
@@ -955,6 +972,11 @@ export async function retrieve(
   // a prior in-page navigation (codex #41 r4). A chrome-error final URL is UNAMBIGUOUS (a real page never has
   // one), unlike an HTML phrase, so folding it into the failure decision is SAFE — otherwise the browser's
   // error DOM extracts to non-empty markdown and is handed back to the caller as page content.
+  // #67: deadNav stays keyed on `status === null` — it is the SUCCESS-GATE nav-failure (feeds `blocked` below,
+  // and via isRetrieveFailure the caller-visible verdict), which r10 LOCKED to status so a timed-out-but-
+  // responded render (partial content, status-null) still fails instead of returning as a partial success. The
+  // exit-health `isDeadExit` (the burned-exit gate) is DISTINCT — it keys off the response receipt, so a
+  // responded-but-slow exit is deadNav-true (still a failure) yet not a dead exit (not a burn).
   const deadNav = render.status === null || isChromeErrorUrl(render.diagnostics?.finalUrl);
   // Blocked = a dead nav, a visible anti-bot phrase, a PerimeterX press-&-hold (pxHint + EITHER thin content
   // OR the challenge copy in source — a 200 challenge whose phrase renders in a cross-origin iframe, never
@@ -988,6 +1010,9 @@ export async function retrieve(
     captchaKind,
     frameworkRoot,
     networkFailed,
+    // #67: the main-frame response receipt — carried so the burned-exit gate below keys off "did the exit
+    // respond" (isDeadExit) rather than status===null, telling a responded-but-slow exit from a truly dead one.
+    ...(render.responseReceived !== undefined ? { responseReceived: render.responseReceived } : {}),
     // The post-redirect / post-client-nav landed URL — lets classifyFailure catch a dead nav that reached a
     // chrome-error page while the (fresh-page) status stayed at the initial 200 (codex #41 r2).
     ...(render.diagnostics?.finalUrl !== undefined ? { finalUrl: render.diagnostics.finalUrl } : {}),
@@ -1000,17 +1025,24 @@ export async function retrieve(
   // #43 (codex r7): re-check the budget AFTER the CPU-heavy extraction/scanning above — a huge blocked DOM can
   // finish parsing seconds over budget, and a timeout must win over the incidental block class it derives from.
   if (!budgetExceeded && overBudget()) budgetExceeded = true;
-  // #45: a proxied escalation that EXHAUSTED every attempt with a DEAD exit (all null-status/chrome-error —
-  // no exit ever reached the site) is a BURNED-EXIT: our residential pool died, distinct from the site
-  // blocking a live exit. Gated on `deadNav` so a successful clear (proxy broke the loop early) can never be
-  // mislabeled, and OUTRANKED by budgetExceeded (a timeout wins). Evidence + a nav-failed refinement — the
-  // loop already re-rolled all exits, so this changes labeling, NOT behavior.
+  // #45: a proxied escalation that EXHAUSTED every attempt with a DEAD exit (no exit ever reached the site) is
+  // a BURNED-EXIT: our residential pool died, distinct from the site blocking a live exit. Gated on the
+  // exit-health dead check so a successful clear (proxy broke the loop early) can never be mislabeled, and
+  // OUTRANKED by budgetExceeded (a timeout wins). Evidence + a nav-failed refinement — the loop already
+  // re-rolled all exits, so this changes labeling, NOT behavior.
+  // #67: gate on the receipt-based `isDeadExit` (over the SHARED signal), NOT `deadNav` (which stays
+  // status-based for the success verdict). A final exit that RESPONDED but timed out before DCL is deadNav-true
+  // (still a failure) yet responseReceived — so it is NOT a dead exit and this burned-exit label no longer
+  // over-fires, keeping the site-attributable class instead of discarding it as an all-exits-dead burn. (The
+  // `!sawLiveProxiedResponse` term already flips true for such an exit via the loop check above; keying the
+  // final-render term off the receipt too keeps the two consistent.)
   // #45 (codex r7): REQUIRE the non-forced path. Escalation there fires only AFTER a direct attempt got a real
   // response (a CF challenge / hard block via shouldEscalateToProxy) — positive evidence the TARGET is
   // reachable, so all-proxied-dead is exit-attributable. The FORCED path SKIPS that direct check, so an
   // off-allowlist/guard-aborted or DNS/TLS-dead target would produce the same all-null signal on HEALTHY exits
   // — not a burn. Without reachability evidence we stay `nav-failed` (positive-signal-only, the #40 doctrine).
-  const burnedExit = proxyUsed && !forced && !budgetExceeded && deadNav && !sawLiveProxiedResponse;
+  const deadExit = isDeadExit(signal.responseReceived, signal.status, signal.finalUrl);
+  const burnedExit = proxyUsed && !forced && !budgetExceeded && deadExit && !sawLiveProxiedResponse;
   // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
   // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /
   // hard-block the last attempt happened to land on. The typed `timeout` failureClass carries the detail.
