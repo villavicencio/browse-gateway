@@ -898,10 +898,13 @@ export async function retrieve(
   // no exit ever reached the site) is a BURNED-EXIT: our residential pool died, distinct from the site
   // blocking a live exit. Gated on `deadNav` so a successful clear (proxy broke the loop early) can never be
   // mislabeled, and OUTRANKED by budgetExceeded (a timeout wins). Evidence + a nav-failed refinement — the
-  // loop already re-rolled all exits, so this changes labeling, NOT behavior. (On the FORCED path there is no
-  // direct-reachability control, so "all exits dead" reads slightly more as "target or exits dead" — still a
-  // truthful all-dead verdict, and diagnostic-only.)
-  const burnedExit = proxyUsed && !budgetExceeded && deadNav && !sawLiveProxiedResponse;
+  // loop already re-rolled all exits, so this changes labeling, NOT behavior.
+  // #45 (codex r7): REQUIRE the non-forced path. Escalation there fires only AFTER a direct attempt got a real
+  // response (a CF challenge / hard block via shouldEscalateToProxy) — positive evidence the TARGET is
+  // reachable, so all-proxied-dead is exit-attributable. The FORCED path SKIPS that direct check, so an
+  // off-allowlist/guard-aborted or DNS/TLS-dead target would produce the same all-null signal on HEALTHY exits
+  // — not a burn. Without reachability evidence we stay `nav-failed` (positive-signal-only, the #40 doctrine).
+  const burnedExit = proxyUsed && !forced && !budgetExceeded && deadNav && !sawLiveProxiedResponse;
   // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
   // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /
   // hard-block the last attempt happened to land on. The typed `timeout` failureClass carries the detail.

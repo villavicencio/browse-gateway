@@ -892,7 +892,11 @@ export class GatewayDriveController implements DriveController {
     // #45: an escalation that EXHAUSTED every attempt with a DEAD exit (none reached the site) is a burned
     // exit — our residential pool died. Gated on `attempts > 0` (a budget bail before any attempt is a timeout,
     // not a burn) and outranked by budgetExceeded. Diagnostic + a nav-failed refinement; behavior is unchanged.
-    const burnedExit = attempts > 0 && !budgetExceeded && !sawLiveResponse;
+    // #45 (codex r7): REQUIRE the non-forced path — escalation here fires only AFTER a direct attempt got a
+    // real block (shouldEscalateDrive), positive evidence the TARGET is reachable, so all-proxied-dead is
+    // exit-attributable. FORCED skips that check, so an off-allowlist/DNS-dead target would look identical on
+    // HEALTHY exits; stay nav-failed without reachability evidence (positive-signal-only).
+    const burnedExit = attempts > 0 && !forced && !budgetExceeded && !sawLiveResponse;
     // #45: skip the opt-in egress probe when we bailed on budget — it is one more proxied request past an
     // already-exhausted deadline. On a real exit-exhaustion (not a budget bail) it still classifies the exit.
     // #45 (codex r3): run the opt-in egress probe ONLY when meaningful budget remains (it opens ANOTHER

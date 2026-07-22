@@ -85,6 +85,25 @@ test("never-ready → typed timeout, not a hang", async () => {
   await assert.rejects(solverWith(f, { timeoutMs: 30, pollMs: 5 }).solve(recaptcha), (e) => e.code === "timeout");
 });
 
+test("solve aborts a STALLED response body at the deadline, not just the request (#45 codex r7)", async () => {
+  // The service sends headers, then never sends the body. resp.json() must still be bounded by the deadline
+  // (the abort covers body consumption) — else solve() would hang past its duration contract.
+  const stall = async (_url, init) => ({
+    ok: true,
+    status: 200,
+    json: () =>
+      new Promise((_resolve, reject) => {
+        const fail = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        if (init.signal.aborted) fail();
+        else init.signal.addEventListener("abort", fail);
+      }),
+  });
+  const s = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: URL_BASE, timeoutMs: 40, pollMs: 5, fetchImpl: stall });
+  const t0 = Date.now();
+  await assert.rejects(s.solve(recaptcha), (e) => e.code === "timeout");
+  assert.ok(Date.now() - t0 < 2000, "the body read was bounded by the deadline (not hung)");
+});
+
 test("solve caps at the caller's remaining-budget DURATION in the solver's OWN clock domain (#45 codex r4/r5)", async () => {
   // maxDurationMs is a DURATION, not an absolute timestamp, so the caller (performance.now) and the solver
   // (Date.now) can keep different clocks without aborting the solve. Uses the DEFAULT Date.now clock so a

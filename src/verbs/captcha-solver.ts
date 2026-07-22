@@ -181,30 +181,41 @@ export class HttpCaptchaSolver implements CaptchaSolver {
     if (remaining <= 0) throw new CaptchaSolveError("timeout", `solve did not complete within ${this.#timeoutMs}ms`);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), remaining);
-    let resp: Response;
+    // #45 (codex r7): the deadline covers the WHOLE exchange — request AND body read. Clearing the timer at
+    // fetch()-resolve left resp.json() unbounded, so a service that returns headers then STALLS the body could
+    // hang solve() indefinitely, past its duration contract; keep the abort live until json() completes.
     try {
-      resp = await this.#fetch(`${this.#apiUrl}/${path}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      // Abort = we hit the deadline mid-request; otherwise a transport failure. Never surface the
-      // request (it carries the key) — report only the failure shape.
-      if (controller.signal.aborted) {
-        throw new CaptchaSolveError("timeout", `${path}: exceeded the ${this.#timeoutMs}ms solve deadline`);
+      let resp: Response;
+      try {
+        resp = await this.#fetch(`${this.#apiUrl}/${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        // Abort = we hit the deadline mid-request; otherwise a transport failure. Never surface the
+        // request (it carries the key) — report only the failure shape.
+        if (controller.signal.aborted) {
+          throw new CaptchaSolveError("timeout", `${path}: exceeded the ${this.#timeoutMs}ms solve deadline`);
+        }
+        throw new CaptchaSolveError("vendor-error", `${path}: request failed (${err instanceof Error ? err.name : "network error"})`);
       }
-      throw new CaptchaSolveError("vendor-error", `${path}: request failed (${err instanceof Error ? err.name : "network error"})`);
+      if (!resp.ok) {
+        throw new CaptchaSolveError("vendor-error", `${path}: HTTP ${resp.status}`);
+      }
+      try {
+        return (await resp.json()) as Record<string, never>;
+      } catch (err) {
+        // The abort fired mid-body → a deadline timeout; anything else is a malformed body.
+        if (controller.signal.aborted) {
+          throw new CaptchaSolveError("timeout", `${path}: exceeded the ${this.#timeoutMs}ms solve deadline`);
+        }
+        throw new CaptchaSolveError("vendor-error", `${path}: invalid JSON response`);
+      }
     } finally {
       clearTimeout(timer);
     }
-    if (!resp.ok) {
-      throw new CaptchaSolveError("vendor-error", `${path}: HTTP ${resp.status}`);
-    }
-    return (await resp.json().catch(() => {
-      throw new CaptchaSolveError("vendor-error", `${path}: invalid JSON response`);
-    })) as Record<string, never>;
   }
 
   #sleep(ms: number): Promise<void> {

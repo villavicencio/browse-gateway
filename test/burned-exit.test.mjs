@@ -87,6 +87,22 @@ test("retrieve: a LIVE block among the proxied attempts is site-attributed, NOT 
   assert.equal(r.proxyDiagnostic.burnedExit, undefined, "burnedExit omitted when an exit reached the site");
 });
 
+test("retrieve: a FORCED-proxy all-dead escalation is NOT burned-exit (no direct-reachability control) — codex r7", async () => {
+  // forceProxy SKIPS the direct attempt, so all-dead could be an off-allowlist/DNS-dead TARGET on HEALTHY
+  // exits — not a burn. Without the direct-reachability evidence, stay nav-failed (positive-signal-only).
+  const gateway = makeRenderSeq([DEAD, DEAD, DEAD]); // no direct render (forced); every proxied attempt dead
+  const r = await retrieve(gateway, new SecretStore(PROXY), {
+    token: "t",
+    url: "https://hard.example/",
+    forceProxy: true,
+    escalation: { onDatacenterIp: true },
+  });
+  assert.equal(r.blocked, true);
+  assert.equal(r.proxyUsed, true);
+  assert.notEqual(r.diagnostics.failureClass, "burned-exit", "the forced path lacks reachability evidence → not a burn");
+  assert.equal(r.proxyDiagnostic.burnedExit, undefined, "no burned-exit evidence on the forced path");
+});
+
 // --- drive: a per-session-programmed gateway that PRESERVES status:null (the dead-exit case) -------
 
 function makeDriveSeq(sessions) {
