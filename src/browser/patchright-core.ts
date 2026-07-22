@@ -1348,11 +1348,17 @@ export class PatchrightBrowserCore implements BrowserCore {
         : "error";
       process.stderr.write(`[browse-gateway] captcha solve failed (${errCode(code, this.#redact)}); page left challenged\n`);
       // #44: surface the typed code instead of DISCARDING it to stderr only. It's a closed-vocabulary,
-      // secret-free marker (never the API key; a sitekey is public) — stashed WITH the attempted challenge's
-      // kind (codex r5) so the next #snapshotOf adopts it only if the final HTML still shows that kind (a page
-      // can rotate its CAPTCHA mid-solve), and returned so #settle can bubble it. `error` covers an
-      // unrecognized code from a custom solver (already allowlist-collapsed above), so nothing opaque escapes.
-      this.#pendingSolveOutcome = { reason: code, kind: challenge.kind };
+      // secret-free marker (never the API key; a sitekey is public) — returned so #settle can bubble it, and
+      // stashed for the next #snapshotOf. `error` covers an unrecognized code (already allowlist-collapsed).
+      // Attribute the failure ONLY if the page still shows the SAME challenge we attempted (codex r5/r6): a
+      // pending solve can outlive a rotation to a DIFFERENT widget — even a same-kind one at a new siteKey/URL
+      // — so revalidate the FULL identity (kind + siteKey + url) here, exactly as the successful-token branch
+      // below does, before stashing. #snapshotOf then re-checks the kind against the final HTML as a second
+      // guard (a rotation between this read and the snapshot).
+      const after = (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null;
+      if (after && after.kind === challenge.kind && after.siteKey === challenge.siteKey && page.url() === challenge.url) {
+        this.#pendingSolveOutcome = { reason: code, kind: challenge.kind };
+      }
       return { replay: false, captchaSolveMs: performance.now() - solve0, solveReason: code };
     }
     const captchaSolveMs = performance.now() - solve0;
