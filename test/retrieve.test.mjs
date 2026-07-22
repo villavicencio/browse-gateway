@@ -19,6 +19,7 @@ import {
   PROXY_CLEARANCE_TIMEOUT_MS,
 } from "../dist/verbs/index.js";
 import { SecretStore } from "../dist/security/index.js";
+import { DEFAULT_CALL_TIMEOUTS } from "../dist/gateway/index.js";
 
 const articleHtml = `<!doctype html><html><head><title>Doc</title></head><body><nav>menu</nav>
 <article><h1>Headline</h1><p>${"Real article sentence with plenty of words. ".repeat(20)}</p>
@@ -221,7 +222,9 @@ test("retrieve: sticky escalation mints a FRESH held exit per proxied attempt + 
   for (const c of calls.slice(1)) {
     assert.equal(c.renderOpts?.clearanceTimeoutMs, PROXY_CLEARANCE_TIMEOUT_MS, "escalated clearance on proxied attempts");
   }
-  assert.equal(calls[0].renderOpts?.clearanceTimeoutMs, undefined, "direct render keeps the default budget");
+  // #43: the direct render now carries the (env-overridable) DEFAULT clearance budget explicitly — distinct
+  // from the raised proxy budget on the escalated attempts (was implicitly undefined → core default 20s).
+  assert.equal(calls[0].renderOpts?.clearanceTimeoutMs, DEFAULT_CALL_TIMEOUTS.clearanceTimeoutMs, "direct render keeps the default (not proxy) budget");
   assert.equal(r.blocked, false);
 });
 
@@ -635,4 +638,133 @@ test("retrieve: a failed nav (null status) carries the envelope but NO wafVendor
   assert.equal(r.reason, "nav-failed");
   assert.ok(r.diagnostics, "the failure envelope is still attached");
   assert.equal(r.diagnostics.wafVendor, undefined, "no vendor is fabricated for a failed nav");
+});
+
+// --- #43: global per-call budget bounds the escalation loop -----------------------------------
+/** A gateway whose render sleeps `delayMs`, so real wall-clock crosses a small callBudgetMs deterministically. */
+function makeSlowGateway(result, delayMs) {
+  const calls = [];
+  const gateway = {
+    async withConsumerSession(token, fn, coreOverrides) {
+      const call = { coreOverrides };
+      calls.push(call);
+      const session = {
+        core: {
+          kind: "fake",
+          async render(_url, renderOpts) { call.renderOpts = renderOpts; await new Promise((r) => setTimeout(r, delayMs)); return renderOf({ ...result }); },
+          async setNavigationGuard() {},
+          async close() {},
+        },
+      };
+      return fn(session, { id: "a" });
+    },
+  };
+  return { gateway, calls };
+}
+
+test("#43: every render carries the shared per-call budget deadline (codex r5 — core bounds nav+clearance)", async () => {
+  // retrieve delegates the true nav+clearance bound to the core by passing ONE absolute deadline on each
+  // render (direct + proxied); the core clamps the goto + clearance poll to it (unit-tested via
+  // deadlineBoundedTimeout). Here we assert the wiring: the deadline is present and ~budget in the future.
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 0);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 30000, proxyMaxAttempts: 1 },
+  });
+  for (const c of calls) {
+    assert.equal(typeof c.renderOpts?.budgetDeadlineMs, "number", "each render gets an absolute budget deadline");
+    assert.ok(c.renderOpts.budgetDeadlineMs > performance.now(), "the deadline is in the future");
+  }
+  // The proxied render keeps the RAW proxy clearance (45s) — the core clamps it to the deadline, not retrieve.
+  assert.equal(calls[1].renderOpts?.clearanceTimeoutMs, DEFAULT_CALL_TIMEOUTS.proxyClearanceTimeoutMs);
+});
+
+test("#43: the escalation loop stops at the global call budget with a typed timeout failure", async () => {
+  // Slow (500ms) renders + a 2.6s budget: the direct render + ONE proxied attempt run (proxyUsed=true), then
+  // the remaining budget drops below the min-attempt floor and the loop stops short of proxyMaxAttempts, with
+  // the decisive `timeout` class (and reason=null so the MCP advertises timeout, not the cf-challenge block).
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway } = makeSlowGateway(block, 500);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  const r = await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 2600, proxyMaxAttempts: 5 },
+  });
+  assert.equal(r.proxyUsed, true, "at least one proxied attempt actually ran");
+  assert.equal(r.diagnostics?.failureClass, "timeout", "budget exhaustion is a typed timeout, not the block class");
+  assert.equal(r.reason, null, "reason is null on a timeout so the MCP surfaces `timeout`, not cf-challenge");
+  assert.ok((r.proxyDiagnostic?.attempts ?? 99) < 5, "the budget cut the loop short of proxyMaxAttempts");
+});
+
+test("#43: a generous budget lets the escalation run its configured attempts (no premature timeout)", async () => {
+  // Same block but a large budget + a fast render: all proxyMaxAttempts run and the class is the real block,
+  // NOT timeout — the budget only trips on genuine overrun.
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 0);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  const r = await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 600000, proxyMaxAttempts: 3 },
+  });
+  assert.notEqual(r.diagnostics?.failureClass, "timeout", "a generous budget does not force a timeout");
+  assert.equal(r.proxyDiagnostic?.attempts, 3, "all configured attempts ran");
+  assert.equal(calls.length, 4, "1 direct + 3 proxied renders");
+});
+
+test("#43: proxyNavTimeoutMs override is applied to each proxied attempt's session", async () => {
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 0);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, proxyNavTimeoutMs: 7777, proxyMaxAttempts: 2 },
+  });
+  for (const c of calls.slice(1)) {
+    assert.equal(c.coreOverrides?.navigationTimeoutMs, 7777, "the proxied session used the overridden nav timeout");
+  }
+});
+
+test("#43: a forced-proxy request that exhausts the budget times out WITHOUT a direct fallback (codex r2)", async () => {
+  // forceProxy + a budget <= the min-attempt floor breaks before any proxied attempt. It must NOT fall
+  // through to a direct request (that defeats force-proxy and would claim proxyUsed with zero attempts).
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 0);
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  const r = await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    escalation: { onDatacenterIp: true },
+    forceProxy: true,
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 1000 },
+  });
+  assert.equal(r.diagnostics?.failureClass, "timeout", "budget exhaustion on a forced request is a decisive timeout");
+  assert.equal(calls.length, 0, "NO direct fallback render happened — force-proxy is honored");
+  assert.equal(r.proxyUsed, false, "no proxied attempt started, so residential routing is NOT claimed (codex r3)");
+});
+
+test("#43: a direct-only render that consumes the budget is classified timeout (codex r6)", async () => {
+  // No proxy configured → no escalation branch runs. A direct render that ran the budget out must still
+  // surface a decisive `timeout` (the post-render deadline check covers the direct path, not only the loop).
+  const block = { ...cfBlockSignal, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway, calls } = makeSlowGateway(block, 60);
+  const secrets = new SecretStore(() => ({})); // NO proxy
+  const r = await retrieve(gateway, secrets, {
+    token: "t",
+    url: "https://hard.example/",
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 10 },
+  });
+  assert.equal(r.proxyUsed, false, "no proxy engaged");
+  assert.equal(calls.length, 1, "only the direct render ran");
+  assert.equal(r.diagnostics?.failureClass, "timeout", "direct-only budget exhaustion is a decisive timeout");
+  assert.equal(r.reason, null, "reason nulled so the MCP surfaces timeout");
 });

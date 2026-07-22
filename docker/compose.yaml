@@ -58,6 +58,13 @@ services:
       # set so they never reach logs/audit/errors (R9).
       # BGW_PROXY_URL / BGW_PROXY_USERNAME / BGW_PROXY_PASSWORD / BGW_CAPTCHA_API_KEY
       # BGW_CONSUMER_TOKEN_<ID>  (one per manifest entry, e.g. BGW_CONSUMER_TOKEN_ATLAS)
+      # --- Per-call time bounds (issue #43), all optional; unset = the shipped defaults (behavior unchanged).
+      # BGW_CALL_BUDGET_MS: "90000"           # global per-call wall-clock ceiling (retrieve escalation)
+      # BGW_CLEARANCE_TIMEOUT_MS: "20000"     # direct-attempt clearance budget
+      # BGW_PROXY_CLEARANCE_TIMEOUT_MS: "45000"  # proxied-attempt clearance budget
+      # BGW_PROXY_NAV_TIMEOUT_MS: "25000"     # per-proxied-attempt navigation timeout
+      # BGW_PROXY_MAX_ATTEMPTS: "3"           # max proxied re-roll attempts
+      # BGW_CAPTCHA_SOLVE_TIMEOUT_MS: "120000"  # CAPTCHA solve deadline
     # Session-lifecycle bootstrap (U2). The image's ENTRYPOINT provisions Xvfb first, then exec's
     # this. The U1 kill-gate (validate-stealth.mjs, the image default), the U6 stdio MCP launcher
     # (dist/mcp/main.js), and the U7a shared HTTP launcher (dist/mcp/http-main.js) run other

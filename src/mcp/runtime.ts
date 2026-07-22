@@ -106,7 +106,14 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   const vault = openVault({ env, canonicalizeHost, redact: (vals) => secrets.addRedactable(vals) });
   if (vault) log("vault: ready (encrypted credential store enabled)");
   // Interactive-CAPTCHA solver for the drive/capture path, wired when BYO config is present.
-  config.core.solver = httpCaptchaSolverFromSecrets(secrets, env.BGW_CAPTCHA_API_URL, { budget: DEFAULT_CAPTCHA_BUDGET });
+  // #43: the solve deadline is env-overridable (BGW_CAPTCHA_SOLVE_TIMEOUT_MS) and CLAMPED to the global call
+  // budget (codex r3) so a stalled vendor can't run past the budget (e.g. the 120s default under a 90s
+  // budget). Static clamp — the shared solver isn't per-call; threading the REMAINING per-call deadline is
+  // the whole-operation-ceiling follow-up (a core-level AbortSignal, same as the direct-nav/lifecycle bound).
+  config.core.solver = httpCaptchaSolverFromSecrets(secrets, env.BGW_CAPTCHA_API_URL, {
+    budget: DEFAULT_CAPTCHA_BUDGET,
+    timeoutMs: Math.min(config.timeouts.captchaSolveTimeoutMs, config.timeouts.callBudgetMs),
+  });
   // R9: give the browser core the SecretStore so its own stderr diagnostics (errCode) scrub a bare
   // secret, not just URL-strip — closes the audit-#3 gap (a proxy password not in URL form). Passing the
   // store (not a redactor fn) lets the core union these values with a launch's proxy creds in one pass.

@@ -31,6 +31,7 @@ export {
   restoreOrClose,
   targetToSelector,
   computeForceKillAvailable,
+  deadlineBoundedTimeout,
 } from "./patchright-core.js";
 export {
   assess,

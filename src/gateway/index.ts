@@ -218,8 +218,8 @@ export class Gateway {
   }
 }
 
-export { loadConfig, DEFAULT_GATEWAY_CONFIG, poolSizingError } from "./config.js";
-export type { GatewayConfig } from "./config.js";
+export { loadConfig, loadCallTimeouts, DEFAULT_GATEWAY_CONFIG, DEFAULT_CALL_TIMEOUTS, poolSizingError } from "./config.js";
+export type { GatewayConfig, CallTimeouts } from "./config.js";
 export {
   SessionManager,
   SessionManagerError,
