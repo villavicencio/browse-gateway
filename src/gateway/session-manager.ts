@@ -257,9 +257,17 @@ export class SessionManager {
     // handles its eventual rejection on BOTH arms, so an abandoned wedged launch that rejects late can't
     // surface as an unhandled rejection. The reserved-slot release is NOT done here — `acquire`'s `finally`
     // already decrements `#reserved`/`#reservedByConsumer` and drops the tracked `#launching` entry when
-    // THIS promise settles, so rejecting on the deadline is what frees the slot. A half-spawned Chromium
-    // orphaned under the still-pending launch is #54 Part 2 (needs a spawn-side PID hook).
-    const launchP = this.#factory(coreOptions);
+    // THIS promise settles, so rejecting on the deadline is what frees the slot. A never-returning
+    // half-spawned Chromium (no core, no PID) is #54 Part 2; a launch that RESOLVES late IS reaped below.
+    let launchP: Promise<BrowserCore>;
+    try {
+      launchP = this.#factory(coreOptions);
+    } catch (cause) {
+      // A factory that throws SYNCHRONOUSLY (before returning its promise) must still surface as the
+      // documented CORE_LAUNCH, not a raw error (issue #54, codex r1). The async-rejection path is
+      // normalized by the `.then(onR)` arm below; this try guards the synchronous throw the race can't see.
+      throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause });
+    }
     const deadline = deadlineTimer(this.#launchDeadlineMs);
     const outcome = await Promise.race([
       launchP.then(
@@ -273,6 +281,22 @@ export class SessionManager {
       throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause: outcome.cause });
     }
     if (outcome.kind === "timeout") {
+      // The deadline won, but `launchP` is still pending. If it RESOLVES late with a real core, that browser
+      // is untracked — never registered, never reaped — so it would leak AND let a later acquire exceed
+      // `maxSessions`. Attach a best-effort confirmable teardown to the late fulfillment (issue #54, codex r1);
+      // this is the KILLABLE late-resolve case, distinct from #54 Part 2's half-spawned orphan that never
+      // returns a core. A late REJECTION is already absorbed by the race's `.then(onR)` arm above.
+      void launchP.then(
+        async (lateCore) => {
+          const orphan = new Session(lateCore);
+          try {
+            await orphan.teardown(this.#closeGraceMs, this.#killConfirmMs);
+          } catch {
+            this.#unconfirmed.add(orphan); // kill couldn't confirm → the reaper / shutdown drain reclaims it
+          }
+        },
+        () => {}, // swallow a late rejection (already handled above) so it can't surface as unhandled
+      );
       throw new SessionManagerError(
         "CORE_LAUNCH",
         `browser core launch exceeded ${this.#launchDeadlineMs}ms deadline`,
