@@ -725,10 +725,16 @@ export async function retrieve(
       // #43: make callBudgetMs a TRUE outer wall-clock bound (codex r1). A pre-attempt check alone doesn't
       // bound it — an in-flight attempt (up to proxyNav + proxyClearance ≈ 70s on defaults) could start just
       // under the deadline and finish far past it. So (a) stop once too little budget remains for a
-      // meaningful attempt, and (b) CLAMP this attempt's nav + clearance to the remaining budget — nav first
-      // (usually fast: a dead exit fails in ~1s), clearance (the pollable stage) gets the REST — so their sum
-      // can't overrun. clearanceTimeoutMs=0 is a no-op poll (a while-loop, not a Playwright timeout), so a
-      // fully-consumed clearance simply skips the wait rather than hanging.
+      // meaningful attempt (a decisive timeout), and (b) CLAMP each stage to the remaining budget so the loop
+      // can't stack. Each stage is capped at `remaining` INDEPENDENTLY — NOT nav-first-then-rest (codex r4):
+      // a nav-first split starved clearance when remaining < proxyNav (nav rarely uses its full budget, but
+      // reserving it left clearanceBudget=0), skipping challenge polling and failing calls that had plenty of
+      // wall-clock left. Clearance is the WORK stage, so it keeps its full share up to the budget; nav keeps
+      // its fail-fast cap. RESIDUAL (documented follow-up): a pathologically-slow nav + a full clearance
+      // could still sum past `remaining` by up to one attempt — a tight per-attempt bound needs a single
+      // core-level deadline allocating nav+clearance dynamically (the AbortSignal follow-up, same as the
+      // whole-op ceiling), not two static stage timeouts. clearanceTimeoutMs=0 is a no-op poll (a while-loop,
+      // not a Playwright timeout), so a fully-consumed clearance skips the wait rather than hanging.
       const remaining = timeouts.callBudgetMs - (performance.now() - t0);
       if (remaining <= MIN_ATTEMPT_BUDGET_MS) {
         budgetExceeded = true;
@@ -742,7 +748,7 @@ export async function retrieve(
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
       const attempt0 = performance.now();
       const navBudget = Math.min(timeouts.proxyNavTimeoutMs, remaining);
-      const clearanceBudget = Math.min(proxiedRenderOpts.clearanceTimeoutMs ?? timeouts.proxyClearanceTimeoutMs, remaining - navBudget);
+      const clearanceBudget = Math.min(proxiedRenderOpts.clearanceTimeoutMs ?? timeouts.proxyClearanceTimeoutMs, remaining);
       render = await gateway.withConsumerSession(
         token,
         (s) => s.core.render(url, { ...proxiedRenderOpts, clearanceTimeoutMs: clearanceBudget }),
