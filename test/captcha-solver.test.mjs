@@ -85,6 +85,20 @@ test("never-ready → typed timeout, not a hang", async () => {
   await assert.rejects(solverWith(f, { timeoutMs: 30, pollMs: 5 }).solve(recaptcha), (e) => e.code === "timeout");
 });
 
+test("solve caps at the caller deadline when tighter than its own timeout (#45 codex r4)", async () => {
+  // A CAPTCHA reached just before the drive/render per-call budget deadline must not run the solver's full
+  // (up to callBudgetMs) timeout past it — solve honors the MIN of its own deadline and the caller's.
+  let t = 0;
+  const now = () => (t += 10); // each clock read advances 10ms
+  const f = fakeFetch([
+    { body: { errorId: 0, taskId: "t-r4" } },
+    { body: { errorId: 0, status: "processing" } }, // never ready → only a deadline can end the poll
+  ]);
+  const s = solverWith(f, { timeoutMs: 10_000_000, pollMs: 1, now }); // own timeout effectively unbounded
+  await assert.rejects(s.solve(recaptcha, 200), (e) => e.code === "timeout"); // a tight caller deadline of 200
+  assert.ok(f.calls.length < 50, `the caller deadline bounded the poll to ${f.calls.length} calls, not the ~1e6 the own timeout allows`);
+});
+
 test("missing siteKey → missing-sitekey (no fetch)", async () => {
   const f = fakeFetch([{ body: {} }]);
   await assert.rejects(solverWith(f).solve({ kind: "recaptcha", url: "https://x/" }), (e) => e.code === "missing-sitekey");

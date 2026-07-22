@@ -96,7 +96,7 @@ export class HttpCaptchaSolver implements CaptchaSolver {
     this.#now = config.now ?? Date.now;
   }
 
-  async solve(challenge: CaptchaChallenge): Promise<string> {
+  async solve(challenge: CaptchaChallenge, deadlineMs?: number): Promise<string> {
     if (!this.#apiKey || !this.#apiUrl) {
       throw new CaptchaSolveError("not-configured", "no CAPTCHA solving service configured");
     }
@@ -109,7 +109,10 @@ export class HttpCaptchaSolver implements CaptchaSolver {
     }
     this.#chargeBudget();
 
-    const deadline = this.#now() + this.#timeoutMs;
+    // #45 (codex r4): cap the solve by the caller's remaining per-call budget when it is TIGHTER than the
+    // solver's own timeout, so a solve started near a drive/render deadline can't run its full configured
+    // timeout past it. Omitted deadlineMs → the solver's own timeout governs (behavior unchanged).
+    const deadline = Math.min(this.#now() + this.#timeoutMs, deadlineMs ?? Infinity);
     const taskId = await this.#createTask(type, challenge, deadline);
     return this.#pollForToken(taskId, deadline);
   }

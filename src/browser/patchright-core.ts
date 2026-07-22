@@ -1348,7 +1348,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // may still be blocking the flow. Auto-solve it transparently when a solver is configured. `replay`
     // is true when the caller should replay the triggering action to complete a submit-gated flow.
     // #42: the solve wall-clock bubbles up from #trySolveCaptcha.
-    const solve = await this.#trySolveCaptcha(page);
+    const solve = await this.#trySolveCaptcha(page, budgetDeadlineMs);
     return {
       replay: solve.replay,
       domContentLoadedMs,
@@ -1375,8 +1375,13 @@ export class PatchrightBrowserCore implements BrowserCore {
    * whenever a solve was ATTEMPTED (a widget was found), including a solve that errored — so the drive
    * timing breakdown attributes the seconds a solve spent even when it ultimately failed.
    */
-  async #trySolveCaptcha(page: PatchrightPage): Promise<SolveResult> {
+  async #trySolveCaptcha(page: PatchrightPage, budgetDeadlineMs?: number): Promise<SolveResult> {
     if (!this.#solver) return { replay: false };
+    // #45 (codex r4): the remaining per-call budget bounds BOTH the widget-render poll AND the solve, so a
+    // CAPTCHA reached JUST BEFORE the deadline can't run its full render-timeout + solver-timeout past it
+    // (the earlier #settle guard only skips a solve already PAST the deadline). No deadline → the full budgets.
+    const renderTimeoutMs =
+      budgetDeadlineMs !== undefined ? Math.min(CAPTCHA_RENDER_TIMEOUT_MS, Math.max(0, budgetDeadlineMs - performance.now())) : CAPTCHA_RENDER_TIMEOUT_MS;
     // Resolve the widget, polling out its render race: navigate() resolves at domcontentloaded, but
     // the response field is injected by a later async script, so a one-shot detect sees the container
     // with no field yet and would skip forever (the next detect pass re-navigates and re-races).
@@ -1384,7 +1389,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       async () => (await page.evaluate(DETECT_LIVE_CAPTCHA_JS).catch(() => null)) as LiveCaptcha | null,
       () => page.url(),
       (ms) => page.waitForTimeout(ms).catch(() => {}),
-      { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: CAPTCHA_RENDER_TIMEOUT_MS },
+      { pollMs: CAPTCHA_RENDER_POLL_MS, timeoutMs: renderTimeoutMs },
     );
     if (!challenge) {
       // #44 (codex r2): a supported widget was detected but never became attemptable — preserve WHY (no
@@ -1404,7 +1409,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     const solve0 = performance.now();
     let token: string;
     try {
-      token = await this.#solver.solve(challenge);
+      token = await this.#solver.solve(challenge, budgetDeadlineMs); // #45 (codex r4): cap by the remaining call budget
     } catch (err) {
       // Vendor error / timeout / budget: leave the page challenged rather than throw under the verb,
       // but emit a diagnostic so a left-challenged drive page has a WHY (parity with retrieve's

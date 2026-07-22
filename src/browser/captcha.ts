@@ -80,8 +80,11 @@ export interface CaptchaChallenge {
 }
 
 export interface CaptchaSolver {
-  /** Solve the challenge and return the response token to inject into the page. */
-  solve(challenge: CaptchaChallenge): Promise<string>;
+  /** Solve the challenge and return the response token to inject into the page. `deadlineMs` (#45) is an
+   *  absolute `performance.now()`-domain ceiling from the caller's remaining per-call budget: the solve must
+   *  not run past it even if the solver's own configured timeout is larger (the effective deadline is the
+   *  MIN of the two). Omitted → the solver's own timeout governs. */
+  solve(challenge: CaptchaChallenge, deadlineMs?: number): Promise<string>;
 }
 
 /**
