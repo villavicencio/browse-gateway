@@ -728,20 +728,6 @@ export class PatchrightBrowserCore implements BrowserCore {
       // the Windows identity errors out rather than rendering as Linux. Non-listed host = no-op (native).
       if (this.#shouldPresentWindows(url)) await this.#applyWindowsToFreshPage(page);
       let status: number | null = null;
-      // #45 (codex r9): page.goto() returns the response ONLY when it RESOLVES (reaches DCL). A goto that TIMES
-      // OUT after the server already responded would otherwise leave status null — which isDeadExit misreads as
-      // a dead exit (a false burned-exit that discards the site's block attribution). Capture the main-frame
-      // navigation response via a listener too (mirrors navigate's #lastDocStatus), so a live-but-slow exit is
-      // attributed to the site. Removed right after the goto — the clearance poll classifies on `status`.
-      let observedNavStatus: number | null = null;
-      const onNavResponse = (resp: { request(): { isNavigationRequest(): boolean }; frame(): unknown; status(): number }) => {
-        try {
-          if (resp.request().isNavigationRequest() && resp.frame() === page.mainFrame()) observedNavStatus = resp.status();
-        } catch {
-          // a superseded/aborted response can throw on access — ignore; the goto/next response updates status
-        }
-      };
-      page.on("response", onNavResponse);
       // domContentLoadedMs = goto wall-clock (waitUntil:"domcontentloaded" resolves AT DCL). Measured around
       // the try so a goto that THROWS (timeout / challenge abort) still records its time-to-abort.
       const goto0 = performance.now();
@@ -752,14 +738,15 @@ export class PatchrightBrowserCore implements BrowserCore {
       const navTimeout = deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1);
       try {
         const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
-        status = resp ? resp.status() : observedNavStatus;
+        status = resp ? resp.status() : null;
       } catch {
-        // Navigation timed out / was aborted by a challenge — but the exit may have RESPONDED before DCL; fall
-        // back to the observed main-frame response so a slow-but-live exit isn't misread as a dead exit. Assess
-        // whatever rendered.
-        status = observedNavStatus;
-      } finally {
-        page.off("response", onNavResponse);
+        // Navigation may time out or be aborted by a challenge; status stays null (a nav failure) so the
+        // success gate + isRetrieveFailure correctly treat a timed-out goto as a FAILURE — never a partial
+        // success (codex r10). SCOPED (documented #45 residual): a proxied exit that RESPONDED but timed out
+        // before DCL is recorded status-null, so isDeadExit may label it `burned-exit` rather than the site
+        // block. That is a DIAGNOSTIC imprecision only (the re-roll behavior is identical); attributing it
+        // precisely needs a response-receipt signal tracked SEPARATELY from the nav-failure status — a
+        // follow-up, deliberately not conflated with `status` (which the success gate reads). Assess whatever rendered.
       }
       const domContentLoadedMs = performance.now() - goto0;
 
@@ -974,16 +961,13 @@ export class PatchrightBrowserCore implements BrowserCore {
     // domContentLoadedMs = goto wall-clock (measured around the try so an aborted nav still records its
     // time-to-abort). Deliberately do NOT bind the goto response — status stays on #lastDocStatus (a CF
     // 403→200 reload makes goto's first response the wrong one; see the #lastDocStatus note above).
+    // #45: bound the goto by the shared per-call deadline (parity with render()), so a proxied drive attempt
+    // that starts near the budget can't run its full nav timeout past it. Floor 1ms — an already-passed
+    // deadline still makes a bounded (fast-failing) attempt. No deadline (action path) → the raw nav timeout.
+    const navTimeout = deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1);
     const goto0 = performance.now();
     try {
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        // #45: bound the goto by the shared per-call deadline too (parity with render()), so a proxied drive
-        // attempt that starts near the budget can't run its full nav timeout past it. Floor 1ms — an already-
-        // passed deadline still makes a bounded (fast-failing) attempt, never a zero/negative timeout. No
-        // deadline passed (the action path, a budget-less caller) → the raw navigationTimeoutMs, unchanged.
-        timeout: deadlineBoundedTimeout(this.#resolved.navigationTimeoutMs, opts.budgetDeadlineMs, performance.now(), 1),
-      });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
     } catch {
       // A challenge/redirect/dead-exit may abort the navigation; settle on whatever rendered. With no
       // main-frame response the listener leaves status null, so the drive layer treats it as a failed nav.
@@ -993,7 +977,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // once it clears via a full reload — wait for the real document to land content rather than the
     // blank inter-navigation moment. A page still blocked after the budget is surfaced by navFailed.
     // #settle returns its clearance-poll + captcha-solve wall-clock for the #42 timing breakdown.
-    const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs, opts.budgetDeadlineMs);
+    // #45 (codex r10): the goto already spent up to navTimeout on THIS nav — pass only the LEFTOVER stage
+    // allowance for #settle's DCL wait, so a goto that timed out before DCL can't re-charge a full navTimeout
+    // (which would double the per-attempt nav cost and starve the fresh-exit re-rolls). Floor 1ms.
+    const dclBudgetMs = Math.max(1, navTimeout - domContentLoadedMs);
+    const settled = await this.#settle(page, clearanceTimeoutMs, pollIntervalMs, opts.budgetDeadlineMs, dclBudgetMs);
     // #58: the CF/PX/DataDome vendor hints + the interactive-CAPTCHA widget KIND are now computed inside
     // #snapshotOf (on EVERY snapshot), so `base` already carries cfHint/pxHint/ddHint/captchaKind — the
     // navigate path no longer computes them (nor a second page.content()) here. They let drive's escalation
@@ -1311,6 +1299,10 @@ export class PatchrightBrowserCore implements BrowserCore {
     // breaks at it (parity with render's deadline-bounded poll). Undefined for the action path / a
     // budget-less caller → Infinity budget, poll behavior unchanged.
     budgetDeadlineMs?: number,
+    // #45 (codex r10): the LEFTOVER navigation-stage allowance for the DCL wait — navigate() passes
+    // navTimeout minus the goto's elapsed, so a timed-out goto doesn't re-charge a full nav timeout here.
+    // Undefined (the action path, which has no prior goto) → the full stage navigation timeout.
+    dclBudgetMs?: number,
   ): Promise<SettleResult> {
     // Let any navigation the prior action triggered reach domcontentloaded, so its response status is
     // captured and the snapshot reflects the landed page (resolves immediately if nothing navigated).
@@ -1323,7 +1315,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // remaining budget on the SAME slow exit — that would starve the fresh-exit re-rolls the budget exists to
     // enable. min of both, floored at 1 (Playwright treats 0 as infinite). No budget → just the stage bound.
     const dclRemaining = budgetDeadlineMs !== undefined ? budgetDeadlineMs - performance.now() : Infinity;
-    const dclTimeout = Math.max(1, Math.min(this.#resolved.navigationTimeoutMs, dclRemaining));
+    const dclTimeout = Math.max(1, Math.min(dclBudgetMs ?? this.#resolved.navigationTimeoutMs, dclRemaining));
     await page.waitForLoadState("domcontentloaded", { timeout: dclTimeout }).catch(() => {});
     const domContentLoadedMs = performance.now() - dcl0;
     // #42: clearancePollMs is the WALL-CLOCK of the poll loop, not the sleep-interval counter — each
