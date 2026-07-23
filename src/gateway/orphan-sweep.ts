@@ -27,10 +27,14 @@ import { readProcStat } from "../browser/index.js";
 /** Outcome of one sweep attempt over a profile dir. */
 export type SweepResult = "confirmed" | "unconfirmed" | "unsupported";
 
-/** One stamped process group from a sweep attempt: the marker-carrying pid observed, its generation
- *  (start-time) and its process group. OPAQUE to the manager — it only round-trips these into the next
- *  attempt (codex r3): the stamps are what let a retry keep blocking on a surviving ARGLESS group member
- *  after the marker-carrying leader died (a fresh scan alone would find no marker and false-confirm). */
+/** One stamped PROCESS GROUP from a sweep attempt — keyed per group, ONE stamp each (codex r4: a
+ *  per-matching-pid ledger let a non-leader entry, whose recycle check can never fire, retain a
+ *  reclaimed group forever once its pgid was reused). `pid` is the stamped representative — the group
+ *  LEADER whenever its stat was readable (then `pid === pgrp` and `startTime` is the group's generation,
+ *  so a recycled pgid is provable); a leaderless group keeps a member representative (recycle stays
+ *  unprovable — documented residual, same shape as #50's). OPAQUE to the manager — it only round-trips
+ *  these into the next attempt (codex r3): the stamps are what let a retry keep blocking on a surviving
+ *  ARGLESS group member after the marker-carrying leader died. */
 export interface SweepStamp {
   pid: number;
   startTime: string;
@@ -134,13 +138,19 @@ export async function sweepOrphanProcesses(
    * launch-captured ChildProcess, which a never-resolved launch cannot provide) — documented, not fixable
    * at this layer.
    */
-  const killMatches = (): Map<number, { startTime: string; pgrp: number }> => {
-    const stamped = new Map<number, { startTime: string; pgrp: number }>();
+  const killMatches = (): Map<number, { pid: number; startTime: string }> => {
+    // Keyed by PROCESS GROUP, one stamp each (codex r4) — see {@link SweepStamp}. Prefer the LEADER's
+    // generation (pid === pgrp): only a leader stamp can later prove a recycled pgid; a per-pid ledger
+    // would keep non-leader entries whose recycle check never fires, retaining a reclaimed group forever.
+    const stamped = new Map<number, { pid: number; startTime: string }>();
     for (const pid of findPidsByUserDataDir(dir, procRoot)) {
       const stat = readProcStat(pid, procRoot);
       if (!stat) continue; // exited since the scan — never signal an unverifiable pid
       if (!carriesMarker(pid)) continue; // recycled between scan and stat — NOT ours; never signal
-      stamped.set(pid, { startTime: stat.startTime, pgrp: stat.pgrp });
+      const existing = stamped.get(stat.pgrp);
+      if (existing === undefined || pid === stat.pgrp) {
+        stamped.set(stat.pgrp, { pid, startTime: stat.startTime });
+      }
       try {
         // Group-SIGKILL (the #50 discipline): renderers/crashpad live in the leader's group without
         // carrying --user-data-dir themselves. ESRCH = already gone — success-shaped, swallowed.
@@ -148,6 +158,13 @@ export async function sweepOrphanProcesses(
       } catch {
         // ESRCH/EPERM: gone, or not ours to signal — either way the confirm pass below decides
       }
+    }
+    // Upgrade any non-leader representative to the group leader's own generation when readable — the
+    // leader need not carry the marker itself; its stat is the group's identity.
+    for (const [pgrp, rep] of stamped) {
+      if (rep.pid === pgrp) continue;
+      const leader = readProcStat(pgrp, procRoot);
+      if (leader && leader.pgrp === pgrp) stamped.set(pgrp, { pid: pgrp, startTime: leader.startTime });
     }
     return stamped;
   };
@@ -162,39 +179,49 @@ export async function sweepOrphanProcesses(
    * read as "our tree survives"). Anything else — leader alive, a lingering child, an unprovable recycle —
    * stays NOT gone, so the sweep reports `unconfirmed` rather than freeing capacity over a live process.
    */
-  const groupGone = (pid: number, stamp: { startTime: string; pgrp: number }): boolean => {
+  const groupGone = (pgrp: number, rep: { pid: number; startTime: string }): boolean => {
     try {
-      kill(-stamp.pgrp, 0);
+      kill(-pgrp, 0);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       return code === "ESRCH" || code === "EPERM";
     }
-    if (pid === stamp.pgrp) {
-      const stat = readProcStat(stamp.pgrp, procRoot);
-      if (stat && stat.pgrp === stamp.pgrp && stat.startTime !== stamp.startTime) return true; // recycled group
+    if (rep.pid === pgrp) {
+      const stat = readProcStat(pgrp, procRoot);
+      if (stat && stat.pgrp === pgrp && stat.startTime !== rep.startTime) return true; // recycled group
     }
     return false;
   };
 
-  // Codex r3: seed from the PRIOR attempt's stamps. After a first attempt kills the marker-carrying
-  // leader but a surviving ARGLESS group member forces "unconfirmed", a fresh scan alone would find no
-  // marker and false-confirm over that live member — the stamped groups are the memory that keeps every
-  // owed group blocking the confirm across attempts. A prior group that is now gone simply confirms.
-  const stamped = new Map<number, { startTime: string; pgrp: number }>();
-  for (const s of priorStamps) stamped.set(s.pid, { startTime: s.startTime, pgrp: s.pgrp });
-  for (const [pid, stamp] of killMatches()) stamped.set(pid, stamp);
-  const owedStamps = (): SweepStamp[] => [...stamped].map(([pid, s]) => ({ pid, startTime: s.startTime, pgrp: s.pgrp }));
+  // Codex r3: seed from the PRIOR attempt's stamps (keyed per group, leader-preferred — codex r4). After
+  // a first attempt kills the marker-carrying leader but a surviving ARGLESS group member forces
+  // "unconfirmed", a fresh scan alone would find no marker and false-confirm over that live member — the
+  // stamped groups are the memory that keeps every owed group blocking the confirm across attempts. A
+  // prior group that is now gone (or provably recycled) simply confirms.
+  const stamped = new Map<number, { pid: number; startTime: string }>();
+  for (const s of priorStamps) {
+    const existing = stamped.get(s.pgrp);
+    if (existing === undefined || s.pid === s.pgrp) stamped.set(s.pgrp, { pid: s.pid, startTime: s.startTime });
+  }
+  for (const [pgrp, rep] of killMatches()) {
+    const existing = stamped.get(pgrp);
+    if (existing === undefined || rep.pid === pgrp) stamped.set(pgrp, rep);
+  }
+  const owedStamps = (): SweepStamp[] => [...stamped].map(([pgrp, rep]) => ({ pid: rep.pid, startTime: rep.startTime, pgrp }));
   if (stamped.size === 0) return { result: "confirmed" }; // nothing lives under this profile RIGHT NOW (see
   // OrphanDirOps note: the CALLER must treat an empty-scan confirm on a still-PENDING launch as
   // provisional — the launcher may spawn later; the manager's watch-list covers that window.)
   const deadline = now() + confirmMs;
   for (;;) {
-    const allGone = [...stamped].every(([pid, stamp]) => groupGone(pid, stamp));
+    const allGone = [...stamped].every(([pgrp, rep]) => groupGone(pgrp, rep));
     if (allGone) {
       // Rescan for a process forked under the profile mid-sweep; kill it and keep polling if found.
       const fresh = killMatches();
       if (fresh.size === 0) return { result: "confirmed" };
-      for (const [pid, stamp] of fresh) stamped.set(pid, stamp);
+      for (const [pgrp, rep] of fresh) {
+        const existing = stamped.get(pgrp);
+        if (existing === undefined || rep.pid === pgrp) stamped.set(pgrp, rep);
+      }
     }
     if (now() >= deadline) return { result: "unconfirmed", stamps: owedStamps() };
     await sleep(SWEEP_POLL_MS);

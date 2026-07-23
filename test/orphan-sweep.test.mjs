@@ -177,6 +177,28 @@ test("sweep: prior stamps keep a marker-less survivor blocking the confirm ACROS
   rmSync(root, { recursive: true, force: true });
 });
 
+test("sweep: stamps are deduped per GROUP (leader generation), so a recycled pgid frees the orphan on retry (codex r4)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-group-dedupe";
+  // TWO marker-carrying pids in ONE group (leader 240 + a marker-carrying utility 241). A per-pid ledger
+  // would keep a non-leader stamp whose recycle check can never fire.
+  writeProc(root, 240, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 240, startTime: "1000" });
+  writeProc(root, 241, { args: ["chrome", "--utility", `--user-data-dir=${dir}`], pgrp: 240, startTime: "1001" });
+  const { kill } = makeKillFake(root); // SIGKILL does nothing — the tree survives attempt 1 (D-state)
+  const a1 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() });
+  assert.equal(a1.result, "unconfirmed");
+  assert.equal(a1.stamps?.length, 1, "one stamp per GROUP, not per matching pid");
+  assert.equal(a1.stamps?.[0].pid, a1.stamps?.[0].pgrp, "the group is stamped by its LEADER's generation");
+
+  // Between attempts: the whole tree finally dies AND the pgid is recycled by an unrelated group.
+  rmSync(join(root, "240"), { recursive: true, force: true });
+  rmSync(join(root, "241"), { recursive: true, force: true });
+  writeProc(root, 240, { args: ["sshd"], pgrp: 240, startTime: "9999" }); // recycled leader, new generation
+  const a2 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() }, a1.stamps);
+  assert.equal(a2.result, "confirmed", "the leader-generation stamp proves the recycle — capacity frees");
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("sweep: a matched pid whose stat vanished (exited between scan and stat) is never signaled (codex r1)", async () => {
   const root = makeProcRoot();
   const dir = "/tmp/bgw-exited";
