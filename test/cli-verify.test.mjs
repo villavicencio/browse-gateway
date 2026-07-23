@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyProbeCode, verifyGateway } from "../dist/cli/index.js";
+import { classifyProbeCode, verifyGateway, healthProbe } from "../dist/cli/index.js";
 
 /** A probe that returns each code in sequence, then repeats the last forever. */
 function scriptedProbe(codes) {
@@ -66,4 +66,17 @@ test("unexpected codes are retried (transient 502 during recreate) then reported
   const stuck = await verifyGateway({ probe: scriptedProbe(["502"]), timeoutMs: 10, pollMs: 1, wait: async () => {} });
   assert.equal(stuck.state, "unexpected");
   assert.equal(stuck.code, "502");
+});
+
+test("#53 r8: healthProbe with a malformed token (illegal header char) resolves 000, never throws", async () => {
+  // A token with a newline makes node's request() throw ERR_INVALID_CHAR synchronously; the probe must
+  // swallow it into the {code:'000'} contract so obscura status renders 'unavailable', not a crash.
+  const result = await healthProbe(59999, "127.0.0.1:8080", "bad\ntoken")();
+  assert.equal(result.code, "000");
+  assert.equal(result.body, undefined);
+});
+
+test("#53 r8: healthProbe against a dead port resolves 000 (network failure contract)", async () => {
+  const result = await healthProbe(1, "127.0.0.1:8080", "fine-token")();
+  assert.equal(result.code, "000");
 });

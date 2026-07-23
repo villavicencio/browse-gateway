@@ -101,16 +101,22 @@ export function healthProbe(localPort: number, hostHeader: string, bearerToken: 
         destroy?.();
       }, PROBE_TIMEOUT_MS);
       hardDeadline.unref?.();
-      const req = request(
-        {
-          host: "127.0.0.1",
-          port: localPort,
-          path: "/health",
-          method: "GET",
-          headers: { Host: hostHeader, Authorization: `Bearer ${bearerToken}` },
-          timeout: PROBE_TIMEOUT_MS,
-        },
-        (res) => {
+      // Codex #53 r8: `request()` throws SYNCHRONOUSLY (ERR_INVALID_CHAR) when a header value carries an
+      // HTTP-illegal character — a health token with a stray newline would otherwise escape the promise
+      // and crash `obscura status`, breaking the "a failure resolves {code:'000'}" contract. Wrap the
+      // whole construction so a malformed token reads as unavailable like any other probe failure.
+      let req: ReturnType<typeof request>;
+      try {
+        req = request(
+          {
+            host: "127.0.0.1",
+            port: localPort,
+            path: "/health",
+            method: "GET",
+            headers: { Host: hostHeader, Authorization: `Bearer ${bearerToken}` },
+            timeout: PROBE_TIMEOUT_MS,
+          },
+          (res) => {
           // Codex r2: cap the body too — the counters payload is ~200 bytes; an oversized or
           // ever-trickling body is not our gateway and settles as unavailable.
           let total = 0;
@@ -139,8 +145,11 @@ export function healthProbe(localPort: number, hostHeader: string, bearerToken: 
             }
             finish({ code, ...(body !== undefined ? { body } : {}) });
           });
-        },
-      );
+          },
+        );
+      } catch {
+        return finish({ code: "000" }); // malformed header/token — unavailable, never a thrown crash
+      }
       destroy = () => req.destroy();
       req.on("timeout", () => req.destroy());
       req.on("error", () => finish({ code: "000" }));
