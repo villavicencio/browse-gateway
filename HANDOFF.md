@@ -6,27 +6,25 @@ two reliability HOLDs per my own recs → **"go ahead with #54 Part 2 and #53"**
 
 ## Prod state (CURRENT)
 
-- **Prod: `sha256:961e149d…` = git `754f6a8`** (= #54 Part 2 + #53, on top of #66/#67/#54P1/#48…). Deploy
-  run `30035327744` (gate → swap → verify SUCCESS, 2026-07-23 ~18:49Z).
-- **Rollback anchor: `sha256:f45dc6eb…`** (= `e6fb131`, #66 — the previous prod).
-- Combined gate (all PASS on the deployed digest): stealth (CF 1/1, DataDome 1/1, WebRTC/WebGL/secret-leak/
-  negative-control), drive, failure-envelope (1 benign note: cleared CF → no wafVendor), retrieve,
-  call-budget, **teardown (21/21 incl. Section F — the #54P2 orphan sweep proven against a real headful
+- **Prod: `sha256:4becdf0a…` = git `978cc89`** (the docs-commit rebuild of `:latest`; **functionally
+  identical** to the gated `961e149d`/`754f6a8` — the only delta is HANDOFF.md + a solution doc, and
+  `docs/` is NOT COPYed into the image, so the 6-leg gate on `961e149d` fully covers this). Deploy run
+  `30044094837` (2026-07-23 ~20:55Z) — this run also **activated #53** (picked up `BGW_HEALTH_TOKEN`).
+- **Rollback anchor: `sha256:961e149d…`** (= `754f6a8`, #54P2+#53 — the prior prod).
+- Gate evidence (on `961e149d`, the equivalent image): stealth (CF 1/1, DataDome 1/1, WebRTC/WebGL/
+  secret-leak/negative-control), drive, failure-envelope (1 benign note: cleared CF → no wafVendor),
+  retrieve, call-budget, **teardown 21/21 incl. Section F (the #54P2 orphan sweep vs a real headful
   Chromium reaped by userDataDir alone)**.
 
-## ⚠️ ACTION REQUIRED to activate #53 (fleet-side, not code)
+## #53 ACTIVATED + confirmed in prod (2026-07-23 ~20:55Z)
 
-The #53 operator health surface is **deployed but INERT** until provisioned — same shape as any consumer
-key but it is **NOT a consumer key**:
-1. Set **`BGW_HEALTH_TOKEN=<a fresh distinct secret>`** in the prod env file (must NOT equal any consumer
-   token — the gateway **fails closed at boot** if it collides). It grants ONLY the `/health` counters
-   read; no manifest entry, no MAX_SESSIONS impact.
-2. Put the **same value** as **`healthToken`** in `~/.config/obscura/config.json` (or `OBSCURA_HEALTH_TOKEN`).
-3. Re-create the container (`gh workflow run deploy-http.yml -f image_tag=latest`, or the `keys --apply`
-   path) so the env is read. Then `obscura status` shows the pool section (force-kill / unconfirmed /
-   orphan / watched / sessions incl. reservations); a degraded pool renders **impaired** (squinting owl
-   `(o,~)`, nonzero exit) — distinct from a down/outage.
-Until then `obscura status` prints `pool health: skipped (no healthToken…)` — harmless.
+`BGW_HEALTH_TOKEN` set in the prod env + `healthToken` in `~/.config/obscura/config.json`; container
+re-created via deploy run `30044094837` (verify OK, no rollback → the token did NOT collide with a
+consumer). **End-to-end confirmed:** `obscura status` now shows
+`✓ pool healthy — force-kill armed, 0 unconfirmed, 0/7 sessions` (prod `MAX_SESSIONS=7`). The
+`force-kill armed` line is the meaningful one — the #50 PID-capture primitive is proven working on the
+LIVE prod build (previously only in container stderr). A degraded pool would render impaired
+(`(o,~)`, nonzero exit). **No further #53 action needed.**
 
 ## What shipped this session
 
