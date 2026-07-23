@@ -255,15 +255,22 @@ export async function sweepOrphanProcesses(
     }
     // Phase 1b — upgrade any non-leader representative to the group leader's own generation when
     // readable (the leader need not carry the marker; its stat is the group's identity). Pre-signal, so
-    // the read cannot race our own kill.
+    // the read cannot race our own kill. Codex r12: adopt the leader ONLY while the ORIGINAL member
+    // still exists with its stamped generation and group — the member's whole group can exit and have
+    // its pgid reused between phase 1a and this read (the OS is concurrent even across two synchronous
+    // reads), and adopting the UNRELATED new leader would pass phase-2 revalidation and SIGKILL
+    // innocents. A member that vanished keeps its member stamp, whose phase-2 revalidation then
+    // fail-safes (skip); a group that dies+recycles AFTER adoption is caught by phase 2's generation
+    // compare against the adopted (old-leader) stamp.
     for (const [pgrp, rep] of observed) {
       if (rep.pid === pgrp) continue;
       const leader = readProcStat(pgrp, procRoot);
-      if (leader && leader.pgrp === pgrp) {
-        const up = { pid: pgrp, startTime: leader.startTime };
-        observed.set(pgrp, up);
-        mergeStamp(into, pgrp, up);
-      }
+      if (!leader || leader.pgrp !== pgrp) continue;
+      const member = readProcStat(rep.pid, procRoot);
+      if (!member || member.startTime !== rep.startTime || member.pgrp !== pgrp) continue;
+      const up = { pid: pgrp, startTime: leader.startTime };
+      observed.set(pgrp, up);
+      mergeStamp(into, pgrp, up);
     }
     // Phase 2 — one group-SIGKILL per group observed THIS PASS (the #50 discipline: renderers/crashpad
     // live in the leader's group without carrying the marker themselves). Codex r6: REVALIDATE each
