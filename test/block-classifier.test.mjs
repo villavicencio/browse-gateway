@@ -13,6 +13,7 @@ import {
   isPerimeterXChallenge,
   hasPerimeterXChallengeCopy,
   activeCaptchaKind,
+  isSolvableCaptchaKind,
 } from "../dist/browser/index.js";
 
 // The real PerimeterX "Press & Hold" interstitial text (from the issue #21 repro).
@@ -267,4 +268,47 @@ test("wafVendorFromReason∘classifyBlock: the surfaced vendor NEVER contradicts
     const reason = classifyBlock(sig);
     assert.equal(wafVendorFromReason(reason), reasonToVendor[reason], `reason=${reason} must map to its own vendor`);
   }
+});
+
+// --- #44 (HOLD, RESOLVED-NEEDLESS 2026-07-23): the Turnstile-kind precedence residual is a NON-ISSUE ---
+//
+// The residual worried that a Turnstile widget co-firing with a Cloudflare hint gets reason=cf-challenge /
+// wafVendor=cloudflare (WAF-first), "losing" the solver-eligibility signal. It doesn't: solverEligible rides
+// the DETECTED widget (activeCaptchaKind → captchaKind → isSolvableCaptchaKind), INDEPENDENTLY of the WAF-first
+// vendor label (retrieve.ts / patchright-core.ts derive it from signal.captchaKind, not from reason). And
+// Turnstile is now SOLVABLE (captcha-solver TASK_TYPE maps it). Promoting `turnstile` over `cf-challenge` would
+// therefore change only the telemetry vendor STRING — and would REGRESS the deliberate #40-r2 "specific WAF
+// vendor wins" behavior tested above. These tests lock the two facts so the residual can't silently reopen.
+
+test("#44 needless: a Turnstile widget co-firing with cfHint keeps cf-challenge yet PRESERVES solver eligibility", () => {
+  // WAF-first: the surfaced reason/vendor is Cloudflare (the deliberate #40-r2 precedence) — NOT promoted to
+  // captcha/turnstile.
+  const sig = { title: "Just a moment...", text: "", status: 403, cfHint: true, captchaKind: "turnstile" };
+  assert.equal(resolveBlockReason(sig), "cf-challenge");
+  assert.equal(wafVendorFromReason(resolveBlockReason(sig), sig.captchaKind), "cloudflare");
+  // BUT the widget kind survives on the signal and Turnstile is solvable — so the eligibility signal the
+  // downstream envelope derives (solverEligible = isSolvableCaptchaKind(captchaKind), independent of the vendor
+  // label) is NOT lost. This is the whole reason the precedence "fix" is needless.
+  assert.equal(sig.captchaKind, "turnstile");
+  assert.equal(isSolvableCaptchaKind("turnstile"), true);
+});
+
+test("#44 needless: a CF managed-challenge interstitial (challenge-platform iframe, no explicit widget) is NOT a Turnstile widget", () => {
+  // The blocker feared a managed Under-Attack interstitial might carry cf-turnstile markers that make
+  // activeCaptchaKind falsely report a solvable widget. It doesn't: a managed challenge injects the
+  // /cdn-cgi/challenge-platform/ iframe, which matches NONE of the turnstile WIDGET_EVIDENCE (no
+  // class="cf-turnstile"[data-sitekey] container, no cf-turnstile-response field; turnstile has no iframe-src
+  // rule). Representative interstitial shape → undefined (proxy-cleared managed challenge, correctly NOT
+  // routed to the token solver). No captured fixture needed: the discriminator is structural.
+  const managedInterstitial =
+    '<div class="cf-wrapper"><div id="challenge-running"></div>' +
+    '<iframe src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=abc"></iframe>' +
+    '<input type="hidden" name="cf-challenge-response" /></div>';
+  assert.equal(activeCaptchaKind(managedInterstitial), undefined);
+  // A cfHint co-fires on such a page, but with no widget the block stays a plain CF challenge (proxy-cleared),
+  // never a solvable-captcha attribution.
+  assert.equal(resolveBlockReason({ title: "Just a moment...", text: "", status: 403, cfHint: true }), "cf-challenge");
+  // Contrast: an EXPLICIT standalone Turnstile widget a site embeds IS detected (and IS solvable) — the
+  // discriminator that makes the managed-vs-embedded distinction real, not incidental.
+  assert.equal(activeCaptchaKind('<div class="cf-turnstile" data-sitekey="0x4AAA"></div>'), "turnstile");
 });
