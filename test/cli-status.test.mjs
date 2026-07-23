@@ -295,7 +295,7 @@ test("#53 r6: ownership is RE-CHECKED before the send — a tunnel that dropped 
   // foreign process binds the port before the pool read. The fresh re-check must catch the flip.
   let call = 0;
   let probed = false;
-  const { deps } = makeDeps({
+  const { deps, lines } = makeDeps({
     state: async () => (call++ === 0 ? { agent: "running", port: "ours" } : { agent: "running", port: "foreign" }),
     probe: async () => "401",
     poolHealth: async () => {
