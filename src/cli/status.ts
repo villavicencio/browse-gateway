@@ -71,7 +71,7 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
     pollMs: deps.verifyPollMs ?? STATUS_VERIFY_POLL_MS,
     ...(deps.wait ? { wait: deps.wait } : {}),
   });
-  const gateway = verify.state;
+  let gateway = verify.state;
 
   let stealthGreen: boolean | undefined;
   if (opts.stealth) {
@@ -123,6 +123,17 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
         typeof b.maxSessions === "number";
       pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";
     }
+  }
+
+  // Codex #53 r10: a `gateway === "healthy"` verdict means "/mcp answered 401", but that answer is only
+  // attributable to OUR gateway when the loopback port is OURS. If the authoritative `tunnel` is foreign
+  // (a squatter answered) or none (the forward dropped), the probe result does not describe our gateway —
+  // reclassify to `tunnel-down` so the gateway line, the report field, and the owl all agree with the
+  // tunnel line instead of printing "✓ gateway healthy" beside "FOREIGN process bound". (A latent
+  // pre-#53 inconsistency for a foreign-from-start bind; the ownership refresh made it reachable, so it
+  // is fixed at the source here for both the mid-check flip and the from-start case.)
+  if (gateway === "healthy" && tunnel.port !== "ours") {
+    gateway = "tunnel-down";
   }
 
   // A DEGRADED pool is unhealthy (a wedged core could zombie / a browser may be alive uncounted) but

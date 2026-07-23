@@ -108,6 +108,10 @@ test("foreign binder is flagged and makes the report unhealthy even with a 401",
   const report = await status(deps);
   assert.equal(report.healthy, false);
   assert.ok(lines.some((l) => l.includes("FOREIGN process")));
+  // Codex #53 r10: the /mcp 401 came from the foreign process, so gateway health is NOT attributable to
+  // us — the report + gateway line must not claim "healthy" beside the foreign-tunnel line.
+  assert.notEqual(report.gateway, "healthy", "a 401 from a foreign binder is not OUR gateway being healthy");
+  assert.ok(!lines.some((l) => l.startsWith("✓ gateway healthy")), "no contradictory gateway-healthy line");
 });
 
 test("configured consumers listed from the manifest; tokens never shown; desync flagged", async () => {
