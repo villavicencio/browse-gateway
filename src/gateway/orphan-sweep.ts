@@ -215,8 +215,15 @@ export async function sweepOrphanProcesses(
       if (leader && leader.pgrp === pgrp) stamped.set(pgrp, { pid: pgrp, startTime: leader.startTime });
     }
     // Phase 2 — one group-SIGKILL per stamped group (the #50 discipline: renderers/crashpad live in the
-    // leader's group without carrying the marker themselves). ESRCH = already gone — swallowed.
-    for (const pgrp of stamped.keys()) {
+    // leader's group without carrying the marker themselves). Codex r6: REVALIDATE each group's
+    // representative immediately before its signal — the two-phase split widened the stamp→signal window
+    // (it now spans the whole scan), and under the small pid space a stamped group can exit and have its
+    // pgid reused inside it. A representative that vanished or changed generation ⇒ skip the signal (the
+    // confirm loop re-decides; a still-live group re-matches on the next rescan). This narrows the race
+    // back to the irreducible microsecond TOCTOU documented on phase 1. ESRCH = already gone — swallowed.
+    for (const [pgrp, rep] of stamped) {
+      const s = readProcStat(rep.pid, procRoot);
+      if (!s || s.startTime !== rep.startTime || s.pgrp !== pgrp) continue; // not provably ours anymore
       try {
         kill(-pgrp, "SIGKILL");
       } catch {

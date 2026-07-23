@@ -1216,6 +1216,27 @@ test("orphans: unconfirmed sweep stamps are round-tripped into the retry (#54 Pa
   assert.deepEqual(ops.priors[1], token, "the retry received the previous attempt's owed stamps");
 });
 
+test("orphans: a late-resolve teardown does NOT discard owed sweep stamps — the record re-sweeps before the dir goes (#54 Part 2, codex r6)", async () => {
+  const token = [{ pid: 888, startTime: "4321", pgrp: 888 }];
+  const gate = deferred();
+  const ops = makeFakeDirOps();
+  ops.nextSweep = { promise: Promise.resolve({ result: "unconfirmed", stamps: token }) }; // an OWED group exists
+  const { factory, late } = makeWedgeFactory({ gate });
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "unconfirmed sweep → counted, stamps owed");
+
+  gate.resolve(); // the late core arrives; its teardown confirms ITS group — but NOT the owed stamped group
+  for (let i = 0; i < 50 && ops.swept.length < 2; i++) await tick();
+  assert.equal(late.closed || late.killed, true, "the late core was torn down");
+  assert.deepEqual(ops.priors[1], token, "the post-teardown settlement re-swept WITH the owed stamps");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "finalized only after the owed group's sweep confirmed");
+  assert.deepEqual(ops.removed, [ops.made[0]], "the dir went only after BOTH the teardown and the stamps confirmed");
+});
+
 test("shutdown: drains in-flight orphan work and RETAINS an unconfirmable orphan loudly (#54 Part 2)", async () => {
   const ops = makeFakeDirOps({ sweepResult: "unconfirmed" }); // the wedge's tree never confirms dead
   const { factory } = makeWedgeFactory();

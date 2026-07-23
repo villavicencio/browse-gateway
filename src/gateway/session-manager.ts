@@ -457,7 +457,7 @@ export class SessionManager {
       this.#orphans.add(rec);
       try {
         await orphan.teardown(this.#closeGraceMs, this.#killConfirmMs);
-        await this.#finalizeOrphan(rec);
+        await this.#settleReapedOrphan(rec); // honors any owed sweep stamps (codex r6) before the dir goes
       } catch {
         this.#unconfirmed.add(orphan); // rec stays counted; the reconfirm drain finalizes it
       }
@@ -517,12 +517,31 @@ export class SessionManager {
     const work = (async () => {
       try {
         await orphan.teardown(this.#closeGraceMs, this.#killConfirmMs);
-        await this.#finalizeOrphan(rec);
+        await this.#settleReapedOrphan(rec);
       } catch {
         this.#unconfirmed.add(orphan); // rec stays counted; the reconfirm drain finalizes it
       }
     })();
     return this.#trackOrphanWork(work);
+  }
+
+  /**
+   * A reaped orphan's post-teardown settlement (codex r6): the core teardown confirmed ITS process
+   * group dead, but an earlier sweep may still hold OWED stamps for a group the core's teardown does not
+   * cover (a detached/crashpad-shaped survivor observed before the core resolved). Finalizing on the
+   * teardown alone would remove the dir and report clean while that group may live. With outstanding
+   * stamps: hand the record BACK to the dir-sweep (session cleared — its job is done; the record stays
+   * COUNTED in `#orphans`), whose prior-stamp round-trip keeps every owed group blocking until confirmed.
+   * No outstanding stamps: finalize as before.
+   */
+  async #settleReapedOrphan(rec: OrphanRecord): Promise<void> {
+    if (rec.dir !== undefined && rec.stamps !== undefined && rec.stamps.length > 0) {
+      rec.session = undefined;
+      this.#orphans.add(rec); // stays counted until the stamped groups confirm
+      await this.#sweepOrphan(rec);
+      return;
+    }
+    await this.#finalizeOrphan(rec);
   }
 
   /** Track a bounded orphan-work promise so `shutdown()`'s drain awaits it; self-removes on settle. */
@@ -622,21 +641,25 @@ export class SessionManager {
    *  disk, never removed under a possible future spawn) so a permanently-wedging factory can't grow
    *  the watch set, its dirs, and its per-tick /proc scans without bound. */
   #watchLaunch(rec: OrphanRecord): void {
-    while (this.#watch.size >= MAX_WATCHED_LAUNCHES) {
-      // Codex r3: never evict a record whose sweep is IN FLIGHT — its verdict may be "unconfirmed"
-      // (a known-live process) that must land back in the counted ledger, and while the unconfirmed
-      // arm re-adds unconditionally as a backstop, preferring an idle eviction keeps the accounting
-      // paths simple. Oldest NON-sweeping record goes first; if every entry is mid-sweep (sweeps are
-      // bounded by killConfirmMs), accept a transient overflow rather than evict a pending verdict.
+    this.#enforceWatchCap(1); // make room for the incoming record
+    this.#watch.add(rec);
+  }
+
+  /** Evict oldest NON-sweeping watch entries until `size + reserve <= cap` (codex r3/r6). Never evicts a
+   *  record whose sweep is IN FLIGHT — its verdict may be "unconfirmed" (a known-live process) that must
+   *  land back in the counted ledger; if every entry is mid-sweep, the overflow is accepted TRANSIENTLY
+   *  and this is re-run on every reaper tick (codex r6: sweeps settling never re-enter #watchLaunch, so
+   *  without the per-tick re-enforcement an all-sweeping overflow would persist indefinitely). */
+  #enforceWatchCap(reserve = 0): void {
+    while (this.#watch.size + reserve > MAX_WATCHED_LAUNCHES) {
       const evictable = [...this.#watch].find((r) => r.sweeping !== true);
-      if (evictable === undefined) break;
+      if (evictable === undefined) break; // all mid-sweep — transient; the reaper tick re-enforces
       this.#watch.delete(evictable);
       process.stderr.write(
         `[browse-gateway] watch list full (${MAX_WATCHED_LAUNCHES}): evicting the oldest pending wedge ` +
           `(its profile dir is retained on disk, untracked — container teardown is the backstop)\n`,
       );
     }
-    this.#watch.add(rec);
   }
 
   #beginTeardown(session: Session): Promise<void> {
@@ -694,10 +717,11 @@ export class SessionManager {
             this.#sessions.delete(s.id); // no-op for an orphan never registered
             this.#unconfirmed.delete(s);
             // #54 Part 2: confirmed death frees the profile dir + orphan slot too — a registered
-            // session's owned dir, or an anchorless orphan's ledger record (whichever this was).
+            // session's owned dir, or an anchorless orphan's ledger record (whichever this was). The
+            // orphan settlement honors any OWED sweep stamps (codex r6) before letting the dir go.
             this.#removeOwnedDir(s);
             const rec = [...this.#orphans].find((r) => r.session === s);
-            if (rec) await this.#finalizeOrphan(rec);
+            if (rec) await this.#settleReapedOrphan(rec);
           },
           () => {}, // still unconfirmed → stays for the next drain
         ),
@@ -745,6 +769,9 @@ export class SessionManager {
     // #54 Part 2: retry the dir sweep over any dir-only orphan still counted (a wedged launch whose
     // first sweep couldn't confirm, or one enqueued between ticks) AND over the uncounted watch list
     // (a pending wedge that may spawn late — kill anything that appeared). Single-flight per record.
+    // Codex r6: re-enforce the watch cap each tick — an all-sweeping overflow at park time persists
+    // until something re-checks it, and settling sweeps never re-enter #watchLaunch.
+    this.#enforceWatchCap();
     await Promise.all([...this.#orphans, ...this.#watch].map((rec) => this.#sweepOrphan(rec).catch(() => {})));
     return stale.map((s) => s.id);
   }
