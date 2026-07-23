@@ -1,109 +1,93 @@
-# HANDOFF — 2026-07-23, afternoon
+# HANDOFF — 2026-07-23, later afternoon
 
-Session arc: `/pickup` (same repo, day after the #66 session) → operator: "stop colima, then what's
-next?" → picked the two **reliability HOLDs** per my recs → "go ahead with #54 Part 2 and #53" → both
-**SHIPPED (13- and 12-round Codex loops) + one combined 6-leg gate + DEPLOYED**, then #53 **provisioned
-and confirmed live in prod** (`obscura status` → `pool healthy`). Tree clean, no open PRs, main == prod.
+Session arc: `/pickup` (same-day continuation of the #54P2+#53 session) → operator: "go, start with
+#44" → **#44 closed as NEEDLESS** (verify-and-close, guard test + comment, PR #77) → "pick up #48" →
+**#48 closed as (C)+docs** (operator chose via AskUserQuestion; no new gateway surface) → reviewed and
+**CLOSED the umbrella epic #38** (all children + follow-ups done), plus closed a dangling-open #67.
+**🎉 Epic #38 is COMPLETE.** No production code shipped this session — both closes were
+docs/test/comment only, so **prod is UNCHANGED**. Tree clean, no open PRs, main ahead of prod by two
+docs/test commits only.
 
-## Prod state (CURRENT)
+## Prod state (CURRENT — unchanged this session)
 
-- **Prod: `sha256:4becdf0a…` = git `978cc89`** — the docs-commit rebuild of `:latest`; **functionally
-  identical** to the gated `961e149d`/`754f6a8` (only delta is HANDOFF.md + a solution doc, and `docs/`
-  is NOT COPYed into the image, so the 6-leg gate on `961e149d` fully covers it). Deploy run
-  `30044094837` (2026-07-23 ~20:55Z) — also activated #53.
-- **Rollback anchor: `sha256:961e149d…`** (= `754f6a8`, #54P2+#53 — the prior prod).
-- **#53 is LIVE + confirmed:** `obscura status` shows `✓ pool healthy — force-kill armed, 0 unconfirmed,
-  0/7 sessions` (prod `MAX_SESSIONS=7`). No further #53 action needed.
-- main == `82cab58`.
+- **Prod: `sha256:4becdf0a…` = git `978cc89`** (unchanged — no deploy this session). Rollback anchor
+  **`sha256:961e149d…`** (= `754f6a8`, #54P2+#53). `#53` is live + provisioned (prior session):
+  `obscura status` → `✓ pool healthy — force-kill armed, 0 unconfirmed, 0/7 sessions`.
+- **main == `7f3f3a6`** — two commits ahead of the prod image, BOTH non-prod-affecting:
+  `33e3e80` (#44 test+comment, PR #77) and `7f3f3a6` (#48 solution doc). `docs/` is not COPYed into the
+  image and the #44 change is test-only, so prod needs no redeploy. `prodDeployNeeded:false` for both.
 
-## What We Built
+## What We Did (this session)
 
-- **#54 Part 2 — orphan reap + truthful capacity (PR #72, squash `9baaf0c`, 13-round Codex loop).**
-  New `src/gateway/orphan-sweep.ts`: a never-resolving `launchPersistentContext` (no context, no PID —
-  #50's post-resolve capture can't reach it) is now reapable because the gateway MINTS every ephemeral
-  profile dir (`mkdtemp`), so its Chromium is findable by `--user-data-dir=<dir>` on the cmdline (plus
-  cwd/fd references into the dir, for argless crashpad-shaped survivors). Sweep = observe-and-stamp per
-  process GROUP (leader-generation preferred, revalidated) → group-SIGKILL → confirm via the #50 /proc
-  start-time generation marker, with cross-attempt owed stamps and fail-CLOSED errno triage
-  (EMFILE/EIO reject-and-retry, never read-as-exited). `session-manager.ts`: a live-orphan ledger
-  counted in `activeCount` + the per-consumer cap until confirmed dead (activeCount may transiently
-  exceed maxSessions — truthful back-pressure), a bounded uncounted **watch list** for still-pending
-  wedges, and shutdown drains all of it. New getters `orphanCount`/`watchedCount`/`reservedCount`.
-  Gate: `scripts/validate-teardown.mjs` Section F (real headful Chromium reaped by dir alone).
-  Learning: `docs/solutions/architecture-patterns/reap-detached-process-by-owned-userdatadir.md`.
-- **#53 — operator-tier /health surface (PR #73, squash `754f6a8`, 12-round loop, r12 clean).**
-  `src/mcp/http-server.ts`: `GET /health` fail-closed tiers — rebind-Host guard → operator
-  `BGW_HEALTH_TOKEN` (timing-safe, hashed-length compare) → consumer liveness → 401. The token
-  authenticates NOTHING but /health; `http-main.ts` fails closed at boot if it collides with a consumer
-  token. `buildOperatorHealth` derives ONE degraded verdict (force-kill unavailable OR unconfirmed>0 OR
-  orphans>0; watch/capacity informational). CLI: `src/cli/{verify,status,config,brand,obscura}.ts` —
-  `healthProbe` sends the token ONLY to a re-verified owned tunnel (credential-leak guard), `obscura
-  status` renders the pool section; a degraded pool = **impaired** squinting owl `(o,~)` (distinct from
-  down). `healthToken`/`OBSCURA_HEALTH_TOKEN` config.
-- **846 tests** (from 788 at session start), 0 TS errors throughout. PRs #74/#75 = docs (handoff,
-  solution doc, prod-state refresh).
+- **#44 Turnstile-kind precedence (HOLD #1) — RESOLVED as NEEDLESS.** Verify-and-close, no production
+  code. The residual's premise was stale on two counts: (1) Turnstile is now solvable
+  (`captcha-solver` `TASK_TYPE.turnstile = "AntiTurnstileTaskProxyLess"`, in `SOLVABLE_CAPTCHA_KINDS`);
+  (2) `solverEligible`/`captchaKind` are a projection of the DETECTED widget
+  (`activeCaptchaKind(html)` → `isSolvableCaptchaKind`) derived INDEPENDENTLY of the WAF-first
+  `reason`/`wafVendor` (`retrieve.ts:1123-1124`, `patchright-core.ts:1624`; the #44-r3 comment at
+  `retrieve.ts:1104-1108` names this exact co-fire case). A Turnstile widget co-firing with `cfHint`
+  still emits `captchaKind=turnstile`+`solverEligible=true`; only the vendor STRING reads `cloudflare`
+  (the correct who-blocked/which-widget split). Promoting `turnstile` precedence would contradict the
+  green #40-r2 test and change nothing behavioral. Blocker fixture moot (a managed
+  `/cdn-cgi/challenge-platform/` interstitial matches none of the turnstile `WIDGET_EVIDENCE` regexes →
+  `activeCaptchaKind` undefined). **Guard:** two `#44 needless:` tests in
+  `test/block-classifier.test.mjs` (848 total, +2). `isSolvableCaptchaKind` docblock rewritten to
+  RESOLVED-NEEDLESS. **PR #77 → `33e3e80`, CI green.** Design doc `…-003-…` headed with the resolution;
+  traceability note on the already-closed issue #44.
+- **#48 location-context primitive (HOLD #2) — RESOLVED as option (C) + documented choreography.**
+  Operator chose (C) via AskUserQuestion. Grounding showed (A)'s three claimed "reusable parts" already
+  exist in the shipped drive model: **persistence** (one MCP session ↔ one `DriveController` ↔ one
+  PINNED browser session `drive-controller.ts` `#pinned` — picker state survives a subsequent
+  `browser_navigate`), **sequencing** (the full `browser_*` verb suite exposed + serialized on `#lock`),
+  **verification** (`navigate()` already annotates `homeFallback:true`, `drive-controller.ts:378`; so
+  `!homeFallback` after re-navigating the deep link IS "location established"). Consumers are LLM agents
+  that already drive bespoke pickers; no site-agnostic "selected store" signal exists (option B = a
+  rot-prone scraper DB, excluded). **Deliverable = knowledge not surface:**
+  `docs/solutions/architecture-patterns/location-context-via-pinned-session-and-homefallback.md`
+  (choreography: set store via picker verbs → re-navigate deep link → check `homeFallback`). **Committed
+  straight to main `7f3f3a6`** (docs policy). Design doc `…-004-…` headed with the resolution;
+  **issue #48 CLOSED.**
+- **Epic hygiene.** Verified all child tickets #39–#48 + follow-ups #50/#53/#54/#58/#66/#67/#21 are
+  CLOSED. Found **#67 was a dangling-open issue** — its fix (`e27497b`, PR #69) shipped and deployed
+  (via #66) but the PR title lacked a `Closes` keyword → **closed #67** with a note. Updated the
+  **epic #38 body** (checked every child box + completion header) and **CLOSED epic #38** with a
+  completion summary.
 
 ## Decisions Made
 
-- **Took the two reliability HOLDs (#54P2, #53), left the two site-shaped ones (#44, #48).** They form a
-  coherent unit (#53 surfaces the counters #54P2 makes truthful); the site HOLDs are softer and need
-  fixtures/product calls.
-- **#53 = operator-only token (design option A).** Pool internals are cross-tenant telemetry; a
-  dedicated `BGW_HEALTH_TOKEN` (not a consumer key — no manifest, no pool-sizing) keeps them off the
-  consumer tier. Upgradeable to two-tier later without breaking the consumer contract.
-- **#54P2 capacity model = count orphans truthfully, back-pressure.** `activeCount` includes live
-  orphans and may transiently exceed `maxSessions` — the honest state; acquire refuses rather than
-  stacking live browsers past the cap. Rejected: soft-headroom slack (invents a second cap) and
-  don't-count (relies on pids_limit, the blunt backstop).
-- **ROI stop on both loops (operator-directed).** When a loop's tail converged into same-theme
-  permutations, fix the LAST finding AT ITS SOURCE (not another bolt-on) to close the theme, and stop
-  paying for further permutations. #54P2 r13 (a 4-deep-rare reused-pgid/stale-stamp race) was
-  documented as a scoped residual rather than chased.
+- **Both remaining HOLDs closed WITHOUT code (verify-and-close).** #44 because the premise went stale
+  between filing and pickup (Turnstile became solvable; eligibility never rode the vendor label); #48
+  because the pinned-session + `homeFallback` re-check already compose "location context" and the callers
+  are agents that sequence verbs — a wrapper tool would be renamed-boolean surface sprawl.
+- **#48: option (C) + docs over (A) build or (C) pure.** Operator's explicit pick. Captures (A)'s
+  cross-agent-reuse intent as a documented pattern at zero code/tool cost.
 
-## What Didn't Work
+## What's Next — the epic is done; no active work item
 
-- **Bolt-on fixes spawned repeat rounds.** #53 r6→r10 were all the same mid-check-takeover output
-  coherence issue; each round I patched one more output (verdict, then tunnel field, then gateway field)
-  as a separate boolean, which just surfaced the next inconsistency. Only making the refreshed tunnel
-  reading the AUTHORITATIVE state (r9/r10) closed the whole theme. Same shape on #54P2 (per-pid stamps →
-  per-group; catch-any → errno-triage). Lesson recorded in Gotchas.
-- **`codex exec review` as a plain `run_in_background` Bash** kept getting killed at the 600s harness
-  cap (the review now routinely runs 8–12 min). Switched to `nohup … &` + a `kill -0` watcher.
-- **A per-pid orphan stamp ledger** false-retained reclaimed groups (a non-leader entry's recycle check
-  can never fire) — had to key stamps per process GROUP with a leader representative.
+**Epic #38 is fully closed. There is no pending epic work and nothing undeployed that affects prod.**
+Future directions all live OUTSIDE this epic and none is approved/active:
+- **Durability D-track** (from `[[obscura-durability-external-users-brainstorm]]`): D1 split
+  front-door↔workers (keystone), D4 healthcheck + keys-apply pre-flight, D2/D3/D6. First spike = D1+D4.
+- **External users (Track 2)** — a STRATEGY REVERSAL gated on the abuse/legal surface; confirm intent
+  before any design.
+- **Stealth Track A / credential-vault Track B** (`[[obscura-stealth-vault-brainstorm]]`), **PX/Total
+  Wine tier** (deferred spike; out of epic scope), **interactive TUI** (north-star; operator wants a
+  dedicated design session FIRST — do not draft unprompted).
 
-## What's Next — remaining epic #38 = TWO site-shaped HOLDs
-
-Both have decision-ready design docs from 2026-07-22 (`docs/plans/2026-07-22-00{3,4}-*.local.md`):
-1. **#44 Turnstile precedence** (HOLD #1) — `…-003-…`. Blocker: capture a CF managed-challenge fixture
-   first; the doc flags the fix **may be needless** — verify whether only the vendor STRING is lost
-   (`solverEligible` may already resolve `turnstile` → unsolvable correctly). **Cheapest remaining item.**
-2. **#48 location primitive** (HOLD #2) — `…-004-…`. Recommends caller-supplied-steps choreography (not
-   per-site recipes); (C) do-nothing is the acceptable fallback. Softest / most site-shaped.
-
-The #54P2/#53 design docs (`…-001-…`, `…-002-…`) are **consumed** (both shipped).
+Pick any of the above only on operator direction.
 
 ## Gotchas & Watch-outs
 
-- **colima is STOPPED** (stopped at session end). `colima start --vm-type vz --vz-rosetta` before any gate.
-- **Codex runner:** `codex exec review --base main`, run **detached** — `nohup … > out 2>&1 &` + a
-  `until ! kill -0 <pid>; do sleep 15; done` watcher (a plain `run_in_background` Bash dies at the 600s
-  cap; the review often exceeds it). Parse the final `codex` text block from the out file. Sandbox EPERM
-  on loopback `listen` / socket tests in its run are NOT real failures — verify locally.
-- **ROI discipline (operator-reinforced):** long Codex loops converge into same-theme permutations in the
-  tail. Fix the LAST finding AT ITS SOURCE (make the right thing authoritative), not as another bolt-on
-  boolean — that closes the theme instead of spawning the next round. Stop once findings are same-theme
-  micro-variants bounded by a backstop; document the residual.
-- **Batched-gate recipe (now 6 legs):** verify `:latest` digest == intended commit, pull by digest,
-  per-leg `docker run --rm --init --platform linux/amd64 --shm-size 1gb -e BGW_ATTEMPTS=1 -e
-  BGW_REQUIRED=1 -e BGW_NO_SANDBOX=1 -e BGW_CHANNEL=chrome -e BGW_PROXY_*="$SPIKE_*" <img> node
-  scripts/validate-{stealth,drive,failure-envelope,retrieve,call-budget,teardown}.mjs`. Stream in
-  background, NO `| tail`. The **teardown leg is now part of the gate** (`--init` load-bearing; scripts
-  ship in the image). `.env.spike` keys are `export`-prefixed (a bare `^[A-Z_]*=` grep misses them).
-- **A docs merge to main rebuilds `:latest` to a new digest**, so prod-digest and latest-digest drift.
-  Prod is pinned (deploy is manual `workflow_dispatch`); the recorded prod digest above is authoritative.
-- **`BGW_HEALTH_TOKEN` provisioning is done** — but if it's ever rotated: set it in the prod env AND
-  `healthToken` in `~/.config/obscura/config.json` to the SAME value, re-create the container (env is
-  frozen at `docker run`; a plain restart won't do). A value that collides with a consumer token makes
-  the gateway refuse to boot → deploy verify fails → auto-rollback (self-protecting).
-- **Public repo** — never commit fleet codenames. Design docs with fleet detail stay `.local.md`.
+- **colima is STOPPED** (from the prior session). `colima start --vm-type vz --vz-rosetta` before any
+  gate. Not needed for unit tests (pure Node) — this session ran `node --test` with no container.
+- **main is 2 commits ahead of the prod image, intentionally.** Both are docs/test/comment
+  (`prodDeployNeeded:false`). Do NOT trigger a deploy to "sync" — prod digest `4becdf0a` is authoritative
+  and the deltas don't enter the image.
+- **A docs merge to main rebuilds `:latest` to a new digest**, so latest-digest and prod-digest drift.
+  Prod is pinned (manual `workflow_dispatch`); the recorded prod digest is authoritative.
+- **Verify-and-close discipline paid off twice.** A HOLD ticket's own premise can go stale between
+  filing and pickup — re-verify the premise against current code BEFORE building. Both #44 and #48'
+  design docs had predicted their own likely resolution ("may be needless" / "(C) is acceptable").
+- **Codex runner** (unchanged, for when code work resumes): `codex exec review --base main`, detached
+  (`nohup … &` + a `kill -0` watcher) — it now routinely exceeds the 600s Bash cap.
+- **Public repo** — never commit fleet codenames; design docs with fleet detail stay `.local.md`.
