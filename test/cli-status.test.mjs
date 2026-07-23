@@ -289,3 +289,21 @@ test("#53 r5: a FOREIGN local port never receives the operator health token (cre
   assert.equal(report.healthy, false, "a foreign port is unhealthy regardless");
   assert.ok(lines.some((l) => l.includes("FOREIGN")), `got: ${lines.join(" | ")}`);
 });
+
+test("#53 r6: ownership is RE-CHECKED before the send — a tunnel that dropped mid-status never leaks the token (TOCTOU)", async () => {
+  // The forward is "ours" at the top-of-function snapshot, but DROPS during the verify window and a
+  // foreign process binds the port before the pool read. The fresh re-check must catch the flip.
+  let call = 0;
+  let probed = false;
+  const { deps } = makeDeps({
+    state: async () => (call++ === 0 ? { agent: "running", port: "ours" } : { agent: "running", port: "foreign" }),
+    probe: async () => "401",
+    poolHealth: async () => {
+      probed = true;
+      return { code: "200", body: POOL_OK_BODY };
+    },
+  });
+  const report = await status(deps);
+  assert.equal(probed, false, "the token was NOT sent after the port flipped to foreign mid-status");
+  assert.equal(report.pool, undefined, "no pool verdict once ownership can't be reconfirmed");
+});

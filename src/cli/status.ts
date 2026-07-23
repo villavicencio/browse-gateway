@@ -77,11 +77,19 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
   // — pool health (issue #53): the operator-token /health read, only meaningful when the gateway answers —
   let pool: StatusReport["pool"];
   let poolBody: Record<string, unknown> | undefined;
-  // Codex #53 r5: only send the operator health TOKEN once the local port is provably OURS. A FOREIGN
-  // listener (tunnel.port === "foreign") can answer 401 to the unauthenticated /mcp probe — reading as
-  // gateway "healthy" — and the authenticated /health request would then hand it the operator
-  // credential. `tunnel.port === "ours"` is the same provenance gate the tunnel line already trusts.
-  if (deps.poolHealth && gateway === "healthy" && tunnel.port === "ours") {
+  // Codex #53 r5/r6: only send the operator health TOKEN to a listener that is provably OURS. A FOREIGN
+  // process (rebind/port-squat) can answer 401 to the unauthenticated /mcp probe — reading as gateway
+  // "healthy" — and the authenticated /health request would then hand it the operator credential.
+  // r6 (TOCTOU): the top-of-function `tunnel` snapshot is STALE by here — verifyGateway's retry window
+  // (up to ~6s) sits between them, ample time for the SSH forward to drop and a foreign process to bind
+  // the port. RE-CHECK ownership immediately before the send and gate on the FRESH reading, collapsing
+  // the window to the gap between this check and the socket write. RESIDUAL (documented, irreducible in
+  // userspace): a bind that wins that sub-call gap still receives the token — closing it fully needs a
+  // socket peer-credential assertion loopback HTTP to an ssh forward doesn't expose; the token is a
+  // read-only pool-counters credential (no consumer/secret access), and the operator's own loopback is
+  // the only attack surface.
+  const ownedNow = gateway === "healthy" && (await state(spec)).port === "ours";
+  if (deps.poolHealth && ownedNow) {
     const read = await deps.poolHealth();
     poolBody = read.body;
     // Codex #53 r1: require the FULL operator shape before trusting the verdict — a healthToken
