@@ -77,7 +77,11 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
   // — pool health (issue #53): the operator-token /health read, only meaningful when the gateway answers —
   let pool: StatusReport["pool"];
   let poolBody: Record<string, unknown> | undefined;
-  if (deps.poolHealth && gateway === "healthy") {
+  // Codex #53 r5: only send the operator health TOKEN once the local port is provably OURS. A FOREIGN
+  // listener (tunnel.port === "foreign") can answer 401 to the unauthenticated /mcp probe — reading as
+  // gateway "healthy" — and the authenticated /health request would then hand it the operator
+  // credential. `tunnel.port === "ours"` is the same provenance gate the tunnel line already trusts.
+  if (deps.poolHealth && gateway === "healthy" && tunnel.port === "ours") {
     const read = await deps.poolHealth();
     poolBody = read.body;
     // Codex #53 r1: require the FULL operator shape before trusting the verdict — a healthToken

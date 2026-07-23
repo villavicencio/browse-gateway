@@ -271,3 +271,21 @@ test("#53 r3: watched wedges are visible on the HEALTHY branch too", async () =>
   assert.equal(report.healthy, true, "watch alone never degrades");
   assert.ok(lines.some((l) => l.includes("2 pending wedge(s) under watch")), `got: ${lines.join(" | ")}`);
 });
+
+test("#53 r5: a FOREIGN local port never receives the operator health token (credential-leak guard)", async () => {
+  let probed = false;
+  const { deps, lines } = makeDeps({
+    // A foreign listener that 401s /mcp (so gateway reads "healthy") — the classic rebind/squat setup.
+    state: async () => ({ agent: "running", port: "foreign" }),
+    probe: async () => "401",
+    poolHealth: async () => {
+      probed = true; // must NEVER run — the token would go to the foreign process
+      return { code: "200", body: POOL_OK_BODY };
+    },
+  });
+  const report = await status(deps);
+  assert.equal(probed, false, "the operator token was NOT sent to a foreign listener");
+  assert.equal(report.pool, undefined, "no pool verdict without an owned tunnel");
+  assert.equal(report.healthy, false, "a foreign port is unhealthy regardless");
+  assert.ok(lines.some((l) => l.includes("FOREIGN")), `got: ${lines.join(" | ")}`);
+});
