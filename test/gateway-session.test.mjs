@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Gateway, SessionManager, SessionManagerError, MAX_INFLIGHT_MS } from "../dist/gateway/index.js";
+import { Gateway, SessionManager, SessionManagerError, MAX_INFLIGHT_MS, MAX_WATCHED_LAUNCHES } from "../dist/gateway/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 
 /** A configurable fake BrowserCore factory that records created cores. */
@@ -903,4 +903,437 @@ test("acquire: a late-resolving core whose death CANNOT be confirmed is RETAINED
   // COUNTING a still-alive late orphan against the RUNNING cap is deferred to #54 Part 2 (orphan reaping, HOLD #4).
   assert.equal(mgr.unconfirmedCount, 1, "the unconfirmable late core is retained (never erased), not leaked");
   assert.equal(late.killCalls > 0, true, "a best-effort force-kill was attempted on the late orphan");
+});
+
+// --- issue #54 Part 2: orphan ledger — wedged/late/failed launches counted until CONFIRMED reclaimed ------
+
+/** Controllable fake OrphanDirOps: records mints/sweeps/removals (and each sweep's prior stamps, r3).
+ *  Per the OrphanDirOps contract a fake sweep must SETTLE (bounded) — model "can't confirm yet" with
+ *  "unconfirmed", never a hanging promise; `nextSweep` (a deferred resolved by the test with a
+ *  SweepResult string or a full outcome) holds ONE sweep open observably. */
+function makeFakeDirOps({ sweepResult = "confirmed" } = {}) {
+  let n = 0;
+  const asOutcome = (v) => (typeof v === "string" ? { result: v } : v);
+  const ops = {
+    made: [],
+    swept: [],
+    removed: [],
+    priors: [], // the priorStamps each sweep call received (r3 round-trip observability)
+    sweepResult,
+    nextSweep: undefined,
+    async make() {
+      const d = `/fake/profile-${n++}`;
+      ops.made.push(d);
+      return d;
+    },
+    async sweep(dir, _confirmMs, priorStamps) {
+      ops.swept.push(dir);
+      ops.priors.push(priorStamps);
+      if (ops.nextSweep) {
+        const p = ops.nextSweep.promise;
+        ops.nextSweep = undefined;
+        return asOutcome(await p);
+      }
+      return asOutcome(ops.sweepResult);
+    },
+    async remove(dir) {
+      ops.removed.push(dir);
+    },
+  };
+  return ops;
+}
+
+/** A factory whose FIRST launch wedges (forever, or until `gate` opens → resolves `late`, or rejects
+ *  when `mode: "reject"`); later launches resolve normal controllable cores. */
+function makeWedgeFactory({ gate, lateConfig, mode = "resolve" } = {}) {
+  const late = makeControllableCore(lateConfig ?? { closeMode: "resolve" });
+  let first = true;
+  const factory = async () => {
+    if (first) {
+      first = false;
+      await (gate ? gate.promise : new Promise(() => {}));
+      if (mode === "reject") throw new Error("wedged launch finally failed");
+      return late;
+    }
+    return makeControllableCore({ closeMode: "resolve" });
+  };
+  return { factory, late };
+}
+
+test("orphans: a wedged launch is COUNTED (back-pressures acquire) until the sweep confirms; a PENDING launch's confirm parks on the watch list (#54 Part 2)", async () => {
+  const ops = makeFakeDirOps();
+  const held = deferred();
+  ops.nextSweep = held; // hold the immediate post-timeout sweep open so the counted window is observable
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  assert.equal(mgr.orphanCount, 1, "the wedged launch is a counted live orphan");
+  assert.equal(mgr.activeCount, 1, "activeCount includes the orphan");
+  assert.equal(ops.swept.length, 1, "the wedge kicked an immediate sweep over its owned dir");
+  assert.equal(ops.swept[0], ops.made[0], "the sweep keys off the minted dir");
+  // Truthful back-pressure: the possibly-live half-spawned Chromium holds the only slot.
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT");
+
+  held.resolve("confirmed"); // nothing lives under the dir RIGHT NOW…
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "the empty-scan confirm freed the capacity slot (the Part-1 promise)");
+  // …but the launch promise is STILL PENDING (codex r1): the launcher could spawn Chromium later, so the
+  // dir is PARKED on the watch list — retained (not removed) and re-swept by the reaper, never finalized.
+  assert.deepEqual(ops.removed, [], "a pending launch's dir is retained (watch), not removed");
+  const s = await mgr.acquire(); // capacity is truly free again
+  await mgr.release(s.id);
+  await mgr.reapIdle(1_000); // a reaper tick keeps sweeping the watched dir
+  assert.equal(ops.swept.length >= 2, true, "the watch list is re-swept on reaper ticks");
+});
+
+test("orphans: a watched wedge that finally REJECTS is finalized — swept clear and its dir removed (#54 Part 2, codex r1)", async () => {
+  const gate = deferred();
+  const ops = makeFakeDirOps(); // every sweep confirms-empty
+  const { factory } = makeWedgeFactory({ gate, mode: "reject" });
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.deepEqual(ops.removed, [], "while pending: parked on watch, dir retained");
+
+  gate.resolve(); // the wedged factory finally REJECTS — nothing can spawn from it anymore
+  for (let i = 0; i < 50 && ops.removed.length === 0; i++) await tick();
+  assert.deepEqual(ops.removed, [ops.made[0]], "the settled launch's confirm is FINAL — dir removed");
+});
+
+test("orphans: an unsupported-platform sweep degrades LOUDLY to Part-1 semantics (uncounted, dir retained) (#54 Part 2)", async () => {
+  const ops = makeFakeDirOps({ sweepResult: "unsupported" });
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "no /proc → the slot is released (cannot confirm on this platform)");
+  assert.deepEqual(ops.removed, [], "the dir is NOT removed — a live process may still be writing it");
+});
+
+test("orphans: an unconfirmed sweep keeps the orphan counted; the reaper tick retries until confirmed (#54 Part 2)", async () => {
+  const ops = makeFakeDirOps({ sweepResult: "unconfirmed" });
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "an unconfirmed sweep never frees the slot (the #50 never-lie posture)");
+
+  ops.sweepResult = "confirmed"; // the unkillable finally died
+  await mgr.reapIdle(1_000); // the reaper tick retries the sweep
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "the reaper's retry confirmed and freed the orphan slot");
+  assert.equal(ops.swept.length >= 2, true, "the sweep was retried");
+  // The launch promise never settled, so the confirm parks the dir on the watch list (retained).
+  assert.deepEqual(ops.removed, [], "pending launch → dir watched, not removed");
+});
+
+test("orphans: a consumer's live orphans count against ITS per-consumer cap (#54 Part 2, codex r1)", async () => {
+  const ops = makeFakeDirOps({ sweepResult: "unconfirmed" }); // the orphan never confirms — stays counted
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({
+    maxSessions: 4,
+    perConsumerMax: 1,
+    coreFactory: factory,
+    launchDeadlineMs: 30,
+    orphanDirOps: ops,
+  });
+
+  await assert.rejects(mgr.acquire(undefined, { consumerId: "atlas" }), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "atlas's wedge is a counted live orphan");
+  // atlas is at its cap via the orphan — it must NOT be able to stack another launch on the global pool.
+  await assert.rejects(mgr.acquire(undefined, { consumerId: "atlas" }), (e) =>
+    e.code === "SESSION_LIMIT" && /per-consumer/.test(e.message),
+  );
+  // A DIFFERENT consumer is unaffected (global pool has room).
+  const other = await mgr.acquire(undefined, { consumerId: "vault" });
+  await mgr.release(other.id);
+});
+
+test("orphans: a SYNC-throwing factory's minted dir is enqueued and cleaned, not leaked (#54 Part 2, codex r1)", async () => {
+  const ops = makeFakeDirOps();
+  let first = true;
+  const factory = () => {
+    if (first) {
+      first = false;
+      throw new Error("synchronous launch boom"); // throws BEFORE returning a promise
+    }
+    return Promise.resolve(makeControllableCore({ closeMode: "resolve" }));
+  };
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.removed.length === 0; i++) await tick();
+  assert.equal(ops.swept.length, 1, "the sync-throw's dir was swept for a spawn-before-throw straggler");
+  assert.deepEqual(ops.removed, [ops.made[0]], "the settled (thrown) launch's confirm removed the dir");
+  assert.equal(mgr.orphanCount, 0);
+});
+
+test("orphans: a late-resolving core stays COUNTED through its confirmable teardown, even past maxSessions (#54 Part 2)", async () => {
+  // The codex #54-Part-1 r3 scenario: the wedge's slot was freed, a REPLACEMENT took it, and only then
+  // did the wedged launch resolve a real browser. The late orphan must be COUNTED (activeCount exceeds
+  // maxSessions — the truthful state) and back-pressure new acquires until its teardown confirms.
+  const gate = deferred();
+  const ops = makeFakeDirOps(); // the immediate sweep confirms fast (nothing spawned yet) — rec drops
+  const { factory, late } = makeWedgeFactory({ gate });
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  const replacement = await mgr.acquire(); // the freed slot is taken
+  assert.equal(mgr.activeCount, 1);
+
+  gate.resolve(); // the wedged launch NOW resolves a live browser
+  for (let i = 0; i < 50 && mgr.orphanCount === 0; i++) await tick();
+  // (the late teardown may confirm within the same window; assert via the transcript instead of racing it)
+  for (let i = 0; i < 50 && !late.closed && !late.killed; i++) await tick();
+  assert.equal(late.closed || late.killed, true, "the late core was torn down, not leaked");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "the late orphan left accounting only after its teardown confirmed");
+  assert.equal(mgr.activeCount, 1, "back to the registered session only");
+  assert.equal(ops.removed.includes(ops.made[0]), true, "the late orphan's dir was removed after confirmation");
+  await mgr.release(replacement.id);
+});
+
+test("orphans: a late-resolving core that can't confirm death stays counted via the ledger until reconfirm succeeds (#54 Part 2)", async () => {
+  const gate = deferred();
+  const ops = makeFakeDirOps();
+  const { factory, late } = makeWedgeFactory({ gate, lateConfig: { closeMode: "reject", killMode: "reject" } });
+  const mgr = new SessionManager({
+    maxSessions: 2,
+    coreFactory: factory,
+    launchDeadlineMs: 30,
+    closeGraceMs: 30,
+    killConfirmMs: 30,
+    orphanDirOps: ops,
+  });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  gate.resolve();
+  for (let i = 0; i < 50 && mgr.unconfirmedCount === 0; i++) await tick();
+  assert.equal(mgr.unconfirmedCount, 1, "the unconfirmable late core entered the reconfirm loop");
+  assert.equal(mgr.orphanCount, 1, "…and its ledger record stays COUNTED meanwhile");
+  assert.equal(mgr.activeCount, 1, "activeCount reflects the possibly-live orphan");
+
+  late.killMode = "resolve"; // the SIGKILL finally lands
+  await mgr.reapIdle(1_000); // reconfirm drain
+  assert.equal(mgr.unconfirmedCount, 0, "reconfirm confirmed death");
+  assert.equal(mgr.orphanCount, 0, "…and finalized the ledger record");
+  assert.deepEqual(ops.removed, [ops.made[0]], "dir removed only after the reconfirm confirmed");
+});
+
+test("orphans: a FAILED launch's dir is swept (a rejected launch is not proof the process died) (#54 Part 2)", async () => {
+  const ops = makeFakeDirOps();
+  const factory = async () => {
+    throw new Error("chrome exited during startup");
+  };
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(ops.swept.length, 1, "the failed launch's dir was swept for stragglers");
+  assert.deepEqual(ops.removed, [ops.made[0]], "confirmed-clear → the dir was removed");
+  assert.equal(mgr.orphanCount, 0);
+});
+
+test("dirs: a registered session's owned profile dir is removed ONLY after its teardown confirms (#54 Part 2)", async () => {
+  const ops = makeFakeDirOps();
+  const { factory } = makeControllableFactory({ closeMode: "resolve" });
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, orphanDirOps: ops });
+
+  const s = await mgr.acquire();
+  assert.equal(ops.made.length, 1, "the launch minted a gateway-owned dir");
+  assert.deepEqual(ops.removed, [], "the dir survives while the browser lives");
+  await mgr.release(s.id);
+  for (let i = 0; i < 50 && ops.removed.length === 0; i++) await tick();
+  assert.deepEqual(ops.removed, [ops.made[0]], "confirmed death removed the dir");
+  assert.equal(ops.swept.length, 0, "a clean registered teardown never needs the sweep");
+});
+
+test("dirs: a caller-supplied userDataDir is respected — never minted over, swept, or removed (#54 Part 2)", async () => {
+  const ops = makeFakeDirOps();
+  const { factory } = makeControllableFactory({ closeMode: "resolve" });
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, orphanDirOps: ops });
+
+  const s = await mgr.acquire({ userDataDir: "/custom/profile" });
+  assert.deepEqual(ops.made, [], "no gateway dir minted over the caller's");
+  await mgr.release(s.id);
+  await tick();
+  assert.deepEqual(ops.removed, [], "the caller's dir is never removed");
+  assert.deepEqual(ops.swept, [], "…nor swept");
+});
+
+test("orphans: a WATCHED wedge whose retick sweep turns unconfirmed is re-COUNTED (a live process appeared) (#54 Part 2, codex r2)", async () => {
+  const ops = makeFakeDirOps(); // first sweep confirms-empty → parks on watch
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.watchedCount, 1, "the pending wedge is parked on the watch list");
+  assert.equal(mgr.activeCount, 0, "…holding no capacity while nothing has spawned");
+
+  ops.sweepResult = "unconfirmed"; // the wedged launcher finally spawned something the kill can't confirm
+  await mgr.reapIdle(1_000);
+  for (let i = 0; i < 50 && mgr.orphanCount === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "a known-live spawn moves the record back to the COUNTED ledger");
+  assert.equal(mgr.watchedCount, 0);
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT", "capacity back-pressures again");
+});
+
+test("orphans: the watch list is BOUNDED — the oldest pending wedge is evicted loudly at the cap (#54 Part 2, codex r2)", async () => {
+  const ops = makeFakeDirOps(); // every sweep confirms-empty → every wedge parks on watch
+  const factory = async () => new Promise(() => {}); // EVERY launch wedges forever
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 5, orphanDirOps: ops });
+
+  for (let i = 0; i < MAX_WATCHED_LAUNCHES + 3; i++) {
+    await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+    for (let t = 0; t < 50 && mgr.orphanCount > 0; t++) await tick();
+  }
+  assert.equal(mgr.watchedCount, MAX_WATCHED_LAUNCHES, "the watch set never grows past its cap");
+  assert.equal(mgr.orphanCount, 0, "evicted/watched wedges hold no capacity");
+  assert.deepEqual(ops.removed, [], "no dir was removed under a still-possible future spawn");
+});
+
+test("orphans: unconfirmed sweep stamps are round-tripped into the retry (#54 Part 2, codex r3)", async () => {
+  const token = [{ pid: 777, startTime: "1234", pgrp: 777 }];
+  const ops = makeFakeDirOps();
+  ops.nextSweep = { promise: Promise.resolve({ result: "unconfirmed", stamps: token }) };
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  assert.equal(ops.priors[0], undefined, "the first attempt starts with no prior stamps");
+
+  ops.sweepResult = "unconfirmed"; // still blocking, so the round-trip is observable again
+  await mgr.reapIdle(1_000); // retry
+  assert.deepEqual(ops.priors[1], token, "the retry received the previous attempt's owed stamps");
+});
+
+test("orphans: a late-resolve teardown does NOT discard owed sweep stamps — the record re-sweeps before the dir goes (#54 Part 2, codex r6)", async () => {
+  const token = [{ pid: 888, startTime: "4321", pgrp: 888 }];
+  const gate = deferred();
+  const ops = makeFakeDirOps();
+  ops.nextSweep = { promise: Promise.resolve({ result: "unconfirmed", stamps: token }) }; // an OWED group exists
+  const { factory, late } = makeWedgeFactory({ gate });
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "unconfirmed sweep → counted, stamps owed");
+
+  gate.resolve(); // the late core arrives; its teardown confirms ITS group — but NOT the owed stamped group
+  for (let i = 0; i < 50 && ops.swept.length < 2; i++) await tick();
+  assert.equal(late.closed || late.killed, true, "the late core was torn down");
+  assert.deepEqual(ops.priors[1], token, "the post-teardown settlement re-swept WITH the owed stamps");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "finalized only after the owed group's sweep confirmed");
+  assert.deepEqual(ops.removed, [ops.made[0]], "the dir went only after BOTH the teardown and the stamps confirmed");
+});
+
+test("orphans: a fast late-resolve teardown DEFERS settlement to the in-flight sweep's verdict (#54 Part 2, codex r7)", async () => {
+  const token = [{ pid: 999, startTime: "5555", pgrp: 999 }];
+  const gate = deferred();
+  const ops = makeFakeDirOps();
+  const held = deferred();
+  ops.nextSweep = held; // the post-timeout sweep is STILL POLLING when the late core resolves
+  const { factory, late } = makeWedgeFactory({ gate });
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  gate.resolve(); // late core arrives; its (fast) teardown completes while the sweep is mid-flight
+  for (let i = 0; i < 50 && !late.closed && !late.killed; i++) await tick();
+  await tick();
+  assert.deepEqual(ops.removed, [], "settlement DEFERRED — nothing finalized ahead of the sweep's verdict");
+  assert.equal(mgr.orphanCount, 1, "the record stays counted while the verdict is pending");
+
+  held.resolve({ result: "unconfirmed", stamps: token }); // the sweep found an owed group after all
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.deepEqual(ops.priors[1], token, "the deferred settlement re-swept WITH the owed stamps");
+  assert.equal(mgr.orphanCount, 0, "finalized only after the owed group confirmed");
+  assert.deepEqual(ops.removed, [ops.made[0]]);
+});
+
+test("orphans: an EVICTED watch record whose launch finally rejects is re-enqueued and its dir removed (#54 Part 2, codex r7)", async () => {
+  const ops = makeFakeDirOps();
+  const gates = [];
+  const factory = () => new Promise((_resolve, reject) => gates.push({ reject })); // every launch wedges, individually rejectable
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 5, orphanDirOps: ops });
+
+  for (let i = 0; i < MAX_WATCHED_LAUNCHES + 1; i++) {
+    await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+    for (let t = 0; t < 50 && mgr.orphanCount > 0; t++) await tick();
+  }
+  assert.equal(mgr.watchedCount, MAX_WATCHED_LAUNCHES, "the oldest record was evicted at the cap");
+
+  gates[0].reject(new Error("evicted wedge finally failed")); // the EVICTED launch settles
+  for (let i = 0; i < 50 && !ops.removed.includes(ops.made[0]); i++) await tick();
+  assert.equal(ops.removed.includes(ops.made[0]), true, "the evicted-then-settled launch's dir was reclaimed, not leaked");
+});
+
+test("orphans: a REJECTED sweep resumes a deferred settlement instead of pinning the record forever (#54 Part 2, codex r8)", async () => {
+  const gate = deferred();
+  const ops = makeFakeDirOps();
+  const held = deferred();
+  ops.nextSweep = held; // the post-timeout sweep is in flight…
+  const { factory, late } = makeWedgeFactory({ gate });
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  gate.resolve(); // …the late core arrives and its teardown completes (settlement deferred to the sweep)
+  for (let i = 0; i < 50 && !late.closed && !late.killed; i++) await tick();
+
+  held.promise.catch(() => {}); // silence the deliberate rejection below
+  // The in-flight sweep REJECTS (a transient scan error) — the deferred settlement must still run.
+  ops.nextSweep = undefined;
+  await tick();
+  // reject via a fresh rejected promise path: resolve the held deferred with a rejected outcome
+  held.resolve(Promise.reject(new Error("scan blew up")));
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "the rejection arm resumed the settlement — no permanent pin");
+  assert.deepEqual(ops.removed, [ops.made[0]], "the confirmed-dead orphan's dir was reclaimed");
+});
+
+test("orphans: a WATCHED record whose retick sweep REJECTS is re-counted (a failed scan proves nothing) (#54 Part 2, codex r9)", async () => {
+  const ops = makeFakeDirOps(); // first sweep confirms-empty → parks on watch
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.watchedCount === 0; i++) await tick();
+  assert.equal(mgr.watchedCount, 1, "parked on watch");
+
+  const rejected = Promise.reject(new Error("scan failed"));
+  rejected.catch(() => {}); // pre-attach so the deliberate rejection never surfaces unhandled
+  ops.nextSweep = { promise: rejected };
+  await mgr.reapIdle(1_000);
+  for (let i = 0; i < 50 && mgr.orphanCount === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "the failed scan re-counted the record — Chrome may have appeared");
+  assert.equal(mgr.watchedCount, 0);
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT", "capacity back-pressures until a scan succeeds");
+});
+
+test("shutdown: drains in-flight orphan work and RETAINS an unconfirmable orphan loudly (#54 Part 2)", async () => {
+  const ops = makeFakeDirOps({ sweepResult: "unconfirmed" }); // the wedge's tree never confirms dead
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+
+  let done = false;
+  await mgr.shutdown().then(() => {
+    done = true;
+  });
+  assert.equal(done, true, "shutdown completed despite the unconfirmable orphan (bounded sweep)");
+  assert.equal(mgr.orphanCount, 1, "the possibly-live orphan is RETAINED in accounting, never erased");
+  assert.deepEqual(ops.removed, [], "its dir is retained too (a live process may hold it)");
 });

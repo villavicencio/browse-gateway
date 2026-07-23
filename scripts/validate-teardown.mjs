@@ -13,6 +13,9 @@
  *      in its process group (the whole tree is reaped, not merely the leader).
  *   4. MANAGER TEARDOWN reclaims for real — a `SessionManager.release()` on a live session frees the slot
  *      AND leaves no live browser process behind.
+ *   F. (#54 Part 2) the ORPHAN SWEEP reaps a real Chromium by its gateway-owned userDataDir ALONE —
+ *      no context, no PID handle (the wedged-launch premise): cmdline scan finds it, group-SIGKILL +
+ *      generation-confirm reaps it, and the owned profile dir is removed after.
  *
  * The state-machine escalation logic (wedged/rejected close → kill, unconfirmed → reconfirm, acquire⇄
  * shutdown, transient reap) is covered deterministically by test/gateway-session.test.mjs with fakes; this
@@ -203,6 +206,26 @@ try {
   const st2 = readStartTime(g2.pid);
   check("Eb. a fresh process has a DIFFERENT start-time (a recycled pid would be told apart)", st1 !== st2);
   process.kill(-g2.pid, "SIGKILL");
+
+  // --- Section F: the #54 Part 2 orphan sweep reaps a REAL Chromium by its userDataDir alone -----------
+  // The wedged-launch case has no context and no PID — the sweep's whole premise is that the gateway-owned
+  // profile dir on Chromium's cmdline is enough to find, group-kill, and CONFIRM the tree, then remove the
+  // dir. Prove it against a real headful Chrome launched through the shipping path with a minted dir,
+  // deliberately NOT closed (simulating the launch whose promise the manager never saw resolve).
+  const { defaultOrphanDirOps } = await import("../dist/gateway/orphan-sweep.js");
+  const wedgeDir = await defaultOrphanDirOps.make();
+  // Launch and DISCARD the handle — from the manager's perspective this browser is unreachable.
+  await createBrowserCore({ ...cfg.core, userDataDir: wedgeDir });
+  await new Promise((r) => setTimeout(r, 500)); // let the tree settle
+  const foundBefore = (await import("../dist/gateway/orphan-sweep.js")).findPidsByUserDataDir(wedgeDir);
+  console.log(`     sweep target: ${foundBefore.length} proc(s) carry --user-data-dir=${wedgeDir}`);
+  check("F. a real Chromium is findable by its gateway-owned userDataDir (cmdline scan)", foundBefore.length > 0);
+  const sweepOutcome = await defaultOrphanDirOps.sweep(wedgeDir, 5_000);
+  check("Fb. the sweep kill-and-confirms the whole tree by dir alone (no PID handle)", sweepOutcome.result === "confirmed");
+  const foundAfter = (await import("../dist/gateway/orphan-sweep.js")).findPidsByUserDataDir(wedgeDir);
+  check("Fc. nothing carries the dir after the sweep", foundAfter.length === 0);
+  await defaultOrphanDirOps.remove(wedgeDir);
+  check("Fd. the owned profile dir is removable after the confirmed sweep", !fs.existsSync(wedgeDir));
 } catch (err) {
   console.log(`  FAIL  threw: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
   failures++;

@@ -113,9 +113,11 @@ export function computeForceKillAvailable(
  * leader (issue #50 r5). Fields are parsed after the last ')' so a comm with spaces/parens can't shift
  * offsets. Returns `undefined` when /proc is unavailable (e.g. macOS CLI) or the pid is gone.
  */
-function readProcStat(pid: number): { pgrp: number; startTime: string } | undefined {
+export function readProcStat(pid: number, procRoot = "/proc"): { pgrp: number; startTime: string } | undefined {
+  // Exported for the #54 Part 2 orphan sweep (same generation discipline keyed off a SCANNED pid);
+  // `procRoot` is injectable there so the parse is unit-testable against a fake proc tree.
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const stat = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
     const after = stat.slice(stat.lastIndexOf(")") + 2).split(" "); // [state, ppid, pgrp, ... starttime@idx19]
     const pgrp = after[2];
     const startTime = after[19];
