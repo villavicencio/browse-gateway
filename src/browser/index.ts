@@ -32,6 +32,7 @@ export {
   targetToSelector,
   computeForceKillAvailable,
   deadlineBoundedTimeout,
+  readProcStat,
 } from "./patchright-core.js";
 export {
   assess,
