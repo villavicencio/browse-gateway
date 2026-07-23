@@ -302,6 +302,13 @@ export async function sweepOrphanProcesses(
    * read as "our tree survives"). Anything else — leader alive, a lingering child, an unprovable recycle —
    * stays NOT gone, so the sweep reports `unconfirmed` rather than freeing capacity over a live process.
    */
+  // SCOPED RESIDUAL (codex r13, documented-not-fixed per the ROI stop): if a wedged launch's NEW group
+  // reuses a pgid held in priorStamps from an EARLIER group of the SAME profile, AND only a non-leader
+  // exposes the profile, AND a transient stat failure blocks the 1b generation refresh at that exact
+  // pass, AND the discoverable member exits while the new leader survives a SIGKILL — the stale prior
+  // leader stamp can misread the live reused group as recycled and confirm. Four stacked rare events;
+  // bounded by the container's pids_limit/namespace backstop. A clean fix needs prior-stamp refresh
+  // surgery in the seed path — deferred.
   const groupGone = (pgrp: number, rep: { pid: number; startTime: string }): boolean => {
     try {
       kill(-pgrp, 0);
