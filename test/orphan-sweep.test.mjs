@@ -96,6 +96,19 @@ test("sweep: nothing under the dir → confirmed immediately (no kills)", async 
   rmSync(root, { recursive: true, force: true });
 });
 
+test("sweep: an UNREADABLE proc root on Linux → unsupported, never a false confirm (codex r2)", async () => {
+  const r = await sweepOrphanProcesses("/tmp/bgw-x", 500, {
+    platform: "linux",
+    procRoot: "/nonexistent-proc-root-for-test",
+    ...fakeClock(),
+  });
+  assert.equal(r, "unsupported", "no scan happened, so nothing was 'confirmed'");
+  assert.throws(
+    () => findPidsByUserDataDir("/tmp/bgw-x", "/nonexistent-proc-root-for-test"),
+    "an unreadable root throws — an empty result always means 'scanned and found nothing'",
+  );
+});
+
 test("sweep: non-Linux platform → unsupported (never scans or kills)", async () => {
   const kills = [];
   const r = await sweepOrphanProcesses("/tmp/bgw-x", 1_000, {

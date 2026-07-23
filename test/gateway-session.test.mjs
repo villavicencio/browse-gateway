@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Gateway, SessionManager, SessionManagerError, MAX_INFLIGHT_MS } from "../dist/gateway/index.js";
+import { Gateway, SessionManager, SessionManagerError, MAX_INFLIGHT_MS, MAX_WATCHED_LAUNCHES } from "../dist/gateway/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 
 /** A configurable fake BrowserCore factory that records created cores. */
@@ -1162,6 +1162,38 @@ test("dirs: a caller-supplied userDataDir is respected — never minted over, sw
   await tick();
   assert.deepEqual(ops.removed, [], "the caller's dir is never removed");
   assert.deepEqual(ops.swept, [], "…nor swept");
+});
+
+test("orphans: a WATCHED wedge whose retick sweep turns unconfirmed is re-COUNTED (a live process appeared) (#54 Part 2, codex r2)", async () => {
+  const ops = makeFakeDirOps(); // first sweep confirms-empty → parks on watch
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.watchedCount, 1, "the pending wedge is parked on the watch list");
+  assert.equal(mgr.activeCount, 0, "…holding no capacity while nothing has spawned");
+
+  ops.sweepResult = "unconfirmed"; // the wedged launcher finally spawned something the kill can't confirm
+  await mgr.reapIdle(1_000);
+  for (let i = 0; i < 50 && mgr.orphanCount === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "a known-live spawn moves the record back to the COUNTED ledger");
+  assert.equal(mgr.watchedCount, 0);
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT", "capacity back-pressures again");
+});
+
+test("orphans: the watch list is BOUNDED — the oldest pending wedge is evicted loudly at the cap (#54 Part 2, codex r2)", async () => {
+  const ops = makeFakeDirOps(); // every sweep confirms-empty → every wedge parks on watch
+  const factory = async () => new Promise(() => {}); // EVERY launch wedges forever
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 5, orphanDirOps: ops });
+
+  for (let i = 0; i < MAX_WATCHED_LAUNCHES + 3; i++) {
+    await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+    for (let t = 0; t < 50 && mgr.orphanCount > 0; t++) await tick();
+  }
+  assert.equal(mgr.watchedCount, MAX_WATCHED_LAUNCHES, "the watch set never grows past its cap");
+  assert.equal(mgr.orphanCount, 0, "evicted/watched wedges hold no capacity");
+  assert.deepEqual(ops.removed, [], "no dir was removed under a still-possible future spawn");
 });
 
 test("shutdown: drains in-flight orphan work and RETAINS an unconfirmable orphan loudly (#54 Part 2)", async () => {

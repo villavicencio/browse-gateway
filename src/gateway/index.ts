@@ -227,7 +227,10 @@ export {
   CLOSE_GRACE_MS,
   KILL_CONFIRM_MS,
   LAUNCH_DEADLINE_MS,
+  MAX_WATCHED_LAUNCHES,
 } from "./session-manager.js";
+export { defaultOrphanDirOps, sweepOrphanProcesses, findPidsByUserDataDir } from "./orphan-sweep.js";
+export type { OrphanDirOps, SweepResult, SweepEnv } from "./orphan-sweep.js";
 export type {
   CoreFactory,
   SessionManagerOptions,

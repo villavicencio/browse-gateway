@@ -91,6 +91,17 @@ export const SHUTDOWN_RECONFIRM_TRIES = 3;
  */
 export const LAUNCH_DEADLINE_MS = 120_000;
 
+/**
+ * Ceiling on WATCHED wedge records (issue #54 Part 2, codex r2): a permanently-pending launch whose
+ * sweeps keep confirming empty parks on the uncounted watch list — one entry per wedge, each holding a
+ * profile dir plus a per-tick /proc scan. A crash-looping caller against a permanently-wedging factory
+ * would otherwise grow that set (and its disk/scan cost) without bound. At the cap the OLDEST entry is
+ * EVICTED with a loud stderr line — its dir is retained on disk (never removed under a possible future
+ * spawn) but no longer tracked/swept; the prod container teardown is the ultimate backstop. 32 is far
+ * above any real incident (each entry costs a full launch-deadline window to mint).
+ */
+export const MAX_WATCHED_LAUNCHES = 32;
+
 export type SessionManagerErrorCode = "SESSION_LIMIT" | "CORE_LAUNCH";
 
 export class SessionManagerError extends Error {
@@ -224,6 +235,13 @@ export class SessionManager {
    *  primitive alongside {@link unconfirmedCount}. */
   get orphanCount(): number {
     return this.#orphans.size;
+  }
+
+  /** Count of WATCHED wedge records (issue #54 Part 2, codex r2) — still-pending launches whose dirs are
+   *  kept under the reaper's sweep but hold no capacity. Non-zero is normal transient state after a
+   *  wedge; a growing value means launches are wedging repeatedly. A health-surface primitive. */
+  get watchedCount(): number {
+    return this.#watch.size;
   }
 
   get maxSessions(): number {
@@ -560,7 +578,7 @@ export class SessionManager {
           if (rec.settled === true) {
             await this.#finalizeOrphan(rec);
           } else if (this.#orphans.delete(rec)) {
-            this.#watch.add(rec);
+            this.#watchLaunch(rec);
           }
           return;
         }
@@ -575,13 +593,33 @@ export class SessionManager {
           return;
         }
         // "unconfirmed": something still lives (e.g. a D-state unkillable). Stay counted — the #50
-        // never-lie posture — and let the next reaper tick retry.
+        // never-lie posture — and let the next reaper tick retry. Codex r2: a WATCHED record that turns
+        // unconfirmed just proved a live process spawned under it — move it BACK to the counted ledger
+        // (activeCount + the consumer cap must see a known-live orphan; watch is for "nothing there").
+        if (this.#watch.delete(rec)) this.#orphans.add(rec);
       },
       () => {
         rec.sweeping = false; // sweep errored — retry on the next tick
       },
     );
     return this.#trackOrphanWork(work);
+  }
+
+  /** Park a still-pending wedge on the bounded watch list (issue #54 Part 2, codex r2). At
+   *  {@link MAX_WATCHED_LAUNCHES} the OLDEST entry is evicted LOUDLY — untracked (its dir retained on
+   *  disk, never removed under a possible future spawn) so a permanently-wedging factory can't grow
+   *  the watch set, its dirs, and its per-tick /proc scans without bound. */
+  #watchLaunch(rec: OrphanRecord): void {
+    while (this.#watch.size >= MAX_WATCHED_LAUNCHES) {
+      const oldest = this.#watch.values().next().value as OrphanRecord | undefined;
+      if (oldest === undefined) break;
+      this.#watch.delete(oldest);
+      process.stderr.write(
+        `[browse-gateway] watch list full (${MAX_WATCHED_LAUNCHES}): evicting the oldest pending wedge ` +
+          `(its profile dir is retained on disk, untracked — container teardown is the backstop)\n`,
+      );
+    }
+    this.#watch.add(rec);
   }
 
   #beginTeardown(session: Session): Promise<void> {

@@ -44,16 +44,13 @@ const SWEEP_POLL_MS = 100;
  * Pids whose `/proc/<pid>/cmdline` carries the EXACT `--user-data-dir=<dir>` argument (NUL-separated
  * exact-arg match — never a substring, so a dir that happens to prefix another can't over-match; the
  * mkdtemp'd dir is unique per launch regardless). A pid that exits mid-scan is skipped, never an error.
+ * An UNREADABLE proc root THROWS (codex r2): an empty result must always mean "scanned and found
+ * nothing" — silently returning [] there would let the sweep false-confirm with zero scanning.
  */
 export function findPidsByUserDataDir(dir: string, procRoot = "/proc"): number[] {
   const marker = `--user-data-dir=${dir}`;
   const out: number[] = [];
-  let names: string[];
-  try {
-    names = readdirSync(procRoot);
-  } catch {
-    return out; // no proc tree readable → nothing findable (the caller's platform gate reports unsupported)
-  }
+  const names = readdirSync(procRoot); // throws on an unreadable root — the sweep maps it to "unsupported"
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
     try {
@@ -86,6 +83,14 @@ export async function sweepOrphanProcesses(
   const kill = env.kill ?? ((pid: number, sig: NodeJS.Signals | 0) => process.kill(pid, sig));
   const sleep = env.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = env.now ?? (() => Date.now());
+  // Codex r2: a Linux host whose proc root is absent/unreadable (a misconfigured mount) must report
+  // UNSUPPORTED — never "confirmed" off a scan that scanned nothing. One up-front probe; /proc does not
+  // vanish mid-process, and a per-pid read failure inside the scan still means "that pid exited".
+  try {
+    readdirSync(procRoot);
+  } catch {
+    return "unsupported";
+  }
 
   const marker = `--user-data-dir=${dir}`;
   const carriesMarker = (pid: number): boolean => {
