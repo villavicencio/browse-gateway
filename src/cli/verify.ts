@@ -68,6 +68,95 @@ export function httpProbe(localPort: number, hostHeader: string, bearerToken?: s
     });
 }
 
+/** One authed `GET /health` read (issue #53): the HTTP status plus the parsed JSON body (undefined on
+ *  a non-200 / unparseable body). The operator token yields the pool counters; a network failure
+ *  resolves `{ code: "000" }` — the caller renders "unavailable", never throws. */
+export interface HealthProbeResult {
+  code: string;
+  body?: Record<string, unknown>;
+}
+
+/** The /health body is a handful of counters (~200 bytes); anything past this is not our gateway. */
+const HEALTH_BODY_CAP_BYTES = 16 * 1024;
+
+export function healthProbe(localPort: number, hostHeader: string, bearerToken: string): () => Promise<HealthProbeResult> {
+  return () =>
+    new Promise((resolve) => {
+      // ONE settle path shared by every request- and response-level event (codex #53 r1/r3): a reset
+      // after headers emits `error`/`aborted` (never `end`), and the request `timeout` measures
+      // INACTIVITY only — a peer trickling HEADER bytes resets it forever and the response callback
+      // never even fires. So the absolute deadline is armed HERE, before the request is issued, and
+      // every path funnels through `finish` — the probe's contract (a failure resolves {code:"000"},
+      // never a hang, never a throw) holds regardless of where in the exchange the peer misbehaves.
+      let settled = false;
+      let destroy: (() => void) | undefined;
+      const finish = (result: HealthProbeResult): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardDeadline);
+        resolve(result);
+      };
+      const hardDeadline = setTimeout(() => {
+        finish({ code: "000" });
+        destroy?.();
+      }, PROBE_TIMEOUT_MS);
+      hardDeadline.unref?.();
+      // Codex #53 r8: `request()` throws SYNCHRONOUSLY (ERR_INVALID_CHAR) when a header value carries an
+      // HTTP-illegal character — a health token with a stray newline would otherwise escape the promise
+      // and crash `obscura status`, breaking the "a failure resolves {code:'000'}" contract. Wrap the
+      // whole construction so a malformed token reads as unavailable like any other probe failure.
+      let req: ReturnType<typeof request>;
+      try {
+        req = request(
+          {
+            host: "127.0.0.1",
+            port: localPort,
+            path: "/health",
+            method: "GET",
+            headers: { Host: hostHeader, Authorization: `Bearer ${bearerToken}` },
+            timeout: PROBE_TIMEOUT_MS,
+          },
+          (res) => {
+          // Codex r2: cap the body too — the counters payload is ~200 bytes; an oversized or
+          // ever-trickling body is not our gateway and settles as unavailable.
+          let total = 0;
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => {
+            total += c.length;
+            if (total > HEALTH_BODY_CAP_BYTES) {
+              finish({ code: "000" });
+              req.destroy();
+              return;
+            }
+            chunks.push(c);
+          });
+          res.on("error", () => finish({ code: "000" }));
+          res.on("aborted", () => finish({ code: "000" }));
+          res.on("end", () => {
+            const code = String(res.statusCode ?? 0).padStart(3, "0");
+            let body: Record<string, unknown> | undefined;
+            if (res.statusCode === 200) {
+              try {
+                const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+                if (parsed !== null && typeof parsed === "object") body = parsed as Record<string, unknown>;
+              } catch {
+                /* unparseable → body stays undefined; the caller renders "unavailable" */
+              }
+            }
+            finish({ code, ...(body !== undefined ? { body } : {}) });
+          });
+          },
+        );
+      } catch {
+        return finish({ code: "000" }); // malformed header/token — unavailable, never a thrown crash
+      }
+      destroy = () => req.destroy();
+      req.on("timeout", () => req.destroy());
+      req.on("error", () => finish({ code: "000" }));
+      req.end();
+    });
+}
+
 export interface VerifyOptions {
   probe: VerifyProbe;
   /** Total retry window; defaults ride out a container recreate. */

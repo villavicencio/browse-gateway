@@ -15,7 +15,7 @@ import { retrieve, hostForcesProxy } from "../verbs/index.js";
 import { buildGatewayRuntime } from "./runtime.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
-import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
+import { createHttpHandler, dnsRebindBootError, buildOperatorHealth } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
@@ -51,6 +51,15 @@ async function main(): Promise<void> {
   const allowedOrigins = splitCsv(process.env.BGW_ALLOWED_ORIGINS);
   const rebindError = dnsRebindBootError(allowedHosts);
   if (rebindError) throw new Error(rebindError);
+
+  // #53 (codex r1): the operator health token must never COLLIDE with a consumer credential — the
+  // /health route checks it BEFORE consumer auth, so a collision would hand that consumer the
+  // cross-tenant pool counters, breaking the operator-only boundary. Fail closed at boot (the message
+  // names neither token — R9).
+  const healthToken = process.env.BGW_HEALTH_TOKEN;
+  if (healthToken && specs.some((s) => s.token === healthToken)) {
+    throw new Error("BGW_HEALTH_TOKEN collides with a consumer token — the operator health token must be a distinct credential. Refusing to boot.");
+  }
 
   const handler = createHttpHandler({
     authenticate: (token: string) => policy.authenticate(token),
@@ -91,9 +100,14 @@ async function main(): Promise<void> {
     },
     allowedHosts,
     allowedOrigins,
-    // Liveness/health for a client-side breaker (issue #47): a cheap, browser-session-free signal.
-    // Minimal today; issue #53 folds in the gateway's pool-degradation counters (gateway.sessions).
+    // Liveness/health for a client-side breaker (issue #47): a cheap, browser-session-free signal —
+    // the CONSUMER tier stays this bare body. The OPERATOR tier (issue #53) surfaces the #50/#54
+    // pool-degradation counters behind the dedicated BGW_HEALTH_TOKEN — a token that is NOT a consumer
+    // key (never in the manifest, never counted toward pool sizing, grants only this read). It is
+    // compared, never logged; absent/empty → the operator tier is simply off.
     health: () => ({ status: "ok" as const }),
+    healthToken,
+    operatorHealth: () => buildOperatorHealth(gateway.sessions),
     log,
   });
   handler.startReaper(MCP_SESSION_REAPER_INTERVAL_MS);

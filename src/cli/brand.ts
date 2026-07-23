@@ -8,15 +8,18 @@
  * line of defense — callers still must not put secrets in messages.
  */
 
-export type OwlState = "rest" | "connected" | "down";
+export type OwlState = "rest" | "connected" | "degraded" | "down";
 
-/** The one-line owl face: at rest, winking (connected), or eyes-shut (down). */
+/** The one-line owl face: at rest, winking (connected), squinting (degraded — alive but impaired,
+ *  issue #53), or eyes-shut (down). */
 export function owl(state: OwlState): string {
   switch (state) {
     case "rest":
       return "(o,o)";
     case "connected":
       return "(^,o)";
+    case "degraded":
+      return "(o,~)";
     case "down":
       return "(-,-)";
   }

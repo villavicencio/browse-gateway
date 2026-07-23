@@ -483,3 +483,118 @@ test("awaitBounded: a rejecting promise resolves the bound WITHOUT an unhandledR
     process.removeListener("unhandledRejection", onUnhandled);
   }
 });
+
+// --- issue #53: the operator-tier health surface --------------------------------------------------
+
+const POOL_OK = { forceKillAvailable: true, unconfirmedCount: 0, orphanCount: 0, watchedCount: 0, activeCount: 1, reservedCount: 0, maxSessions: 2 };
+const POOL_DEGRADED = { forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 1, watchedCount: 1, activeCount: 2, reservedCount: 0, maxSessions: 2 };
+
+test("#53: buildOperatorHealth derives ONE degraded verdict from the pool getters", async () => {
+  const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");
+  assert.equal(buildOperatorHealth(POOL_OK).status, "ok");
+  assert.equal(buildOperatorHealth({ ...POOL_OK, forceKillAvailable: false }).status, "degraded");
+  assert.equal(buildOperatorHealth({ ...POOL_OK, unconfirmedCount: 1 }).status, "degraded");
+  assert.equal(buildOperatorHealth({ ...POOL_OK, orphanCount: 1 }).status, "degraded");
+  // watchedCount alone is informational — a pending wedge under sweep is normal transient state.
+  assert.equal(buildOperatorHealth({ ...POOL_OK, watchedCount: 3 }).status, "ok");
+  // pool-at-capacity alone is not degradation (back-pressure is working as designed).
+  assert.equal(buildOperatorHealth({ ...POOL_OK, activeCount: 2 }).status, "ok");
+});
+
+test("#53: the operator token gets the counters; a consumer token gets the bare liveness body", async () => {
+  const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");
+  const { deps } = makeDeps({
+    healthToken: "op-secret",
+    operatorHealth: () => buildOperatorHealth(POOL_DEGRADED),
+  });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const op = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer op-secret" } });
+    assert.equal(op.status, 200);
+    const opBody = await op.json();
+    assert.equal(opBody.status, "degraded");
+    assert.equal(opBody.forceKillAvailable, false);
+    assert.equal(opBody.unconfirmedCount, 1);
+    assert.equal(opBody.orphanCount, 1);
+    assert.equal(opBody.activeCount, 2);
+
+    const consumer = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer tok-alice" } });
+    assert.equal(consumer.status, 200);
+    assert.deepEqual(await consumer.json(), { status: "ok" }, "pool internals never reach a consumer token");
+
+    const bad = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer nope" } });
+    assert.equal(bad.status, 401, "an unknown bearer stays 401 with the operator tier configured");
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("#53: the operator health token authenticates NOTHING but /health (never the MCP routes)", async () => {
+  const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");
+  const { deps } = makeDeps({ healthToken: "op-secret", operatorHealth: () => buildOperatorHealth(POOL_OK) });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: "Bearer op-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "1" } }, id: 1 }),
+    });
+    assert.equal(res.status, 401, "the health token must never open an MCP session");
+    assert.equal(handler.sessionCount(), 0);
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("#53: a rebind Host is refused BEFORE any token tier (operator token included)", async () => {
+  const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");
+  const { deps } = makeDeps({
+    allowedHosts: ["gw.allowed:8080"],
+    healthToken: "op-secret",
+    operatorHealth: () => buildOperatorHealth(POOL_OK),
+  });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const rebind = await rawGet(url.port, "/health", { Host: "evil.rebind:8080", Authorization: "Bearer op-secret" });
+    assert.equal(rebind.status, 403, "pool internals must never cross a rebound Host");
+    const ok = await rawGet(url.port, "/health", { Host: "gw.allowed:8080", Authorization: "Bearer op-secret" });
+    assert.equal(ok.status, 200);
+    assert.equal(JSON.parse(ok.body).forceKillAvailable, true);
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("#53: an EMPTY configured health token never matches (no accidental open tier)", async () => {
+  const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");
+  const { deps } = makeDeps({ healthToken: "", operatorHealth: () => buildOperatorHealth(POOL_DEGRADED) });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const none = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer " } });
+    assert.equal(none.status, 401, "an empty bearer against an empty token is refused, not matched");
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("#53 r11: healthToken set with NO operatorHealth producer → the token is honored, gets the consumer-tier body (not 401)", async () => {
+  const { deps } = makeDeps({ healthToken: "op-secret" }); // no operatorHealth wired
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const op = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer op-secret" } });
+    assert.equal(op.status, 200, "the operator token is recognized even without a producer (contract)");
+    assert.deepEqual(await op.json(), { status: "ok" }, "falls back to the bare consumer-tier liveness body");
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});

@@ -34,8 +34,8 @@ export {
   SELF_DISABLE_MARKER,
 } from "./tunnel.js";
 export type { TunnelSpec, TunnelSpecOptions, TunnelState, AgentState, PortOwner, PortListener, EnsureResult } from "./tunnel.js";
-export { classifyProbeCode, httpProbe, verifyGateway } from "./verify.js";
-export type { VerifyState, VerifyResult, VerifyProbe, VerifyOptions } from "./verify.js";
+export { classifyProbeCode, httpProbe, healthProbe, verifyGateway } from "./verify.js";
+export type { VerifyState, VerifyResult, VerifyProbe, VerifyOptions, HealthProbeResult } from "./verify.js";
 export { registerMcp, MCP_SERVER_NAME } from "./mcp-register.js";
 export type { RegisterOutcome, RegisterOptions } from "./mcp-register.js";
 export { connect, discoverToken, sshStealthGate } from "./connect.js";

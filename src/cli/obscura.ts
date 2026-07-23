@@ -19,6 +19,7 @@ import { connect, sshStealthGate } from "./connect.js";
 import type { ConnectDeps } from "./connect.js";
 import { status } from "./status.js";
 import type { StatusDeps } from "./status.js";
+import { healthProbe } from "./verify.js";
 import { tunnelSpec } from "./tunnel.js";
 
 function keysDeps(): KeysDeps {
@@ -89,6 +90,10 @@ async function runStatus(invocation: Invocation): Promise<void> {
       : {}),
     ...(invocation.flags.stealth
       ? { stealth: sshStealthGate(adminShell ?? sshShell(requireConfig(config, "adminSsh")), config.container) }
+      : {}),
+    // #53: the operator-token pool-health read, only when a healthToken is configured.
+    ...(config.healthToken
+      ? { poolHealth: healthProbe(spec.localPort, config.gatewayHost, config.healthToken) }
       : {}),
   };
   const report = await status(deps, { stealth: invocation.flags.stealth });

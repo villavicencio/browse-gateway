@@ -108,6 +108,10 @@ test("foreign binder is flagged and makes the report unhealthy even with a 401",
   const report = await status(deps);
   assert.equal(report.healthy, false);
   assert.ok(lines.some((l) => l.includes("FOREIGN process")));
+  // Codex #53 r10: the /mcp 401 came from the foreign process, so gateway health is NOT attributable to
+  // us — the report + gateway line must not claim "healthy" beside the foreign-tunnel line.
+  assert.notEqual(report.gateway, "healthy", "a 401 from a foreign binder is not OUR gateway being healthy");
+  assert.ok(!lines.some((l) => l.startsWith("✓ gateway healthy")), "no contradictory gateway-healthy line");
 });
 
 test("configured consumers listed from the manifest; tokens never shown; desync flagged", async () => {
@@ -155,4 +159,177 @@ test("--stealth runs the gate and folds into health; default omits it", async ()
   const offReport = await status(off.deps);
   assert.equal(offReport.stealthGreen, undefined);
   assert.ok(!off.lines.some((l) => l.includes("stealth")), "default omits the stealth line");
+});
+
+// --- issue #53: the pool-health section ------------------------------------------------------------
+
+const POOL_OK_BODY = { status: "ok", forceKillAvailable: true, unconfirmedCount: 0, orphanCount: 0, watchedCount: 0, activeCount: 1, reservedCount: 0, maxSessions: 2 };
+const POOL_DEGRADED_BODY = { status: "degraded", forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 1, watchedCount: 1, activeCount: 2, reservedCount: 0, maxSessions: 2 };
+
+test("#53: a healthy pool renders its counters and stays healthy", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: POOL_OK_BODY }) });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.equal(report.pool, "ok");
+  assert.ok(lines.some((l) => l.includes("pool healthy") && l.includes("1/2 sessions")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53: a DEGRADED pool flips overall health and names each degradation", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: POOL_DEGRADED_BODY }) });
+  const report = await status(deps);
+  assert.equal(report.healthy, false, "a degraded pool is UNHEALTHY even though /mcp answers");
+  assert.equal(report.owl, "degraded", "…but it is IMPAIRED, not an outage — the distinct squinting owl (codex r4)");
+  assert.equal(report.pool, "degraded");
+  assert.ok(lines.some((l) => l.includes("pool DEGRADED")));
+  assert.ok(lines.some((l) => l.includes("force-kill unavailable")));
+  assert.ok(lines.some((l) => l.includes("1 browser teardown(s) unconfirmed")));
+  assert.ok(lines.some((l) => l.includes("1 live orphaned launch(es)")));
+  assert.ok(lines.some((l) => l.includes("1 pending wedge(s) under watch")));
+});
+
+test("#53: a rejected/unreadable health read renders 'unavailable' without failing overall health", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "401" }) });
+  const report = await status(deps);
+  assert.equal(report.pool, "unavailable");
+  assert.equal(report.healthy, true, "a token/rollout mismatch is surfaced, not a health failure");
+  assert.ok(lines.some((l) => l.includes("pool health: unavailable")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53: no healthToken configured → the pool section is skipped with the enable hint", async () => {
+  const { deps, lines } = makeDeps(); // no poolHealth dep
+  const report = await status(deps);
+  assert.equal(report.pool, undefined);
+  assert.ok(lines.some((l) => l.includes("pool health: skipped") && l.includes("healthToken")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53: a pool at capacity renders the amber note but stays healthy", async () => {
+  const { deps, lines } = makeDeps({
+    poolHealth: async () => ({ code: "200", body: { ...POOL_OK_BODY, activeCount: 2 } }),
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.ok(lines.some((l) => l.includes("pool is at capacity")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53 end-to-end: a degraded live core flips external health through the REAL http route + probe (the AC)", async () => {
+  const { createServer } = await import("node:http");
+  const { createHttpHandler } = await import("../dist/mcp/index.js");
+  const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");
+  const { healthProbe } = await import("../dist/cli/index.js");
+
+  // A fake pool in the degraded shape #50/#54 produce (a markerless / force-kill-unavailable core).
+  const pool = { forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 0, watchedCount: 0, activeCount: 1, reservedCount: 0, maxSessions: 2 };
+  const handler = createHttpHandler({
+    authenticate: () => { throw new Error("no consumers in this test"); },
+    buildServer: () => { throw new Error("never"); },
+    healthToken: "op-secret",
+    operatorHealth: () => buildOperatorHealth(pool),
+  });
+  const server = createServer((req, res) => void handler.handle(req, res).catch(() => res.end()));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  try {
+    const { deps, lines } = makeDeps({
+      poolHealth: healthProbe(port, "127.0.0.1:8080", "op-secret"),
+    });
+    const report = await status(deps);
+    assert.equal(report.pool, "degraded", "the degraded core surfaced through the real route + real probe");
+    assert.equal(report.healthy, false, "external health flipped end to end");
+    assert.ok(lines.some((l) => l.includes("force-kill unavailable")));
+
+    // And the fix side: the pool recovers → external health goes green through the same path.
+    pool.forceKillAvailable = true;
+    pool.unconfirmedCount = 0;
+    const { deps: deps2 } = makeDeps({ poolHealth: healthProbe(port, "127.0.0.1:8080", "op-secret") });
+    const report2 = await status(deps2);
+    assert.equal(report2.pool, "ok");
+    assert.equal(report2.healthy, true);
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("#53 r1: a bare consumer-tier body (healthToken misconfigured to a consumer key) reads as UNAVAILABLE, never healthy", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: { status: "ok" } }) });
+  const report = await status(deps);
+  assert.equal(report.pool, "unavailable", "a counters-free body must not claim the pool is verified healthy");
+  assert.ok(lines.some((l) => l.includes("pool health: unavailable")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53 r3: in-flight reservations count toward occupancy — a slow launch holding the last slot is visible", async () => {
+  const { deps, lines } = makeDeps({
+    poolHealth: async () => ({ code: "200", body: { ...POOL_OK_BODY, activeCount: 0, reservedCount: 1, maxSessions: 1 } }),
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.ok(lines.some((l) => l.includes("1/1 sessions (1 launching)")), `got: ${lines.join(" | ")}`);
+  assert.ok(lines.some((l) => l.includes("pool is at capacity")), "the admission gate's view drives the capacity note");
+});
+
+test("#53 r3: watched wedges are visible on the HEALTHY branch too", async () => {
+  const { deps, lines } = makeDeps({
+    poolHealth: async () => ({ code: "200", body: { ...POOL_OK_BODY, watchedCount: 2 } }),
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true, "watch alone never degrades");
+  assert.ok(lines.some((l) => l.includes("2 pending wedge(s) under watch")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53 r5: a FOREIGN local port never receives the operator health token (credential-leak guard)", async () => {
+  let probed = false;
+  const { deps, lines } = makeDeps({
+    // A foreign listener that 401s /mcp (so gateway reads "healthy") — the classic rebind/squat setup.
+    state: async () => ({ agent: "running", port: "foreign" }),
+    probe: async () => "401",
+    poolHealth: async () => {
+      probed = true; // must NEVER run — the token would go to the foreign process
+      return { code: "200", body: POOL_OK_BODY };
+    },
+  });
+  const report = await status(deps);
+  assert.equal(probed, false, "the operator token was NOT sent to a foreign listener");
+  assert.equal(report.pool, undefined, "no pool verdict without an owned tunnel");
+  assert.equal(report.healthy, false, "a foreign port is unhealthy regardless");
+  assert.ok(lines.some((l) => l.includes("FOREIGN")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53 r6: ownership is RE-CHECKED before the send — a tunnel that dropped mid-status never leaks the token (TOCTOU)", async () => {
+  // The forward is "ours" at the top-of-function snapshot, but DROPS during the verify window and a
+  // foreign process binds the port before the pool read. The fresh re-check must catch the flip.
+  let call = 0;
+  let probed = false;
+  const { deps, lines } = makeDeps({
+    state: async () => (call++ === 0 ? { agent: "running", port: "ours" } : { agent: "running", port: "foreign" }),
+    probe: async () => "401",
+    poolHealth: async () => {
+      probed = true;
+      return { code: "200", body: POOL_OK_BODY };
+    },
+  });
+  const report = await status(deps);
+  assert.equal(probed, false, "the token was NOT sent after the port flipped to foreign mid-status");
+  assert.equal(report.pool, undefined, "no pool verdict once ownership can't be reconfirmed");
+  // Codex r7: the FRESH foreign verdict must flip the whole status, not just skip the send.
+  assert.equal(report.healthy, false, "a mid-run foreign takeover reports unhealthy, not connected");
+  assert.equal(report.owl, "down");
+  // Codex r9: the refreshed reading is AUTHORITATIVE — the report + tunnel line are coherent, never
+  // "unhealthy" over a stale port:"ours" with a contradictory "tunnel up" line.
+  assert.equal(report.tunnel.port, "foreign", "the report reflects the refreshed (foreign) tunnel state");
+  assert.ok(lines.some((l) => l.includes("FOREIGN") || l.includes("NO LONGER")), `got: ${lines.join(" | ")}`);
+  assert.ok(!lines.some((l) => l.startsWith("✓ tunnel up")), "no contradictory 'tunnel up' line during a takeover");
+});
+
+test("#53 r7: the ownership refresh is SKIPPED entirely when no health token is configured (no double tunnel inspection)", async () => {
+  let stateCalls = 0;
+  const { deps } = makeDeps({
+    state: async () => {
+      stateCalls++;
+      return { agent: "running", port: "ours" };
+    },
+    // no poolHealth dep → the refresh must not run
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.equal(stateCalls, 1, "tunnel state is inspected ONCE for an ordinary status (the refresh is pool-health-only)");
 });

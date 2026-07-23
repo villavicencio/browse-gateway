@@ -13,7 +13,7 @@ import type { KeysListResult } from "./keys.js";
 import { formatConsumerLine } from "./keys.js";
 import type { TunnelSpec, TunnelState } from "./tunnel.js";
 import { tunnelState } from "./tunnel.js";
-import type { VerifyProbe, VerifyState } from "./verify.js";
+import type { HealthProbeResult, VerifyProbe, VerifyState } from "./verify.js";
 import { verifyGateway, httpProbe } from "./verify.js";
 
 /** Status should be snappy: a short window still rides out a blip without feeling hung. */
@@ -34,6 +34,9 @@ export interface StatusDeps {
   consumers?: () => Promise<KeysListResult>;
   /** The 1/1 stealth gate; wired only when --stealth is requested. */
   stealth?: () => Promise<boolean>;
+  /** Operator-token `GET /health` read (issue #53); absent = no healthToken configured — the pool
+   *  section is skipped with a hint. Wired from `healthProbe(...)` with the config's healthToken. */
+  poolHealth?: () => Promise<HealthProbeResult>;
 }
 
 export interface StatusOptions {
@@ -43,24 +46,32 @@ export interface StatusOptions {
 export interface StatusReport {
   tunnel: TunnelState;
   gateway: VerifyState;
-  /** Overall: gateway reachable + port ours + (when requested) stealth green. */
+  /** Overall: gateway reachable + port ours + (when requested) stealth green + pool not degraded. */
   healthy: boolean;
   owl: OwlState;
   consumers?: KeysListResult;
   stealthGreen?: boolean;
+  /** The pool-degradation verdict from the operator /health read (issue #53): "ok" | "degraded" |
+   *  "unavailable" (probe failed / rejected) — absent when no healthToken is configured. */
+  pool?: "ok" | "degraded" | "unavailable";
 }
 
 export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promise<StatusReport> {
   const { spec, out } = deps;
   const state = deps.state ?? tunnelState;
-  const tunnel = await state(spec);
+  const initialTunnel = await state(spec);
+  // `tunnel` is the AUTHORITATIVE reading used for the verdict, the tunnel line, and the report. When a
+  // health token is configured, the #53 ownership re-check below refreshes it (the top snapshot is stale
+  // by then — verifyGateway's retry window sits between) so a mid-check listener flip renders coherently
+  // rather than "unhealthy" over a stale `port: "ours"` (codex #53 r9). Otherwise it stays the snapshot.
+  let tunnel = initialTunnel;
   const verify = await verifyGateway({
     probe: deps.probe ?? httpProbe(spec.localPort, deps.gatewayHost),
     timeoutMs: deps.verifyTimeoutMs ?? STATUS_VERIFY_WINDOW_MS,
     pollMs: deps.verifyPollMs ?? STATUS_VERIFY_POLL_MS,
     ...(deps.wait ? { wait: deps.wait } : {}),
   });
-  const gateway = verify.state;
+  let gateway = verify.state;
 
   let stealthGreen: boolean | undefined;
   if (opts.stealth) {
@@ -68,8 +79,72 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
     stealthGreen = await deps.stealth();
   }
 
-  const healthy = gateway === "healthy" && tunnel.port === "ours" && stealthGreen !== false;
-  const face: OwlState = healthy ? "connected" : "down";
+  // — pool health (issue #53): the operator-token /health read, only meaningful when the gateway answers —
+  let pool: StatusReport["pool"];
+  let poolBody: Record<string, unknown> | undefined;
+  // Codex #53 r5/r6: only send the operator health TOKEN to a listener that is provably OURS. A FOREIGN
+  // process (rebind/port-squat) can answer 401 to the unauthenticated /mcp probe — reading as gateway
+  // "healthy" — and the authenticated /health request would then hand it the operator credential.
+  // r6 (TOCTOU): the top-of-function `tunnel` snapshot is STALE by here — verifyGateway's retry window
+  // (up to ~6s) sits between them, ample time for the SSH forward to drop and a foreign process to bind
+  // the port. RE-CHECK ownership immediately before the send and gate on the FRESH reading, collapsing
+  // the window to the gap between this check and the socket write. RESIDUAL (documented, irreducible in
+  // userspace): a bind that wins that sub-call gap still receives the token — closing it fully needs a
+  // socket peer-credential assertion loopback HTTP to an ssh forward doesn't expose; the token is a
+  // read-only pool-counters credential (no consumer/secret access), and the operator's own loopback is
+  // the only attack surface.
+  // r7/r9: the refresh runs ONLY when a health token is configured (it re-spawns launchctl/lsof/ps — no
+  // ordinary `status` should pay for it twice). Its fresh reading BECOMES the authoritative `tunnel`
+  // state, so a listener flip detected here drives the verdict, the tunnel line, AND the returned report
+  // coherently — never "unhealthy" while the report still says `port: "ours"`.
+  if (deps.poolHealth && gateway === "healthy") {
+    const refreshed = await state(spec);
+    tunnel = refreshed; // authoritative from here on
+    const ownedNow = refreshed.port === "ours";
+    if (initialTunnel.port === "ours" && !ownedNow) {
+      out(fail(`local port ${spec.localPort} was ours but is NO LONGER — a listener change mid-check (the tunnel dropped / a foreign process bound it); the operator health token was NOT sent`));
+    }
+    if (ownedNow) {
+      const read = await deps.poolHealth();
+      poolBody = read.body;
+      // Codex #53 r1: require the FULL operator shape before trusting the verdict — a healthToken
+      // mistakenly set to a valid CONSUMER token gets the bare `{status:"ok"}` liveness body, which must
+      // read as "unavailable" (misconfigured), never as "pool healthy, force-kill armed".
+      const b = read.body;
+      const isOperatorShape =
+        b !== undefined &&
+        (b.status === "ok" || b.status === "degraded") &&
+        typeof b.forceKillAvailable === "boolean" &&
+        typeof b.unconfirmedCount === "number" &&
+        typeof b.orphanCount === "number" &&
+        typeof b.watchedCount === "number" && // codex r2: a skewed body missing it must not read as verified
+        typeof b.activeCount === "number" &&
+        typeof b.reservedCount === "number" && // codex r3: the admission gate counts reservations too
+        typeof b.maxSessions === "number";
+      pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";
+    }
+  }
+
+  // Codex #53 r10: a `gateway === "healthy"` verdict means "/mcp answered 401", but that answer is only
+  // attributable to OUR gateway when the loopback port is OURS. If the authoritative `tunnel` is foreign
+  // (a squatter answered) or none (the forward dropped), the probe result does not describe our gateway —
+  // reclassify to `tunnel-down` so the gateway line, the report field, and the owl all agree with the
+  // tunnel line instead of printing "✓ gateway healthy" beside "FOREIGN process bound". (A latent
+  // pre-#53 inconsistency for a foreign-from-start bind; the ownership refresh made it reachable, so it
+  // is fixed at the source here for both the mid-check flip and the from-start case.)
+  if (gateway === "healthy" && tunnel.port !== "ours") {
+    gateway = "tunnel-down";
+  }
+
+  // A DEGRADED pool is unhealthy (a wedged core could zombie / a browser may be alive uncounted) but
+  // it is NOT an outage — the gateway answers; the pool is impaired. Codex #53 r4: keep the states
+  // visually distinct (squinting owl, nonzero exit) so ops can tell "restart/debug the pool" apart
+  // from "the service is dead". An UNAVAILABLE read is a config/rollout mismatch, surfaced but not a
+  // health failure by itself. `tunnel` is the refreshed reading when a health token ran (codex r9), so
+  // a mid-check foreign takeover flows through here — and the tunnel line + report — coherently.
+  const reachable = gateway === "healthy" && tunnel.port === "ours" && stealthGreen !== false;
+  const healthy = reachable && pool !== "degraded";
+  const face: OwlState = healthy ? "connected" : reachable && pool === "degraded" ? "degraded" : "down";
   out(`${owl(face)}  obscura status`);
 
   // — tunnel line —
@@ -111,6 +186,46 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
       break;
   }
 
+  // — pool line (issue #53) —
+  if (pool !== undefined) {
+    const n = (k: string): number | undefined => (typeof poolBody?.[k] === "number" ? (poolBody[k] as number) : undefined);
+    const active = n("activeCount");
+    const reserved = n("reservedCount") ?? 0;
+    const max = n("maxSessions");
+    // Codex r3: occupancy is what the ADMISSION GATE sees — active + in-flight reservations. A slow
+    // launch holding the last slot must not render as "0/1 sessions" while acquires are refused.
+    const occupied = active !== undefined ? active + reserved : undefined;
+    const sessions =
+      occupied !== undefined && max !== undefined
+        ? `${occupied}/${max} sessions${reserved > 0 ? ` (${reserved} launching)` : ""}`
+        : "sessions n/a";
+    const watched = n("watchedCount") ?? 0;
+    if (pool === "ok") {
+      out(ok(`pool healthy — force-kill armed, 0 unconfirmed, ${sessions}`));
+      if (occupied !== undefined && max !== undefined && occupied >= max) {
+        out(note("pool is at capacity — new sessions will be refused until one frees"));
+      }
+      // Codex r3: watched wedges are informational but must be VISIBLE on the healthy branch too —
+      // hiding them until something else degrades would mask a recurring launch-wedge pattern.
+      if (watched > 0) out(note(`${watched} pending wedge(s) under watch (uncounted; being swept)`));
+    } else if (pool === "degraded") {
+      out(fail(`pool DEGRADED (${sessions}):`));
+      if (poolBody?.forceKillAvailable === false) {
+        out(fail("  force-kill unavailable — a wedged close can only zombie (check launch-time stderr)"));
+      }
+      const unconfirmed = n("unconfirmedCount") ?? 0;
+      if (unconfirmed > 0) out(fail(`  ${unconfirmed} browser teardown(s) unconfirmed — a browser may still be alive`));
+      const orphans = n("orphanCount") ?? 0;
+      if (orphans > 0) out(fail(`  ${orphans} live orphaned launch(es) holding capacity (wedged/late launches)`));
+      const watched = n("watchedCount") ?? 0;
+      if (watched > 0) out(note(`  ${watched} pending wedge(s) under watch (uncounted; being swept)`));
+    } else {
+      out(note("pool health: unavailable — the health token was rejected or the body was unreadable (is BGW_HEALTH_TOKEN deployed and matching?)"));
+    }
+  } else if (deps.poolHealth === undefined) {
+    out(note("pool health: skipped (no healthToken in config — set healthToken/OBSCURA_HEALTH_TOKEN to enable)"));
+  }
+
   // — configured consumers (KTD12: configured, not live) —
   let consumers: KeysListResult | undefined;
   if (deps.consumers) {
@@ -142,5 +257,6 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
     owl: face,
     ...(consumers ? { consumers } : {}),
     ...(stealthGreen !== undefined ? { stealthGreen } : {}),
+    ...(pool !== undefined ? { pool } : {}),
   };
 }
