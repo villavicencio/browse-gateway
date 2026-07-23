@@ -87,18 +87,39 @@ export async function sweepOrphanProcesses(
   const sleep = env.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = env.now ?? (() => Date.now());
 
-  /** Generation-stamped kill of every current match; returns the stamped pids for the confirm below. */
-  const killMatches = (): Map<number, string | undefined> => {
-    const stamped = new Map<number, string | undefined>();
+  const marker = `--user-data-dir=${dir}`;
+  const carriesMarker = (pid: number): boolean => {
+    try {
+      return readFileSync(join(procRoot, String(pid), "cmdline"), "utf8").split("\0").includes(marker);
+    } catch {
+      return false; // exited — no marker, nothing to signal
+    }
+  };
+
+  /**
+   * Generation-stamped kill of every current match; returns the stamps `{pid → {startTime, pgrp}}` the
+   * group-confirm below polls. TOCTOU discipline (codex #54P2 r1): between the scan and the stat read a
+   * matched pid can EXIT AND BE RECYCLED by an unrelated process (real under pids_limit=512) — signaling
+   * the recycled pid's group would kill innocents. So per pid: read the stat (generation stamp), then
+   * RE-READ the cmdline — only OUR launch's processes ever carry the mkdtemp-unique marker, so a marker
+   * still present after the stat read proves the pid (and therefore the stamped pgrp) is ours at this
+   * instant. A pid whose stat is unreadable or whose marker vanished is SKIPPED, never raw-signaled (the
+   * confirm rescan re-decides). Residual: an exit-and-recycle in the microseconds between the re-read and
+   * the SIGKILL is irreducible from userspace (no pidfd in Node; #50 avoids it only by holding the
+   * launch-captured ChildProcess, which a never-resolved launch cannot provide) — documented, not fixable
+   * at this layer.
+   */
+  const killMatches = (): Map<number, { startTime: string; pgrp: number }> => {
+    const stamped = new Map<number, { startTime: string; pgrp: number }>();
     for (const pid of findPidsByUserDataDir(dir, procRoot)) {
       const stat = readProcStat(pid, procRoot);
-      stamped.set(pid, stat?.startTime);
-      // Group-SIGKILL (the #50 discipline): renderers/crashpad live in the leader's group without
-      // carrying --user-data-dir themselves. Fall back to the pid itself when the group read failed
-      // (already-exiting process). ESRCH = already gone — success-shaped, swallowed.
-      const target = stat ? -stat.pgrp : pid;
+      if (!stat) continue; // exited since the scan — never signal an unverifiable pid
+      if (!carriesMarker(pid)) continue; // recycled between scan and stat — NOT ours; never signal
+      stamped.set(pid, { startTime: stat.startTime, pgrp: stat.pgrp });
       try {
-        kill(target, "SIGKILL");
+        // Group-SIGKILL (the #50 discipline): renderers/crashpad live in the leader's group without
+        // carrying --user-data-dir themselves. ESRCH = already gone — success-shaped, swallowed.
+        kill(-stat.pgrp, "SIGKILL");
       } catch {
         // ESRCH/EPERM: gone, or not ours to signal — either way the confirm pass below decides
       }
@@ -106,18 +127,37 @@ export async function sweepOrphanProcesses(
     return stamped;
   };
 
-  /** A stamped pid is gone when its stat vanished OR its start-time changed (pid recycled — issue #50 r5). */
-  const gone = (pid: number, startTime: string | undefined): boolean => {
-    const stat = readProcStat(pid, procRoot);
-    if (!stat) return true;
-    return startTime !== undefined && stat.startTime !== startTime;
+  /**
+   * A stamp's WHOLE GROUP is gone — the #50 `#ourGroupGone` rule, per stamp (codex #54P2 r1: confirming
+   * only the marker-carrying pids would false-confirm past a surviving argless renderer/crashpad in the
+   * group). Group probe `kill(-pgrp, 0)`: ESRCH = truly empty; EPERM = a member we can't signal — not our
+   * same-uid Chrome, so our tree is gone. Probe-alive is GONE only for a provably RECYCLED group: our
+   * stamped pid WAS the group leader (pid === pgrp) and the pid now present at that slot is a leader with
+   * a DIFFERENT start-time (issue #50 r5 — a freed pgid recycled as an unrelated group's leader must never
+   * read as "our tree survives"). Anything else — leader alive, a lingering child, an unprovable recycle —
+   * stays NOT gone, so the sweep reports `unconfirmed` rather than freeing capacity over a live process.
+   */
+  const groupGone = (pid: number, stamp: { startTime: string; pgrp: number }): boolean => {
+    try {
+      kill(-stamp.pgrp, 0);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return code === "ESRCH" || code === "EPERM";
+    }
+    if (pid === stamp.pgrp) {
+      const stat = readProcStat(stamp.pgrp, procRoot);
+      if (stat && stat.pgrp === stamp.pgrp && stat.startTime !== stamp.startTime) return true; // recycled group
+    }
+    return false;
   };
 
   let stamped = killMatches();
-  if (stamped.size === 0) return "confirmed"; // nothing lives under this profile
+  if (stamped.size === 0) return "confirmed"; // nothing lives under this profile RIGHT NOW (see OrphanDirOps
+  // note: the CALLER must treat an empty-scan confirm on a still-PENDING launch as provisional — the
+  // launcher may spawn later; the manager's watch-list covers that window.)
   const deadline = now() + confirmMs;
   for (;;) {
-    const allGone = [...stamped].every(([pid, st]) => gone(pid, st));
+    const allGone = [...stamped].every(([pid, stamp]) => groupGone(pid, stamp));
     if (allGone) {
       // Rescan for a process forked under the profile mid-sweep; kill it and keep polling if found.
       const fresh = killMatches();

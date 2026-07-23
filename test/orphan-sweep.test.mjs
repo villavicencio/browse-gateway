@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findPidsByUserDataDir, sweepOrphanProcesses } from "../dist/gateway/orphan-sweep.js";
@@ -31,6 +31,43 @@ function makeProcRoot() {
 function fakeClock() {
   let t = 0;
   return { now: () => t, sleep: async (ms) => { t += ms; } };
+}
+
+/** True while any fake-proc entry sits in process group `pgid`. */
+function groupAlive(root, pgid) {
+  for (const name of readdirSync(root)) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const stat = readFileSync(join(root, name, "stat"), "utf8");
+      const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (Number(after[2]) === pgid) return true;
+    } catch {
+      /* raced */
+    }
+  }
+  return false;
+}
+
+/**
+ * A probe-aware fake `kill` over the fake proc tree: signal 0 on a negative pid implements the REAL
+ * group-liveness semantics (throws ESRCH once no entry sits in the group — what the sweep's
+ * group-confirm polls), while SIGKILLs are recorded and delegated to `impl` (which mutates the tree).
+ */
+function makeKillFake(root, impl) {
+  const kills = [];
+  const kill = (pid, sig) => {
+    if (sig === 0) {
+      if (!groupAlive(root, -pid)) {
+        const e = new Error("no such process group");
+        e.code = "ESRCH";
+        throw e;
+      }
+      return;
+    }
+    kills.push([pid, sig]);
+    impl?.(pid, sig);
+  };
+  return { kill, kills };
 }
 
 test("findPidsByUserDataDir: exact NUL-separated arg match only (no substring/prefix over-match)", () => {
@@ -69,23 +106,48 @@ test("sweep: non-Linux platform → unsupported (never scans or kills)", async (
   assert.deepEqual(kills, []);
 });
 
-test("sweep: group-SIGKILLs the match's process group and confirms once the entries vanish", async () => {
+test("sweep: group-SIGKILLs the match's process group and confirms once the WHOLE group is gone", async () => {
   const root = makeProcRoot();
   const dir = "/tmp/bgw-wedge";
   writeProc(root, 200, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 200 });
   writeProc(root, 201, { args: ["chrome", "--type=renderer"], pgrp: 200 }); // group member w/o the arg
-  const kills = [];
-  const kill = (pid, sig) => {
-    kills.push([pid, sig]);
+  const { kill, kills } = makeKillFake(root, (pid) => {
     if (pid === -200) {
       // group-SIGKILL reaps the whole group, arg-carrying or not
       rmSync(join(root, "200"), { recursive: true, force: true });
       rmSync(join(root, "201"), { recursive: true, force: true });
     }
-  };
+  });
   const r = await sweepOrphanProcesses(dir, 1_000, { platform: "linux", procRoot: root, kill, ...fakeClock() });
   assert.equal(r, "confirmed");
   assert.deepEqual(kills, [[-200, "SIGKILL"]], "one group-SIGKILL at the leader's pgid, renderers rode along");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: a surviving ARGLESS group member (D-state renderer) blocks the confirm — unconfirmed, never false-freed (codex r1)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-renderer-survives";
+  writeProc(root, 210, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 210 });
+  writeProc(root, 211, { args: ["chrome", "--type=renderer"], pgrp: 210 }); // no marker — invisible to the rescan
+  const { kill } = makeKillFake(root, (pid) => {
+    if (pid === -210) rmSync(join(root, "210"), { recursive: true, force: true }); // ONLY the leader dies
+  });
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() });
+  assert.equal(r, "unconfirmed", "the group probe sees the lingering renderer — capacity is not freed over it");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: a matched pid whose stat vanished (exited between scan and stat) is never signaled (codex r1)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-exited";
+  // cmdline present but NO stat file — the process exited between readdir/cmdline and the stat read.
+  const pdir = join(root, "220");
+  mkdirSync(pdir, { recursive: true });
+  writeFileSync(join(pdir, "cmdline"), ["chrome", `--user-data-dir=${dir}`].join("\0") + "\0");
+  const { kill, kills } = makeKillFake(root);
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() });
+  assert.equal(r, "confirmed", "an unverifiable (exited) pid is skipped, not treated as alive");
+  assert.deepEqual(kills, [], "no signal was ever sent on an unverifiable pid (recycle-safety)");
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -93,13 +155,13 @@ test("sweep: a RECYCLED pid (same number, new start-time) counts as gone — the
   const root = makeProcRoot();
   const dir = "/tmp/bgw-recycled";
   writeProc(root, 300, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 300, startTime: "1000" });
-  const kill = (pid) => {
+  const { kill } = makeKillFake(root, (pid) => {
     if (pid === -300) {
       // the SIGKILL lands, and an UNRELATED process immediately reuses pid 300 (small pid space)
       rmSync(join(root, "300"), { recursive: true, force: true });
       writeProc(root, 300, { args: ["sshd"], pgrp: 300, startTime: "9999" });
     }
-  };
+  });
   const r = await sweepOrphanProcesses(dir, 1_000, { platform: "linux", procRoot: root, kill, ...fakeClock() });
   assert.equal(r, "confirmed", "the recycled pid's changed start-time proves OUR process is gone");
   rmSync(root, { recursive: true, force: true });
@@ -109,16 +171,14 @@ test("sweep: a process forked under the profile MID-SWEEP is killed too before c
   const root = makeProcRoot();
   const dir = "/tmp/bgw-fork";
   writeProc(root, 400, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 400 });
-  const kills = [];
-  const kill = (pid, sig) => {
-    kills.push([pid, sig]);
+  const { kill, kills } = makeKillFake(root, (pid) => {
     if (pid === -400) {
       rmSync(join(root, "400"), { recursive: true, force: true });
       // …but the wedged launcher had already forked a second chrome under the SAME profile
       writeProc(root, 500, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 500 });
     }
     if (pid === -500) rmSync(join(root, "500"), { recursive: true, force: true });
-  };
+  });
   const r = await sweepOrphanProcesses(dir, 1_000, { platform: "linux", procRoot: root, kill, ...fakeClock() });
   assert.equal(r, "confirmed");
   assert.deepEqual(kills, [[-400, "SIGKILL"], [-500, "SIGKILL"]], "the rescan caught and killed the fork");
@@ -129,12 +189,12 @@ test("sweep: a survivor at the deadline → unconfirmed (never a false confirm)"
   const root = makeProcRoot();
   const dir = "/tmp/bgw-dstate";
   writeProc(root, 600, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 600 });
-  const kills = [];
   // The SIGKILL is sent but the process never dies (D-state unkillable) — entries stay put.
+  const { kill, kills } = makeKillFake(root); // no impl: the tree never changes
   const r = await sweepOrphanProcesses(dir, 500, {
     platform: "linux",
     procRoot: root,
-    kill: (pid, sig) => kills.push([pid, sig]),
+    kill,
     ...fakeClock(),
   });
   assert.equal(r, "unconfirmed");

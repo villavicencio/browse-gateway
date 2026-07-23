@@ -32,6 +32,15 @@ interface OrphanRecord {
   session?: Session;
   /** Single-flight latch so a reaper tick racing shutdown can't run two sweeps over one dir. */
   sweeping?: boolean;
+  /** The consumer whose acquire spawned this launch (codex #54P2 r1): counted by `#countForConsumer`
+   *  while the record lives, so one consumer's repeated wedges trip ITS per-consumer cap instead of
+   *  silently eating the global pool and starving the other consumers. */
+  consumerId?: string;
+  /** True once the underlying factory launch promise SETTLED (resolved late or rejected). Until then an
+   *  empty-scan sweep "confirm" is PROVISIONAL — the still-pending launcher may spawn Chromium later
+   *  (codex #54P2 r1) — so the record moves to the uncounted WATCH list (kept swept, dir retained)
+   *  instead of being finalized; only a settled record's confirm removes the dir and forgets it. */
+  settled?: boolean;
 }
 
 /**
@@ -159,9 +168,17 @@ export class SessionManager {
    *  patchright removes only its own temp dirs, and never on a kill). Issue #54 Part 2. */
   readonly #ownedDirs = new Map<Session, string>();
   /** The live-orphan ledger (issue #54 Part 2) — see {@link OrphanRecord}. Every entry is counted in
-   *  {@link activeCount}; entries leave only on a CONFIRMED reclaim (sweep/teardown/reconfirm) or the
-   *  loud unsupported-platform degrade. */
+   *  {@link activeCount}; entries leave only on a CONFIRMED reclaim (sweep/teardown/reconfirm), the
+   *  loud unsupported-platform degrade, or a move to the {@link #watch} list. */
   readonly #orphans = new Set<OrphanRecord>();
+  /** The UNCOUNTED watch list (codex #54P2 r1): wedge records whose sweep confirmed EMPTY while their
+   *  launch promise was still PENDING. An empty scan then only proves nothing has spawned YET — the
+   *  wedged launcher may still spawn Chromium later — so the record's capacity slot is released (the
+   *  Part-1 promise) but its dir stays registered and the reaper KEEPS SWEEPING it (anything that
+   *  appears is killed within a tick, a bounded understatement window, and the dir is not removed from
+   *  under a future spawn). A late RESOLVE moves the record back to `#orphans` (counted, teardown-owned);
+   *  the launch SETTLING lets the next confirmed sweep finalize it (dir removed, record forgotten). */
+  readonly #watch = new Set<OrphanRecord>();
   /** In-flight orphan work (late-orphan teardowns, dir sweeps, dir removals) — each internally bounded;
    *  `shutdown()` awaits them so the no-orphan drain covers this path too (the Part-1 deferral). */
   readonly #orphanWork = new Set<Promise<void>>();
@@ -185,6 +202,10 @@ export class SessionManager {
   #countForConsumer(consumerId: string): number {
     let n = this.#reservedByConsumer.get(consumerId) ?? 0;
     for (const s of this.#sessions.values()) if (s.consumerId === consumerId) n++;
+    // #54 Part 2 (codex r1): a consumer's live orphans count against ITS cap too — else repeated wedges
+    // release `#reservedByConsumer` while the orphan eats the GLOBAL pool, letting one consumer starve
+    // the others past `perConsumerMax`. (Watch-list entries are uncounted everywhere, consistently.)
+    for (const rec of this.#orphans) if (rec.consumerId === consumerId) n++;
     return n;
   }
 
@@ -338,6 +359,12 @@ export class SessionManager {
       // A factory that throws SYNCHRONOUSLY (before returning its promise) must still surface as the
       // documented CORE_LAUNCH, not a raw error (issue #54, codex r1). The async-rejection path is
       // normalized by the `.then(onR)` arm below; this try guards the synchronous throw the race can't see.
+      // #54 Part 2 (codex r1): the minted dir must not leak on this path either — enqueue it like the
+      // async-failed outcome (a factory that spawned before throwing may also have left a straggler; the
+      // sweep decides). The launch is SETTLED (it threw), so an empty-scan confirm finalizes fully.
+      if (ownedDir !== undefined) {
+        this.#enqueueOrphan({ dir: ownedDir, settled: true, ...(meta?.consumerId ? { consumerId: meta.consumerId } : {}) });
+      }
       throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause });
     }
     const deadline = deadlineTimer(this.#launchDeadlineMs);
@@ -352,8 +379,11 @@ export class SessionManager {
     if (outcome.kind === "failed") {
       // #54 Part 2: a REJECTED launch usually means Chromium exited — but "usually" is not "confirmed".
       // Enqueue the owned dir as an orphan and let the sweep decide: an empty scan confirms instantly
-      // (rec dropped, dir removed); a straggler process is killed + confirmed like a wedge.
-      if (ownedDir !== undefined) this.#enqueueOrphan({ dir: ownedDir });
+      // (the launch already SETTLED, so the confirm is final — rec dropped, dir removed); a straggler
+      // process is killed + confirmed like a wedge. Attributed to the consumer while it lives (codex r1).
+      if (ownedDir !== undefined) {
+        this.#enqueueOrphan({ dir: ownedDir, settled: true, ...(meta?.consumerId ? { consumerId: meta.consumerId } : {}) });
+      }
       throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause: outcome.cause });
     }
     if (outcome.kind === "timeout") {
@@ -367,13 +397,27 @@ export class SessionManager {
       //  - a LATE RESOLVE upgrades the record with the real core and runs the confirmable teardown
       //    (an unconfirmed close goes to `#unconfirmed` for the reaper's reconfirm; the record stays
       //    counted until that confirms).
-      // A late REJECTION is swallowed (the sweep owns the record). Both paths are tracked in
-      // `#orphanWork`, which shutdown() drains — closing the Part-1 no-orphan deferral.
-      const rec: OrphanRecord = ownedDir !== undefined ? { dir: ownedDir } : {};
+      // A late REJECTION marks the record SETTLED and re-kicks the sweep so a provisional watch entry can
+      // now finalize (codex r1). Both paths are tracked in `#orphanWork`, which shutdown() drains —
+      // closing the Part-1 no-orphan deferral. The record carries the consumer id while it lives (codex
+      // r1: a consumer's wedges count against ITS cap, not silently against the global pool).
+      const rec: OrphanRecord = {
+        ...(ownedDir !== undefined ? { dir: ownedDir } : {}),
+        ...(meta?.consumerId ? { consumerId: meta.consumerId } : {}),
+      };
       this.#enqueueOrphan(rec);
       void launchP.then(
-        (lateCore) => this.#reapLateLaunch(lateCore, rec),
-        () => {}, // swallow a late rejection (already handled by the race's `.then(onR)` arm) — never unhandled
+        (lateCore) => {
+          rec.settled = true;
+          return this.#reapLateLaunch(lateCore, rec);
+        },
+        () => {
+          // The wedged launch finally REJECTED: no process can spawn from it anymore. Mark settled and
+          // re-sweep — an empty scan is now a FINAL confirm (dir removed, record forgotten), including
+          // for a record parked on the watch list.
+          rec.settled = true;
+          void this.#sweepOrphan(rec);
+        },
       );
       throw new SessionManagerError(
         "CORE_LAUNCH",
@@ -446,7 +490,8 @@ export class SessionManager {
   #reapLateLaunch(core: BrowserCore, rec: OrphanRecord): Promise<void> {
     const orphan = new Session(core);
     rec.session = orphan; // the confirmable teardown owns the record now; a mid-flight sweep stands down
-    this.#orphans.add(rec); // re-add if a completed sweep already dropped it (a set add is idempotent)
+    this.#watch.delete(rec); // a watched (uncounted) wedge just materialized a real browser…
+    this.#orphans.add(rec); // …so it is COUNTED again until its teardown confirms (idempotent re-add)
     const work = (async () => {
       try {
         await orphan.teardown(this.#closeGraceMs, this.#killConfirmMs);
@@ -467,10 +512,11 @@ export class SessionManager {
 
   /**
    * CONFIRMED reclaim of an orphan: remove its gateway-owned dir (best-effort — a leaked DIR is disk
-   * hygiene, never a reason to keep holding a capacity slot) and drop the record from the ledger.
+   * hygiene, never a reason to keep holding a capacity slot) and drop the record from both ledgers.
    */
   async #finalizeOrphan(rec: OrphanRecord): Promise<void> {
     this.#orphans.delete(rec);
+    this.#watch.delete(rec);
     if (rec.dir !== undefined) {
       const dir = rec.dir;
       rec.dir = undefined; // never remove twice
@@ -491,10 +537,12 @@ export class SessionManager {
    * container, where the sweep is real). `"unconfirmed"` keeps the record counted; the reaper retries.
    */
   #sweepOrphan(rec: OrphanRecord): Promise<void> {
-    if (rec.sweeping || rec.session !== undefined || !this.#orphans.has(rec)) return Promise.resolve();
+    if (rec.sweeping || rec.session !== undefined) return Promise.resolve();
+    if (!this.#orphans.has(rec) && !this.#watch.has(rec)) return Promise.resolve(); // already finalized
     if (rec.dir === undefined) {
       // No sweep key (mint failed / caller-supplied dir launch): nothing findable — Part-1 semantics.
       this.#orphans.delete(rec);
+      this.#watch.delete(rec);
       return Promise.resolve();
     }
     rec.sweeping = true;
@@ -504,7 +552,16 @@ export class SessionManager {
         rec.sweeping = false;
         if (rec.session !== undefined) return; // a late core arrived mid-sweep — its teardown owns the record
         if (result === "confirmed") {
-          await this.#finalizeOrphan(rec);
+          // Codex #54P2 r1: while the wedged launch promise is still PENDING, an empty-scan confirm is
+          // PROVISIONAL — the launcher may spawn Chromium later. Release the capacity slot (the Part-1
+          // promise) but PARK the record on the uncounted watch list: the reaper keeps sweeping the dir
+          // (a late spawn is killed within a tick) and the dir is not deleted from under a future spawn.
+          // Only a SETTLED launch's confirm is final.
+          if (rec.settled === true) {
+            await this.#finalizeOrphan(rec);
+          } else if (this.#orphans.delete(rec)) {
+            this.#watch.add(rec);
+          }
           return;
         }
         if (result === "unsupported") {
@@ -514,6 +571,7 @@ export class SessionManager {
               "any half-spawned Chromium and its profile dir leak until system cleanup)\n",
           );
           this.#orphans.delete(rec);
+          this.#watch.delete(rec);
           return;
         }
         // "unconfirmed": something still lives (e.g. a D-state unkillable). Stay counted — the #50
@@ -630,8 +688,9 @@ export class SessionManager {
     await Promise.all(stale.map((s) => this.release(s.id).catch(() => {})));
     await this.#drainUnconfirmed();
     // #54 Part 2: retry the dir sweep over any dir-only orphan still counted (a wedged launch whose
-    // first sweep couldn't confirm, or one enqueued between ticks). Single-flight per record.
-    await Promise.all([...this.#orphans].map((rec) => this.#sweepOrphan(rec).catch(() => {})));
+    // first sweep couldn't confirm, or one enqueued between ticks) AND over the uncounted watch list
+    // (a pending wedge that may spawn late — kill anything that appeared). Single-flight per record.
+    await Promise.all([...this.#orphans, ...this.#watch].map((rec) => this.#sweepOrphan(rec).catch(() => {})));
     return stale.map((s) => s.id);
   }
 
@@ -691,9 +750,12 @@ export class SessionManager {
       await this.#drainUnconfirmed();
     }
     // #54 Part 2: one final sweep pass over any dir-only orphan still counted (a wedge whose earlier
-    // sweep couldn't confirm, or one enqueued during the drain), bounded per record by killConfirmMs;
-    // then drain the dir removals/teardowns that pass spawned.
-    await Promise.allSettled([...this.#orphans].map((rec) => this.#sweepOrphan(rec)));
+    // sweep couldn't confirm, or one enqueued during the drain) AND the uncounted watch list, bounded
+    // per record by killConfirmMs; then drain the dir removals/teardowns that pass spawned. RESIDUAL
+    // (documented): a still-PENDING wedged launch that spawns Chromium AFTER this final pass and before
+    // process exit escapes the in-process sweep — the prod container namespace teardown reaps it; on the
+    // CLI the loud retained-watch line below flags it.
+    await Promise.allSettled([...this.#orphans, ...this.#watch].map((rec) => this.#sweepOrphan(rec)));
     await Promise.allSettled([...this.#orphanWork]);
     // Do NOT unconditionally clear the maps (issue #50): a confirmed teardown already removed itself from
     // #sessions/#closing/#unconfirmed, so anything STILL present is a browser we could not confirm dead.
@@ -704,6 +766,13 @@ export class SessionManager {
       process.stderr.write(
         `[browse-gateway] shutdown: ${this.#orphans.size} orphaned launch(es) could not be confirmed ` +
           `reclaimed (accounting retained — orphanCount)\n`,
+      );
+    }
+    if (this.#watch.size > 0) {
+      process.stderr.write(
+        `[browse-gateway] shutdown: ${this.#watch.size} wedged launch(es) still PENDING at exit — nothing ` +
+          `had spawned under their profile dirs, but a post-exit spawn cannot be ruled out (container ` +
+          `teardown reaps it on prod; check for stray Chrome on a CLI host)\n`,
       );
     }
     if (this.#unconfirmed.size > 0) {
