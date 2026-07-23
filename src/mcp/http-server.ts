@@ -57,6 +57,9 @@ export interface OperatorHealthReport {
   orphanCount: number;
   watchedCount: number;
   activeCount: number;
+  /** In-flight acquire reservations (codex r3): the admission gate refuses on active + reserved, so
+   *  health must reflect the same occupancy the gate sees. */
+  reservedCount: number;
   maxSessions: number;
 }
 
@@ -68,6 +71,7 @@ export interface PoolHealthSource {
   orphanCount: number;
   watchedCount: number;
   activeCount: number;
+  reservedCount: number;
   maxSessions: number;
 }
 
@@ -82,6 +86,7 @@ export function buildOperatorHealth(pool: PoolHealthSource): OperatorHealthRepor
     orphanCount: pool.orphanCount,
     watchedCount: pool.watchedCount,
     activeCount: pool.activeCount,
+    reservedCount: pool.reservedCount,
     maxSessions: pool.maxSessions,
   };
 }

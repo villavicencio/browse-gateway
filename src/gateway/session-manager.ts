@@ -256,6 +256,13 @@ export class SessionManager {
     return this.#maxSessions;
   }
 
+  /** Slots held by in-flight `acquire()` launches (issue #53, codex r3): the admission gate refuses on
+   *  `activeCount + reservedCount`, so a health surface reporting activeCount alone would read "room
+   *  free" while acquires are already refused. */
+  get reservedCount(): number {
+    return this.#reserved;
+  }
+
   list(): SessionInfo[] {
     return [...this.#sessions.values()].map((s) => s.info);
   }

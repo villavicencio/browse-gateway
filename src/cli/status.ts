@@ -92,6 +92,7 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
       typeof b.orphanCount === "number" &&
       typeof b.watchedCount === "number" && // codex r2: a skewed body missing it must not read as verified
       typeof b.activeCount === "number" &&
+      typeof b.reservedCount === "number" && // codex r3: the admission gate counts reservations too
       typeof b.maxSessions === "number";
     pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";
   }
@@ -145,13 +146,24 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
   if (pool !== undefined) {
     const n = (k: string): number | undefined => (typeof poolBody?.[k] === "number" ? (poolBody[k] as number) : undefined);
     const active = n("activeCount");
+    const reserved = n("reservedCount") ?? 0;
     const max = n("maxSessions");
-    const sessions = active !== undefined && max !== undefined ? `${active}/${max} sessions` : "sessions n/a";
+    // Codex r3: occupancy is what the ADMISSION GATE sees — active + in-flight reservations. A slow
+    // launch holding the last slot must not render as "0/1 sessions" while acquires are refused.
+    const occupied = active !== undefined ? active + reserved : undefined;
+    const sessions =
+      occupied !== undefined && max !== undefined
+        ? `${occupied}/${max} sessions${reserved > 0 ? ` (${reserved} launching)` : ""}`
+        : "sessions n/a";
+    const watched = n("watchedCount") ?? 0;
     if (pool === "ok") {
       out(ok(`pool healthy — force-kill armed, 0 unconfirmed, ${sessions}`));
-      if (active !== undefined && max !== undefined && active >= max) {
+      if (occupied !== undefined && max !== undefined && occupied >= max) {
         out(note("pool is at capacity — new sessions will be refused until one frees"));
       }
+      // Codex r3: watched wedges are informational but must be VISIBLE on the healthy branch too —
+      // hiding them until something else degrades would mask a recurring launch-wedge pattern.
+      if (watched > 0) out(note(`${watched} pending wedge(s) under watch (uncounted; being swept)`));
     } else if (pool === "degraded") {
       out(fail(`pool DEGRADED (${sessions}):`));
       if (poolBody?.forceKillAvailable === false) {

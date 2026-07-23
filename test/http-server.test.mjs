@@ -486,8 +486,8 @@ test("awaitBounded: a rejecting promise resolves the bound WITHOUT an unhandledR
 
 // --- issue #53: the operator-tier health surface --------------------------------------------------
 
-const POOL_OK = { forceKillAvailable: true, unconfirmedCount: 0, orphanCount: 0, watchedCount: 0, activeCount: 1, maxSessions: 2 };
-const POOL_DEGRADED = { forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 1, watchedCount: 1, activeCount: 2, maxSessions: 2 };
+const POOL_OK = { forceKillAvailable: true, unconfirmedCount: 0, orphanCount: 0, watchedCount: 0, activeCount: 1, reservedCount: 0, maxSessions: 2 };
+const POOL_DEGRADED = { forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 1, watchedCount: 1, activeCount: 2, reservedCount: 0, maxSessions: 2 };
 
 test("#53: buildOperatorHealth derives ONE degraded verdict from the pool getters", async () => {
   const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");

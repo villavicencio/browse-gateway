@@ -159,8 +159,8 @@ test("--stealth runs the gate and folds into health; default omits it", async ()
 
 // --- issue #53: the pool-health section ------------------------------------------------------------
 
-const POOL_OK_BODY = { status: "ok", forceKillAvailable: true, unconfirmedCount: 0, orphanCount: 0, watchedCount: 0, activeCount: 1, maxSessions: 2 };
-const POOL_DEGRADED_BODY = { status: "degraded", forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 1, watchedCount: 1, activeCount: 2, maxSessions: 2 };
+const POOL_OK_BODY = { status: "ok", forceKillAvailable: true, unconfirmedCount: 0, orphanCount: 0, watchedCount: 0, activeCount: 1, reservedCount: 0, maxSessions: 2 };
+const POOL_DEGRADED_BODY = { status: "degraded", forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 1, watchedCount: 1, activeCount: 2, reservedCount: 0, maxSessions: 2 };
 
 test("#53: a healthy pool renders its counters and stays healthy", async () => {
   const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: POOL_OK_BODY }) });
@@ -214,7 +214,7 @@ test("#53 end-to-end: a degraded live core flips external health through the REA
   const { healthProbe } = await import("../dist/cli/index.js");
 
   // A fake pool in the degraded shape #50/#54 produce (a markerless / force-kill-unavailable core).
-  const pool = { forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 0, watchedCount: 0, activeCount: 1, maxSessions: 2 };
+  const pool = { forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 0, watchedCount: 0, activeCount: 1, reservedCount: 0, maxSessions: 2 };
   const handler = createHttpHandler({
     authenticate: () => { throw new Error("no consumers in this test"); },
     buildServer: () => { throw new Error("never"); },
@@ -251,4 +251,23 @@ test("#53 r1: a bare consumer-tier body (healthToken misconfigured to a consumer
   const report = await status(deps);
   assert.equal(report.pool, "unavailable", "a counters-free body must not claim the pool is verified healthy");
   assert.ok(lines.some((l) => l.includes("pool health: unavailable")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53 r3: in-flight reservations count toward occupancy — a slow launch holding the last slot is visible", async () => {
+  const { deps, lines } = makeDeps({
+    poolHealth: async () => ({ code: "200", body: { ...POOL_OK_BODY, activeCount: 0, reservedCount: 1, maxSessions: 1 } }),
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.ok(lines.some((l) => l.includes("1/1 sessions (1 launching)")), `got: ${lines.join(" | ")}`);
+  assert.ok(lines.some((l) => l.includes("pool is at capacity")), "the admission gate's view drives the capacity note");
+});
+
+test("#53 r3: watched wedges are visible on the HEALTHY branch too", async () => {
+  const { deps, lines } = makeDeps({
+    poolHealth: async () => ({ code: "200", body: { ...POOL_OK_BODY, watchedCount: 2 } }),
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true, "watch alone never degrades");
+  assert.ok(lines.some((l) => l.includes("2 pending wedge(s) under watch")), `got: ${lines.join(" | ")}`);
 });

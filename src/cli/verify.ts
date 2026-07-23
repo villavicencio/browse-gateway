@@ -82,6 +82,25 @@ const HEALTH_BODY_CAP_BYTES = 16 * 1024;
 export function healthProbe(localPort: number, hostHeader: string, bearerToken: string): () => Promise<HealthProbeResult> {
   return () =>
     new Promise((resolve) => {
+      // ONE settle path shared by every request- and response-level event (codex #53 r1/r3): a reset
+      // after headers emits `error`/`aborted` (never `end`), and the request `timeout` measures
+      // INACTIVITY only — a peer trickling HEADER bytes resets it forever and the response callback
+      // never even fires. So the absolute deadline is armed HERE, before the request is issued, and
+      // every path funnels through `finish` — the probe's contract (a failure resolves {code:"000"},
+      // never a hang, never a throw) holds regardless of where in the exchange the peer misbehaves.
+      let settled = false;
+      let destroy: (() => void) | undefined;
+      const finish = (result: HealthProbeResult): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardDeadline);
+        resolve(result);
+      };
+      const hardDeadline = setTimeout(() => {
+        finish({ code: "000" });
+        destroy?.();
+      }, PROBE_TIMEOUT_MS);
+      hardDeadline.unref?.();
       const req = request(
         {
           host: "127.0.0.1",
@@ -92,31 +111,14 @@ export function healthProbe(localPort: number, hostHeader: string, bearerToken: 
           timeout: PROBE_TIMEOUT_MS,
         },
         (res) => {
-          // Codex #53 r1: settle exactly ONCE, on WHICHEVER stream event fires — a connection reset
-          // after the headers emits `error`/`aborted` (never `end`), which without handlers would leave
-          // the promise pending and surface an unhandled stream error, contradicting the "network
-          // failure resolves {code:'000'}" contract.
-          let settled = false;
-          const finish = (result: HealthProbeResult): void => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(hardDeadline);
-            resolve(result);
-          };
-          // Codex r2: the request `timeout` measures INACTIVITY only — a wrong/hostile service
-          // trickling bytes forever would never trip it and every chunk would buffer unbounded. Cap
-          // the body AND arm an absolute deadline; either bound settles as unavailable and destroys.
-          const hardDeadline = setTimeout(() => {
-            finish({ code: "000" });
-            req.destroy();
-          }, PROBE_TIMEOUT_MS);
-          hardDeadline.unref?.();
+          // Codex r2: cap the body too — the counters payload is ~200 bytes; an oversized or
+          // ever-trickling body is not our gateway and settles as unavailable.
           let total = 0;
           const chunks: Buffer[] = [];
           res.on("data", (c: Buffer) => {
             total += c.length;
             if (total > HEALTH_BODY_CAP_BYTES) {
-              finish({ code: "000" }); // oversized — not our gateway's ~200-byte counters body
+              finish({ code: "000" });
               req.destroy();
               return;
             }
@@ -139,8 +141,9 @@ export function healthProbe(localPort: number, hostHeader: string, bearerToken: 
           });
         },
       );
+      destroy = () => req.destroy();
       req.on("timeout", () => req.destroy());
-      req.on("error", () => resolve({ code: "000" }));
+      req.on("error", () => finish({ code: "000" }));
       req.end();
     });
 }
