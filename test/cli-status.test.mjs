@@ -306,4 +306,21 @@ test("#53 r6: ownership is RE-CHECKED before the send — a tunnel that dropped 
   const report = await status(deps);
   assert.equal(probed, false, "the token was NOT sent after the port flipped to foreign mid-status");
   assert.equal(report.pool, undefined, "no pool verdict once ownership can't be reconfirmed");
+  // Codex r7: the FRESH foreign verdict must flip the whole status, not just skip the send.
+  assert.equal(report.healthy, false, "a mid-run foreign takeover reports unhealthy, not connected");
+  assert.equal(report.owl, "down");
+});
+
+test("#53 r7: the ownership refresh is SKIPPED entirely when no health token is configured (no double tunnel inspection)", async () => {
+  let stateCalls = 0;
+  const { deps } = makeDeps({
+    state: async () => {
+      stateCalls++;
+      return { agent: "running", port: "ours" };
+    },
+    // no poolHealth dep → the refresh must not run
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.equal(stateCalls, 1, "tunnel state is inspected ONCE for an ordinary status (the refresh is pool-health-only)");
 });

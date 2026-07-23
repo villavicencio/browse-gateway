@@ -88,33 +88,45 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
   // socket peer-credential assertion loopback HTTP to an ssh forward doesn't expose; the token is a
   // read-only pool-counters credential (no consumer/secret access), and the operator's own loopback is
   // the only attack surface.
-  const ownedNow = gateway === "healthy" && (await state(spec)).port === "ours";
-  if (deps.poolHealth && ownedNow) {
-    const read = await deps.poolHealth();
-    poolBody = read.body;
-    // Codex #53 r1: require the FULL operator shape before trusting the verdict — a healthToken
-    // mistakenly set to a valid CONSUMER token gets the bare `{status:"ok"}` liveness body, which must
-    // read as "unavailable" (misconfigured), never as "pool healthy, force-kill armed".
-    const b = read.body;
-    const isOperatorShape =
-      b !== undefined &&
-      (b.status === "ok" || b.status === "degraded") &&
-      typeof b.forceKillAvailable === "boolean" &&
-      typeof b.unconfirmedCount === "number" &&
-      typeof b.orphanCount === "number" &&
-      typeof b.watchedCount === "number" && // codex r2: a skewed body missing it must not read as verified
-      typeof b.activeCount === "number" &&
-      typeof b.reservedCount === "number" && // codex r3: the admission gate counts reservations too
-      typeof b.maxSessions === "number";
-    pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";
+  // r7: the refresh runs ONLY when a health token is configured (it re-spawns launchctl/lsof/ps — no
+  // ordinary `status` should pay for it twice), and its FRESH ownership verdict feeds the health
+  // decision below — a foreign takeover detected here must flip the whole status, not just skip the send.
+  let freshForeign = false;
+  if (deps.poolHealth) {
+    const ownedNow = gateway === "healthy" && (await state(spec)).port === "ours";
+    freshForeign = tunnel.port === "ours" && !ownedNow && gateway === "healthy"; // the port flipped away from us
+    if (freshForeign) {
+      out(fail(`local port ${spec.localPort} was ours but is NO LONGER — a listener change mid-check (the tunnel dropped / a foreign process bound it); NOT sending the operator health token`));
+    }
+    if (ownedNow) {
+      const read = await deps.poolHealth();
+      poolBody = read.body;
+      // Codex #53 r1: require the FULL operator shape before trusting the verdict — a healthToken
+      // mistakenly set to a valid CONSUMER token gets the bare `{status:"ok"}` liveness body, which must
+      // read as "unavailable" (misconfigured), never as "pool healthy, force-kill armed".
+      const b = read.body;
+      const isOperatorShape =
+        b !== undefined &&
+        (b.status === "ok" || b.status === "degraded") &&
+        typeof b.forceKillAvailable === "boolean" &&
+        typeof b.unconfirmedCount === "number" &&
+        typeof b.orphanCount === "number" &&
+        typeof b.watchedCount === "number" && // codex r2: a skewed body missing it must not read as verified
+        typeof b.activeCount === "number" &&
+        typeof b.reservedCount === "number" && // codex r3: the admission gate counts reservations too
+        typeof b.maxSessions === "number";
+      pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";
+    }
   }
 
   // A DEGRADED pool is unhealthy (a wedged core could zombie / a browser may be alive uncounted) but
   // it is NOT an outage — the gateway answers; the pool is impaired. Codex #53 r4: keep the states
   // visually distinct (squinting owl, nonzero exit) so ops can tell "restart/debug the pool" apart
   // from "the service is dead". An UNAVAILABLE read is a config/rollout mismatch, surfaced but not a
-  // health failure by itself.
-  const reachable = gateway === "healthy" && tunnel.port === "ours" && stealthGreen !== false;
+  // health failure by itself. Codex r7: a FRESH-detected foreign takeover (`freshForeign`) flips the
+  // whole verdict — the stale top-of-function snapshot must not report "connected" over a port we just
+  // observed is no longer ours.
+  const reachable = gateway === "healthy" && tunnel.port === "ours" && !freshForeign && stealthGreen !== false;
   const healthy = reachable && pool !== "degraded";
   const face: OwlState = healthy ? "connected" : reachable && pool === "degraded" ? "degraded" : "down";
   out(`${owl(face)}  obscura status`);
