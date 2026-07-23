@@ -1237,6 +1237,47 @@ test("orphans: a late-resolve teardown does NOT discard owed sweep stamps — th
   assert.deepEqual(ops.removed, [ops.made[0]], "the dir went only after BOTH the teardown and the stamps confirmed");
 });
 
+test("orphans: a fast late-resolve teardown DEFERS settlement to the in-flight sweep's verdict (#54 Part 2, codex r7)", async () => {
+  const token = [{ pid: 999, startTime: "5555", pgrp: 999 }];
+  const gate = deferred();
+  const ops = makeFakeDirOps();
+  const held = deferred();
+  ops.nextSweep = held; // the post-timeout sweep is STILL POLLING when the late core resolves
+  const { factory, late } = makeWedgeFactory({ gate });
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  gate.resolve(); // late core arrives; its (fast) teardown completes while the sweep is mid-flight
+  for (let i = 0; i < 50 && !late.closed && !late.killed; i++) await tick();
+  await tick();
+  assert.deepEqual(ops.removed, [], "settlement DEFERRED — nothing finalized ahead of the sweep's verdict");
+  assert.equal(mgr.orphanCount, 1, "the record stays counted while the verdict is pending");
+
+  held.resolve({ result: "unconfirmed", stamps: token }); // the sweep found an owed group after all
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.deepEqual(ops.priors[1], token, "the deferred settlement re-swept WITH the owed stamps");
+  assert.equal(mgr.orphanCount, 0, "finalized only after the owed group confirmed");
+  assert.deepEqual(ops.removed, [ops.made[0]]);
+});
+
+test("orphans: an EVICTED watch record whose launch finally rejects is re-enqueued and its dir removed (#54 Part 2, codex r7)", async () => {
+  const ops = makeFakeDirOps();
+  const gates = [];
+  const factory = () => new Promise((_resolve, reject) => gates.push({ reject })); // every launch wedges, individually rejectable
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 5, orphanDirOps: ops });
+
+  for (let i = 0; i < MAX_WATCHED_LAUNCHES + 1; i++) {
+    await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+    for (let t = 0; t < 50 && mgr.orphanCount > 0; t++) await tick();
+  }
+  assert.equal(mgr.watchedCount, MAX_WATCHED_LAUNCHES, "the oldest record was evicted at the cap");
+
+  gates[0].reject(new Error("evicted wedge finally failed")); // the EVICTED launch settles
+  for (let i = 0; i < 50 && !ops.removed.includes(ops.made[0]); i++) await tick();
+  assert.equal(ops.removed.includes(ops.made[0]), true, "the evicted-then-settled launch's dir was reclaimed, not leaked");
+});
+
 test("shutdown: drains in-flight orphan work and RETAINS an unconfirmable orphan loudly (#54 Part 2)", async () => {
   const ops = makeFakeDirOps({ sweepResult: "unconfirmed" }); // the wedge's tree never confirms dead
   const { factory } = makeWedgeFactory();

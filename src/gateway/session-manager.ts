@@ -45,6 +45,10 @@ interface OrphanRecord {
    *  attempt so a surviving ARGLESS group member keeps blocking the confirm after the marker-carrying
    *  leader died — a fresh scan alone would find no marker and false-confirm. Opaque to the manager. */
   stamps?: SweepStamp[];
+  /** Set when a late core's teardown finished while a sweep was still IN FLIGHT (codex r7): settlement
+   *  must not finalize ahead of that sweep's verdict (its owed stamps may not be written yet), so the
+   *  sweep's completion handler re-runs the settlement instead. */
+  settleAfterSweep?: boolean;
 }
 
 /**
@@ -435,9 +439,13 @@ export class SessionManager {
         },
         () => {
           // The wedged launch finally REJECTED: no process can spawn from it anymore. Mark settled and
-          // re-sweep — an empty scan is now a FINAL confirm (dir removed, record forgotten), including
-          // for a record parked on the watch list.
+          // RE-ENQUEUE — an empty scan is now a FINAL confirm (dir removed, record forgotten). Enqueue
+          // rather than bare-sweep (codex r7): a record EVICTED from the watch list is in neither
+          // ledger, and #sweepOrphan's membership guard would no-op it — permanently leaking the minted
+          // dir on every evicted-then-rejected launch in a long-running service. Re-adding to the
+          // counted ledger for the (fast, settled) final sweep is truthful: a straggler may exist.
           rec.settled = true;
+          if (!this.#watch.has(rec)) this.#orphans.add(rec);
           void this.#sweepOrphan(rec);
         },
       );
@@ -535,6 +543,14 @@ export class SessionManager {
    * No outstanding stamps: finalize as before.
    */
   async #settleReapedOrphan(rec: OrphanRecord): Promise<void> {
+    if (rec.sweeping === true) {
+      // Codex r7: a sweep is still polling — its verdict (and owed stamps) isn't written yet, so
+      // finalizing NOW could drop a live stamped group and remove the dir under it. Defer: the sweep's
+      // completion handler re-runs this settlement with the verdict in hand. The record stays counted.
+      rec.settleAfterSweep = true;
+      this.#orphans.add(rec);
+      return;
+    }
     if (rec.dir !== undefined && rec.stamps !== undefined && rec.stamps.length > 0) {
       rec.session = undefined;
       this.#orphans.add(rec); // stays counted until the stamped groups confirm
@@ -595,6 +611,13 @@ export class SessionManager {
         rec.sweeping = false;
         const result = outcome.result;
         rec.stamps = result === "unconfirmed" ? outcome.stamps : undefined;
+        if (rec.settleAfterSweep === true) {
+          // Codex r7: a late core's teardown finished while this sweep was polling and deferred its
+          // settlement to us — the verdict (stamps) is now written, so settle with it.
+          rec.settleAfterSweep = false;
+          await this.#settleReapedOrphan(rec);
+          return;
+        }
         if (rec.session !== undefined) return; // a late core arrived mid-sweep — its teardown owns the record
         if (result === "confirmed") {
           // Codex #54P2 r1: while the wedged launch promise is still PENDING, an empty-scan confirm is
