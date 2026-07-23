@@ -1302,6 +1302,25 @@ test("orphans: a REJECTED sweep resumes a deferred settlement instead of pinning
   assert.deepEqual(ops.removed, [ops.made[0]], "the confirmed-dead orphan's dir was reclaimed");
 });
 
+test("orphans: a WATCHED record whose retick sweep REJECTS is re-counted (a failed scan proves nothing) (#54 Part 2, codex r9)", async () => {
+  const ops = makeFakeDirOps(); // first sweep confirms-empty → parks on watch
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 1, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && mgr.watchedCount === 0; i++) await tick();
+  assert.equal(mgr.watchedCount, 1, "parked on watch");
+
+  const rejected = Promise.reject(new Error("scan failed"));
+  rejected.catch(() => {}); // pre-attach so the deliberate rejection never surfaces unhandled
+  ops.nextSweep = { promise: rejected };
+  await mgr.reapIdle(1_000);
+  for (let i = 0; i < 50 && mgr.orphanCount === 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 1, "the failed scan re-counted the record — Chrome may have appeared");
+  assert.equal(mgr.watchedCount, 0);
+  await assert.rejects(mgr.acquire(), (e) => e.code === "SESSION_LIMIT", "capacity back-pressures until a scan succeeds");
+});
+
 test("shutdown: drains in-flight orphan work and RETAINS an unconfirmable orphan loudly (#54 Part 2)", async () => {
   const ops = makeFakeDirOps({ sweepResult: "unconfirmed" }); // the wedge's tree never confirms dead
   const { factory } = makeWedgeFactory();

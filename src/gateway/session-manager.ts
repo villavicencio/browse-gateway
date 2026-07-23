@@ -661,7 +661,13 @@ export class SessionManager {
           // already holds; #settleReapedOrphan re-sweeps or finalizes from there.
           rec.settleAfterSweep = false;
           void this.#trackOrphanWork(this.#settleReapedOrphan(rec));
+          return;
         }
+        // Codex r9: a rejected scan proves NOTHING about the profile — Chrome may have appeared since
+        // the watch parked it. A watched (uncounted) record moves back to the COUNTED ledger until a
+        // successful sweep decides; leaving it uncounted would admit replacements past the global cap
+        // on the strength of a failed scan.
+        if (this.#watch.delete(rec)) this.#orphans.add(rec);
       },
     );
     return this.#trackOrphanWork(work);

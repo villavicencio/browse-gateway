@@ -70,6 +70,16 @@ const SWEEP_POLL_MS = 100;
  * An UNREADABLE proc root THROWS (codex r2): an empty result must always mean "scanned and found
  * nothing" — silently returning [] there would let the sweep false-confirm with zero scanning.
  */
+/** Errno triage for a per-pid proc read (codex r9): ENOENT/ESRCH = the process GENUINELY vanished
+ *  (skip it); EACCES = not ours to inspect (another uid / hidepid — ours are same-uid readable, so
+ *  skip); anything else (EMFILE/ENFILE fd exhaustion IN THE GATEWAY, EIO…) is OUR failure to scan —
+ *  treating it as "exited" would let a resource-exhausted sweep false-confirm over a live Chrome, so
+ *  it PROPAGATES (the sweep rejects; the manager retries with the orphan retained). */
+function vanishedOrForeign(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ESRCH" || code === "EACCES";
+}
+
 export function findPidsByUserDataDir(dir: string, procRoot = "/proc"): number[] {
   const marker = `--user-data-dir=${dir}`;
   const out: number[] = [];
@@ -79,8 +89,9 @@ export function findPidsByUserDataDir(dir: string, procRoot = "/proc"): number[]
     try {
       const cmdline = readFileSync(join(procRoot, name, "cmdline"), "utf8");
       if (cmdline.split("\0").includes(marker)) out.push(Number(name));
-    } catch {
-      // raced exit between readdir and read — skip
+    } catch (err) {
+      if (!vanishedOrForeign(err)) throw err; // codex r9: fail closed on a scan-side failure
+      // raced exit / foreign pid — skip
     }
   }
   return out;
@@ -123,8 +134,9 @@ export async function sweepOrphanProcesses(
   const carriesMarker = (pid: number): boolean => {
     try {
       return readFileSync(join(procRoot, String(pid), "cmdline"), "utf8").split("\0").includes(marker);
-    } catch {
-      return false; // exited — no marker, nothing to signal
+    } catch (err) {
+      if (!vanishedOrForeign(err)) throw err; // codex r9: our own scan failure must not read as "exited"
+      return false; // exited/foreign — no marker, nothing to signal
     }
   };
 
@@ -141,21 +153,27 @@ export async function sweepOrphanProcesses(
   const holdsDirRef = (pid: number): boolean => {
     const base = join(procRoot, String(pid));
     const refs = (target: string): boolean => target === dir || target.startsWith(dirPrefix);
+    // Codex r9 errno triage throughout: EACCES here is ROUTINE (another uid's cwd/fd table — cannot be
+    // our same-uid Chrome) and ENOENT is a raced exit — both skip; a gateway-side failure (EMFILE…)
+    // propagates so a resource-exhausted scan can't false-confirm.
     try {
       if (refs(readlinkSync(join(base, "cwd")))) return true;
-    } catch {
+    } catch (err) {
+      if (!vanishedOrForeign(err) && (err as NodeJS.ErrnoException).code !== "EINVAL") throw err;
       /* no cwd link readable — fall through to fds */
     }
     try {
       for (const fd of readdirSync(join(base, "fd"))) {
         try {
           if (refs(readlinkSync(join(base, "fd", fd)))) return true;
-        } catch {
+        } catch (err) {
+          if (!vanishedOrForeign(err) && (err as NodeJS.ErrnoException).code !== "EINVAL") throw err;
           /* fd closed mid-scan */
         }
       }
-    } catch {
-      /* no fd table readable */
+    } catch (err) {
+      if (!vanishedOrForeign(err)) throw err;
+      /* no fd table readable (foreign/exited) */
     }
     return false;
   };
@@ -275,6 +293,20 @@ export async function sweepOrphanProcesses(
   if (stamped.size === 0) return { result: "confirmed" }; // nothing lives under this profile RIGHT NOW (see
   // OrphanDirOps note: the CALLER must treat an empty-scan confirm on a still-PENDING launch as
   // provisional — the launcher may spawn later; the manager's watch-list covers that window.)
+  // Codex r9: RE-SIGNAL owed groups once per attempt — killMatches signals only DISCOVERABLE (marker/
+  // ref-carrying) pids, so a group whose carriers all died while an argless member survives would be
+  // probed forever but never re-SIGKILLed (a permanent pin). Safety mirrors the #50 reconfirm: only a
+  // LEADER-stamped group (rep.pid === pgrp) is re-signaled, and only while groupGone() is false — a pgid
+  // cannot be recycled while any member lives, and a provably-recycled leader already reads as gone. A
+  // non-leader-stamped owed group stays probe-only (ownership unprovable — documented residual).
+  for (const [pgrp, rep] of stamped) {
+    if (rep.pid !== pgrp || groupGone(pgrp, rep)) continue;
+    try {
+      kill(-pgrp, "SIGKILL");
+    } catch {
+      // ESRCH/EPERM — the confirm loop decides
+    }
+  }
   const deadline = now() + confirmMs;
   for (;;) {
     // Codex r8: rescan-and-merge on EVERY poll — not only once the owed groups are gone. While an owed

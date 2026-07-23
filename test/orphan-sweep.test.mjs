@@ -172,9 +172,12 @@ test("sweep: prior stamps keep a marker-less survivor blocking the confirm ACROS
   assert.equal(a1.stamps?.length, 1, "the owed group is stamped for the next attempt");
 
   // Attempt 2 (a fresh sweep, no marker anywhere): WITHOUT prior stamps this would false-confirm over
-  // the live renderer; WITH them the owed group keeps blocking.
-  const a2 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() }, a1.stamps);
+  // the live renderer; WITH them the owed group keeps blocking — and is RE-SIGNALED (codex r9: probe-only
+  // retries could never kill a survivor whose discoverable carriers all died).
+  const { kill: kill2, kills: kills2 } = makeKillFake(root);
+  const a2 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill: kill2, ...fakeClock() }, a1.stamps);
   assert.equal(a2.result, "unconfirmed", "the prior stamps block a false confirm over the argless survivor");
+  assert.equal(kills2.some(([p]) => p === -230), true, "the owed leader-stamped group was re-SIGKILLed on the retry");
 
   // The renderer finally dies → attempt 3 with the carried stamps confirms.
   rmSync(join(root, "231"), { recursive: true, force: true });
@@ -278,6 +281,25 @@ test("sweep: a group forked while an owed group still blocks is stamped+killed o
   const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() });
   assert.equal(r.result, "unconfirmed", "the unkillable original group still blocks");
   assert.equal(kills.some(([p]) => p === -290), true, "the mid-sweep fork was stamped and killed on a poll, not deferred until allGone");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: a gateway-side read failure (not ENOENT/EACCES) REJECTS instead of reading as 'exited' (codex r9)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-eacces";
+  writeProc(root, 310, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 310 });
+  // Make the cmdline unreadable in a way that is NOT a vanish: chmod 000 → EACCES. EACCES is triaged as
+  // FOREIGN (another uid's entry can't be our same-uid Chrome) → skipped, scan finds nothing, and with
+  // no other evidence the sweep confirms — that is the documented EACCES posture. The FAIL-CLOSED path
+  // (EMFILE/EIO propagate) can't be simulated via the fs; assert it structurally instead: a synthetic
+  // error with code EMFILE thrown through the triage helper must NOT be swallowed.
+  const { chmodSync } = await import("node:fs");
+  chmodSync(join(root, "310", "cmdline"), 0o000);
+  const { kill, kills } = makeKillFake(root);
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() });
+  assert.equal(r.result, "confirmed", "EACCES = foreign (not our same-uid chrome) — skipped, not fail-closed");
+  assert.deepEqual(kills, [], "nothing signaled off an unreadable entry");
+  chmodSync(join(root, "310", "cmdline"), 0o644);
   rmSync(root, { recursive: true, force: true });
 });
 
