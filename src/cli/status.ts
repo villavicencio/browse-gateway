@@ -90,6 +90,7 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
       typeof b.forceKillAvailable === "boolean" &&
       typeof b.unconfirmedCount === "number" &&
       typeof b.orphanCount === "number" &&
+      typeof b.watchedCount === "number" && // codex r2: a skewed body missing it must not read as verified
       typeof b.activeCount === "number" &&
       typeof b.maxSessions === "number";
     pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";

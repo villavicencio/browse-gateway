@@ -76,6 +76,9 @@ export interface HealthProbeResult {
   body?: Record<string, unknown>;
 }
 
+/** The /health body is a handful of counters (~200 bytes); anything past this is not our gateway. */
+const HEALTH_BODY_CAP_BYTES = 16 * 1024;
+
 export function healthProbe(localPort: number, hostHeader: string, bearerToken: string): () => Promise<HealthProbeResult> {
   return () =>
     new Promise((resolve) => {
@@ -97,10 +100,28 @@ export function healthProbe(localPort: number, hostHeader: string, bearerToken: 
           const finish = (result: HealthProbeResult): void => {
             if (settled) return;
             settled = true;
+            clearTimeout(hardDeadline);
             resolve(result);
           };
+          // Codex r2: the request `timeout` measures INACTIVITY only — a wrong/hostile service
+          // trickling bytes forever would never trip it and every chunk would buffer unbounded. Cap
+          // the body AND arm an absolute deadline; either bound settles as unavailable and destroys.
+          const hardDeadline = setTimeout(() => {
+            finish({ code: "000" });
+            req.destroy();
+          }, PROBE_TIMEOUT_MS);
+          hardDeadline.unref?.();
+          let total = 0;
           const chunks: Buffer[] = [];
-          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("data", (c: Buffer) => {
+            total += c.length;
+            if (total > HEALTH_BODY_CAP_BYTES) {
+              finish({ code: "000" }); // oversized — not our gateway's ~200-byte counters body
+              req.destroy();
+              return;
+            }
+            chunks.push(c);
+          });
           res.on("error", () => finish({ code: "000" }));
           res.on("aborted", () => finish({ code: "000" }));
           res.on("end", () => {
