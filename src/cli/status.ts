@@ -13,7 +13,7 @@ import type { KeysListResult } from "./keys.js";
 import { formatConsumerLine } from "./keys.js";
 import type { TunnelSpec, TunnelState } from "./tunnel.js";
 import { tunnelState } from "./tunnel.js";
-import type { VerifyProbe, VerifyState } from "./verify.js";
+import type { HealthProbeResult, VerifyProbe, VerifyState } from "./verify.js";
 import { verifyGateway, httpProbe } from "./verify.js";
 
 /** Status should be snappy: a short window still rides out a blip without feeling hung. */
@@ -34,6 +34,9 @@ export interface StatusDeps {
   consumers?: () => Promise<KeysListResult>;
   /** The 1/1 stealth gate; wired only when --stealth is requested. */
   stealth?: () => Promise<boolean>;
+  /** Operator-token `GET /health` read (issue #53); absent = no healthToken configured — the pool
+   *  section is skipped with a hint. Wired from `healthProbe(...)` with the config's healthToken. */
+  poolHealth?: () => Promise<HealthProbeResult>;
 }
 
 export interface StatusOptions {
@@ -43,11 +46,14 @@ export interface StatusOptions {
 export interface StatusReport {
   tunnel: TunnelState;
   gateway: VerifyState;
-  /** Overall: gateway reachable + port ours + (when requested) stealth green. */
+  /** Overall: gateway reachable + port ours + (when requested) stealth green + pool not degraded. */
   healthy: boolean;
   owl: OwlState;
   consumers?: KeysListResult;
   stealthGreen?: boolean;
+  /** The pool-degradation verdict from the operator /health read (issue #53): "ok" | "degraded" |
+   *  "unavailable" (probe failed / rejected) — absent when no healthToken is configured. */
+  pool?: "ok" | "degraded" | "unavailable";
 }
 
 export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promise<StatusReport> {
@@ -68,7 +74,19 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
     stealthGreen = await deps.stealth();
   }
 
-  const healthy = gateway === "healthy" && tunnel.port === "ours" && stealthGreen !== false;
+  // — pool health (issue #53): the operator-token /health read, only meaningful when the gateway answers —
+  let pool: StatusReport["pool"];
+  let poolBody: Record<string, unknown> | undefined;
+  if (deps.poolHealth && gateway === "healthy") {
+    const read = await deps.poolHealth();
+    poolBody = read.body;
+    const status = typeof read.body?.status === "string" ? read.body.status : undefined;
+    pool = status === "ok" ? "ok" : status === "degraded" ? "degraded" : "unavailable";
+  }
+
+  // A DEGRADED pool is unhealthy (a wedged core could zombie / a browser may be alive uncounted);
+  // an UNAVAILABLE read is a config/rollout mismatch, surfaced but not a health failure by itself.
+  const healthy = gateway === "healthy" && tunnel.port === "ours" && stealthGreen !== false && pool !== "degraded";
   const face: OwlState = healthy ? "connected" : "down";
   out(`${owl(face)}  obscura status`);
 
@@ -111,6 +129,35 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
       break;
   }
 
+  // — pool line (issue #53) —
+  if (pool !== undefined) {
+    const n = (k: string): number | undefined => (typeof poolBody?.[k] === "number" ? (poolBody[k] as number) : undefined);
+    const active = n("activeCount");
+    const max = n("maxSessions");
+    const sessions = active !== undefined && max !== undefined ? `${active}/${max} sessions` : "sessions n/a";
+    if (pool === "ok") {
+      out(ok(`pool healthy — force-kill armed, 0 unconfirmed, ${sessions}`));
+      if (active !== undefined && max !== undefined && active >= max) {
+        out(note("pool is at capacity — new sessions will be refused until one frees"));
+      }
+    } else if (pool === "degraded") {
+      out(fail(`pool DEGRADED (${sessions}):`));
+      if (poolBody?.forceKillAvailable === false) {
+        out(fail("  force-kill unavailable — a wedged close can only zombie (check launch-time stderr)"));
+      }
+      const unconfirmed = n("unconfirmedCount") ?? 0;
+      if (unconfirmed > 0) out(fail(`  ${unconfirmed} browser teardown(s) unconfirmed — a browser may still be alive`));
+      const orphans = n("orphanCount") ?? 0;
+      if (orphans > 0) out(fail(`  ${orphans} live orphaned launch(es) holding capacity (wedged/late launches)`));
+      const watched = n("watchedCount") ?? 0;
+      if (watched > 0) out(note(`  ${watched} pending wedge(s) under watch (uncounted; being swept)`));
+    } else {
+      out(note("pool health: unavailable — the health token was rejected or the body was unreadable (is BGW_HEALTH_TOKEN deployed and matching?)"));
+    }
+  } else if (deps.poolHealth === undefined) {
+    out(note("pool health: skipped (no healthToken in config — set healthToken/OBSCURA_HEALTH_TOKEN to enable)"));
+  }
+
   // — configured consumers (KTD12: configured, not live) —
   let consumers: KeysListResult | undefined;
   if (deps.consumers) {
@@ -142,5 +189,6 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
     owl: face,
     ...(consumers ? { consumers } : {}),
     ...(stealthGreen !== undefined ? { stealthGreen } : {}),
+    ...(pool !== undefined ? { pool } : {}),
   };
 }

@@ -50,6 +50,13 @@ export interface ObscuraConfig {
    * also live in the gitignored config file or `OBSCURA_TOKEN`.
    */
   token?: string;
+  /**
+   * The OPERATOR health token (issue #53) — the bearer `obscura status` sends to `GET /health` to
+   * read the gateway's pool-degradation counters (forceKillAvailable / unconfirmedCount /
+   * orphanCount / activeCount / maxSessions). NOT a consumer key: it must match the gateway's
+   * `BGW_HEALTH_TOKEN` and grants nothing but that read. Absent → `status` skips the pool section.
+   */
+  healthToken?: string;
 }
 
 /** Keys that may appear in the config file, with their env override. */
@@ -66,6 +73,7 @@ const ENV_OVERRIDES = {
   smokeCmd: "OBSCURA_SMOKE_CMD",
   labelPrefix: "OBSCURA_LABEL_PREFIX",
   token: "OBSCURA_TOKEN",
+  healthToken: "OBSCURA_HEALTH_TOKEN",
 } as const satisfies Record<keyof ObscuraConfig, string>;
 
 type ConfigKey = keyof typeof ENV_OVERRIDES;

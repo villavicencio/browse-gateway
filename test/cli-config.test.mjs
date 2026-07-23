@@ -111,3 +111,13 @@ test("malformed file, unknown keys, and non-string values fail loudly", () => {
     array.cleanup();
   }
 });
+
+test("#53: healthToken loads from the file and OBSCURA_HEALTH_TOKEN overrides it", () => {
+  const { path, cleanup } = withConfigFile(JSON.stringify({ healthToken: "from-file" }));
+  try {
+    assert.equal(loadObscuraConfig({}, path).healthToken, "from-file");
+    assert.equal(loadObscuraConfig({ OBSCURA_HEALTH_TOKEN: "from-env" }, path).healthToken, "from-env");
+  } finally {
+    cleanup();
+  }
+});

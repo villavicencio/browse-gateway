@@ -156,3 +156,92 @@ test("--stealth runs the gate and folds into health; default omits it", async ()
   assert.equal(offReport.stealthGreen, undefined);
   assert.ok(!off.lines.some((l) => l.includes("stealth")), "default omits the stealth line");
 });
+
+// --- issue #53: the pool-health section ------------------------------------------------------------
+
+const POOL_OK_BODY = { status: "ok", forceKillAvailable: true, unconfirmedCount: 0, orphanCount: 0, watchedCount: 0, activeCount: 1, maxSessions: 2 };
+const POOL_DEGRADED_BODY = { status: "degraded", forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 1, watchedCount: 1, activeCount: 2, maxSessions: 2 };
+
+test("#53: a healthy pool renders its counters and stays healthy", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: POOL_OK_BODY }) });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.equal(report.pool, "ok");
+  assert.ok(lines.some((l) => l.includes("pool healthy") && l.includes("1/2 sessions")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53: a DEGRADED pool flips overall health and names each degradation", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: POOL_DEGRADED_BODY }) });
+  const report = await status(deps);
+  assert.equal(report.healthy, false, "a degraded pool is UNHEALTHY even though /mcp answers");
+  assert.equal(report.owl, "down");
+  assert.equal(report.pool, "degraded");
+  assert.ok(lines.some((l) => l.includes("pool DEGRADED")));
+  assert.ok(lines.some((l) => l.includes("force-kill unavailable")));
+  assert.ok(lines.some((l) => l.includes("1 browser teardown(s) unconfirmed")));
+  assert.ok(lines.some((l) => l.includes("1 live orphaned launch(es)")));
+  assert.ok(lines.some((l) => l.includes("1 pending wedge(s) under watch")));
+});
+
+test("#53: a rejected/unreadable health read renders 'unavailable' without failing overall health", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "401" }) });
+  const report = await status(deps);
+  assert.equal(report.pool, "unavailable");
+  assert.equal(report.healthy, true, "a token/rollout mismatch is surfaced, not a health failure");
+  assert.ok(lines.some((l) => l.includes("pool health: unavailable")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53: no healthToken configured → the pool section is skipped with the enable hint", async () => {
+  const { deps, lines } = makeDeps(); // no poolHealth dep
+  const report = await status(deps);
+  assert.equal(report.pool, undefined);
+  assert.ok(lines.some((l) => l.includes("pool health: skipped") && l.includes("healthToken")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53: a pool at capacity renders the amber note but stays healthy", async () => {
+  const { deps, lines } = makeDeps({
+    poolHealth: async () => ({ code: "200", body: { ...POOL_OK_BODY, activeCount: 2 } }),
+  });
+  const report = await status(deps);
+  assert.equal(report.healthy, true);
+  assert.ok(lines.some((l) => l.includes("pool is at capacity")), `got: ${lines.join(" | ")}`);
+});
+
+test("#53 end-to-end: a degraded live core flips external health through the REAL http route + probe (the AC)", async () => {
+  const { createServer } = await import("node:http");
+  const { createHttpHandler } = await import("../dist/mcp/index.js");
+  const { buildOperatorHealth } = await import("../dist/mcp/http-server.js");
+  const { healthProbe } = await import("../dist/cli/index.js");
+
+  // A fake pool in the degraded shape #50/#54 produce (a markerless / force-kill-unavailable core).
+  const pool = { forceKillAvailable: false, unconfirmedCount: 1, orphanCount: 0, watchedCount: 0, activeCount: 1, maxSessions: 2 };
+  const handler = createHttpHandler({
+    authenticate: () => { throw new Error("no consumers in this test"); },
+    buildServer: () => { throw new Error("never"); },
+    healthToken: "op-secret",
+    operatorHealth: () => buildOperatorHealth(pool),
+  });
+  const server = createServer((req, res) => void handler.handle(req, res).catch(() => res.end()));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  try {
+    const { deps, lines } = makeDeps({
+      poolHealth: healthProbe(port, "127.0.0.1:8080", "op-secret"),
+    });
+    const report = await status(deps);
+    assert.equal(report.pool, "degraded", "the degraded core surfaced through the real route + real probe");
+    assert.equal(report.healthy, false, "external health flipped end to end");
+    assert.ok(lines.some((l) => l.includes("force-kill unavailable")));
+
+    // And the fix side: the pool recovers → external health goes green through the same path.
+    pool.forceKillAvailable = true;
+    pool.unconfirmedCount = 0;
+    const { deps: deps2 } = makeDeps({ poolHealth: healthProbe(port, "127.0.0.1:8080", "op-secret") });
+    const report2 = await status(deps2);
+    assert.equal(report2.pool, "ok");
+    assert.equal(report2.healthy, true);
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});

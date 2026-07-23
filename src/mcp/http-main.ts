@@ -15,7 +15,7 @@ import { retrieve, hostForcesProxy } from "../verbs/index.js";
 import { buildGatewayRuntime } from "./runtime.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
-import { createHttpHandler, dnsRebindBootError } from "./http-server.js";
+import { createHttpHandler, dnsRebindBootError, buildOperatorHealth } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
@@ -91,9 +91,14 @@ async function main(): Promise<void> {
     },
     allowedHosts,
     allowedOrigins,
-    // Liveness/health for a client-side breaker (issue #47): a cheap, browser-session-free signal.
-    // Minimal today; issue #53 folds in the gateway's pool-degradation counters (gateway.sessions).
+    // Liveness/health for a client-side breaker (issue #47): a cheap, browser-session-free signal —
+    // the CONSUMER tier stays this bare body. The OPERATOR tier (issue #53) surfaces the #50/#54
+    // pool-degradation counters behind the dedicated BGW_HEALTH_TOKEN — a token that is NOT a consumer
+    // key (never in the manifest, never counted toward pool sizing, grants only this read). It is
+    // compared, never logged; absent/empty → the operator tier is simply off.
     health: () => ({ status: "ok" as const }),
+    healthToken: process.env.BGW_HEALTH_TOKEN,
+    operatorHealth: () => buildOperatorHealth(gateway.sessions),
     log,
   });
   handler.startReaper(MCP_SESSION_REAPER_INTERVAL_MS);

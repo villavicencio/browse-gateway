@@ -19,7 +19,7 @@
  *    only on an explicit DELETE — a crashed client (SSE drop / TCP reset) does NOT, so an idle-MCP
  *    reaper closes abandoned sessions and disposes their controller (releasing the browser session).
  */
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -33,13 +33,57 @@ export interface ConsumerServer {
 }
 
 /**
- * The liveness/health payload the `GET /health` route returns (issue #47). A cheap, browser-session-free
- * signal a client-side breaker re-probes instead of blind-cooling. Deliberately minimal here — issue #53
- * enriches it with pool-degradation counters (forceKillAvailable / unconfirmedCount / activeCount /
- * maxSessions) by extending the injected `health` producer, without changing this route's plumbing.
+ * The liveness/health payload the `GET /health` route returns to a CONSUMER token (issue #47). A cheap,
+ * browser-session-free signal a client-side breaker re-probes instead of blind-cooling. Deliberately
+ * minimal: pool internals are cross-tenant telemetry and are NOT exposed at this tier (issue #53 — the
+ * operator tier below carries them).
  */
 export interface HealthReport {
   status: "ok";
+}
+
+/**
+ * The OPERATOR-tier health payload (issue #53): the #50/#54 pool-degradation counters, returned by
+ * `GET /health` ONLY to the dedicated operator health token (`BGW_HEALTH_TOKEN` — NOT a consumer key;
+ * it grants nothing but this read). Counters only — no session metadata, no consumer ids, no URLs —
+ * so the body is secrets-free by construction. `status: "degraded"` when force-kill is unavailable
+ * (a wedged close would zombie), an unconfirmed browser may be alive, or a live orphan holds capacity;
+ * `watchedCount` is informational (a pending wedge under sweep — normal transient state).
+ */
+export interface OperatorHealthReport {
+  status: "ok" | "degraded";
+  forceKillAvailable: boolean;
+  unconfirmedCount: number;
+  orphanCount: number;
+  watchedCount: number;
+  activeCount: number;
+  maxSessions: number;
+}
+
+/** The pool getters the operator health report projects — structurally `SessionManager`'s surface,
+ *  kept as a type so the builder is pure and unit-testable off a fake. */
+export interface PoolHealthSource {
+  forceKillAvailable: boolean;
+  unconfirmedCount: number;
+  orphanCount: number;
+  watchedCount: number;
+  activeCount: number;
+  maxSessions: number;
+}
+
+/** Project the pool getters into the operator health body (issue #53). Pure — the degraded verdict is
+ *  derived here, in ONE place, so the CLI and any future consumer read the same semantics. */
+export function buildOperatorHealth(pool: PoolHealthSource): OperatorHealthReport {
+  const degraded = !pool.forceKillAvailable || pool.unconfirmedCount > 0 || pool.orphanCount > 0;
+  return {
+    status: degraded ? "degraded" : "ok",
+    forceKillAvailable: pool.forceKillAvailable,
+    unconfirmedCount: pool.unconfirmedCount,
+    orphanCount: pool.orphanCount,
+    watchedCount: pool.watchedCount,
+    activeCount: pool.activeCount,
+    maxSessions: pool.maxSessions,
+  };
 }
 
 /**
@@ -76,10 +120,17 @@ export interface HttpHandlerDeps {
   cleanupAwaitMs?: number;
   /** Max request body bytes accepted on POST. Default 4 MiB. */
   maxBodyBytes?: number;
-  /** Liveness/health producer for the `GET /health` route (issue #47). Cheap + browser-session-free —
-   *  it must NOT acquire a browser or block. Absent → the route returns a bare `{ status: "ok" }`.
-   *  Issue #53 injects a producer that folds in the gateway's pool-degradation counters. */
+  /** Liveness/health producer for the `GET /health` route's CONSUMER tier (issue #47). Cheap +
+   *  browser-session-free — it must NOT acquire a browser or block. Absent → a bare `{ status: "ok" }`. */
   health?: () => HealthReport;
+  /** The dedicated OPERATOR health token (issue #53, `BGW_HEALTH_TOKEN`). NOT a consumer key: it is
+   *  checked ONLY on `GET /health` (timing-safe), grants nothing else, and never reaches the MCP
+   *  routes. Absent/empty → the operator tier is off (every caller gets the consumer tier). */
+  healthToken?: string;
+  /** Producer for the operator-tier body (issue #53) — typically `() =>
+   *  buildOperatorHealth(gateway.sessions)`. Same cheap/non-blocking contract as `health`. Absent →
+   *  the operator token (if any) receives the consumer tier. */
+  operatorHealth?: () => OperatorHealthReport;
   log?: (msg: string) => void;
   now?: () => number;
   /** Injectable session-id generator (tests). Default `randomUUID`. */
@@ -240,28 +291,46 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       return sendError(res, 405, -32600, "method not allowed");
     }
 
-    // Auth FIRST, through the single policy point. Never log the header or the token. 401 carries a
-    // distinct JSON-RPC code from the 404 session-not-found case (-32001) so clients can tell
-    // "re-provision the token" apart from "re-initialize the session".
+    // Liveness/health (issue #47/#53): a cheap, browser-session-free signal. Session-INDEPENDENT (no
+    // MCP initialize handshake) and handled BEFORE the consumer-auth policy point because the OPERATOR
+    // health token (#53) is deliberately NOT a consumer credential — it must never authenticate toward
+    // the MCP routes, and consumer auth would 401 it before this route could see it. The tier order is
+    // fail-closed: (1) the DNS-rebinding Host/Origin validation the SDK transport enforces on the MCP
+    // routes applies here FIRST (this route bypasses the transport; the Host allowlist is load-bearing —
+    // codex #47 r2 — doubly so now that pool internals ride the operator body); (2) the operator token
+    // (timing-safe compare) gets the counters; (3) a valid CONSUMER token gets the bare liveness body
+    // (unchanged #47 contract); (4) anything else gets the same 401 as before.
+    if (method === "GET" && requestPath(req) === "/health") {
+      if (dnsRebindProtection && dnsRebindRequestError(req, allowedHosts, allowedOrigins)) {
+        return sendError(res, 403, -32003, "forbidden");
+      }
+      const bearer = parseBearer(req.headers["authorization"]);
+      if (
+        deps.healthToken !== undefined &&
+        deps.healthToken !== "" &&
+        deps.operatorHealth !== undefined &&
+        timingSafeTokenEqual(bearer, deps.healthToken)
+      ) {
+        return sendHealth(res, deps.operatorHealth);
+      }
+      try {
+        deps.authenticate(bearer);
+      } catch {
+        res.setHeader("WWW-Authenticate", "Bearer");
+        return sendError(res, 401, -32002, "unauthorized");
+      }
+      return sendHealth(res, deps.health);
+    }
+
+    // Auth FIRST for everything else, through the single policy point. Never log the header or the
+    // token. 401 carries a distinct JSON-RPC code from the 404 session-not-found case (-32001) so
+    // clients can tell "re-provision the token" apart from "re-initialize the session".
     let consumer: Consumer;
     try {
       consumer = deps.authenticate(parseBearer(req.headers["authorization"]));
     } catch {
       res.setHeader("WWW-Authenticate", "Bearer");
       return sendError(res, 401, -32002, "unauthorized");
-    }
-
-    // Liveness/health (issue #47): a cheap, browser-session-free signal a client-side breaker re-probes
-    // instead of blind-cooling. Session-INDEPENDENT (no MCP initialize handshake) and authed through the
-    // single policy point above. This route bypasses the SDK transport, so it must apply the SAME
-    // fail-closed DNS-rebinding Host/Origin validation the transport enforces on the MCP routes — the Host
-    // allowlist is load-bearing here (codex r2), doubly so once #53 exposes pool internals on this body.
-    // (Distinct path from `/mcp`, so it never collides with the session-keyed MCP routing below.)
-    if (method === "GET" && requestPath(req) === "/health") {
-      if (dnsRebindProtection && dnsRebindRequestError(req, allowedHosts, allowedOrigins)) {
-        return sendError(res, 403, -32003, "forbidden");
-      }
-      return sendHealth(res, deps.health);
     }
 
     const sessionId = headerValue(req.headers["mcp-session-id"]);
@@ -432,13 +501,21 @@ function requestPath(req: IncomingMessage): string {
   }
 }
 
-/** Write the liveness payload (issue #47): a small JSON body, no-store, consuming no browser session.
- *  `no-store` so an intermediary can't serve a stale "ok" for a since-degraded gateway (matters once
- *  #53 folds degradation counters into the body). */
-function sendHealth(res: ServerResponse, health?: () => HealthReport): void {
+/** Write the liveness payload (issue #47/#53): a small JSON body, no-store, consuming no browser
+ *  session. `no-store` so an intermediary can't serve a stale "ok" for a since-degraded gateway —
+ *  load-bearing now that the operator tier carries degradation counters. */
+function sendHealth(res: ServerResponse, health?: () => HealthReport | OperatorHealthReport): void {
   const body = JSON.stringify(health ? health() : { status: "ok" });
   res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
   res.end(body);
+}
+
+/** Constant-time bearer compare for the operator health token (issue #53): both sides are hashed to a
+ *  fixed length first, so neither content nor LENGTH differences leak timing. */
+function timingSafeTokenEqual(candidate: string, expected: string): boolean {
+  const a = createHash("sha256").update(candidate).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
 }
 
 /** Write a JSON-RPC 2.0 error envelope with an HTTP status, so MCP clients parse it cleanly. */

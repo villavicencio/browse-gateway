@@ -68,6 +68,50 @@ export function httpProbe(localPort: number, hostHeader: string, bearerToken?: s
     });
 }
 
+/** One authed `GET /health` read (issue #53): the HTTP status plus the parsed JSON body (undefined on
+ *  a non-200 / unparseable body). The operator token yields the pool counters; a network failure
+ *  resolves `{ code: "000" }` — the caller renders "unavailable", never throws. */
+export interface HealthProbeResult {
+  code: string;
+  body?: Record<string, unknown>;
+}
+
+export function healthProbe(localPort: number, hostHeader: string, bearerToken: string): () => Promise<HealthProbeResult> {
+  return () =>
+    new Promise((resolve) => {
+      const req = request(
+        {
+          host: "127.0.0.1",
+          port: localPort,
+          path: "/health",
+          method: "GET",
+          headers: { Host: hostHeader, Authorization: `Bearer ${bearerToken}` },
+          timeout: PROBE_TIMEOUT_MS,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const code = String(res.statusCode ?? 0).padStart(3, "0");
+            let body: Record<string, unknown> | undefined;
+            if (res.statusCode === 200) {
+              try {
+                const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+                if (parsed !== null && typeof parsed === "object") body = parsed as Record<string, unknown>;
+              } catch {
+                /* unparseable → body stays undefined; the caller renders "unavailable" */
+              }
+            }
+            resolve({ code, ...(body !== undefined ? { body } : {}) });
+          });
+        },
+      );
+      req.on("timeout", () => req.destroy());
+      req.on("error", () => resolve({ code: "000" }));
+      req.end();
+    });
+}
+
 export interface VerifyOptions {
   probe: VerifyProbe;
   /** Total retry window; defaults ride out a container recreate. */
