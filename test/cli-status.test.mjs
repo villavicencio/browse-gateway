@@ -174,7 +174,7 @@ test("#53: a DEGRADED pool flips overall health and names each degradation", asy
   const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: POOL_DEGRADED_BODY }) });
   const report = await status(deps);
   assert.equal(report.healthy, false, "a degraded pool is UNHEALTHY even though /mcp answers");
-  assert.equal(report.owl, "down");
+  assert.equal(report.owl, "degraded", "…but it is IMPAIRED, not an outage — the distinct squinting owl (codex r4)");
   assert.equal(report.pool, "degraded");
   assert.ok(lines.some((l) => l.includes("pool DEGRADED")));
   assert.ok(lines.some((l) => l.includes("force-kill unavailable")));

@@ -97,10 +97,14 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
     pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";
   }
 
-  // A DEGRADED pool is unhealthy (a wedged core could zombie / a browser may be alive uncounted);
-  // an UNAVAILABLE read is a config/rollout mismatch, surfaced but not a health failure by itself.
-  const healthy = gateway === "healthy" && tunnel.port === "ours" && stealthGreen !== false && pool !== "degraded";
-  const face: OwlState = healthy ? "connected" : "down";
+  // A DEGRADED pool is unhealthy (a wedged core could zombie / a browser may be alive uncounted) but
+  // it is NOT an outage — the gateway answers; the pool is impaired. Codex #53 r4: keep the states
+  // visually distinct (squinting owl, nonzero exit) so ops can tell "restart/debug the pool" apart
+  // from "the service is dead". An UNAVAILABLE read is a config/rollout mismatch, surfaced but not a
+  // health failure by itself.
+  const reachable = gateway === "healthy" && tunnel.port === "ours" && stealthGreen !== false;
+  const healthy = reachable && pool !== "degraded";
+  const face: OwlState = healthy ? "connected" : reachable && pool === "degraded" ? "degraded" : "down";
   out(`${owl(face)}  obscura status`);
 
   // — tunnel line —
