@@ -7,19 +7,25 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findPidsByUserDataDir, sweepOrphanProcesses } from "../dist/gateway/orphan-sweep.js";
 
 /** Write a fake /proc/<pid> entry: NUL-separated cmdline + a stat line readProcStat can parse
- *  (fields after the comm's closing paren: [state, ppid, pgrp, …, starttime@19]). */
-function writeProc(root, pid, { args = [], pgrp = pid, startTime = "1000" } = {}) {
+ *  (fields after the comm's closing paren: [state, ppid, pgrp, …, starttime@19]). `fdRefs` become
+ *  fd/N symlinks (open-file targets) and `cwd` a cwd symlink — the r5 dir-reference discovery keys. */
+function writeProc(root, pid, { args = [], pgrp = pid, startTime = "1000", fdRefs = [], cwd } = {}) {
   const dir = join(root, String(pid));
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "cmdline"), args.join("\0") + "\0");
   const after = ["S", "1", String(pgrp), "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "1", "0", startTime, "0"];
   writeFileSync(join(dir, "stat"), `${pid} (chrome) ${after.join(" ")}`);
+  if (fdRefs.length > 0) {
+    mkdirSync(join(dir, "fd"), { recursive: true });
+    fdRefs.forEach((target, i) => symlinkSync(target, join(dir, "fd", String(i + 3))));
+  }
+  if (cwd) symlinkSync(cwd, join(dir, "cwd"));
 }
 
 function makeProcRoot() {
@@ -196,6 +202,60 @@ test("sweep: stamps are deduped per GROUP (leader generation), so a recycled pgi
   writeProc(root, 240, { args: ["sshd"], pgrp: 240, startTime: "9999" }); // recycled leader, new generation
   const a2 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() }, a1.stamps);
   assert.equal(a2.result, "confirmed", "the leader-generation stamp proves the recycle — capacity frees");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: an ARGLESS survivor holding a profile fd is DISCOVERED after its marker-carrier died (codex r5)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-fd-survivor";
+  // The marker-carrying leader already EXITED before the first sweep; only crashpad-shaped pid 260
+  // survives — no marker on its cmdline, but it holds an open fd into the profile dir.
+  writeProc(root, 260, { args: ["chrome_crashpad_handler", "--no-rate-limit"], pgrp: 260, fdRefs: [`${dir}/Crash Reports/pending.lock`] });
+  const { kill, kills } = makeKillFake(root, (pid) => {
+    if (pid === -260) rmSync(join(root, "260"), { recursive: true, force: true });
+  });
+  const r = await sweepOrphanProcesses(dir, 1_000, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() });
+  assert.equal(r.result, "confirmed", "the dir-reference scan found and reaped the marker-less survivor");
+  assert.deepEqual(kills, [[-260, "SIGKILL"]], "it was killed by its own group");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: dir-prefix discipline — a ref to a SIBLING dir sharing the prefix is NOT ours (codex r5)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-prefix";
+  writeProc(root, 265, { args: ["something-else"], pgrp: 265, fdRefs: ["/tmp/bgw-prefix-other/file"], cwd: "/tmp/bgw-prefixed" });
+  const { kill, kills } = makeKillFake(root);
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() });
+  assert.equal(r.result, "confirmed", "nothing of ours found");
+  assert.deepEqual(kills, [], "a sibling-prefix dir reference is never treated as ours");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: the leader generation is captured BEFORE the kill, so a wrapper-shaped group frees after pgid reuse (codex r5)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-wrapper";
+  // Wrapper shape: the group LEADER (270) carries no marker and no refs; only member 271 carries the
+  // marker. The leader's generation must be stamped pre-kill — post-kill it may already be dead.
+  writeProc(root, 270, { args: ["chrome-wrapper"], pgrp: 270, startTime: "1000" });
+  writeProc(root, 271, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 270, startTime: "1001" });
+  writeProc(root, 272, { args: ["chrome", "--type=renderer"], pgrp: 270, startTime: "1002" }); // invisible survivor
+  const { kill } = makeKillFake(root, (pid) => {
+    if (pid === -270) {
+      rmSync(join(root, "270"), { recursive: true, force: true }); // leader dies
+      rmSync(join(root, "271"), { recursive: true, force: true }); // marker-carrier dies
+      // 272 survives (D-state) — attempt 1 must stay unconfirmed
+    }
+  });
+  const a1 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() });
+  assert.equal(a1.result, "unconfirmed");
+  assert.equal(a1.stamps?.[0].pid, 270, "the stamp is the LEADER's, captured before the kill");
+  assert.equal(a1.stamps?.[0].startTime, "1000");
+
+  // Between attempts: the survivor dies and pgid 270 is recycled by an unrelated group.
+  rmSync(join(root, "272"), { recursive: true, force: true });
+  writeProc(root, 270, { args: ["sshd"], pgrp: 270, startTime: "9999" });
+  const a2 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() }, a1.stamps);
+  assert.equal(a2.result, "confirmed", "the pre-kill leader generation proves the recycle — capacity frees");
   rmSync(root, { recursive: true, force: true });
 });
 

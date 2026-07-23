@@ -18,7 +18,7 @@
  * and `kill` so they are unit-testable against a fake proc tree without real processes; the kill path's
  * real-physics proof is the in-container `scripts/validate-teardown.mjs` sweep leg.
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,6 +57,8 @@ export interface SweepEnv {
   /** Poll sleep; injectable so tests don't wait wall-clock. */
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  /** The sweeping process's own pid, excluded from the dir-reference discovery scan. Injectable. */
+  selfPid?: number;
 }
 
 const SWEEP_POLL_MS = 100;
@@ -117,12 +119,61 @@ export async function sweepOrphanProcesses(
   }
 
   const marker = `--user-data-dir=${dir}`;
+  const selfPid = env.selfPid ?? process.pid;
   const carriesMarker = (pid: number): boolean => {
     try {
       return readFileSync(join(procRoot, String(pid), "cmdline"), "utf8").split("\0").includes(marker);
     } catch {
       return false; // exited — no marker, nothing to signal
     }
+  };
+
+  /**
+   * Whether `pid` holds a live REFERENCE into the profile dir — its cwd or any open fd resolves under
+   * it (codex r5 P1): the discovery key for an ARGLESS survivor whose marker-carrying parent already
+   * died before the first scan (crashpad holding the crash db, any profile-fd holder). Only our
+   * launch's processes can reference the mkdtemp-unique dir, so a match is ours by construction; the
+   * sweeping gateway process itself is excluded. Sandboxed renderers hold no profile references — a
+   * parentless surviving renderer stays a DOCUMENTED residual (pure anonymous memory, no dir handle to
+   * find it by; the container's pids_limit/namespace teardown is the backstop).
+   */
+  const dirPrefix = dir.endsWith("/") ? dir : `${dir}/`;
+  const holdsDirRef = (pid: number): boolean => {
+    const base = join(procRoot, String(pid));
+    const refs = (target: string): boolean => target === dir || target.startsWith(dirPrefix);
+    try {
+      if (refs(readlinkSync(join(base, "cwd")))) return true;
+    } catch {
+      /* no cwd link readable — fall through to fds */
+    }
+    try {
+      for (const fd of readdirSync(join(base, "fd"))) {
+        try {
+          if (refs(readlinkSync(join(base, "fd", fd)))) return true;
+        } catch {
+          /* fd closed mid-scan */
+        }
+      }
+    } catch {
+      /* no fd table readable */
+    }
+    return false;
+  };
+
+  const belongsToLaunch = (pid: number): boolean => carriesMarker(pid) || holdsDirRef(pid);
+
+  /** Every live pid provably belonging to this launch: the cmdline-marker matches PLUS dir-reference
+   *  holders (codex r5 P1). Bounded by the container's pid space; the fd scan runs only while a sweep
+   *  is active (an orphan exists), never on the hot path. */
+  const findLaunchPids = (): number[] => {
+    const out = new Set<number>(findPidsByUserDataDir(dir, procRoot));
+    for (const name of readdirSync(procRoot)) {
+      if (!/^\d+$/.test(name)) continue;
+      const pid = Number(name);
+      if (pid === selfPid || out.has(pid)) continue;
+      if (holdsDirRef(pid)) out.add(pid);
+    }
+    return [...out];
   };
 
   /**
@@ -139,32 +190,38 @@ export async function sweepOrphanProcesses(
    * at this layer.
    */
   const killMatches = (): Map<number, { pid: number; startTime: string }> => {
-    // Keyed by PROCESS GROUP, one stamp each (codex r4) — see {@link SweepStamp}. Prefer the LEADER's
-    // generation (pid === pgrp): only a leader stamp can later prove a recycled pgid; a per-pid ledger
-    // would keep non-leader entries whose recycle check never fires, retaining a reclaimed group forever.
+    // Keyed by PROCESS GROUP, one stamp each (codex r4) — see {@link SweepStamp}. TWO PHASES (codex r5
+    // P2): observe-and-stamp EVERYTHING — including the leader-generation upgrade — BEFORE the first
+    // signal. Upgrading after the kill races it: a wrapper-shaped group (only a non-leader carries the
+    // marker) whose leader dies first would retain a non-leader stamp, and a later pgid reuse could then
+    // never be proven (permanently pinned capacity for an already-gone tree).
     const stamped = new Map<number, { pid: number; startTime: string }>();
-    for (const pid of findPidsByUserDataDir(dir, procRoot)) {
+    // Phase 1a — stamp every launch-owned pid (marker + dir-reference discovery), leader-preferred.
+    for (const pid of findLaunchPids()) {
       const stat = readProcStat(pid, procRoot);
       if (!stat) continue; // exited since the scan — never signal an unverifiable pid
-      if (!carriesMarker(pid)) continue; // recycled between scan and stat — NOT ours; never signal
+      if (!belongsToLaunch(pid)) continue; // recycled between scan and stat — NOT ours; never signal
       const existing = stamped.get(stat.pgrp);
       if (existing === undefined || pid === stat.pgrp) {
         stamped.set(stat.pgrp, { pid, startTime: stat.startTime });
       }
-      try {
-        // Group-SIGKILL (the #50 discipline): renderers/crashpad live in the leader's group without
-        // carrying --user-data-dir themselves. ESRCH = already gone — success-shaped, swallowed.
-        kill(-stat.pgrp, "SIGKILL");
-      } catch {
-        // ESRCH/EPERM: gone, or not ours to signal — either way the confirm pass below decides
-      }
     }
-    // Upgrade any non-leader representative to the group leader's own generation when readable — the
-    // leader need not carry the marker itself; its stat is the group's identity.
+    // Phase 1b — upgrade any non-leader representative to the group leader's own generation when
+    // readable (the leader need not carry the marker; its stat is the group's identity). Pre-signal, so
+    // the read cannot race our own kill.
     for (const [pgrp, rep] of stamped) {
       if (rep.pid === pgrp) continue;
       const leader = readProcStat(pgrp, procRoot);
       if (leader && leader.pgrp === pgrp) stamped.set(pgrp, { pid: pgrp, startTime: leader.startTime });
+    }
+    // Phase 2 — one group-SIGKILL per stamped group (the #50 discipline: renderers/crashpad live in the
+    // leader's group without carrying the marker themselves). ESRCH = already gone — swallowed.
+    for (const pgrp of stamped.keys()) {
+      try {
+        kill(-pgrp, "SIGKILL");
+      } catch {
+        // ESRCH/EPERM: gone, or not ours to signal — either way the confirm pass below decides
+      }
     }
     return stamped;
   };
