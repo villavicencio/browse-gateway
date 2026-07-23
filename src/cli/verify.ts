@@ -89,8 +89,20 @@ export function healthProbe(localPort: number, hostHeader: string, bearerToken: 
           timeout: PROBE_TIMEOUT_MS,
         },
         (res) => {
+          // Codex #53 r1: settle exactly ONCE, on WHICHEVER stream event fires — a connection reset
+          // after the headers emits `error`/`aborted` (never `end`), which without handlers would leave
+          // the promise pending and surface an unhandled stream error, contradicting the "network
+          // failure resolves {code:'000'}" contract.
+          let settled = false;
+          const finish = (result: HealthProbeResult): void => {
+            if (settled) return;
+            settled = true;
+            resolve(result);
+          };
           const chunks: Buffer[] = [];
           res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("error", () => finish({ code: "000" }));
+          res.on("aborted", () => finish({ code: "000" }));
           res.on("end", () => {
             const code = String(res.statusCode ?? 0).padStart(3, "0");
             let body: Record<string, unknown> | undefined;
@@ -102,7 +114,7 @@ export function healthProbe(localPort: number, hostHeader: string, bearerToken: 
                 /* unparseable → body stays undefined; the caller renders "unavailable" */
               }
             }
-            resolve({ code, ...(body !== undefined ? { body } : {}) });
+            finish({ code, ...(body !== undefined ? { body } : {}) });
           });
         },
       );

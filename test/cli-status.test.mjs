@@ -245,3 +245,10 @@ test("#53 end-to-end: a degraded live core flips external health through the REA
     server.closeAllConnections?.();
   }
 });
+
+test("#53 r1: a bare consumer-tier body (healthToken misconfigured to a consumer key) reads as UNAVAILABLE, never healthy", async () => {
+  const { deps, lines } = makeDeps({ poolHealth: async () => ({ code: "200", body: { status: "ok" } }) });
+  const report = await status(deps);
+  assert.equal(report.pool, "unavailable", "a counters-free body must not claim the pool is verified healthy");
+  assert.ok(lines.some((l) => l.includes("pool health: unavailable")), `got: ${lines.join(" | ")}`);
+});

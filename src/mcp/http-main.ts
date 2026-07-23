@@ -52,6 +52,15 @@ async function main(): Promise<void> {
   const rebindError = dnsRebindBootError(allowedHosts);
   if (rebindError) throw new Error(rebindError);
 
+  // #53 (codex r1): the operator health token must never COLLIDE with a consumer credential — the
+  // /health route checks it BEFORE consumer auth, so a collision would hand that consumer the
+  // cross-tenant pool counters, breaking the operator-only boundary. Fail closed at boot (the message
+  // names neither token — R9).
+  const healthToken = process.env.BGW_HEALTH_TOKEN;
+  if (healthToken && specs.some((s) => s.token === healthToken)) {
+    throw new Error("BGW_HEALTH_TOKEN collides with a consumer token — the operator health token must be a distinct credential. Refusing to boot.");
+  }
+
   const handler = createHttpHandler({
     authenticate: (token: string) => policy.authenticate(token),
     buildServer: (consumer: Consumer): ConsumerServer => {
@@ -97,7 +106,7 @@ async function main(): Promise<void> {
     // key (never in the manifest, never counted toward pool sizing, grants only this read). It is
     // compared, never logged; absent/empty → the operator tier is simply off.
     health: () => ({ status: "ok" as const }),
-    healthToken: process.env.BGW_HEALTH_TOKEN,
+    healthToken,
     operatorHealth: () => buildOperatorHealth(gateway.sessions),
     log,
   });

@@ -80,8 +80,19 @@ export async function status(deps: StatusDeps, opts: StatusOptions = {}): Promis
   if (deps.poolHealth && gateway === "healthy") {
     const read = await deps.poolHealth();
     poolBody = read.body;
-    const status = typeof read.body?.status === "string" ? read.body.status : undefined;
-    pool = status === "ok" ? "ok" : status === "degraded" ? "degraded" : "unavailable";
+    // Codex #53 r1: require the FULL operator shape before trusting the verdict — a healthToken
+    // mistakenly set to a valid CONSUMER token gets the bare `{status:"ok"}` liveness body, which must
+    // read as "unavailable" (misconfigured), never as "pool healthy, force-kill armed".
+    const b = read.body;
+    const isOperatorShape =
+      b !== undefined &&
+      (b.status === "ok" || b.status === "degraded") &&
+      typeof b.forceKillAvailable === "boolean" &&
+      typeof b.unconfirmedCount === "number" &&
+      typeof b.orphanCount === "number" &&
+      typeof b.activeCount === "number" &&
+      typeof b.maxSessions === "number";
+    pool = !isOperatorShape ? "unavailable" : b.status === "ok" ? "ok" : "degraded";
   }
 
   // A DEGRADED pool is unhealthy (a wedged core could zombie / a browser may be alive uncounted);
