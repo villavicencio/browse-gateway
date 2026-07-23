@@ -27,6 +27,23 @@ import { readProcStat } from "../browser/index.js";
 /** Outcome of one sweep attempt over a profile dir. */
 export type SweepResult = "confirmed" | "unconfirmed" | "unsupported";
 
+/** One stamped process group from a sweep attempt: the marker-carrying pid observed, its generation
+ *  (start-time) and its process group. OPAQUE to the manager — it only round-trips these into the next
+ *  attempt (codex r3): the stamps are what let a retry keep blocking on a surviving ARGLESS group member
+ *  after the marker-carrying leader died (a fresh scan alone would find no marker and false-confirm). */
+export interface SweepStamp {
+  pid: number;
+  startTime: string;
+  pgrp: number;
+}
+
+/** A sweep attempt's result plus the stamps the NEXT attempt must keep confirming against. */
+export interface SweepOutcome {
+  result: SweepResult;
+  /** Present on "unconfirmed": every group still owed a confirm (prior ∪ this attempt's matches). */
+  stamps?: SweepStamp[];
+}
+
 /** Injection surface for the sweep's OS interactions, so every branch is unit-testable. */
 export interface SweepEnv {
   procRoot?: string;
@@ -65,20 +82,23 @@ export function findPidsByUserDataDir(dir: string, procRoot = "/proc"): number[]
 
 /**
  * Kill-and-confirm every process launched under `dir` (see the module doc for the mechanism), bounded
- * by `confirmMs`. Returns:
- *  - `"confirmed"` — no process carries the dir on its cmdline AND every originally-matched pid is gone
- *    or recycled (start-time generation changed). Includes the trivial case (nothing ever matched).
+ * by `confirmMs`. Returns an outcome whose `result` is:
+ *  - `"confirmed"` — no process carries the dir on its cmdline AND every owed group (this attempt's
+ *    matches ∪ `priorStamps` from earlier attempts, codex r3) is gone or provably recycled. Includes
+ *    the trivial case (nothing ever matched and nothing was owed).
  *  - `"unconfirmed"` — something still lives at the deadline (e.g. a D-state unkillable); the caller
- *    keeps the orphan COUNTED and retries on its next tick (the #50 never-lie posture).
- *  - `"unsupported"` — not Linux / no proc tree; the caller degrades loudly.
+ *    keeps the orphan COUNTED, holds the returned `stamps`, and retries with them on its next tick
+ *    (the #50 never-lie posture — the stamps stop a marker-less survivor from false-confirming later).
+ *  - `"unsupported"` — not Linux / no readable proc tree; the caller degrades loudly.
  */
 export async function sweepOrphanProcesses(
   dir: string,
   confirmMs: number,
   env: SweepEnv = {},
-): Promise<SweepResult> {
+  priorStamps: SweepStamp[] = [],
+): Promise<SweepOutcome> {
   const platform = env.platform ?? process.platform;
-  if (platform !== "linux") return "unsupported";
+  if (platform !== "linux") return { result: "unsupported" };
   const procRoot = env.procRoot ?? "/proc";
   const kill = env.kill ?? ((pid: number, sig: NodeJS.Signals | 0) => process.kill(pid, sig));
   const sleep = env.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -89,7 +109,7 @@ export async function sweepOrphanProcesses(
   try {
     readdirSync(procRoot);
   } catch {
-    return "unsupported";
+    return { result: "unsupported" };
   }
 
   const marker = `--user-data-dir=${dir}`;
@@ -156,20 +176,27 @@ export async function sweepOrphanProcesses(
     return false;
   };
 
-  let stamped = killMatches();
-  if (stamped.size === 0) return "confirmed"; // nothing lives under this profile RIGHT NOW (see OrphanDirOps
-  // note: the CALLER must treat an empty-scan confirm on a still-PENDING launch as provisional — the
-  // launcher may spawn later; the manager's watch-list covers that window.)
+  // Codex r3: seed from the PRIOR attempt's stamps. After a first attempt kills the marker-carrying
+  // leader but a surviving ARGLESS group member forces "unconfirmed", a fresh scan alone would find no
+  // marker and false-confirm over that live member — the stamped groups are the memory that keeps every
+  // owed group blocking the confirm across attempts. A prior group that is now gone simply confirms.
+  const stamped = new Map<number, { startTime: string; pgrp: number }>();
+  for (const s of priorStamps) stamped.set(s.pid, { startTime: s.startTime, pgrp: s.pgrp });
+  for (const [pid, stamp] of killMatches()) stamped.set(pid, stamp);
+  const owedStamps = (): SweepStamp[] => [...stamped].map(([pid, s]) => ({ pid, startTime: s.startTime, pgrp: s.pgrp }));
+  if (stamped.size === 0) return { result: "confirmed" }; // nothing lives under this profile RIGHT NOW (see
+  // OrphanDirOps note: the CALLER must treat an empty-scan confirm on a still-PENDING launch as
+  // provisional — the launcher may spawn later; the manager's watch-list covers that window.)
   const deadline = now() + confirmMs;
   for (;;) {
     const allGone = [...stamped].every(([pid, stamp]) => groupGone(pid, stamp));
     if (allGone) {
       // Rescan for a process forked under the profile mid-sweep; kill it and keep polling if found.
       const fresh = killMatches();
-      if (fresh.size === 0) return "confirmed";
-      stamped = fresh;
+      if (fresh.size === 0) return { result: "confirmed" };
+      for (const [pid, stamp] of fresh) stamped.set(pid, stamp);
     }
-    if (now() >= deadline) return "unconfirmed";
+    if (now() >= deadline) return { result: "unconfirmed", stamps: owedStamps() };
     await sleep(SWEEP_POLL_MS);
   }
 }
@@ -183,15 +210,18 @@ export async function sweepOrphanProcesses(
  * CONTRACT: every op must SETTLE in bounded time — `shutdown()` awaits in-flight orphan work, so a
  * never-settling `sweep` would hang it. The default sweep is internally bounded by its `confirmMs`
  * (returning `"unconfirmed"` rather than waiting forever); an injected test fake must do the same.
+ * `sweep` takes the PRIOR attempt's `stamps` (codex r3) and the manager round-trips the returned ones —
+ * the cross-attempt memory that keeps a surviving argless group member blocking the confirm after the
+ * marker-carrying leader died.
  */
 export interface OrphanDirOps {
   make(): Promise<string>;
-  sweep(dir: string, confirmMs: number): Promise<SweepResult>;
+  sweep(dir: string, confirmMs: number, priorStamps?: SweepStamp[]): Promise<SweepOutcome>;
   remove(dir: string): Promise<void>;
 }
 
 export const defaultOrphanDirOps: OrphanDirOps = {
   make: () => mkdtemp(join(tmpdir(), "bgw-profile-")),
-  sweep: (dir, confirmMs) => sweepOrphanProcesses(dir, confirmMs),
+  sweep: (dir, confirmMs, priorStamps) => sweepOrphanProcesses(dir, confirmMs, {}, priorStamps ?? []),
   remove: (dir) => rm(dir, { recursive: true, force: true }),
 };

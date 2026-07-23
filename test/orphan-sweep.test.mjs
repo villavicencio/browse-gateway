@@ -91,7 +91,7 @@ test("sweep: nothing under the dir → confirmed immediately (no kills)", async 
     kill: (pid, sig) => kills.push([pid, sig]),
     ...fakeClock(),
   });
-  assert.equal(r, "confirmed");
+  assert.equal(r.result, "confirmed");
   assert.deepEqual(kills, []);
   rmSync(root, { recursive: true, force: true });
 });
@@ -102,7 +102,7 @@ test("sweep: an UNREADABLE proc root on Linux → unsupported, never a false con
     procRoot: "/nonexistent-proc-root-for-test",
     ...fakeClock(),
   });
-  assert.equal(r, "unsupported", "no scan happened, so nothing was 'confirmed'");
+  assert.equal(r.result, "unsupported", "no scan happened, so nothing was 'confirmed'");
   assert.throws(
     () => findPidsByUserDataDir("/tmp/bgw-x", "/nonexistent-proc-root-for-test"),
     "an unreadable root throws — an empty result always means 'scanned and found nothing'",
@@ -115,7 +115,7 @@ test("sweep: non-Linux platform → unsupported (never scans or kills)", async (
     platform: "darwin",
     kill: (pid, sig) => kills.push([pid, sig]),
   });
-  assert.equal(r, "unsupported");
+  assert.equal(r.result, "unsupported");
   assert.deepEqual(kills, []);
 });
 
@@ -132,7 +132,7 @@ test("sweep: group-SIGKILLs the match's process group and confirms once the WHOL
     }
   });
   const r = await sweepOrphanProcesses(dir, 1_000, { platform: "linux", procRoot: root, kill, ...fakeClock() });
-  assert.equal(r, "confirmed");
+  assert.equal(r.result, "confirmed");
   assert.deepEqual(kills, [[-200, "SIGKILL"]], "one group-SIGKILL at the leader's pgid, renderers rode along");
   rmSync(root, { recursive: true, force: true });
 });
@@ -146,7 +146,34 @@ test("sweep: a surviving ARGLESS group member (D-state renderer) blocks the conf
     if (pid === -210) rmSync(join(root, "210"), { recursive: true, force: true }); // ONLY the leader dies
   });
   const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() });
-  assert.equal(r, "unconfirmed", "the group probe sees the lingering renderer — capacity is not freed over it");
+  assert.equal(r.result, "unconfirmed", "the group probe sees the lingering renderer — capacity is not freed over it");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: prior stamps keep a marker-less survivor blocking the confirm ACROSS attempts (codex r3)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-cross-attempt";
+  writeProc(root, 230, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 230 });
+  writeProc(root, 231, { args: ["chrome", "--type=renderer"], pgrp: 230 }); // argless, same group
+  const { kill } = makeKillFake(root, (pid) => {
+    if (pid === -230) rmSync(join(root, "230"), { recursive: true, force: true }); // only the leader dies
+  });
+  const env = { platform: "linux", procRoot: root, kill, ...fakeClock() };
+
+  // Attempt 1: leader killed, renderer survives → unconfirmed WITH the owed group stamps.
+  const a1 = await sweepOrphanProcesses(dir, 500, env);
+  assert.equal(a1.result, "unconfirmed");
+  assert.equal(a1.stamps?.length, 1, "the owed group is stamped for the next attempt");
+
+  // Attempt 2 (a fresh sweep, no marker anywhere): WITHOUT prior stamps this would false-confirm over
+  // the live renderer; WITH them the owed group keeps blocking.
+  const a2 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() }, a1.stamps);
+  assert.equal(a2.result, "unconfirmed", "the prior stamps block a false confirm over the argless survivor");
+
+  // The renderer finally dies → attempt 3 with the carried stamps confirms.
+  rmSync(join(root, "231"), { recursive: true, force: true });
+  const a3 = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() }, a2.stamps);
+  assert.equal(a3.result, "confirmed");
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -159,7 +186,7 @@ test("sweep: a matched pid whose stat vanished (exited between scan and stat) is
   writeFileSync(join(pdir, "cmdline"), ["chrome", `--user-data-dir=${dir}`].join("\0") + "\0");
   const { kill, kills } = makeKillFake(root);
   const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, ...fakeClock() });
-  assert.equal(r, "confirmed", "an unverifiable (exited) pid is skipped, not treated as alive");
+  assert.equal(r.result, "confirmed", "an unverifiable (exited) pid is skipped, not treated as alive");
   assert.deepEqual(kills, [], "no signal was ever sent on an unverifiable pid (recycle-safety)");
   rmSync(root, { recursive: true, force: true });
 });
@@ -176,7 +203,7 @@ test("sweep: a RECYCLED pid (same number, new start-time) counts as gone — the
     }
   });
   const r = await sweepOrphanProcesses(dir, 1_000, { platform: "linux", procRoot: root, kill, ...fakeClock() });
-  assert.equal(r, "confirmed", "the recycled pid's changed start-time proves OUR process is gone");
+  assert.equal(r.result, "confirmed", "the recycled pid's changed start-time proves OUR process is gone");
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -193,7 +220,7 @@ test("sweep: a process forked under the profile MID-SWEEP is killed too before c
     if (pid === -500) rmSync(join(root, "500"), { recursive: true, force: true });
   });
   const r = await sweepOrphanProcesses(dir, 1_000, { platform: "linux", procRoot: root, kill, ...fakeClock() });
-  assert.equal(r, "confirmed");
+  assert.equal(r.result, "confirmed");
   assert.deepEqual(kills, [[-400, "SIGKILL"], [-500, "SIGKILL"]], "the rescan caught and killed the fork");
   rmSync(root, { recursive: true, force: true });
 });
@@ -210,7 +237,7 @@ test("sweep: a survivor at the deadline → unconfirmed (never a false confirm)"
     kill,
     ...fakeClock(),
   });
-  assert.equal(r, "unconfirmed");
+  assert.equal(r.result, "unconfirmed");
   assert.equal(kills.length >= 1, true, "the kill was attempted");
   rmSync(root, { recursive: true, force: true });
 });

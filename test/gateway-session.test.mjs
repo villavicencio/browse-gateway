@@ -907,15 +907,18 @@ test("acquire: a late-resolving core whose death CANNOT be confirmed is RETAINED
 
 // --- issue #54 Part 2: orphan ledger — wedged/late/failed launches counted until CONFIRMED reclaimed ------
 
-/** Controllable fake OrphanDirOps: records mints/sweeps/removals. Per the OrphanDirOps contract a fake
- *  sweep must SETTLE (bounded) — model "can't confirm yet" with "unconfirmed", never a hanging promise;
- *  `nextSweep` (a deferred resolved by the test with a SweepResult) holds ONE sweep open observably. */
+/** Controllable fake OrphanDirOps: records mints/sweeps/removals (and each sweep's prior stamps, r3).
+ *  Per the OrphanDirOps contract a fake sweep must SETTLE (bounded) — model "can't confirm yet" with
+ *  "unconfirmed", never a hanging promise; `nextSweep` (a deferred resolved by the test with a
+ *  SweepResult string or a full outcome) holds ONE sweep open observably. */
 function makeFakeDirOps({ sweepResult = "confirmed" } = {}) {
   let n = 0;
+  const asOutcome = (v) => (typeof v === "string" ? { result: v } : v);
   const ops = {
     made: [],
     swept: [],
     removed: [],
+    priors: [], // the priorStamps each sweep call received (r3 round-trip observability)
     sweepResult,
     nextSweep: undefined,
     async make() {
@@ -923,14 +926,15 @@ function makeFakeDirOps({ sweepResult = "confirmed" } = {}) {
       ops.made.push(d);
       return d;
     },
-    async sweep(dir) {
+    async sweep(dir, _confirmMs, priorStamps) {
       ops.swept.push(dir);
+      ops.priors.push(priorStamps);
       if (ops.nextSweep) {
         const p = ops.nextSweep.promise;
         ops.nextSweep = undefined;
-        return p; // the test resolves the deferred with a SweepResult
+        return asOutcome(await p);
       }
-      return ops.sweepResult;
+      return asOutcome(ops.sweepResult);
     },
     async remove(dir) {
       ops.removed.push(dir);
@@ -1194,6 +1198,22 @@ test("orphans: the watch list is BOUNDED — the oldest pending wedge is evicted
   assert.equal(mgr.watchedCount, MAX_WATCHED_LAUNCHES, "the watch set never grows past its cap");
   assert.equal(mgr.orphanCount, 0, "evicted/watched wedges hold no capacity");
   assert.deepEqual(ops.removed, [], "no dir was removed under a still-possible future spawn");
+});
+
+test("orphans: unconfirmed sweep stamps are round-tripped into the retry (#54 Part 2, codex r3)", async () => {
+  const token = [{ pid: 777, startTime: "1234", pgrp: 777 }];
+  const ops = makeFakeDirOps();
+  ops.nextSweep = { promise: Promise.resolve({ result: "unconfirmed", stamps: token }) };
+  const { factory } = makeWedgeFactory();
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  assert.equal(ops.priors[0], undefined, "the first attempt starts with no prior stamps");
+
+  ops.sweepResult = "unconfirmed"; // still blocking, so the round-trip is observable again
+  await mgr.reapIdle(1_000); // retry
+  assert.deepEqual(ops.priors[1], token, "the retry received the previous attempt's owed stamps");
 });
 
 test("shutdown: drains in-flight orphan work and RETAINS an unconfirmable orphan loudly (#54 Part 2)", async () => {

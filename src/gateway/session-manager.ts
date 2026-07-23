@@ -11,7 +11,7 @@ import type { BrowserCore, BrowserCoreOptions } from "../browser/index.js";
 import { Session } from "./session.js";
 import type { SessionInfo } from "./session.js";
 import { defaultOrphanDirOps } from "./orphan-sweep.js";
-import type { OrphanDirOps } from "./orphan-sweep.js";
+import type { OrphanDirOps, SweepStamp } from "./orphan-sweep.js";
 
 export type CoreFactory = (opts: BrowserCoreOptions) => Promise<BrowserCore>;
 
@@ -41,6 +41,10 @@ interface OrphanRecord {
    *  (codex #54P2 r1) — so the record moves to the uncounted WATCH list (kept swept, dir retained)
    *  instead of being finalized; only a settled record's confirm removes the dir and forgets it. */
   settled?: boolean;
+  /** The last unconfirmed sweep's owed process-group stamps (codex r3), round-tripped into the next
+   *  attempt so a surviving ARGLESS group member keeps blocking the confirm after the marker-carrying
+   *  leader died — a fresh scan alone would find no marker and false-confirm. Opaque to the manager. */
+  stamps?: SweepStamp[];
 }
 
 /**
@@ -565,9 +569,13 @@ export class SessionManager {
     }
     rec.sweeping = true;
     const dir = rec.dir;
-    const work = this.#dirOps.sweep(dir, this.#killConfirmMs).then(
-      async (result) => {
+    // Codex r3: round-trip the prior attempt's owed stamps so a marker-less survivor (argless renderer
+    // after the leader died) keeps blocking the confirm across attempts.
+    const work = this.#dirOps.sweep(dir, this.#killConfirmMs, rec.stamps).then(
+      async (outcome) => {
         rec.sweeping = false;
+        const result = outcome.result;
+        rec.stamps = result === "unconfirmed" ? outcome.stamps : undefined;
         if (rec.session !== undefined) return; // a late core arrived mid-sweep — its teardown owns the record
         if (result === "confirmed") {
           // Codex #54P2 r1: while the wedged launch promise is still PENDING, an empty-scan confirm is
@@ -596,7 +604,11 @@ export class SessionManager {
         // never-lie posture — and let the next reaper tick retry. Codex r2: a WATCHED record that turns
         // unconfirmed just proved a live process spawned under it — move it BACK to the counted ledger
         // (activeCount + the consumer cap must see a known-live orphan; watch is for "nothing there").
-        if (this.#watch.delete(rec)) this.#orphans.add(rec);
+        // Codex r3: UNCONDITIONALLY — a record evicted from the watch list mid-sweep is in NEITHER set,
+        // and losing a known-live process from all accounting is exactly the bug class this ticket owns.
+        // The `sweeping` single-flight latch means this sweep is the record's only in-flight verdict.
+        this.#watch.delete(rec);
+        this.#orphans.add(rec);
       },
       () => {
         rec.sweeping = false; // sweep errored — retry on the next tick
@@ -611,9 +623,14 @@ export class SessionManager {
    *  the watch set, its dirs, and its per-tick /proc scans without bound. */
   #watchLaunch(rec: OrphanRecord): void {
     while (this.#watch.size >= MAX_WATCHED_LAUNCHES) {
-      const oldest = this.#watch.values().next().value as OrphanRecord | undefined;
-      if (oldest === undefined) break;
-      this.#watch.delete(oldest);
+      // Codex r3: never evict a record whose sweep is IN FLIGHT — its verdict may be "unconfirmed"
+      // (a known-live process) that must land back in the counted ledger, and while the unconfirmed
+      // arm re-adds unconditionally as a backstop, preferring an idle eviction keeps the accounting
+      // paths simple. Oldest NON-sweeping record goes first; if every entry is mid-sweep (sweeps are
+      // bounded by killConfirmMs), accept a transient overflow rather than evict a pending verdict.
+      const evictable = [...this.#watch].find((r) => r.sweeping !== true);
+      if (evictable === undefined) break;
+      this.#watch.delete(evictable);
       process.stderr.write(
         `[browse-gateway] watch list full (${MAX_WATCHED_LAUNCHES}): evicting the oldest pending wedge ` +
           `(its profile dir is retained on disk, untracked — container teardown is the backstop)\n`,

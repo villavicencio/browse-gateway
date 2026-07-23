@@ -220,8 +220,8 @@ try {
   const foundBefore = (await import("../dist/gateway/orphan-sweep.js")).findPidsByUserDataDir(wedgeDir);
   console.log(`     sweep target: ${foundBefore.length} proc(s) carry --user-data-dir=${wedgeDir}`);
   check("F. a real Chromium is findable by its gateway-owned userDataDir (cmdline scan)", foundBefore.length > 0);
-  const sweepResult = await defaultOrphanDirOps.sweep(wedgeDir, 5_000);
-  check("Fb. the sweep kill-and-confirms the whole tree by dir alone (no PID handle)", sweepResult === "confirmed");
+  const sweepOutcome = await defaultOrphanDirOps.sweep(wedgeDir, 5_000);
+  check("Fb. the sweep kill-and-confirms the whole tree by dir alone (no PID handle)", sweepOutcome.result === "confirmed");
   const foundAfter = (await import("../dist/gateway/orphan-sweep.js")).findPidsByUserDataDir(wedgeDir);
   check("Fc. nothing carries the dir after the sweep", foundAfter.length === 0);
   await defaultOrphanDirOps.remove(wedgeDir);
