@@ -1278,6 +1278,30 @@ test("orphans: an EVICTED watch record whose launch finally rejects is re-enqueu
   assert.equal(ops.removed.includes(ops.made[0]), true, "the evicted-then-settled launch's dir was reclaimed, not leaked");
 });
 
+test("orphans: a REJECTED sweep resumes a deferred settlement instead of pinning the record forever (#54 Part 2, codex r8)", async () => {
+  const gate = deferred();
+  const ops = makeFakeDirOps();
+  const held = deferred();
+  ops.nextSweep = held; // the post-timeout sweep is in flight…
+  const { factory, late } = makeWedgeFactory({ gate });
+  const mgr = new SessionManager({ maxSessions: 2, coreFactory: factory, launchDeadlineMs: 30, orphanDirOps: ops });
+
+  await assert.rejects(mgr.acquire(), (e) => e.code === "CORE_LAUNCH");
+  for (let i = 0; i < 50 && ops.swept.length === 0; i++) await tick();
+  gate.resolve(); // …the late core arrives and its teardown completes (settlement deferred to the sweep)
+  for (let i = 0; i < 50 && !late.closed && !late.killed; i++) await tick();
+
+  held.promise.catch(() => {}); // silence the deliberate rejection below
+  // The in-flight sweep REJECTS (a transient scan error) — the deferred settlement must still run.
+  ops.nextSweep = undefined;
+  await tick();
+  // reject via a fresh rejected promise path: resolve the held deferred with a rejected outcome
+  held.resolve(Promise.reject(new Error("scan blew up")));
+  for (let i = 0; i < 50 && mgr.orphanCount > 0; i++) await tick();
+  assert.equal(mgr.orphanCount, 0, "the rejection arm resumed the settlement — no permanent pin");
+  assert.deepEqual(ops.removed, [ops.made[0]], "the confirmed-dead orphan's dir was reclaimed");
+});
+
 test("shutdown: drains in-flight orphan work and RETAINS an unconfirmable orphan loudly (#54 Part 2)", async () => {
   const ops = makeFakeDirOps({ sweepResult: "unconfirmed" }); // the wedge's tree never confirms dead
   const { factory } = makeWedgeFactory();

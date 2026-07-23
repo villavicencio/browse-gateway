@@ -654,6 +654,14 @@ export class SessionManager {
       },
       () => {
         rec.sweeping = false; // sweep errored — retry on the next tick
+        if (rec.settleAfterSweep === true) {
+          // Codex r8: a deferred settlement must not die with a REJECTED sweep — rec.session is set, so
+          // every future #sweepOrphan would return early and the confirmed-dead orphan would pin
+          // activeCount (and its dir) forever. Resume the settlement with whatever stamps the record
+          // already holds; #settleReapedOrphan re-sweeps or finalizes from there.
+          rec.settleAfterSweep = false;
+          void this.#trackOrphanWork(this.#settleReapedOrphan(rec));
+        }
       },
     );
     return this.#trackOrphanWork(work);

@@ -259,6 +259,28 @@ test("sweep: the leader generation is captured BEFORE the kill, so a wrapper-sha
   rmSync(root, { recursive: true, force: true });
 });
 
+test("sweep: a group forked while an owed group still blocks is stamped+killed on the NEXT POLL, not deferred (codex r8)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-mid-fork";
+  writeProc(root, 280, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 280 }); // unkillable — blocks throughout
+  const { kill, kills } = makeKillFake(root, (pid) => {
+    if (pid === -280 && kills.filter(([p]) => p === -280).length === 1) {
+      // The wedged launcher forks a SECOND group right as the first kill lands. Its marker-carrier
+      // would exit soon — only a per-poll rescan can stamp it while the marker is still visible.
+      writeProc(root, 290, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 290 });
+      writeProc(root, 291, { args: ["chrome", "--type=renderer"], pgrp: 290 });
+    }
+    if (pid === -290) {
+      rmSync(join(root, "290"), { recursive: true, force: true });
+      rmSync(join(root, "291"), { recursive: true, force: true });
+    }
+  });
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() });
+  assert.equal(r.result, "unconfirmed", "the unkillable original group still blocks");
+  assert.equal(kills.some(([p]) => p === -290), true, "the mid-sweep fork was stamped and killed on a poll, not deferred until allGone");
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("sweep: a matched pid whose stat vanished (exited between scan and stat) is never signaled (codex r1)", async () => {
   const root = makeProcRoot();
   const dir = "/tmp/bgw-exited";

@@ -277,16 +277,19 @@ export async function sweepOrphanProcesses(
   // provisional — the launcher may spawn later; the manager's watch-list covers that window.)
   const deadline = now() + confirmMs;
   for (;;) {
-    const allGone = [...stamped].every(([pgrp, rep]) => groupGone(pgrp, rep));
-    if (allGone) {
-      // Rescan for a process forked under the profile mid-sweep; kill it and keep polling if found.
-      const fresh = killMatches();
-      if (fresh.size === 0) return { result: "confirmed" };
-      for (const [pgrp, rep] of fresh) {
-        const existing = stamped.get(pgrp);
-        if (existing === undefined || rep.pid === pgrp) stamped.set(pgrp, rep);
-      }
+    // Codex r8: rescan-and-merge on EVERY poll — not only once the owed groups are gone. While an owed
+    // group still blocks, the pending launcher can fork a NEW group whose marker/ref-carrying members
+    // exit before the owed group clears; deferring the rescan until allGone would let that group escape
+    // stamping entirely and a later attempt confirm over its argless survivor. A per-poll rescan stamps
+    // (and kills) every group at its earliest observable moment. Bounded: one scan per poll for at most
+    // confirmMs, only while a sweep is active.
+    const fresh = killMatches();
+    for (const [pgrp, rep] of fresh) {
+      const existing = stamped.get(pgrp);
+      if (existing === undefined || rep.pid === pgrp) stamped.set(pgrp, rep);
     }
+    const allGone = [...stamped].every(([pgrp, rep]) => groupGone(pgrp, rep));
+    if (allGone && fresh.size === 0) return { result: "confirmed" };
     if (now() >= deadline) return { result: "unconfirmed", stamps: owedStamps() };
     await sleep(SWEEP_POLL_MS);
   }
