@@ -309,6 +309,11 @@ test("#53 r6: ownership is RE-CHECKED before the send — a tunnel that dropped 
   // Codex r7: the FRESH foreign verdict must flip the whole status, not just skip the send.
   assert.equal(report.healthy, false, "a mid-run foreign takeover reports unhealthy, not connected");
   assert.equal(report.owl, "down");
+  // Codex r9: the refreshed reading is AUTHORITATIVE — the report + tunnel line are coherent, never
+  // "unhealthy" over a stale port:"ours" with a contradictory "tunnel up" line.
+  assert.equal(report.tunnel.port, "foreign", "the report reflects the refreshed (foreign) tunnel state");
+  assert.ok(lines.some((l) => l.includes("FOREIGN") || l.includes("NO LONGER")), `got: ${lines.join(" | ")}`);
+  assert.ok(!lines.some((l) => l.startsWith("✓ tunnel up")), "no contradictory 'tunnel up' line during a takeover");
 });
 
 test("#53 r7: the ownership refresh is SKIPPED entirely when no health token is configured (no double tunnel inspection)", async () => {
