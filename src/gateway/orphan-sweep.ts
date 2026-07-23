@@ -121,12 +121,16 @@ export async function sweepOrphanProcesses(
   const sleep = env.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = env.now ?? (() => Date.now());
   // Codex r2: a Linux host whose proc root is absent/unreadable (a misconfigured mount) must report
-  // UNSUPPORTED — never "confirmed" off a scan that scanned nothing. One up-front probe; /proc does not
-  // vanish mid-process, and a per-pid read failure inside the scan still means "that pid exited".
+  // UNSUPPORTED — never "confirmed" off a scan that scanned nothing. One up-front probe. Codex r10:
+  // triage the failure — only a GENUINELY-absent root (ENOENT/ENOTDIR: no proc mount) degrades to
+  // unsupported (which UNCOUNTS the orphan); a transient resource failure (EMFILE/ENFILE/EIO) REJECTS,
+  // so the manager keeps the orphan counted and retries instead of dropping it over fd pressure.
   try {
     readdirSync(procRoot);
-  } catch {
-    return { result: "unsupported" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { result: "unsupported" };
+    throw err;
   }
 
   const marker = `--user-data-dir=${dir}`;
@@ -207,39 +211,69 @@ export async function sweepOrphanProcesses(
    * launch-captured ChildProcess, which a never-resolved launch cannot provide) — documented, not fixable
    * at this layer.
    */
-  const killMatches = (): Map<number, { pid: number; startTime: string }> => {
+  /** Errno-aware stat for the phase-1a EXISTENCE decision (codex r10): a transiently-unreadable stat
+   *  (EMFILE/EIO in the gateway) must not read as "exited" — when it is the only match, that skip would
+   *  leave `stamped` empty and false-confirm. Vanish/foreign → undefined; gateway-side → throw. The
+   *  confirm-side reads (leader upgrade, revalidation, recycle check) stay LENIENT — a failure there
+   *  skips a signal or keeps a group owed, both fail-safe. */
+  const statOf = (pid: number): { pgrp: number; startTime: string } | undefined => {
+    const stat = readProcStat(pid, procRoot);
+    if (stat) return stat;
+    try {
+      readFileSync(join(procRoot, String(pid), "stat"), "utf8");
+    } catch (err) {
+      if (!vanishedOrForeign(err)) throw err;
+      return undefined; // genuinely gone / not ours to read
+    }
+    return undefined; // readable but unparseable — a malformed entry, not our Chrome
+  };
+
+  const mergeStamp = (into: Map<number, { pid: number; startTime: string }>, pgrp: number, rep: { pid: number; startTime: string }): void => {
+    const existing = into.get(pgrp);
+    if (existing === undefined || rep.pid === pgrp) into.set(pgrp, rep);
+  };
+
+  const killMatches = (into: Map<number, { pid: number; startTime: string }>): number => {
     // Keyed by PROCESS GROUP, one stamp each (codex r4) — see {@link SweepStamp}. TWO PHASES (codex r5
     // P2): observe-and-stamp EVERYTHING — including the leader-generation upgrade — BEFORE the first
     // signal. Upgrading after the kill races it: a wrapper-shaped group (only a non-leader carries the
     // marker) whose leader dies first would retain a non-leader stamp, and a later pgid reuse could then
-    // never be proven (permanently pinned capacity for an already-gone tree).
-    const stamped = new Map<number, { pid: number; startTime: string }>();
+    // never be proven (permanently pinned capacity for an already-gone tree). Codex r10: every
+    // observation merges into the caller's DURABLE ledger `into` IMMEDIATELY, so a scan failure later in
+    // the same pass (EMFILE mid-scan) cannot lose a group that was already observed — and possibly
+    // already signaled; the caller converts the throw into `unconfirmed` + the accumulated stamps.
+    // Returns the number of groups DISCOVERABLE this pass (known or new — the confirm gate needs
+    // "nothing is discoverable right now", not "nothing new").
+    const observed = new Map<number, { pid: number; startTime: string }>();
     // Phase 1a — stamp every launch-owned pid (marker + dir-reference discovery), leader-preferred.
     for (const pid of findLaunchPids()) {
-      const stat = readProcStat(pid, procRoot);
-      if (!stat) continue; // exited since the scan — never signal an unverifiable pid
+      const stat = statOf(pid);
+      if (!stat) continue; // genuinely exited/foreign — never signal an unverifiable pid
       if (!belongsToLaunch(pid)) continue; // recycled between scan and stat — NOT ours; never signal
-      const existing = stamped.get(stat.pgrp);
-      if (existing === undefined || pid === stat.pgrp) {
-        stamped.set(stat.pgrp, { pid, startTime: stat.startTime });
-      }
+      mergeStamp(observed, stat.pgrp, { pid, startTime: stat.startTime });
+      mergeStamp(into, stat.pgrp, observed.get(stat.pgrp) as { pid: number; startTime: string });
     }
     // Phase 1b — upgrade any non-leader representative to the group leader's own generation when
     // readable (the leader need not carry the marker; its stat is the group's identity). Pre-signal, so
     // the read cannot race our own kill.
-    for (const [pgrp, rep] of stamped) {
+    for (const [pgrp, rep] of observed) {
       if (rep.pid === pgrp) continue;
       const leader = readProcStat(pgrp, procRoot);
-      if (leader && leader.pgrp === pgrp) stamped.set(pgrp, { pid: pgrp, startTime: leader.startTime });
+      if (leader && leader.pgrp === pgrp) {
+        const up = { pid: pgrp, startTime: leader.startTime };
+        observed.set(pgrp, up);
+        mergeStamp(into, pgrp, up);
+      }
     }
-    // Phase 2 — one group-SIGKILL per stamped group (the #50 discipline: renderers/crashpad live in the
-    // leader's group without carrying the marker themselves). Codex r6: REVALIDATE each group's
-    // representative immediately before its signal — the two-phase split widened the stamp→signal window
-    // (it now spans the whole scan), and under the small pid space a stamped group can exit and have its
-    // pgid reused inside it. A representative that vanished or changed generation ⇒ skip the signal (the
-    // confirm loop re-decides; a still-live group re-matches on the next rescan). This narrows the race
-    // back to the irreducible microsecond TOCTOU documented on phase 1. ESRCH = already gone — swallowed.
-    for (const [pgrp, rep] of stamped) {
+    // Phase 2 — one group-SIGKILL per group observed THIS PASS (the #50 discipline: renderers/crashpad
+    // live in the leader's group without carrying the marker themselves). Codex r6: REVALIDATE each
+    // group's representative immediately before its signal — the two-phase split widened the
+    // stamp→signal window (it now spans the whole scan), and under the small pid space a stamped group
+    // can exit and have its pgid reused inside it. A representative that vanished or changed generation
+    // ⇒ skip the signal (the confirm loop re-decides; a still-live group re-matches on the next rescan).
+    // This narrows the race back to the irreducible microsecond TOCTOU documented on phase 1. ESRCH =
+    // already gone — swallowed.
+    for (const [pgrp, rep] of observed) {
       const s = readProcStat(rep.pid, procRoot);
       if (!s || s.startTime !== rep.startTime || s.pgrp !== pgrp) continue; // not provably ours anymore
       try {
@@ -248,7 +282,7 @@ export async function sweepOrphanProcesses(
         // ESRCH/EPERM: gone, or not ours to signal — either way the confirm pass below decides
       }
     }
-    return stamped;
+    return observed.size;
   };
 
   /**
@@ -285,11 +319,16 @@ export async function sweepOrphanProcesses(
     const existing = stamped.get(s.pgrp);
     if (existing === undefined || s.pid === s.pgrp) stamped.set(s.pgrp, { pid: s.pid, startTime: s.startTime });
   }
-  for (const [pgrp, rep] of killMatches()) {
-    const existing = stamped.get(pgrp);
-    if (existing === undefined || rep.pid === pgrp) stamped.set(pgrp, rep);
-  }
   const owedStamps = (): SweepStamp[] => [...stamped].map(([pgrp, rep]) => ({ pid: rep.pid, startTime: rep.startTime, pgrp }));
+  try {
+    killMatches(stamped);
+  } catch (err) {
+    // Codex r10: a scan failure after groups were observed (and possibly signaled) must not lose them —
+    // return them as OWED so the retry keeps confirming. With nothing owed at all, reject plainly (the
+    // manager's error arm retries with nothing lost).
+    if (stamped.size === 0) throw err;
+    return { result: "unconfirmed", stamps: owedStamps() };
+  }
   if (stamped.size === 0) return { result: "confirmed" }; // nothing lives under this profile RIGHT NOW (see
   // OrphanDirOps note: the CALLER must treat an empty-scan confirm on a still-PENDING launch as
   // provisional — the launcher may spawn later; the manager's watch-list covers that window.)
@@ -315,13 +354,16 @@ export async function sweepOrphanProcesses(
     // stamping entirely and a later attempt confirm over its argless survivor. A per-poll rescan stamps
     // (and kills) every group at its earliest observable moment. Bounded: one scan per poll for at most
     // confirmMs, only while a sweep is active.
-    const fresh = killMatches();
-    for (const [pgrp, rep] of fresh) {
-      const existing = stamped.get(pgrp);
-      if (existing === undefined || rep.pid === pgrp) stamped.set(pgrp, rep);
+    let discoverable: number;
+    try {
+      discoverable = killMatches(stamped);
+    } catch {
+      // Codex r10: a rescan failure mid-confirm keeps every accumulated stamp OWED (an already-killed
+      // carrier group must not vanish from the ledger because a later scan hit fd pressure).
+      return { result: "unconfirmed", stamps: owedStamps() };
     }
     const allGone = [...stamped].every(([pgrp, rep]) => groupGone(pgrp, rep));
-    if (allGone && fresh.size === 0) return { result: "confirmed" };
+    if (allGone && discoverable === 0) return { result: "confirmed" };
     if (now() >= deadline) return { result: "unconfirmed", stamps: owedStamps() };
     await sleep(SWEEP_POLL_MS);
   }

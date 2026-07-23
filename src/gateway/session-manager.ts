@@ -876,6 +876,12 @@ export class SessionManager {
     // CLI the loud retained-watch line below flags it.
     await Promise.allSettled([...this.#orphans, ...this.#watch].map((rec) => this.#sweepOrphan(rec)));
     await Promise.allSettled([...this.#orphanWork]);
+    // Codex r10: a timed-out launch can RESOLVE during the drains above — its late teardown may have
+    // just parked a session in `#unconfirmed` AFTER the reconfirm loop already ran. One more bounded
+    // reconfirm pass so shutdown doesn't return with a browser the very next kill would confirm dead.
+    for (let i = 0; i < SHUTDOWN_RECONFIRM_TRIES && this.#unconfirmed.size > 0; i++) {
+      await this.#drainUnconfirmed();
+    }
     // Do NOT unconditionally clear the maps (issue #50): a confirmed teardown already removed itself from
     // #sessions/#closing/#unconfirmed, so anything STILL present is a browser we could not confirm dead.
     // Erasing it would report a clean shutdown (activeCount 0) while a process may be alive — the exact
