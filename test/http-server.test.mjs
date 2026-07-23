@@ -584,3 +584,17 @@ test("#53: an EMPTY configured health token never matches (no accidental open ti
     server.closeAllConnections?.();
   }
 });
+
+test("#53 r11: healthToken set with NO operatorHealth producer → the token is honored, gets the consumer-tier body (not 401)", async () => {
+  const { deps } = makeDeps({ healthToken: "op-secret" }); // no operatorHealth wired
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  try {
+    const op = await fetch(new URL("/health", url.origin), { headers: { Authorization: "Bearer op-secret" } });
+    assert.equal(op.status, 200, "the operator token is recognized even without a producer (contract)");
+    assert.deepEqual(await op.json(), { status: "ok" }, "falls back to the bare consumer-tier liveness body");
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});

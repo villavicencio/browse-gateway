@@ -310,13 +310,19 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
         return sendError(res, 403, -32003, "forbidden");
       }
       const bearer = parseBearer(req.headers["authorization"]);
+      // Codex #53 r11: match the operator token INDEPENDENTLY of whether a counters producer is wired —
+      // the documented contract is "healthToken set → that token is recognized; with no operatorHealth
+      // it falls back to the consumer-tier body", so requiring `operatorHealth` here would 401 the
+      // dedicated token against its own contract. `operatorHealth ?? health` serves counters when a
+      // producer exists, else the bare `{status:"ok"}` liveness (which the CLI shape-check then reads as
+      // "unavailable" — coherent: no producer, no counters). The token-MATCH gate is unchanged (non-empty
+      // + timing-safe), so this never broadens WHO matches, only what body a match receives.
       if (
         deps.healthToken !== undefined &&
         deps.healthToken !== "" &&
-        deps.operatorHealth !== undefined &&
         timingSafeTokenEqual(bearer, deps.healthToken)
       ) {
-        return sendHealth(res, deps.operatorHealth);
+        return sendHealth(res, deps.operatorHealth ?? deps.health);
       }
       try {
         deps.authenticate(bearer);
