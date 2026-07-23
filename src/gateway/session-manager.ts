@@ -882,6 +882,9 @@ export class SessionManager {
     for (let i = 0; i < SHUTDOWN_RECONFIRM_TRIES && this.#unconfirmed.size > 0; i++) {
       await this.#drainUnconfirmed();
     }
+    // Codex r11: that pass can itself QUEUE dir removals (#removeOwnedDir → #orphanWork) — drain them
+    // too, or the caller's process.exit(0) races the pending rm and leaks the profile dir.
+    await Promise.allSettled([...this.#orphanWork]);
     // Do NOT unconditionally clear the maps (issue #50): a confirmed teardown already removed itself from
     // #sessions/#closing/#unconfirmed, so anything STILL present is a browser we could not confirm dead.
     // Erasing it would report a clean shutdown (activeCount 0) while a process may be alive — the exact
