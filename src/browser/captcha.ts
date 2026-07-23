@@ -31,13 +31,18 @@ export const SOLVABLE_CAPTCHA_KINDS = ["recaptcha", "turnstile", "hcaptcha"] as 
 /** Whether the solver architecture can (in principle) solve this kind — a pure property of the kind,
  *  independent of whether a solver instance is wired or has budget.
  *
- *  DEFERRED (issue #44, HOLD): finer eligibility for a Turnstile widget that co-fires with a Cloudflare
- *  hint. #40 attributes such a page `cf-challenge` → `wafVendor=cloudflare` (WAF-first) and can leave
- *  `captchaKind` unset, so eligibility reads as a generic CF block rather than the (solvable) Turnstile
- *  widget it is. Promoting `turnstile` over `cf-challenge` is BLOCKED on a captured CF *managed-challenge*
- *  fixture: without ground truth on whether the Under-Attack interstitial itself carries a
- *  `cf-turnstile-response` / `class="cf-turnstile"` container, promoting it risks mislabeling managed
- *  challenges. Capture the fixture, then decide precedence. (Codex #40 r8.) */
+ *  RESOLVED-NEEDLESS (issue #44, HOLD closed 2026-07-23): the deferred "promote `turnstile` over
+ *  `cf-challenge` when a widget co-fires with a CF hint" precedence change is a NON-ISSUE and was NOT
+ *  made. Eligibility rides the DETECTED widget — `captchaKind` (from `activeCaptchaKind(html)`) →
+ *  `isSolvableCaptchaKind` — INDEPENDENTLY of the WAF-first `reason`/`wafVendor` label, so a Turnstile
+ *  widget co-firing with `cfHint` still surfaces `solverEligible=true` even though the vendor reads
+ *  `cloudflare` (the deliberate #40-r2 precedence). Turnstile is also solvable now (`captcha-solver`
+ *  `TASK_TYPE.turnstile`), so there is no unsolvable-kind signal to preserve; promoting it would only
+ *  change a telemetry string and would regress the tested WAF-first behavior. The feared managed-
+ *  challenge mislabel can't happen: a `/cdn-cgi/challenge-platform/` interstitial matches none of the
+ *  turnstile `WIDGET_EVIDENCE` regexes → `activeCaptchaKind` returns undefined. See
+ *  `docs/plans/2026-07-22-003-44-turnstile-precedence-design.local.md` and the `#44 needless:` guards
+ *  in `test/block-classifier.test.mjs`. (Was Codex #40 r8.) */
 export function isSolvableCaptchaKind(kind: CaptchaKind): boolean {
   return (SOLVABLE_CAPTCHA_KINDS as readonly string[]).includes(kind);
 }
