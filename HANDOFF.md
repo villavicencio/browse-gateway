@@ -13,9 +13,10 @@ docs/test commits only.
 - **Prod: `sha256:4becdf0a…` = git `978cc89`** (unchanged — no deploy this session). Rollback anchor
   **`sha256:961e149d…`** (= `754f6a8`, #54P2+#53). `#53` is live + provisioned (prior session):
   `obscura status` → `✓ pool healthy — force-kill armed, 0 unconfirmed, 0/7 sessions`.
-- **main == `7f3f3a6`** — two commits ahead of the prod image, BOTH non-prod-affecting:
-  `33e3e80` (#44 test+comment, PR #77) and `7f3f3a6` (#48 solution doc). `docs/` is not COPYed into the
-  image and the #44 change is test-only, so prod needs no redeploy. `prodDeployNeeded:false` for both.
+- **main is ahead of the prod image by the session's docs/test commits, ALL non-prod-affecting:**
+  `33e3e80` (#44 test+comment, PR #77), `7f3f3a6` (#48 solution doc), + this handoff commit (tip of
+  main). `docs/` is not COPYed into the image and the #44 change is test-only, so prod needs no redeploy.
+  `prodDeployNeeded:false` for all of them.
 
 ## What We Did (this session)
 
@@ -88,6 +89,10 @@ Pick any of the above only on operator direction.
 - **Verify-and-close discipline paid off twice.** A HOLD ticket's own premise can go stale between
   filing and pickup — re-verify the premise against current code BEFORE building. Both #44 and #48'
   design docs had predicted their own likely resolution ("may be needless" / "(C) is acceptable").
+- **Dangling-issue sweep when wrapping an epic.** #67 stayed OPEN because PR #69's title was `fix(#67):`
+  with no `Closes #67` in the body — GitHub doesn't auto-close from the title. When closing an epic,
+  cross-check every child/follow-up issue's state against what actually merged; a `fix(#N):`-titled PR is
+  the usual straggler.
 - **Codex runner** (unchanged, for when code work resumes): `codex exec review --base main`, detached
   (`nohup … &` + a `kill -0` watcher) — it now routinely exceeds the 600s Bash cap.
 - **Public repo** — never commit fleet codenames; design docs with fleet detail stay `.local.md`.
