@@ -12,7 +12,7 @@
 export type Category = "cloudflare" | "datadome";
 
 import type { CaptchaSolver, CaptchaKind, CaptchaSolveReason } from "./captcha.js";
-import type { FailureDiagnostics, Timing } from "../observability/index.js";
+import type { FailureDiagnostics, SelfBlockedNav, Timing } from "../observability/index.js";
 
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
 export interface ProxyConfig {
@@ -197,6 +197,14 @@ export interface RenderResult {
    */
   diagnostics?: FailureDiagnostics;
   /**
+   * #80 self-inflicted policy block: set when THIS render's main-frame navigation was aborted by the
+   * gateway's own nav guard (net::ERR_BLOCKED_BY_CLIENT — an off-allowlist target). Carries the blocked
+   * host + the guard's block reason. Drives the retrieve path's `policy-blocked` FailureClass and excludes
+   * the failure from burned-exit re-roll. TOP-FRAME-scoped (a benign off-allowlist subresource never sets
+   * it). Mirrors {@link PageSnapshot.policyBlocked} on the drive path.
+   */
+  policyBlocked?: SelfBlockedNav;
+  /**
    * Per-stage {@link Timing} (issue #42) — the wall-clock stage breakdown (totalMs + domContentLoaded /
    * clearancePoll / snapshot). Set by the core on EVERY render (success and failure), a first-class field
    * independent of the failure-only {@link diagnostics} envelope. The retrieve verb overwrites `totalMs`
@@ -293,6 +301,17 @@ export interface PageSnapshot {
    */
   ddHint?: boolean;
   /**
+   * #80 self-inflicted policy block: set when THIS main-frame navigation was aborted by the gateway's own
+   * navigation guard (net::ERR_BLOCKED_BY_CLIENT — an off-owner / off-allowlist target; the guard is the
+   * sole client-blocker). Carries the blocked `host` + the guard's closed-vocab block `reason` (threaded
+   * from the guard via the decision-safe {@link NavigationBlockInfo} side-channel). Drives the
+   * `policy-blocked` FailureClass so the failure is diagnosed as OUR policy — never a credential/exit fault
+   * — and never re-rolls a fresh exit (which cannot fix an off-allowlist target). TOP-FRAME-scoped
+   * (`req.frame() === page.mainFrame()`): a benign off-allowlist SUBRESOURCE block (ads/analytics) never
+   * sets it. Set by navigate(); a post-action snapshot of the same page carries whatever the last nav set.
+   */
+  policyBlocked?: SelfBlockedNav;
+  /**
    * The interactive CAPTCHA widget kind ({@link CaptchaKind}: recaptcha/hcaptcha/turnstile) detected in
    * the page HTML, or absent when none. Carried so the drive failure envelope can attribute a bare CAPTCHA
    * page's vendor at parity with retrieve (issue #40) — a widget with a visible verify phrase but no
@@ -348,6 +367,18 @@ export interface PageSnapshot {
 
 export type NavigationDecision = "allow" | "block";
 
+/**
+ * DECISION-SAFE side-channel (#80): a write-only out-param a {@link NavigationGuard} MAY fill when it
+ * returns `"block"`, carrying the guard's own block `reason` (the same closed-vocab string it records to
+ * the audit log). The returned decision is computed INDEPENDENTLY and never reads this object, so the
+ * fail-closed invariant is preserved — the interception layer reads it purely for DIAGNOSTICS (to classify
+ * a main-frame self-block as `policy-blocked`). Optional everywhere: a guard called without an `out` (the
+ * decision-only callers + tests) behaves exactly as before.
+ */
+export interface NavigationBlockInfo {
+  reason?: string;
+}
+
 /** The fields the navigation guard sees for each intercepted request. */
 export interface NavigationRequest {
   url: string;
@@ -362,7 +393,7 @@ export interface NavigationRequest {
  * the network layer. Installed below the verb layer (via Fetch interception) so it can't be
  * bypassed by a raw CDP `Page.navigate` — the U3 allowlist guarantee.
  */
-export type NavigationGuard = (req: NavigationRequest) => NavigationDecision;
+export type NavigationGuard = (req: NavigationRequest, out?: NavigationBlockInfo) => NavigationDecision;
 
 /**
  * How a `drive` verb identifies an element: a `ref` from a {@link PageSnapshot} (the primary

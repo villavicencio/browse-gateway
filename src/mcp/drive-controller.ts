@@ -171,6 +171,9 @@ export class GatewayDriveController implements DriveController {
       ddHint: snap.ddHint,
       captchaKind: snap.captchaKind,
       finalUrl: snap.url,
+      // #80: a MAIN-FRAME self-block (the gateway's own guard aborted the nav) → classifyFailure returns
+      // `policy-blocked` (top precedence) and isDeadExit excludes it from burned-exit re-roll.
+      policyBlocked: snap.policyBlocked !== undefined,
     };
   }
 
@@ -957,7 +960,7 @@ export class GatewayDriveController implements DriveController {
       // drive snapshot — so a responded-but-truncated proxied attempt (deadlineTruncated, or status-null with
       // a receipt) counts as a LIVE response, not a burned exit (the same precision retrieve has). The
       // `status`-presence fallback remains only for receipt-less fixtures.
-      if (!isDeadExit(snap.responseReceived, snap.status ?? null, snap.url)) {
+      if (!isDeadExit(snap.responseReceived, snap.status ?? null, snap.url, snap.policyBlocked !== undefined)) {
         sawLiveResponse = true;
         lastLive = snap; // #45 (codex r8): a later dead exit must not erase this site block from the class
       }
@@ -985,7 +988,7 @@ export class GatewayDriveController implements DriveController {
     // failure, not the dead final `last`, so the reason/class/message stay site-attributed (not nav-failed).
     // Only when NOT a timeout/burn (those override the class anyway) and the final snapshot is actually dead.
     const failSnap =
-    !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.responseReceived, last.status ?? null, last.url)
+    !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.responseReceived, last.status ?? null, last.url, last.policyBlocked !== undefined)
       ? lastLive
       : last; // #67/#66: receipt-keyed dead check (the core now carries the receipt; status fallback for fixtures)
     // #45: skip the opt-in egress probe when we bailed on budget — it is one more proxied request past an

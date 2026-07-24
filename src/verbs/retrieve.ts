@@ -298,6 +298,12 @@ export interface FailureSignal extends BlockSignal {
    *  snapshot directly (whose receipt the core populates as of #66) and leaves this unset (like
    *  frameworkRoot/networkFailed). */
   responseReceived?: boolean;
+  /** #80: THIS navigation was aborted by the gateway's OWN nav guard on the MAIN FRAME
+   *  (net::ERR_BLOCKED_BY_CLIENT) — a self-inflicted policy block. {@link classifyFailure} returns
+   *  `policy-blocked` (top precedence), and {@link isDeadExit} excludes it from burned-exit re-roll (a fresh
+   *  exit cannot fix an off-allowlist target). retrieve sets it from `render.policyBlocked`; drive from the
+   *  snapshot's `policyBlocked` (both via `!== undefined`). */
+  policyBlocked?: boolean;
 }
 
 /** True when a URL is a Chrome error page (`chrome-error://…`) — a dead nav (reset socket / unreachable
@@ -327,7 +333,12 @@ export function isDeadExit(
   responseReceived: boolean | undefined,
   status: number | null | undefined,
   finalUrl: string | undefined,
+  policyBlocked?: boolean,
 ): boolean {
+  // #80: a self-inflicted policy block is NEVER a dead exit — our OWN guard aborted the nav before it
+  // reached the site (no exit was even tried), so re-rolling the residential pool (burned-exit) can't help
+  // and would burn the retry budget on an off-allowlist target. Excluded up front (positive-signal-only).
+  if (policyBlocked) return false;
   const responded = responseReceived ?? typeof status === "number";
   return !responded || isChromeErrorUrl(finalUrl);
 }
@@ -477,6 +488,10 @@ export function genuineNetworkFailure(networkFailures: readonly string[] | undef
  * a rendered-evidence challenge-shell detector that folds into the block DECISION — a deferred follow-up.
  */
 export function classifyFailure(sig: FailureSignal): FailureClass {
+  // #80: a self-inflicted policy block (the gateway's own guard aborted this MAIN-FRAME navigation) is the
+  // most authoritative + most-actionable class — it OUTRANKS every site/exit signal below (a fresh exit
+  // cannot fix an off-allowlist target, and the block never reached the site). Highest precedence.
+  if (sig.policyBlocked) return "policy-blocked";
   // A dead nav that reached a chrome-error:// page can inherit a STALE non-null status from a prior
   // document, defeating resolveBlockReason's status===null nav-failed test — attribute it up front from the
   // final URL (codex #41 r1/r2). retrieve derives finalUrl from render.diagnostics.finalUrl, drive from the
@@ -915,7 +930,7 @@ export async function retrieve(
       // a visible/hard block, OR — #67 — a response that arrived but timed out before DCL, not a null/chrome-error
       // dead nav), the failure is site-attributable, so this is NOT an all-exits-dead burn. Tracked across
       // attempts; if the loop exhausts still-false, every exit died.
-      if (!isDeadExit(render.responseReceived, render.status, render.diagnostics?.finalUrl)) {
+      if (!isDeadExit(render.responseReceived, render.status, render.diagnostics?.finalUrl, render.policyBlocked !== undefined)) {
         sawLiveProxiedResponse = true;
         lastLiveRender = render; // #45 (codex r8): remember it — a later dead exit must not erase this site block
       }
@@ -1017,6 +1032,9 @@ export async function retrieve(
     // The post-redirect / post-client-nav landed URL — lets classifyFailure catch a dead nav that reached a
     // chrome-error page while the (fresh-page) status stayed at the initial 200 (codex #41 r2).
     ...(render.diagnostics?.finalUrl !== undefined ? { finalUrl: render.diagnostics.finalUrl } : {}),
+    // #80: a MAIN-FRAME self-block (the gateway's own guard aborted the nav) → `policy-blocked` (top
+    // precedence in classifyFailure) + excluded from the burned-exit gate below (no exit was ever tried).
+    ...(render.policyBlocked !== undefined ? { policyBlocked: true } : {}),
   };
   // Diagnostic reason for the block: nav-failed (off-allowlist/unreachable) first, then the shared
   // resolveBlockReason — a SPECIFIC WAF vendor (cf/px/datadome) wins, and an interactive CAPTCHA
@@ -1042,7 +1060,7 @@ export async function retrieve(
   // reachable, so all-proxied-dead is exit-attributable. The FORCED path SKIPS that direct check, so an
   // off-allowlist/guard-aborted or DNS/TLS-dead target would produce the same all-null signal on HEALTHY exits
   // — not a burn. Without reachability evidence we stay `nav-failed` (positive-signal-only, the #40 doctrine).
-  const deadExit = isDeadExit(signal.responseReceived, signal.status, signal.finalUrl);
+  const deadExit = isDeadExit(signal.responseReceived, signal.status, signal.finalUrl, signal.policyBlocked);
   const burnedExit = proxyUsed && !forced && !budgetExceeded && deadExit && !sawLiveProxiedResponse;
   // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
   // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /

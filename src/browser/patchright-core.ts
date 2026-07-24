@@ -37,6 +37,7 @@ import type {
   BrowserCoreOptions,
   DriveTarget,
   FieldState,
+  NavigationBlockInfo,
   NavigationDecision,
   NavigationGuard,
   NavigationRequest,
@@ -181,10 +182,13 @@ export function decideRequest(
   guard: NavigationGuard | undefined,
   event: FetchRequestPaused,
   onError?: (err: unknown) => void,
+  out?: NavigationBlockInfo,
 ): NavigationDecision {
   if (!guard) return "block";
   try {
-    return guard(cdpRequestToNavigation(event.resourceType, event.request?.url ?? ""));
+    // #80: forward the decision-safe `out` side-channel so a block's reason is captured alongside the
+    // verdict. The guard writes `out.reason` ONLY on a block; the returned decision is independent of it.
+    return guard(cdpRequestToNavigation(event.resourceType, event.request?.url ?? ""), out);
   } catch (err) {
     onError?.(err);
     return "block";
@@ -537,6 +541,20 @@ export class PatchrightBrowserCore implements BrowserCore {
   #consoleErrors: string[] = [];
   #networkFailures: string[] = [];
   /**
+   * #80: the most recent Document-navigation BLOCK the guard emitted (blocked host + its reason), captured
+   * at the CDP decision seam. A holder consulted by the MAIN-FRAME requestfailed listener to attach the
+   * guard's reason to a self-block. Includes subframe-document blocks too; the PROMOTION to a first-class
+   * self-block is top-frame-scoped at the page listener, so a subframe entry is never surfaced. Per-nav reset.
+   */
+  #lastNavBlock?: { host: string; reason?: string };
+  /**
+   * #80: THIS navigation was aborted by the gateway's OWN guard on the MAIN FRAME (net::ERR_BLOCKED_BY_CLIENT
+   * — the sole client-blocker). Set by the top-frame-scoped requestfailed listener; folded into the snapshot
+   * (`policyBlocked`) + the failure envelope (`selfBlockedNav`) so the failure classifies as `policy-blocked`.
+   * Per-nav reset.
+   */
+  #policyBlockedNav?: { host: string; reason?: string };
+  /**
    * #42: the last drive ACTION's settle stages (clearance-poll + captcha-solve wall-clock), stashed by
    * {@link #act}/{@link pressKey} and consumed ONCE by the next {@link #snapshotOf}. A drive action verb
    * returns void and its snapshot is a SEPARATE core call, so this bridges the settle timing across that
@@ -833,6 +851,7 @@ export class PatchrightBrowserCore implements BrowserCore {
         consoleErrors: this.#consoleErrors,
         networkFailures: this.#networkFailures,
         ...(screenshotRef !== undefined ? { screenshotRef } : {}),
+        ...(this.#policyBlockedNav ? { selfBlockedNav: this.#policyBlockedNav } : {}), // #80
       });
       // #42: clearanceWaitedMs (the sleep-interval counter) stays a first-class field for the stealth
       // kill-gate; timing.clearancePollMs is the accurate wall-clock (>= clearanceWaitedMs). The retrieve
@@ -847,7 +866,16 @@ export class PatchrightBrowserCore implements BrowserCore {
         clearancePollMs,
         snapshotMs,
       });
-      return { url, status, responseReceived, ...final, clearanceWaitedMs: waited, diagnostics, timing };
+      return {
+        url,
+        status,
+        responseReceived,
+        ...final,
+        clearanceWaitedMs: waited,
+        diagnostics,
+        timing,
+        ...(this.#policyBlockedNav ? { policyBlocked: this.#policyBlockedNav } : {}), // #80
+      };
     } finally {
       await page.close().catch(() => {});
     }
@@ -930,11 +958,26 @@ export class PatchrightBrowserCore implements BrowserCore {
     // (Redirect-chain capture moved to the page "request" listener in #attachEvidenceListeners — it is
     // MAIN-FRAME-scoped and fires the per-navigation evidence reset, which the CDP layer can't see here.)
     // During close() Fetch.disable would auto-CONTINUE a still-paused request (allow); fail it instead.
+    // #80: capture the guard's block reason via the decision-safe out side-channel (write-only; never reads
+    // back into the decision). Populated only on a block; ignored during teardown (no guard runs).
+    const blockInfo: NavigationBlockInfo = {};
     const decision: NavigationDecision = this.#closing
       ? "block"
-      : decideRequest(this.#activeGuard, event, (err) => {
-          process.stderr.write(`[browse-gateway] navigation guard threw; request blocked (${errCode(err, this.#redact)})\n`);
-        });
+      : decideRequest(
+          this.#activeGuard,
+          event,
+          (err) => {
+            process.stderr.write(`[browse-gateway] navigation guard threw; request blocked (${errCode(err, this.#redact)})\n`);
+          },
+          blockInfo,
+        );
+    // #80: stash a BLOCKED Document-navigation's host + guard reason so the (top-frame-scoped) requestfailed
+    // listener can attach the reason to a MAIN-FRAME self-block. `resourceType === "Document"` includes
+    // subframe docs; the promotion to a first-class self-block is top-frame-scoped at the page listener.
+    if (decision === "block" && event.resourceType === "Document") {
+      const host = hostFromUrl(event.request?.url ?? "");
+      this.#lastNavBlock = { host, ...(blockInfo.reason !== undefined ? { reason: blockInfo.reason } : {}) };
+    }
     try {
       if (decision === "allow") {
         // No url/header overrides: the request egresses unchanged via the context-level proxy and
@@ -1185,6 +1228,8 @@ export class PatchrightBrowserCore implements BrowserCore {
     this.#redirectChain = [];
     this.#consoleErrors = [];
     this.#networkFailures = [];
+    this.#lastNavBlock = undefined; // #80: the guard-reason holder is per-navigation, like the buffers above
+    this.#policyBlockedNav = undefined; // #80: a fresh navigation has not (yet) self-blocked
   }
 
   /**
@@ -1232,6 +1277,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       try {
         const errText = req.failure()?.errorText ?? "failed";
         this.#pushEvidence(this.#networkFailures, `${req.method()} ${req.url()} ${errText}`);
+        // #80: a MAIN-FRAME navigation that failed with net::ERR_BLOCKED_BY_CLIENT is a SELF-inflicted policy
+        // block — the gateway's own nav guard is the sole client-blocker. TOP-FRAME-scoped
+        // (req.frame()===mainFrame() AND isNavigationRequest), so a benign off-allowlist SUBRESOURCE
+        // (ads/analytics/fonts) never sets it. Attach the guard's reason captured at the decision seam,
+        // matched by host (a redirect hop's guard reason is deterministic per host).
+        if (req.isNavigationRequest() && req.frame() === page.mainFrame() && /ERR_BLOCKED_BY_CLIENT/i.test(errText)) {
+          const host = hostFromUrl(req.url());
+          const reason = this.#lastNavBlock?.host === host ? this.#lastNavBlock.reason : undefined;
+          this.#policyBlockedNav = { host, ...(reason !== undefined ? { reason } : {}) };
+        }
       } catch {
         // ignore
       }
@@ -1641,6 +1696,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       consoleErrors: this.#consoleErrors,
       networkFailures: this.#networkFailures,
       ...(screenshotRef !== undefined ? { screenshotRef } : {}),
+      ...(this.#policyBlockedNav ? { selfBlockedNav: this.#policyBlockedNav } : {}), // #80
     });
     const snapshotMs = performance.now() - t0;
     // #42: fold in any pending drive-action settle stages (consume-once), so a post-action snapshot after a
@@ -1665,6 +1721,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       ...(captchaKind ? { captchaKind } : {}),
       ...(solverEligible !== undefined ? { solverEligible } : {}),
       ...(captchaSolveReason ? { captchaSolveReason } : {}),
+      ...(this.#policyBlockedNav ? { policyBlocked: this.#policyBlockedNav } : {}), // #80
     };
   }
 
