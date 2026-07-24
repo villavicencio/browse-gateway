@@ -339,6 +339,13 @@ async function readChildFrames(page: PatchrightPage): Promise<string> {
  *  pays the full, bounded ceiling — correctness (never returning a live fat-frame challenge as healthy) over
  *  latency, and the cost is bounded and pxHint-scoped (a healthy page never reaches here).
  *
+ *  When `topHtml` is supplied and ALREADY carries the challenge copy (an inline / top-frame press-&-hold),
+ *  there is nothing to wait for in the child frames — the caller has already detected the challenge from the
+ *  top document — so skip the poll entirely. Without this, a top-frame PX page (pxHint set, copy in `topHtml`,
+ *  no child frame that will ever hold it) would burn the full bounded poll on EVERY render, and near the
+ *  shared call deadline could tip an anti-bot result into a timeout. The drive `#snapshotOf` caller already
+ *  short-circuits via `||`; this makes the retrieve `snapshot()` caller equivalent.
+ *
  *  EXPORTED for the deterministic poll unit test (test/px-frame-poll.test.mjs): a real-browser gate can't
  *  isolate the poll — render()'s own settle wait outlasts a late injection, so a one-shot read would pass the
  *  gate too — so the load-bearing regression guard is a fake-page unit test (blank→blank→copy) that fails if
@@ -352,7 +359,9 @@ const PX_FRAME_POLL_INTERVAL_MS = 250; // ≤ PX_FRAME_POLL_ATTEMPTS × this = 7
  *  above the handful of blocks a real navigation produces, so a legitimate main-frame reason is never evicted
  *  before its requestfailed reads it. */
 const MAX_NAV_BLOCK_ENTRIES = 32;
-export async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
+export async function captureChildFrameHtml(page: PatchrightPage, topHtml?: string): Promise<string> {
+  // Nothing to wait for if the top document already holds the copy (an inline / top-frame challenge).
+  if (topHtml !== undefined && hasPerimeterXChallengeCopy(topHtml)) return "";
   let html = await readChildFrames(page);
   for (let i = 0; i < PX_FRAME_POLL_ATTEMPTS && !hasPerimeterXChallengeCopy(html); i++) {
     await page.waitForTimeout(PX_FRAME_POLL_INTERVAL_MS).catch(() => {});
@@ -420,8 +429,10 @@ async function snapshot(page: PatchrightPage): Promise<PageSignal> {
   const html = String(await page.content().catch(() => ""));
   // Only walk child frames when the top doc carries a PX marker (the px-captcha-modal element is in
   // the top document even while its challenge body is in the frame) — so an ordinary page with ad
-  // iframes never pays the cost, and an iframe-served press-&-hold is still detectable.
-  const frameHtml = hasPerimeterXHint(html) ? await captureChildFrameHtml(page) : "";
+  // iframes never pays the cost, and an iframe-served press-&-hold is still detectable. Pass `html` so the
+  // helper skips its bounded poll when the copy is ALREADY in the top doc (an inline/top-frame challenge —
+  // nothing to wait for in the child frames); hasPxChallengeCopy(render) still detects it via render.html.
+  const frameHtml = hasPerimeterXHint(html) ? await captureChildFrameHtml(page, html) : "";
   return { title, text, html, frameHtml };
 }
 

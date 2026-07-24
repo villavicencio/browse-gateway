@@ -79,3 +79,20 @@ test("captureChildFrameHtml: a page with NO child frames returns blank without h
   const html = await captureChildFrameHtml(page);
   assert.equal(html, "", "no children → blank, bounded (the poll can't find copy that will never come)");
 });
+
+test("captureChildFrameHtml: short-circuits (no read, no sleep) when the TOP doc already holds the copy", async () => {
+  // An inline / top-frame press-&-hold: the copy is in the top document, which the caller already detects, so
+  // the helper must NOT burn its bounded poll walking child frames that will never hold it (Codex r3).
+  const page = fakePage(["", "", COPY]); // child frames WOULD eventually yield copy — but we must not wait
+  const html = await captureChildFrameHtml(page, "<div>Press &amp; Hold to confirm you are a human.</div>");
+  assert.equal(html, "", "returns blank immediately — nothing to wait for in child frames");
+  assert.equal(page.reads, 0, "did not read child frames at all");
+  assert.equal(page.sleeps, 0, "did not sleep (no 750ms burn on a top-frame challenge)");
+});
+
+test("captureChildFrameHtml: still polls child frames when topHtml is given but lacks the copy", async () => {
+  const page = fakePage(["", COPY]);
+  const html = await captureChildFrameHtml(page, "<main>ordinary fat page chrome, no challenge copy</main>");
+  assert.ok(hasPerimeterXChallengeCopy(html), "top lacks copy → poll child frames as usual");
+  assert.equal(page.reads, 2, "polled past the first blank read");
+});
