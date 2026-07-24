@@ -6,9 +6,10 @@
  * and is SECRET-FREE after redaction. Cannot run on the host (needs Docker/Xvfb + network).
  *
  * Checks:
- *   1. nav-failed (off-allowlist) — retrieve returns `blocked` with a populated `diagnostics`
+ *   1. policy-blocked (off-allowlist) — retrieve returns `blocked` with a populated `diagnostics`
  *      envelope (finalUrl + status), and the drive path THROWS an error carrying the same envelope
- *      (`failureOf(err)`), so both surfaces expose it at parity.
+ *      (`failureOf(err)`), so both surfaces expose it at parity. (An off-allowlist nav is the gateway's
+ *      OWN guard refusing the target — classified `policy-blocked` since #80, NOT `nav-failed`.)
  *   2. post-redirect finalUrl + redirectChain — a drive navigate through a 302 lands with
  *      `diagnostics.finalUrl` = the FINAL (post-redirect) URL and a multi-hop `redirectChain`
  *      (the retrieve URL-bug fix, proven on real evidence). (Notes if httpbin is unreachable.)
@@ -36,7 +37,7 @@ const cfApex = new URL(CF_TARGET).hostname.split(".").slice(-2).join(".");
 // A deterministic 302 → post-redirect finalUrl + a 2-hop redirect chain (best-effort; httpbin may be down).
 const REDIRECT_URL = "https://httpbin.org/redirect-to?url=https%3A%2F%2Fhttpbin.org%2Fhtml&status_code=302";
 const REDIRECT_FINAL = "https://httpbin.org/html";
-const OFF_ALLOWLIST = "https://www.google.com/"; // deliberately NOT in ALLOW → guard-blocked → nav-failed
+const OFF_ALLOWLIST = "https://www.google.com/"; // deliberately NOT in ALLOW → guard-blocked → policy-blocked (#80)
 const LINKED_PAGE = "https://example.com/"; // has an <a> to iana.org (OFF-allowlist) → a click-triggered failing nav
 const ALLOW = ["example.com", "*.example.com", "httpbin.org", "*.httpbin.org", cfApex, `*.${cfApex}`];
 
@@ -73,12 +74,13 @@ try {
   if (r.diagnostics) {
     check("envelope carries a finalUrl", typeof r.diagnostics.finalUrl === "string" && r.diagnostics.finalUrl.length > 0);
     check("envelope carries the (null) status field", "status" in r.diagnostics);
-    // A failed nav has no attributable vendor — #40 must fabricate none (the load-bearing rule). #41 lands
-    // the failure CLASS: an off-allowlist nav is classified `nav-failed` (a real class, not a fabricated
-    // vendor). wafVendor stays undefined (nav-failed has none). #42 now lands per-stage timing: the envelope
-    // carries a populated, non-negative totalMs (the whole-call wall-clock).
-    check("nav-failed is classified failureClass='nav-failed' with NO wafVendor (#40/#41)",
-      r.diagnostics.failureClass === "nav-failed" && r.diagnostics.wafVendor === undefined);
+    // A self-inflicted policy block has no attributable vendor — #40 must fabricate none (the load-bearing
+    // rule). #41 lands the failure CLASS: an off-allowlist nav is the gateway's OWN guard refusing the target,
+    // classified `policy-blocked` since #80 (a real class, not a fabricated vendor). wafVendor stays undefined
+    // (a policy block reached no site to attribute). #42 lands per-stage timing: the envelope carries a
+    // populated, non-negative totalMs (the whole-call wall-clock).
+    check("policy-blocked is classified failureClass='policy-blocked' with NO wafVendor (#40/#41/#80)",
+      r.diagnostics.failureClass === "policy-blocked" && r.diagnostics.wafVendor === undefined);
     check("envelope carries #42 timing with a non-negative totalMs (the wall-clock breakdown)",
       !!r.diagnostics.timing && typeof r.diagnostics.timing.totalMs === "number" && r.diagnostics.timing.totalMs >= 0);
     check("envelope is secret-free (no cookie/authorization value leaked)",
