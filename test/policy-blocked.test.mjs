@@ -201,6 +201,33 @@ test("drive: a FORCED-proxy policy block terminates the escalation loop with a p
   assert.equal(events.filter((e) => e[0] === "open").length, 1, "terminated on the FIRST proxied policy block (no re-roll)");
 });
 
+test("drive: a policy block on a LATER proxied attempt wins over an EARLIER live block (mixed exhaustion, non-forced)", async () => {
+  // The DRIVE twin of the retrieve mixed-exhaustion test: direct CF block → escalate; proxied 1 = a LIVE
+  // hard-block (sets lastLive); proxied 2 = a policy block → break. The failSnap ternary threads
+  // last.policyBlocked into isDeadExit (→ false), so failSnap = the policy snap, NOT lastLive — the class
+  // stays policy-blocked (load-bearing for drive-controller.ts:1048 + 1053).
+  let call = 0;
+  let n = 1;
+  const open = new Map();
+  const seq = [
+    { url: "u", title: "Just a moment...", tree: "Verifying you are human", status: 403, cfHint: true, diagnostics: { finalUrl: "u", status: 403 } }, // direct CF → escalate
+    { url: "u", title: "", tree: "Forbidden", status: 403, responseReceived: true, diagnostics: { finalUrl: "u", status: 403 } }, // proxied 1: LIVE hard-block → lastLive
+    policyBlockedSnap("https://off.example/"), // proxied 2: policy block → break
+  ];
+  const core = { async navigate() { const s = seq[Math.min(call, seq.length - 1)]; call++; return s; }, async snapshot() { return { url: "u", title: "", tree: "", status: null }; } };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + n++; open.set(id, { core }); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error("no session"); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  const c = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  const err = await c.navigate("https://target.example/").then(() => null, (e) => e);
+  assert.ok(err instanceof Error, "rejects");
+  assert.equal(failureOf(err)?.failureClass, "policy-blocked", "policy-blocked wins over the earlier live hard-block (failSnap=policy snap, not lastLive)");
+  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed headline, not a site-block message");
+});
+
 // --- navFailed: a policy block is a nav failure even with a STALE (action-triggered) non-null status ---
 test("navFailed: a policyBlocked snapshot fails even when it carries a STALE prior-page 200 status", () => {
   // An ACTION-triggered nav (click/submit) the guard aborts produces no new document response, so the
