@@ -35,7 +35,7 @@ import {
   MIN_ATTEMPT_BUDGET_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
-import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError, assembleTiming } from "../observability/index.js";
+import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError, assembleTiming, warmFailureAdvice } from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
 import type { VaultEntryStore } from "./vault-login.js";
@@ -486,7 +486,7 @@ export class GatewayDriveController implements DriveController {
           failure,
         );
       }
-      if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null), failure);
+      if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null, failure), failure);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
       throw attachFailure(
         new Error(
@@ -771,7 +771,7 @@ export class GatewayDriveController implements DriveController {
           failure,
         );
       }
-      throw attachFailure(this.#warmError(url, snap.status ?? null), failure);
+      throw attachFailure(this.#warmError(url, snap.status ?? null, failure), failure);
     }
     this.#pinned = true;
     return snap;
@@ -856,39 +856,26 @@ export class GatewayDriveController implements DriveController {
     }
   }
 
-  /** The loud, actionable error for a warm replay that landed stale/blocked: the stored login is
-   *  expired or blocked and only an operator re-capture can fix it (re-rolling the exit would break
-   *  the R3 re-pin, and a bound entry re-pins the SAME captured exit on retry). Used on BOTH the
-   *  first-navigate warm path and the reopen-after-reap warm path, so the "stale warm fails LOUD"
-   *  guarantee does not depend on whether the session happened to be idle-reaped. */
-  #warmStaleError(url: string, status: number | null): Error {
+  /**
+   * #81: the loud, actionable warm-failure error, chosen by the failure EVIDENCE — not host config alone.
+   * Delegates the advice text to the pure {@link warmFailureAdvice} mapper, passing the attached envelope's
+   * closed-vocab typed fields (failureClass / wafVendor) + whether the owner host mints a fresh exit. This
+   * makes the message MATCH what happened: a live behavioral challenge (PerimeterX press-&-hold) is told a
+   * fresh exit won't clear it and a retry re-triggers it — instead of the old host-config-only pick that
+   * mis-messaged it as a fresh-exit dud ("retry") or a stale credential ("re-capture"). The stale-vs-fresh
+   * split is preserved; a policy-block is normally pre-empted upstream (R2) but the mapper handles it
+   * defensively. Used on BOTH the first-navigate warm path and the reopen-after-reap warm path.
+   */
+  #warmError(url: string, status: number | null, failure?: FailureDiagnostics): Error {
+    const advice = warmFailureAdvice({
+      ...(failure?.failureClass ? { failureClass: failure.failureClass } : {}),
+      ...(failure?.wafVendor ? { wafVendor: failure.wafVendor } : {}),
+      freshExitHost: hostForcesProxy(new URL(url).hostname, this.#freshExitHosts),
+    });
     // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
     return new Error(
-      `warm (logged-in) navigation to ${sanitizeUrlForError(url)} failed (status=${status ?? "n/a"}): the stored session ` +
-        `is likely expired or blocked — ask the operator to re-capture this credential`,
+      `warm (logged-in) navigation to ${sanitizeUrlForError(url)} failed (status=${status ?? "n/a"}): ${advice}`,
     );
-  }
-
-  /** A FRESH-EXIT warm session that landed blocked means the freshly-minted residential exit was a dud
-   *  (a burned/dead pool IP), NOT a stale credential — the stored login is fine and the next navigate
-   *  re-warms with a DIFFERENT fresh exit. So tell the consumer to retry, not to re-capture (the wrong,
-   *  alarming signal here). The pinned path keeps {@link #warmStaleError} (a re-pin retry is pointless). */
-  #warmFreshError(url: string, status: number | null): Error {
-    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
-    return new Error(
-      `warm (logged-in) navigation to ${sanitizeUrlForError(url)} was blocked (status=${status ?? "n/a"}): the fresh ` +
-        `residential exit was likely burned or unreachable — retry navigate to draw a clean exit`,
-    );
-  }
-
-  /** Pick the warm-failure error by the host's exit policy: a fresh-exit host (BGW_WARM_FRESH_EXIT_HOSTS)
-   *  failed because the exit was a dud (retry); any other warm host failed because the captured exit /
-   *  stored session is stale (re-capture). Derived from the URL host so it holds on BOTH the first-navigate
-   *  and the reopen-after-reap path without a separate per-session flag (the host-set is the source of truth). */
-  #warmError(url: string, status: number | null): Error {
-    return hostForcesProxy(new URL(url).hostname, this.#freshExitHosts)
-      ? this.#warmFreshError(url, status)
-      : this.#warmStaleError(url, status);
   }
 
   /** #80: a navigation the gateway's OWN nav guard aborted (net::ERR_BLOCKED_BY_CLIENT — an off-allowlist /
