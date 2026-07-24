@@ -965,7 +965,10 @@ export async function retrieve(
   // FINAL attempt died — classify on that live failure, not the dead final render, so the reason/class stay
   // site-attributed (anti-bot-block / hard-block) instead of degrading to nav-failed. Skipped for a timeout
   // (which overrides the class regardless) and when no live response was ever seen.
-  if (!budgetExceeded && lastLiveRender && (render.status === null || isChromeErrorUrl(render.diagnostics?.finalUrl))) {
+  // #80: NEVER swap away a policy-blocked final render — the loop TERMINATED on it (our own guard aborted the
+  // nav), which is the decisive, most-actionable verdict; a policy block is status===null, so without this
+  // guard the substitution would fire and discard `policyBlocked`, hiding the class behind an earlier site block.
+  if (!budgetExceeded && render.policyBlocked === undefined && lastLiveRender && (render.status === null || isChromeErrorUrl(render.diagnostics?.finalUrl))) {
     render = lastLiveRender;
   }
   // #43 (codex r1/r6): flag a timeout whenever the WHOLE call consumed the budget — the escalation loop

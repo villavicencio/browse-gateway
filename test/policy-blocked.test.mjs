@@ -129,6 +129,7 @@ test("resolveFailureReason: policyBlocked → policy-blocked reason (not nav-fai
 const PROXY = () => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" });
 const CF_BLOCK = { url: "u", status: 403, title: "Just a moment...", text: "Enable JavaScript and cookies to continue", html: "<div id='challenge-platform' class='cf-chl-opt'></div>", clearanceWaitedMs: 0, diagnostics: { finalUrl: "u", status: 403 } };
 const DEAD = { url: "u", status: null, title: "", text: "", html: "", clearanceWaitedMs: 0, diagnostics: { finalUrl: "u", status: null } };
+const HARD_403 = { url: "u", status: 403, title: "", text: "Forbidden", html: "Forbidden", clearanceWaitedMs: 0, responseReceived: true, diagnostics: { finalUrl: "u", status: 403 } };
 const POLICY_BLOCKED = {
   url: "u", status: null, title: "", text: "", html: "", clearanceWaitedMs: 0,
   policyBlocked: { host: "off.example", reason: "host not in consumer allowlist" },
@@ -164,6 +165,40 @@ test("retrieve: a FORCED-proxy policy block terminates at the FIRST attempt (no 
   assert.notEqual(r.proxyDiagnostic.attempts, DEFAULT_CALL_TIMEOUTS.proxyMaxAttempts, "did NOT exhaust every exit");
   assert.equal(r.diagnostics.failureClass, "policy-blocked");
   assert.equal(r.reason, "policy-blocked");
+});
+
+test("retrieve: a policy block on the FINAL attempt wins over an EARLIER live site block (mixed exhaustion)", async () => {
+  // direct CF → escalate; proxied 1 = a LIVE hard-block (sets lastLiveRender); proxied 2 = a policy block
+  // (a redirect hop off-allowlist) → loop breaks. The post-loop mixed-exhaustion swap must NOT replace the
+  // policy-blocked final render with the earlier live block (which would hide the class + mis-advise a fresh
+  // exit for an off-allowlist target). policy-blocked is the top-precedence, decisive verdict.
+  const gateway = makeRenderSeq([CF_BLOCK, HARD_403, POLICY_BLOCKED, DEAD]);
+  const r = await retrieve(gateway, new SecretStore(PROXY), { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.diagnostics.failureClass, "policy-blocked", "policy-blocked wins over the earlier hard-block (not swapped away)");
+  assert.equal(r.reason, "policy-blocked", "the surfaced reason stays policy-blocked, not hard-block");
+  assert.equal(r.proxyDiagnostic.burnedExit, undefined, "not a burn");
+});
+
+test("drive: a FORCED-proxy policy block terminates the escalation loop with a policy headline (not burned-exit)", async () => {
+  // Covers the DRIVE escalation-loop policy-block handling (#openHealthyAndNavigate: loop break, sawLiveResponse
+  // guard, burnedExit exclusion, policy headline) — reachable only via forceProxy.
+  let n = 1;
+  const open = new Map();
+  const events = [];
+  const core = { async navigate(url) { return policyBlockedSnap(url); }, async snapshot() { return { url: "https://off.example/", title: "", tree: "", status: null }; } };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + n++; open.set(id, { core }); events.push(["open", id]); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error("no session"); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); events.push(["close", h]); },
+  };
+  const c = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  const err = await c.navigate("https://off.example/", { forceProxy: true }).then(() => null, (e) => e);
+  assert.ok(err instanceof Error, "the forced-proxy policy block rejects");
+  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed escalation headline");
+  assert.doesNotMatch(err.message, /burned exit|could not land a working proxied exit/i, "not a burned-exit / exit-hunting message");
+  assert.equal(failureOf(err)?.failureClass, "policy-blocked", "classified policy-blocked, not burned-exit/nav-failed");
+  assert.equal(events.filter((e) => e[0] === "open").length, 1, "terminated on the FIRST proxied policy block (no re-roll)");
 });
 
 // --- navFailed: a policy block is a nav failure even with a STALE (action-triggered) non-null status ---
