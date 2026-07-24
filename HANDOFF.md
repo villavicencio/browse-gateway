@@ -1,81 +1,103 @@
-# HANDOFF — 2026-07-24
+# HANDOFF — 2026-07-24, afternoon
 
-## Epic #78 (post-#38 regression follow-ups) — **COMPLETE + CLOSED**
+Autonomous Opus run: implemented **epic #78** (owner-host contract + diagnosis honesty, the post-#38
+regression follow-ups) end-to-end — R1→R2→R3→R4, each through review + in-container gate + merge. All four
+shipped and the epic is closed. Then the operator reset Codex usage and I re-ran per-ticket Codex reviews of
+the *merged* code (Codex had been rate-limited mid-R2), which surfaced **5 real follow-up defects** that the
+in-line verification agents had missed. Those 5 are the live work; nothing is deployed.
 
-All four children shipped to `main` and merged; epic #78 closed; no open issues remain. Prod is
-**UNCHANGED** — nothing from this epic is deployed (deploy is operator-hand item #1).
+## What We Built
 
-| Ticket | What shipped | PR | squash on main |
-|---|---|---|---|
-| **R1 #79** (keystone) | warm cross-host nav → typed `owner-host-mismatch` result, refused **before the wire**, session preserved | #83 | `ed99400` |
-| **R2 #80** (foundation) | `policy-blocked` FailureClass for a self-inflicted main-frame `ERR_BLOCKED_BY_CLIENT`; no re-roll; decision-safe guard-reason side-channel | #84 | `07f181e` |
-| **R3 #81** | evidence-driven `warmFailureAdvice` mapper (`#warmError` matches the evidence, not host config) | #85 | `4e452a2` |
-| **R4 #82** | shape-invariant PerimeterX on the drive path (`pxCopy` + `navFailed (pxHint && pxCopy)` arm) | #86 | `dfa1a74` |
+- **R1 #79** (PR #83, squash `ed99400`) — warm cross-host nav → typed `owner-host-mismatch` result, refused
+  **before the wire** (pre-flight in `#navigate`'s pinned branch, `drive-controller.ts`); the warm context +
+  its live PX clearance survive. Clamp (`policy/index.ts`) untouched — changes the *response*, not the
+  *decision*. Added the "one warm session = one owner host" note to the `browser_navigate` MCP description.
+- **R2 #80** (PR #84, `07f181e`) — new `policy-blocked` `FailureClass` for a self-inflicted main-frame
+  `ERR_BLOCKED_BY_CLIENT`, captured top-frame-scoped (`req.frame()===mainFrame()`), top precedence, no
+  re-roll; **preserves the healthy session** on every failure surface (pinned/warm-open/cold-first-nav/
+  forced-escalation/action). Guard reason rides a decision-safe write-only out-param (`NavigationBlockInfo`);
+  scrubbed at every seam (R9). The 3 guards' block paths DRY'd into one `#navBlock` helper.
+- **R3 #81** (PR #85, `4e452a2`) — pure `warmFailureAdvice(evidence)` mapper (`observability/warm-advice.ts`);
+  `#warmError` delegates to it so a live PerimeterX press-&-hold is told "a fresh exit won't clear it" instead
+  of host-config's "draw a clean exit"/"re-capture".
+- **R4 #82** (PR #86, `dfa1a74`) — drive `#snapshotOf` derives a scrubbed `pxCopy` from the child-frame walk
+  (gated on `pxHint`); `navFailed` gains `(pxHint && pxCopy)` so a fat-top-frame PX classifies like a thin one.
+- **Docs (`4ce3eff`)**: 2 compounded learnings (`self-inflicted-refusal-classify-dont-discard`,
+  `drive-retrieve-shape-invariant-pxcopy`) + the prior handoff. Epic #78 closed on GitHub.
+- **878 unit tests** on main; all in-container gates green (`validate-owner-host`, `validate-policy-block`,
+  `validate-drive-pxcopy`, + regressions). New gates: `scripts/validate-policy-block.mjs`,
+  `scripts/validate-drive-pxcopy.mjs`. New unit suites: `test/policy-blocked.test.mjs` (16),
+  `test/warm-advice.test.mjs` (5), `test/px-copy-drive.test.mjs` (3), `test/owner-host-mismatch.test.mjs` (6).
 
-**main tip after this handoff = the handoff commit** (docs-only; `prodDeployNeeded:false`). Full suite **878**
-green on main. All in-container gates PASS: `validate-owner-host` (R1), `validate-policy-block` (R2),
-`validate-drive-pxcopy` (R4), plus regression: `validate-policy` (guard refactor), `validate-drive`,
-`validate-vault-warm-open`, `validate-frame-capture`.
+## Decisions Made
 
-## What each change actually does (30-sec)
+- **Ratified contract enforced: one warm drive session = one owner host** (R1). A cross-host nav is an
+  *expected scope rejection*, not a failure — refuse cleanly, never discard.
+- **A self-refusal is a scope decision to surface, not an exit-death to recover from** (R1+R2 theme). Classify
+  it before the destructive path; preserve the healthy session everywhere.
+- **Decision-safe side-channel** for the guard reason: a *write-only* out-param the fail-closed decision never
+  reads. Kept the security invariant intact while surfacing the reason.
+- **Codex rate-limited mid-R2 → substituted independent adversarial Workflow / verification-agent reviews.**
+  They caught a real regression the 4 completed Codex rounds missed (retrieve mixed-exhaustion swap hiding the
+  class) — but they are NOT a full Codex substitute (see What Didn't Work).
+- **R4 scope = parity with retrieve, not a new poll.** Deliberately did NOT touch `shouldEscalateDrive` (a
+  behavioral challenge is IP-independent).
 
-- **R1** — the clamp already *forbids* a warm cross-host nav; the bug was only in the *handling* (discard +
-  mis-diagnose). Pre-flight refusal returns a typed `owner-host-mismatch` before `core.navigate`, so the
-  clamp is never tripped and the warm context (with its live PX clearance) survives. Changes the *response*,
-  never the clamp's *decision* (`policy/index.ts` untouched). Added the "one warm session = one owner host"
-  note to the `browser_navigate` MCP tool description.
-- **R2** — a main-frame `ERR_BLOCKED_BY_CLIENT` is always the gateway's own guard. Captured top-frame-scoped
-  (`req.frame()===mainFrame()`) as `policy-blocked` (top precedence); never escalates/re-rolls; **preserves
-  the healthy session** on every failure surface (pinned / warm-open / cold-first-nav / forced-escalation /
-  action). The guard's reason rides a **decision-safe write-only out-param** (`NavigationBlockInfo`) that can
-  never influence the fail-closed decision; scrubbed at every seam (R9). The 3 guards' block paths were DRY'd
-  into one `#navBlock` helper (behavior-preserving — the nav-guard/policy gates pass unchanged).
-- **R3** — `warmFailureAdvice(evidence)` (pure, in `observability/warm-advice.ts`) branches on the envelope's
-  `failureClass`/`wafVendor` + the fresh-exit flag: a **live PerimeterX** press-&-hold now says "a fresh exit
-  won't clear it, a retry re-triggers it" instead of the old host-config-only "draw a clean exit" / "re-capture".
-- **R4** — drive `#snapshotOf` derives a scrubbed `pxCopy` from the child-frame walk (gated on `pxHint`), and
-  `navFailed` gains `(pxHint && pxCopy)` — so a FAT-top-frame PX (challenge in a cross-origin child frame)
-  classifies identically to a thin one. NOT added to `shouldEscalateDrive` (behavioral ≠ IP-reputation).
+## What Didn't Work
 
-## ⚠️ Pieces that need the operator's hand
+- **Single verification agents are not a Codex substitute.** For R3 and R4 the focused verification agents
+  each returned "CLEAN" — Codex's later re-review found **real defects in both**. Lesson: a convergent Codex
+  loop still leaves a tail, and one adversarial agent misses what a different reviewer catches; use multiple,
+  independent passes.
+- **R4 gate fixture, first two attempts.** A same-origin, then a cross-origin *accessible-text* child iframe
+  both failed the gate: Playwright's `ariaSnapshot` **stitches even cross-origin OOPIF accessible text** into
+  the top tree, so `isVisiblyBlocked` caught the copy and `pxCopy` wasn't load-bearing. Fix that worked: put
+  the challenge copy in the child-frame **source only** (HTML comment + a canvas widget) — matches the real
+  press-&-hold shape. (Documented in the pxcopy solution doc.)
 
-1. **Prod deploy + smoke test (item #1).** Nothing here is deployed. Deploy: `gh workflow run deploy-http.yml
-   -f image_tag=latest`. Smoke: `obscura status` healthy, then a warm cross-host attempt returns the typed
-   `owner-host-mismatch` result (not a credential/exit error) and the owner-host context survives.
-2. **Live end-to-end re-run of the original Atlas regression sequence** (Total Wine warm → Costco cross-host →
-   return to Total Wine), against the real sites — the autonomous gates used controlled loopback fixtures, so
-   the real-world confirmation is a daytime/operator item.
-3. **R1's consumer-facing "open a new drive session per host" note** — added in-repo to the `browser_navigate`
-   description; if the fleet agents need their driving pattern updated, that's a fleet action, not code.
-4. **Confirm the credential owner-host spelling (apex vs www)** for R2's cold path (minor; strategy §7.3).
-5. **R5 (fast-terminal a detected behavioral challenge)** remains an **unfiled stretch** (latency-only; not one
-   of the three genuine defects). File + build only if the ~45 s clearance-poll waste on a detected
-   press-&-hold is worth reclaiming.
+## What's Next
 
-## Review journey (worth knowing)
+**→ Follow-up PR for the 5 post-merge Codex findings (nothing deployed — pre-deploy is the time to fix).**
+Prioritized:
 
-- **Codex hit its usage limit mid-epic** (during R2's round 5, rate-limited until ~Jul 29). R2 had already
-  been through **4 completed Codex rounds** (each finding real policy-block-honoring gaps, all fixed at
-  source). For the round-5 confirmation and for R3/R4, review was done by **independent adversarial Workflow /
-  verification-agent passes** — which caught a real regression the 4 Codex rounds missed (the retrieve
-  mixed-exhaustion swap discarding a `policy-blocked` final render). Lesson: the multi-lens adversarial
-  workflow is a viable Codex substitute; even a convergent Codex loop leaves a tail.
-- The R4 gate needed a **source-only** challenge-copy fixture (comment/canvas, not accessible text) because
-  Playwright's `ariaSnapshot` stitches cross-origin OOPIF accessible text into the top tree — see the
-  solution doc.
+1. **R3 behavioral-gating [clear mis-advice, do first]** — `warm-advice.ts:52` fires the behavioral branch on
+   `wafVendor===perimeterx`, which also comes from a *persistent* pxHint marker on a burned-exit 403. A
+   fresh-exit host then gets "a fresh exit won't clear it" when a fresh exit *would* help. Fix: thread a
+   `behavioralChallenge` flag (`snap.pxHint && snap.pxCopy`, now available post-R4) into `WarmFailureEvidence`
+   and gate the branch on it, not on vendor attribution.
+2. **R4 P1 late-loading iframe** — `#snapshotOf`'s one-shot `captureChildFrameHtml` can read a *blank* child
+   frame if the PX iframe loads after DCL → `pxCopy` false → the challenge slips through again. Retrieve has
+   the **identical** one-shot limitation, so this is parity-inherited; the fix (bounded poll of the marked
+   child frame before finalizing) should land on BOTH paths and be gated on `pxHint` so healthy pages don't
+   pay it. Higher-touch (hot `#snapshotOf` path) — bound the poll carefully.
+3. **R2 concurrency correlation** — `patchright-core.ts:~979` `#lastNavBlock` is one context-wide slot keyed
+   only by host; concurrent Document blocks (main-frame redirect + iframe/popup) can overwrite it before the
+   `requestfailed` fires, mis-attributing owner-host vs origination. Fix: key by frame/request identity.
+4. **R3 transport failures** — a conn-reset/timeout (`nav-failed`) on a non-fresh warm host defaults to
+   "re-capture credential". Thread `genuineNetworkFailure(networkFailures)` into the mapper → advise
+   retry/transport, not re-capture. (Pre-existing behavior R3 can now improve.)
+5. **R4 P2 formatSnapshot** — `formatSnapshot()` renders `pxHint` but not `pxCopy`, so a standalone
+   `browser_snapshot` of an async PX challenge hides the live signal. Trivial: render `pxCopy` in the header.
 
-## Prod state (UNCHANGED)
+**Then — operator-hand items (unchanged):** (a) **prod deploy + smoke** — `gh workflow run deploy-http.yml -f
+image_tag=latest`, then `obscura status` + a warm cross-host attempt; (b) **live re-run** of the original
+Atlas sequence (Total Wine → Costco → back) against the real sites (gates used loopback fixtures); (c) confirm
+R2 cold-path apex-vs-www spelling; (d) R5 fast-terminal is an unfiled latency-only stretch.
 
-Prod `sha256:4becdf0a` = git `978cc89`. Rollback anchor `sha256:961e149d`. `#53` health surface live
-(`obscura status` → pool healthy). Nothing from epic #78 built into a deployed image.
+## Gotchas & Watch-outs
 
-## Learnings compounded (this session)
-
-- `docs/solutions/architecture-patterns/self-inflicted-refusal-classify-dont-discard.md` (R1+R2).
-- `docs/solutions/architecture-patterns/drive-retrieve-shape-invariant-pxcopy.md` (R4 + the aria-OOPIF gate trap).
-
-## Local context
-
-Strategy doc (gitignored): `docs/plans/2026-07-23-001-post-38-recovery-and-diagnosis-honesty-strategy.local.md`.
-Memory `[[post-38-regression-recovery-strategy]]`. Public-repo hygiene held (no fleet/consumer/retailer names
-in code, commits, or issue comments).
+- **Prod is UNCHANGED.** `sha256:4becdf0a` = git `978cc89`; rollback anchor `sha256:961e149d`. None of epic
+  #78 is in a deployed image. Do NOT deploy without the smoke test (operator-gated).
+- **The 5 follow-ups are in MERGED code** — a fix is a normal follow-up PR, not a revert. Fix the R3
+  behavioral-gating one before any deploy (it's a real mis-diagnosis that ships today).
+- **Chrome crash popups during Codex review = Codex's Computer Use client** (`SkyComputerUseClient`), NOT the
+  gateway. It drives host Chrome (hence "normal Chrome" on Reopen; the gateway's Patchright browser is
+  in-container only). Self-terminated after the reviews finished; safe to Ignore if it recurs, or kill the
+  `SkyComputerUseClient` pid (leave the Chrome processes — may be the operator's own browser).
+- **Run `validate-*.mjs` gates ONLY via `docker run`** (in-container, Chrome-under-Xvfb). Running them locally
+  launches host Chrome with container-tuned flags and can crash.
+- A **concurrent session ("Sol")** was touching this repo's working tree during the run (noticed by a review
+  agent). Coordinate if resuming.
+- **Codex is available again** (usage reset). If continuing, run the follow-up through the normal Codex loop.
+- Strategy doc (gitignored): `docs/plans/2026-07-23-001-post-38-recovery-and-diagnosis-honesty-strategy.local.md`.
+  Memory `[[post-38-regression-recovery-strategy]]` (marked SHIPPED). Public-repo hygiene held throughout.
