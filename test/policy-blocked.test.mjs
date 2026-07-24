@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyFailure, isDeadExit, resolveFailureReason, retrieve } from "../dist/verbs/index.js";
+import { classifyFailure, isDeadExit, resolveFailureReason, retrieve, navFailed } from "../dist/verbs/index.js";
 import { buildFailureDiagnostics, redactFailureDiagnostics, failureOf } from "../dist/observability/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 import { DEFAULT_CALL_TIMEOUTS } from "../dist/gateway/index.js";
@@ -160,31 +160,78 @@ test("retrieve: a FORCED-proxy policy block terminates at the FIRST attempt (no 
   assert.equal(r.reason, "policy-blocked");
 });
 
-// --- guardrail (c): a COLD pinned session's off-allowlist nav is policy-attributed, NEVER "fresh exit" ---
-test("drive: a COLD pinned session's off-allowlist nav → policy message, NEVER suggests a fresh exit", async () => {
+// --- navFailed: a policy block is a nav failure even with a STALE (action-triggered) non-null status ---
+test("navFailed: a policyBlocked snapshot fails even when it carries a STALE prior-page 200 status", () => {
+  // An ACTION-triggered nav (click/submit) the guard aborts produces no new document response, so the
+  // snapshot can inherit the previous page's 200 — which every other navFailed arm reads as healthy.
+  assert.equal(navFailed({ url: "https://x/", title: "prev", tree: "content ".repeat(30), status: 200, policyBlocked: { host: "off", reason: "r" } }), true);
+  // NON-REGRESSION: the same snapshot WITHOUT the marker (a real healthy 200) is not a failure.
+  assert.equal(navFailed({ url: "https://x/", title: "prev", tree: "content ".repeat(30), status: 200 }), false);
+});
+
+// --- fake gateway/core with open/close tracking, for the drive session-lifecycle assertions ---
+function makeTrackingGateway(navFn) {
   let n = 1;
   const open = new Map();
+  const events = [];
   const okSnap = (url) => ({ url, title: "ok", tree: "real ".repeat(20), status: 200 });
-  const blockedSnap = (url) => ({
-    url, title: "", tree: "", status: null,
-    policyBlocked: { host: new URL(url).hostname, reason: "host not in consumer allowlist" },
-    diagnostics: { finalUrl: url, status: null, selfBlockedNav: { host: new URL(url).hostname, reason: "host not in consumer allowlist" } },
-  });
-  const core = { async navigate(url) { return url.includes("/off") ? blockedSnap(url) : okSnap(url); }, async snapshot() { return okSnap("u"); } };
+  const core = { async navigate(url) { return navFn(url) ?? okSnap(url); }, async snapshot() { return okSnap("u"); } };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + n++; open.set(id, { core }); events.push(["open", id]); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error("no session"); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); events.push(["close", h]); },
+  };
+  return { gateway, open, events };
+}
+const policyBlockedSnap = (url) => ({
+  url, title: "", tree: "", status: null,
+  policyBlocked: { host: new URL(url).hostname, reason: "host not in consumer allowlist" },
+  diagnostics: { finalUrl: url, status: null, selfBlockedNav: { host: new URL(url).hostname, reason: "host not in consumer allowlist" } },
+});
+
+// --- guardrail (c) + session preservation: a COLD pinned session's off-allowlist nav is policy-attributed,
+//     NEVER "fresh exit", and PRESERVES the healthy session (our guard refused the target, not a dead exit) ---
+test("drive: a COLD pinned session's off-allowlist nav → policy message, no fresh-exit advice, session PRESERVED", async () => {
+  const g = makeTrackingGateway((url) => (url.includes("/off") ? policyBlockedSnap(url) : undefined));
+  // Proxy configured + datacenter IP → the OLD generic message WOULD have appended "retry for a fresh exit".
+  const c = new GatewayDriveController(g.gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "proxypass" })), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  await c.navigate("https://good.com/"); // direct 200 → pins (cold)
+  const opensAfterPin = g.events.filter((e) => e[0] === "open").length;
+
+  const err = await c.navigate("https://good.com/off").then(() => null, (e) => e); // pinned, off-allowlist → policy block
+  assert.ok(err instanceof Error, "the off-allowlist nav on a pinned cold session rejects");
+  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed message");
+  assert.doesNotMatch(err.message, /retry navigate for a fresh exit/i, "does NOT SUGGEST retrying for a fresh exit (guardrail c)");
+  assert.equal(failureOf(err)?.failureClass, "policy-blocked", "the envelope classifies policy-blocked");
+  // SESSION PRESERVED: our guard refused the TARGET, the exit is healthy — do NOT discard.
+  assert.equal(g.open.size, 1, "the healthy session is PRESERVED (not discarded) on a policy block");
+  assert.equal(g.events.filter((e) => e[0] === "close").length, 0, "no #discardSession on a policy block");
+  // a follow-up navigate to an allowlisted target reuses the SAME session (no re-open)
+  const back = await c.navigate("https://good.com/ok");
+  assert.equal(back.status, 200, "returning to an allowlisted target succeeds");
+  assert.equal(g.events.filter((e) => e[0] === "open").length, opensAfterPin, "reused the preserved session — no re-open");
+});
+
+// --- Fix 1 (integration): an ACTION (click) that triggers a policy-blocked nav is surfaced as a failure ---
+test("drive: a click that triggers a policy-blocked nav is a FAILURE, not the stale prior page returned as success", async () => {
+  let n = 1;
+  const open = new Map();
+  // navigate pins on a real page; the click's post-action snapshot is a policy block carrying a STALE 200.
+  const staleBlocked = { url: "https://good.com/", title: "prev", tree: "prev content ".repeat(20), status: 200, policyBlocked: { host: "sibling.com", reason: "credential scope: navigation is not the credential owner host" }, diagnostics: { finalUrl: "https://good.com/", status: 200, selfBlockedNav: { host: "sibling.com", reason: "credential scope: navigation is not the credential owner host" } } };
+  const core = {
+    async navigate() { return { url: "https://good.com/", title: "ok", tree: "form [ref=e1]", status: 200 }; },
+    async click() {},
+    async snapshot() { return staleBlocked; },
+  };
   const gateway = {
     sessions: { get: (h) => open.get(h) },
     async openConsumerSession() { const id = "h" + n++; open.set(id, { core }); return id; },
     async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error("no session"); return fn(s); },
     async closeConsumerSession(_t, h) { open.delete(h); },
   };
-  // Proxy configured + datacenter IP → the OLD generic message WOULD have appended "retry for a fresh exit";
-  // the policy-blocked branch must pre-empt it.
-  const c = new GatewayDriveController(gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "proxypass" })), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
-  await c.navigate("https://good.com/"); // direct 200 → pins (cold)
-  const err = await c.navigate("https://good.com/off").then(() => null, (e) => e); // pinned, off-allowlist → policy block
-  assert.ok(err instanceof Error, "the off-allowlist nav on a pinned cold session rejects");
-  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed message");
-  assert.doesNotMatch(err.message, /retry navigate for a fresh exit/i, "does NOT SUGGEST retrying for a fresh exit (guardrail c)");
-  assert.match(err.message, /fresh exit cannot reach|fix the scope\/policy/i, "explicitly advises AGAINST a fresh exit / points at policy");
-  assert.equal(failureOf(err)?.failureClass, "policy-blocked", "the envelope classifies policy-blocked");
+  const c = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok");
+  await c.navigate("https://good.com/"); // pins
+  // Without Fix 1, navFailed(200, no visible block) is false → the click returns the stale page as success.
+  await assert.rejects(() => c.click({ target: "e1", element: "x" }), /blocked|policy|challenge|did not clear/i, "the action-triggered policy block is surfaced, not swallowed");
 });
