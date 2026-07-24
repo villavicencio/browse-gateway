@@ -8,7 +8,7 @@ import { buildFailureDiagnostics, assembleTiming, FAILURE_DIAGNOSTICS_CAP } from
 import { hostFromUrl, hostMatchesAnySuffix } from "../security/url.js";
 import { SecretStore, redactSecrets } from "../security/secrets.js";
 import { buildWindowsUaOverride, buildNativeUaOverride, READ_LIVE_UA_JS, type LiveUserAgent } from "./os-presentation.js";
-import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, hasDataDomeHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
+import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, hasPerimeterXChallengeCopy, hasDataDomeHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
@@ -1658,6 +1658,15 @@ export class PatchrightBrowserCore implements BrowserCore {
     // binds the kind to an ACTIVE widget container, so it can't mislabel a WAF block's vendor (codex #40 r3/r4).
     const html = String(await page.content().catch(() => ""));
     const captchaKind = activeCaptchaKind(html);
+    // R4 (#82): shape-invariant PerimeterX detection on the DRIVE path — parity with retrieve
+    // (drive↔retrieve detection-parity invariant). A press-&-hold challenge's copy lives in the page SOURCE
+    // (top `html`) or a cross-origin `px-captcha-modal` CHILD FRAME, NOT the top-doc innerText — so a FAT top
+    // frame (modal chrome ≥200 chars) with the challenge in an iframe slips past navFailed's isHardBlock
+    // (which needs a THIN body). Derive a SCRUBBED boolean `pxCopy` (never carry the raw frameHtml — drive is
+    // deliberately content-free), GATED on `pxHint` so ordinary pages with ad iframes never pay the
+    // child-frame walk. Mirrors retrieve's hasPxChallengeCopy(render.html || render.frameHtml).
+    const pxHintV = hasPerimeterXHint(html);
+    const pxCopy = pxHintV ? hasPerimeterXChallengeCopy(html) || hasPerimeterXChallengeCopy(await captureChildFrameHtml(page)) : false;
     // #44: solver eligibility (a pure KIND property) + why a solve wasn't completed. captchaSolveReason
     // prefers the stashed code from an ACTUAL failed attempt (#trySolveCaptcha ran in this op's #settle);
     // else a pre-attempt why-not derived from the kind — `not-configured` (no solver wired) or
@@ -1721,7 +1730,8 @@ export class PatchrightBrowserCore implements BrowserCore {
       diagnostics,
       timing,
       cfHint: hasCloudflareHint(html),
-      pxHint: hasPerimeterXHint(html),
+      pxHint: pxHintV,
+      ...(pxCopy ? { pxCopy: true } : {}), // #82: scrubbed shape-invariant PX-copy boolean (gated on pxHint)
       ddHint: hasDataDomeHint(html),
       ...(captchaKind ? { captchaKind } : {}),
       ...(solverEligible !== undefined ? { solverEligible } : {}),
