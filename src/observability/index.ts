@@ -17,3 +17,5 @@ export {
   FAILURE_DIAGNOSTICS_CAP,
 } from "./failure-diagnostics.js";
 export type { FailureDiagnostics, FailureDiagnosticsInput, FailureCarrier, WafVendor, FailureClass, SelfBlockedNav, Timing } from "./failure-diagnostics.js";
+export { warmFailureAdvice } from "./warm-advice.js";
+export type { WarmFailureEvidence } from "./warm-advice.js";
