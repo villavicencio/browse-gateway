@@ -317,17 +317,57 @@ async function pollSignal(page: PatchrightPage): Promise<Pick<PageSignal, "title
   return { title, text };
 }
 
-/**
- * Concatenated HTML of every child frame. `page.content()` serializes only the TOP document, so a
- * challenge rendered inside a child frame (PerimeterX's `px-captcha-modal`) is invisible to it.
- * Playwright reads a child frame's document even cross-origin (verified), so the press-&-hold copy is
- * recoverable here. Each frame is fetched best-effort — a detached/navigating frame yields "".
- */
-async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
+/** One synchronous read of every child frame's document — the raw, un-polled body of {@link
+ *  captureChildFrameHtml}. Each frame is fetched best-effort: a detached/navigating (or not-yet-committed
+ *  cross-origin) frame yields "" from the caught `content()`, and a page with no child frames yields "". */
+async function readChildFrames(page: PatchrightPage): Promise<string> {
   const children = page.frames().filter((f) => f !== page.mainFrame());
   if (children.length === 0) return "";
   const parts = await Promise.all(children.map((f) => f.content().catch(() => "")));
   return parts.join("\n");
+}
+
+/** A bounded poll over the child-frame read (only reached on a `hasPerimeterXHint` page whose TOP html lacks
+ *  the copy — both callers short-circuit on it, so ordinary pages never pay it). The `px-captcha-modal`
+ *  marker is in the TOP document at DCL, but the challenge BODY renders inside a child iframe on a LATER
+ *  async tick — so a single one-shot read can miss the press-&-hold copy: the frame may not have committed
+ *  yet, or it may have committed an EMPTY skeleton before injecting the copy, or an UNRELATED ad/tracking
+ *  iframe may make the concatenated markup non-blank while the challenge frame is still copy-less. So poll for
+ *  the CHALLENGE COPY itself (via {@link hasPerimeterXChallengeCopy}), not merely non-blank markup, and stop
+ *  the instant it appears. A live challenge that already rendered its copy is caught on attempt 0 (~0 cost).
+ *  Trade-off (accepted): a CLEARED page keeps its `px-captcha-modal` marker but never renders the copy, so it
+ *  pays the full, bounded ceiling — correctness (never returning a live fat-frame challenge as healthy) over
+ *  latency, and the cost is bounded and pxHint-scoped (a healthy page never reaches here).
+ *
+ *  When `topHtml` is supplied and ALREADY carries the challenge copy (an inline / top-frame press-&-hold),
+ *  there is nothing to wait for in the child frames — the caller has already detected the challenge from the
+ *  top document — so skip the poll entirely. Without this, a top-frame PX page (pxHint set, copy in `topHtml`,
+ *  no child frame that will ever hold it) would burn the full bounded poll on EVERY render, and near the
+ *  shared call deadline could tip an anti-bot result into a timeout. The drive `#snapshotOf` caller already
+ *  short-circuits via `||`; this makes the retrieve `snapshot()` caller equivalent.
+ *
+ *  EXPORTED for the deterministic poll unit test (test/px-frame-poll.test.mjs): a real-browser gate can't
+ *  isolate the poll — render()'s own settle wait outlasts a late injection, so a one-shot read would pass the
+ *  gate too — so the load-bearing regression guard is a fake-page unit test (blank→blank→copy) that fails if
+ *  this is reverted to a one-shot read. */
+const PX_FRAME_POLL_ATTEMPTS = 3;
+const PX_FRAME_POLL_INTERVAL_MS = 250; // ≤ PX_FRAME_POLL_ATTEMPTS × this = 750ms ceiling, only on a pxHint page
+
+/** Upper bound on the per-navigation blocked-Document reason holder (#lastNavBlock). A page can spam blocked
+ *  subframe Document requests to UNIQUE URLs within one navigation (no top-level nav to reset the holder), so
+ *  cap it and evict oldest-first — page-controlled activity can't grow gateway memory without bound. Far
+ *  above the handful of blocks a real navigation produces, so a legitimate main-frame reason is never evicted
+ *  before its requestfailed reads it. */
+const MAX_NAV_BLOCK_ENTRIES = 32;
+export async function captureChildFrameHtml(page: PatchrightPage, topHtml?: string): Promise<string> {
+  // Nothing to wait for if the top document already holds the copy (an inline / top-frame challenge).
+  if (topHtml !== undefined && hasPerimeterXChallengeCopy(topHtml)) return "";
+  let html = await readChildFrames(page);
+  for (let i = 0; i < PX_FRAME_POLL_ATTEMPTS && !hasPerimeterXChallengeCopy(html); i++) {
+    await page.waitForTimeout(PX_FRAME_POLL_INTERVAL_MS).catch(() => {});
+    html = await readChildFrames(page);
+  }
+  return html;
 }
 
 /**
@@ -389,8 +429,10 @@ async function snapshot(page: PatchrightPage): Promise<PageSignal> {
   const html = String(await page.content().catch(() => ""));
   // Only walk child frames when the top doc carries a PX marker (the px-captcha-modal element is in
   // the top document even while its challenge body is in the frame) — so an ordinary page with ad
-  // iframes never pays the cost, and an iframe-served press-&-hold is still detectable.
-  const frameHtml = hasPerimeterXHint(html) ? await captureChildFrameHtml(page) : "";
+  // iframes never pays the cost, and an iframe-served press-&-hold is still detectable. Pass `html` so the
+  // helper skips its bounded poll when the copy is ALREADY in the top doc (an inline/top-frame challenge —
+  // nothing to wait for in the child frames); hasPxChallengeCopy(render) still detects it via render.html.
+  const frameHtml = hasPerimeterXHint(html) ? await captureChildFrameHtml(page, html) : "";
   return { title, text, html, frameHtml };
 }
 
@@ -541,12 +583,19 @@ export class PatchrightBrowserCore implements BrowserCore {
   #consoleErrors: string[] = [];
   #networkFailures: string[] = [];
   /**
-   * #80: the most recent Document-navigation BLOCK the guard emitted (blocked host + its reason), captured
-   * at the CDP decision seam. A holder consulted by the MAIN-FRAME requestfailed listener to attach the
-   * guard's reason to a self-block. Includes subframe-document blocks too; the PROMOTION to a first-class
-   * self-block is top-frame-scoped at the page listener, so a subframe entry is never surfaced. Per-nav reset.
+   * #80: the Document-navigation guard-block reasons for THIS navigation, keyed by the blocked request URL,
+   * captured at the CDP decision seam. A holder consulted by the MAIN-FRAME requestfailed listener to attach
+   * the guard's reason to a self-block. Keyed by the full URL (not a single slot, and not merely the host) so
+   * concurrent Document blocks in one navigation don't evict each other's reason before the requestfailed
+   * fires — including two blocks to the SAME host with DIFFERENT reasons (policy is path-sensitive: an
+   * origination-denied `/signup` vs an off-owner `/other`), where a host key would clobber. The CDP write URL
+   * (`event.request.url`) and the Playwright read URL (`req.url()`) are the same request URL, so they
+   * correlate; policy is deterministic per URL, so different reasons imply different keys. Includes
+   * subframe-doc blocks; the PROMOTION to a first-class self-block is top-frame-scoped at the page listener,
+   * so a subframe entry is never surfaced. DIAGNOSTIC-only (write-only side channel; the fail-closed decision
+   * never reads it back). Per-nav reset; size-capped ({@link MAX_NAV_BLOCK_ENTRIES}) against page-driven growth.
    */
-  #lastNavBlock?: { host: string; reason?: string };
+  #lastNavBlock = new Map<string, string>();
   /**
    * #80: THIS navigation was aborted by the gateway's OWN guard on the MAIN FRAME (net::ERR_BLOCKED_BY_CLIENT
    * — the sole client-blocker). Set by the top-frame-scoped requestfailed listener; folded into the snapshot
@@ -974,9 +1023,17 @@ export class PatchrightBrowserCore implements BrowserCore {
     // #80: stash a BLOCKED Document-navigation's host + guard reason so the (top-frame-scoped) requestfailed
     // listener can attach the reason to a MAIN-FRAME self-block. `resourceType === "Document"` includes
     // subframe docs; the promotion to a first-class self-block is top-frame-scoped at the page listener.
-    if (decision === "block" && event.resourceType === "Document") {
-      const host = hostFromUrl(event.request?.url ?? "");
-      this.#lastNavBlock = { host, ...(blockInfo.reason !== undefined ? { reason: blockInfo.reason } : {}) };
+    if (decision === "block" && event.resourceType === "Document" && blockInfo.reason !== undefined) {
+      // Store per REQUEST URL (only when a reason exists — the read consults nothing else): the main-frame
+      // requestfailed reads back its own URL's reason, and a concurrent block to a different URL (even the
+      // same host, different path) gets its own entry instead of clobbering this one. Evict oldest-first at
+      // the cap so a page spamming unique-URL blocked iframes in one nav can't grow this holder without bound.
+      const key = event.request?.url ?? "";
+      if (this.#lastNavBlock.size >= MAX_NAV_BLOCK_ENTRIES && !this.#lastNavBlock.has(key)) {
+        const oldest = this.#lastNavBlock.keys().next().value;
+        if (oldest !== undefined) this.#lastNavBlock.delete(oldest);
+      }
+      this.#lastNavBlock.set(key, blockInfo.reason);
     }
     try {
       if (decision === "allow") {
@@ -1228,7 +1285,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     this.#redirectChain = [];
     this.#consoleErrors = [];
     this.#networkFailures = [];
-    this.#lastNavBlock = undefined; // #80: the guard-reason holder is per-navigation, like the buffers above
+    this.#lastNavBlock = new Map(); // #80: the guard-reason holder is per-navigation, like the buffers above
     this.#policyBlockedNav = undefined; // #80: a fresh navigation has not (yet) self-blocked
   }
 
@@ -1281,10 +1338,13 @@ export class PatchrightBrowserCore implements BrowserCore {
         // block — the gateway's own nav guard is the sole client-blocker. TOP-FRAME-scoped
         // (req.frame()===mainFrame() AND isNavigationRequest), so a benign off-allowlist SUBRESOURCE
         // (ads/analytics/fonts) never sets it. Attach the guard's reason captured at the decision seam,
-        // matched by host (a redirect hop's guard reason is deterministic per host).
+        // matched by the request URL (see the lookup below).
         if (req.isNavigationRequest() && req.frame() === page.mainFrame() && /ERR_BLOCKED_BY_CLIENT/i.test(errText)) {
           const host = hostFromUrl(req.url());
-          const reason = this.#lastNavBlock?.host === host ? this.#lastNavBlock.reason : undefined;
+          // Look up the reason by the SAME request URL the CDP seam keyed it under (not host) so a same-host
+          // different-path concurrent block can't hand back the wrong reason. #policyBlockedNav.host stays the
+          // blocked host (a redirect hop's requested URL differs from the refused host).
+          const reason = this.#lastNavBlock.get(req.url());
           this.#policyBlockedNav = { host, ...(reason !== undefined ? { reason } : {}) };
         }
       } catch {
