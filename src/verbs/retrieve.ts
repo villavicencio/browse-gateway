@@ -102,6 +102,7 @@ export interface RetrieveOptions {
  */
 export type BlockReason =
   | "nav-failed"
+  | "policy-blocked"
   | "captcha"
   | "cf-challenge"
   | "perimeterx-challenge"
@@ -435,6 +436,11 @@ function isIndexFilenamePath(pathname: string): boolean {
  * case needs the override here.
  */
 export function resolveFailureReason(sig: FailureSignal): BlockReason | null {
+  // #80: a self-inflicted policy block is its OWN reason — so the surfaced `reason` AGREES with the
+  // `policy-blocked` FailureClass (the one-reason invariant). Without this the null-status signal collapses
+  // to `nav-failed` below, and the MCP surface (which prefers `reason` over `failureClass`) would hide the
+  // classification, mis-advising a fresh exit for an off-allowlist target. Highest precedence.
+  if (sig.policyBlocked) return "policy-blocked";
   return isChromeErrorUrl(sig.finalUrl) ? "nav-failed" : resolveBlockReason(sig);
 }
 
@@ -909,6 +915,11 @@ export async function retrieve(
         { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: timeouts.proxyNavTimeoutMs },
       );
       attemptMs.push(performance.now() - attempt0);
+      // #80: a SELF-inflicted policy block (the gateway's own guard aborted this nav — off-allowlist/off-owner
+      // target, not exit-reputation) can NEVER be fixed by a fresh exit. TERMINATE the re-roll loop
+      // immediately (no wasted attempts), surfacing the policy-blocked render — and BEFORE the
+      // sawLiveProxiedResponse tracking below, since our guard aborted the request so no exit reached the site.
+      if (render.policyBlocked !== undefined) break;
       // A fresh exit landed a real page -> done. Retry on a failed nav (null status), a dead exit that
       // reached a `chrome-error://` page while carrying a STALE 200 (else the loop would treat that dead
       // exit as healthy and break without trying later exits — defeating PROXY_MAX_ATTEMPTS, codex #41 r5),

@@ -7,9 +7,12 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyFailure, isDeadExit } from "../dist/verbs/index.js";
-import { buildFailureDiagnostics, redactFailureDiagnostics } from "../dist/observability/index.js";
+import { classifyFailure, isDeadExit, resolveFailureReason, retrieve } from "../dist/verbs/index.js";
+import { buildFailureDiagnostics, redactFailureDiagnostics, failureOf } from "../dist/observability/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
+import { DEFAULT_CALL_TIMEOUTS } from "../dist/gateway/index.js";
+import { SecretStore } from "../dist/security/index.js";
+import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 
 // --- classifyFailure: policy-blocked is the TOP-precedence class ---
 test("classifyFailure: policyBlocked → policy-blocked, outranking every site/exit signal", () => {
@@ -105,4 +108,83 @@ test("buildFailureDiagnostics + redact: selfBlockedNav carries host+reason; host
     "credential scope: navigation is not the credential owner host",
     "the closed-vocab guard reason passes redaction untouched",
   );
+});
+
+// --- P2: resolveFailureReason surfaces `policy-blocked` so the reason AGREES with the class ---
+test("resolveFailureReason: policyBlocked → policy-blocked reason (not nav-failed), so the class is visible", () => {
+  assert.equal(resolveFailureReason({ title: "", text: "", status: null, policyBlocked: true }), "policy-blocked");
+  // outranks the chrome-error nav-failed override
+  assert.equal(resolveFailureReason({ title: "", text: "", status: null, finalUrl: "chrome-error://x", policyBlocked: true }), "policy-blocked");
+  // NON-REGRESSION: without the flag the null-status signal is still nav-failed
+  assert.equal(resolveFailureReason({ title: "", text: "", status: null }), "nav-failed");
+});
+
+// --- P1: a policy block TERMINATES the escalation loop immediately (no wasted exit re-rolls) ---
+const PROXY = () => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" });
+const CF_BLOCK = { url: "u", status: 403, title: "Just a moment...", text: "Enable JavaScript and cookies to continue", html: "<div id='challenge-platform' class='cf-chl-opt'></div>", clearanceWaitedMs: 0, diagnostics: { finalUrl: "u", status: 403 } };
+const DEAD = { url: "u", status: null, title: "", text: "", html: "", clearanceWaitedMs: 0, diagnostics: { finalUrl: "u", status: null } };
+const POLICY_BLOCKED = {
+  url: "u", status: null, title: "", text: "", html: "", clearanceWaitedMs: 0,
+  policyBlocked: { host: "off.example", reason: "host not in consumer allowlist" },
+  diagnostics: { finalUrl: "u", status: null, selfBlockedNav: { host: "off.example", reason: "host not in consumer allowlist" } },
+};
+/** withConsumerSession returns results[call] — call 0 is the direct render, 1.. are proxied attempts. */
+function makeRenderSeq(results) {
+  let i = 0;
+  return {
+    async withConsumerSession(_token, fn) {
+      const result = results[Math.min(i, results.length - 1)];
+      i += 1;
+      return fn({ core: { async render() { return result; }, async setNavigationGuard() {}, async close() {} } }, { id: "agent-1" });
+    },
+  };
+}
+
+test("retrieve: a policy block mid-escalation TERMINATES the loop (no re-roll) and surfaces policy-blocked", async () => {
+  // direct CF-block → escalate; the FIRST proxied attempt hits a policy block (an off-allowlist redirect hop).
+  // The loop must STOP there — a fresh exit can't reach an off-allowlist target.
+  const gateway = makeRenderSeq([CF_BLOCK, POLICY_BLOCKED, DEAD, DEAD]);
+  const r = await retrieve(gateway, new SecretStore(PROXY), { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyDiagnostic.attempts, 1, "the loop TERMINATED on the policy block — no wasted re-rolls");
+  assert.equal(r.diagnostics.failureClass, "policy-blocked", "classified policy-blocked (not nav-failed / burned-exit)");
+  assert.equal(r.reason, "policy-blocked", "the surfaced reason AGREES with the class (P2 — not nav-failed)");
+  assert.equal(r.proxyDiagnostic.burnedExit, undefined, "a policy block is never an all-exits-dead burn");
+});
+
+test("retrieve: a FORCED-proxy policy block terminates at the FIRST attempt (no re-roll)", async () => {
+  const gateway = makeRenderSeq([POLICY_BLOCKED, DEAD, DEAD]); // forced → no direct render; 1st proxied = policy block
+  const r = await retrieve(gateway, new SecretStore(PROXY), { token: "t", url: "https://off.example/", forceProxy: true, escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyDiagnostic.attempts, 1, "forced policy block terminates immediately (not proxyMaxAttempts)");
+  assert.notEqual(r.proxyDiagnostic.attempts, DEFAULT_CALL_TIMEOUTS.proxyMaxAttempts, "did NOT exhaust every exit");
+  assert.equal(r.diagnostics.failureClass, "policy-blocked");
+  assert.equal(r.reason, "policy-blocked");
+});
+
+// --- guardrail (c): a COLD pinned session's off-allowlist nav is policy-attributed, NEVER "fresh exit" ---
+test("drive: a COLD pinned session's off-allowlist nav → policy message, NEVER suggests a fresh exit", async () => {
+  let n = 1;
+  const open = new Map();
+  const okSnap = (url) => ({ url, title: "ok", tree: "real ".repeat(20), status: 200 });
+  const blockedSnap = (url) => ({
+    url, title: "", tree: "", status: null,
+    policyBlocked: { host: new URL(url).hostname, reason: "host not in consumer allowlist" },
+    diagnostics: { finalUrl: url, status: null, selfBlockedNav: { host: new URL(url).hostname, reason: "host not in consumer allowlist" } },
+  });
+  const core = { async navigate(url) { return url.includes("/off") ? blockedSnap(url) : okSnap(url); }, async snapshot() { return okSnap("u"); } };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + n++; open.set(id, { core }); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error("no session"); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); },
+  };
+  // Proxy configured + datacenter IP → the OLD generic message WOULD have appended "retry for a fresh exit";
+  // the policy-blocked branch must pre-empt it.
+  const c = new GatewayDriveController(gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "proxypass" })), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  await c.navigate("https://good.com/"); // direct 200 → pins (cold)
+  const err = await c.navigate("https://good.com/off").then(() => null, (e) => e); // pinned, off-allowlist → policy block
+  assert.ok(err instanceof Error, "the off-allowlist nav on a pinned cold session rejects");
+  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed message");
+  assert.doesNotMatch(err.message, /retry navigate for a fresh exit/i, "does NOT SUGGEST retrying for a fresh exit (guardrail c)");
+  assert.match(err.message, /fresh exit cannot reach|fix the scope\/policy/i, "explicitly advises AGAINST a fresh exit / points at policy");
+  assert.equal(failureOf(err)?.failureClass, "policy-blocked", "the envelope classifies policy-blocked");
 });
