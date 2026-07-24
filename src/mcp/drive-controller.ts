@@ -171,6 +171,9 @@ export class GatewayDriveController implements DriveController {
       ddHint: snap.ddHint,
       captchaKind: snap.captchaKind,
       finalUrl: snap.url,
+      // #80: a MAIN-FRAME self-block (the gateway's own guard aborted the nav) → classifyFailure returns
+      // `policy-blocked` (top precedence) and isDeadExit excludes it from burned-exit re-roll.
+      policyBlocked: snap.policyBlocked !== undefined,
     };
   }
 
@@ -452,6 +455,17 @@ export class GatewayDriveController implements DriveController {
       s.core.navigate(url, { ...(this.#proxiedSession ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs }),
     );
     if (navFailed(snap)) {
+      // #80: a SELF-inflicted policy block (the gateway's OWN guard aborted the nav — an off-owner redirect
+      // hop, an off-allowlist target, or an origination-boundary refusal) is NOT an exit/credential failure:
+      // the session is HEALTHY (our guard refused the TARGET; the committed exit + any WARM clearance are
+      // intact). PRESERVE it (no #discardSession) and surface a policy-attributed error — BEFORE the discard +
+      // budget/warm/generic remediation below, which would wrongly DESTROY the healthy session and advise
+      // "re-capture this credential" / a fresh exit (the exact mis-diagnosis R2 exists to fix). Mirrors R1's
+      // keystone: don't destroy a healthy session for a scope refusal. The guard aborts before any wait, so a
+      // policy block is sub-second — it precedes even the budget/deadline branches (never a real timeout).
+      if (snap.policyBlocked !== undefined) {
+        throw attachFailure(this.#policyBlockedError(snap.policyBlocked), this.#failure(snap));
+      }
       await this.#discardSession();
       // #45 (codex r2): a pinned single-shot navigate that hit the per-call deadline is a TIMEOUT, not the
       // incidental block/nav class — and the warm re-capture remediation is wrong for a budget timeout. Classify
@@ -525,6 +539,16 @@ export class GatewayDriveController implements DriveController {
     if (!navFailed(direct)) {
       this.#pinned = true; // direct works → commit it (no residential GB spent)
       return direct;
+    }
+    // #80: a self-inflicted policy block on the FIRST cold navigate — the guard refused an off-allowlist
+    // target. The session is HEALTHY (our guard aborted the nav, the direct exit is fine), so PIN + PRESERVE
+    // it (a subsequent in-scope navigate reuses it) and surface the policy remediation — BEFORE the discard +
+    // escalation/generic branches below, whose "no residential proxy configured to escalate to" clause
+    // wrongly implies a fresh proxy exit would help (it can never reach an off-allowlist target). Parity with
+    // the pinned + warm-open paths; mirrors R1's keystone (never destroy a healthy session for a scope refusal).
+    if (direct.policyBlocked !== undefined) {
+      this.#pinned = true;
+      throw attachFailure(this.#policyBlockedError(direct.policyBlocked), this.#failure(direct));
     }
     // Direct failed. Escalate to a proxied exit ONLY on a qualifying block — a visible challenge or a
     // hard reputation block, the two a clean residential exit can clear. A bare null-status failure
@@ -717,6 +741,17 @@ export class GatewayDriveController implements DriveController {
       s.core.navigate(url, { ...(override.proxy ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs }),
     );
     if (navFailed(snap)) {
+      // #80: a self-inflicted policy block (a redirect hop off the owner host, or an origination-boundary
+      // refusal on the warm target) is a SCOPE refusal — NOT a stale/expired credential. The warm session is
+      // HEALTHY (opened + warmed on the owner host, its WAF clearance intact), so PIN + PRESERVE it (an
+      // in-scope retry reuses the clearance — the epic's don't-discard-live-clearance goal) and surface a
+      // policy-attributed error, BEFORE the #discardSession + budget/warm remediation that would wrongly
+      // DESTROY it and advise "re-capture this credential" (the exact mis-diagnosis R2 exists to fix). Mirrors
+      // the pinned path + R1's keystone: never destroy a healthy session for a scope refusal.
+      if (snap.policyBlocked !== undefined) {
+        this.#pinned = true;
+        throw attachFailure(this.#policyBlockedError(snap.policyBlocked), this.#failure(snap));
+      }
       await this.#discardSession();
       // #45 (codex r2): a warm navigate that hit the per-call deadline is a TIMEOUT — surface it as such and do
       // NOT issue the stale-login/re-capture remediation (#warmError), which is the wrong fix for a budget timeout.
@@ -856,6 +891,27 @@ export class GatewayDriveController implements DriveController {
       : this.#warmStaleError(url, status);
   }
 
+  /** #80: a navigation the gateway's OWN nav guard aborted (net::ERR_BLOCKED_BY_CLIENT — an off-allowlist /
+   *  off-owner target). This is OUR policy refusing the target, not a site block, a dead exit, or a stale
+   *  credential — so the message points at the SCOPE/POLICY and NEVER suggests a fresh exit or a re-capture
+   *  (guardrail c: a fresh exit cannot reach an off-policy target). Carries the guard's own closed-vocab
+   *  block reason. Mirrors the `policy-blocked` FailureClass on the attached envelope. Used on the cold /
+   *  non-warm pinned path; the warm path's evidence-driven advice is R3 (#81). */
+  #policyBlockedError(block: { host: string; reason?: string }): Error {
+    // Keyed on the BLOCKED host — accurate for a redirect hop off the owner (where the requested URL differs
+    // from the actually-refused host) and for an action-triggered nav (no requested URL). Both fields are
+    // scrubbed through the secret pass (#80): the guards only write a structural hostname + a hardcoded reason,
+    // but the NavigationBlockInfo.reason type permits any string, and this message is thrown OUTSIDE #run's
+    // redaction re-wrap — so scrub here rather than trust a closed-vocab assumption. NEVER suggests a fresh
+    // exit or a re-capture (guardrail c).
+    const host = redactSecrets(block.host, this.#secrets);
+    const reason = block.reason !== undefined ? redactSecrets(block.reason, this.#secrets) : "the target is off this consumer's scope";
+    return new Error(
+      `navigation to ${host} blocked by gateway policy: ${reason} — ` +
+        `a fresh exit cannot reach an off-policy target; fix the scope/policy, not the exit or credential`,
+    );
+  }
+
   /**
    * R1 (#79) keystone: a WARM drive session is pinned to ONE owner host, so a cross-host navigation is an
    * EXPECTED scope rejection — not a session/credential failure and NOT "recovery" (nothing was burned).
@@ -951,21 +1007,28 @@ export class GatewayDriveController implements DriveController {
         return snap;
       }
       last = snap;
+      // #80: a SELF-inflicted policy block (the gateway's own guard aborted this nav — off-allowlist/off-owner
+      // target, not exit-reputation) can NEVER be fixed by a fresh exit. It is NOT a live site response (no
+      // exit reached the site), so it must not set sawLiveResponse; and the re-roll loop must TERMINATE
+      // immediately (no wasted attempts) — the whole point of the `policy-blocked` class.
+      const policyBlocked = snap.policyBlocked !== undefined;
       // #45: this attempt FAILED. If the exit REACHED the site (a live block/challenge — not a null-status /
-      // chrome-error dead nav), the failure is site-attributable, so NOT an all-exits-dead burn.
+      // chrome-error dead nav, and NOT a self-inflicted policy block), the failure is site-attributable, so
+      // NOT an all-exits-dead burn.
       // #67/#66: isDeadExit keys off the main-frame response RECEIPT, which the core now populates on every
       // drive snapshot — so a responded-but-truncated proxied attempt (deadlineTruncated, or status-null with
       // a receipt) counts as a LIVE response, not a burned exit (the same precision retrieve has). The
       // `status`-presence fallback remains only for receipt-less fixtures.
-      if (!isDeadExit(snap.responseReceived, snap.status ?? null, snap.url)) {
+      if (!policyBlocked && !isDeadExit(snap.responseReceived, snap.status ?? null, snap.url)) {
         sawLiveResponse = true;
         lastLive = snap; // #45 (codex r8): a later dead exit must not erase this site block from the class
       }
-      await this.#discardSession(); // close the unhealthy session so the next attempt draws a fresh exit
+      await this.#discardSession(); // close the (healthy) session so the next attempt draws a fresh exit
       // #42: record AFTER teardown so a FAILED attempt's session close (grace + kill-confirm, up to ~15s of
       // caller-visible latency) counts toward its attemptMs — else ~45s of three wedged teardowns would sit in
       // totalMs but in no attemptMs entry. Exactly one push per iteration keeps attemptMs 1:1 with `attempts`.
       attemptMs.push(performance.now() - attempt0);
+      if (policyBlocked) break; // #80: no fresh exit can reach an off-allowlist target — stop re-rolling now
     }
     // #45 (codex r1): re-check the deadline AFTER the final attempt — the last allowed attempt can START with
     // budget remaining but RETURN past the deadline (no next iteration to set budgetExceeded). A timeout must
@@ -980,12 +1043,14 @@ export class GatewayDriveController implements DriveController {
     // real block (shouldEscalateDrive), positive evidence the TARGET is reachable, so all-proxied-dead is
     // exit-attributable. FORCED skips that check, so an off-allowlist/DNS-dead target would look identical on
     // HEALTHY exits; stay nav-failed without reachability evidence (positive-signal-only).
-    const burnedExit = attempts > 0 && !forced && !budgetExceeded && !sawLiveResponse;
+    // #80: a self-inflicted policy block is never a burn — our guard aborted the nav, the exits were healthy.
+    // Exclude it so the `burnedExit` loop-verdict can't override the `policy-blocked` class in #failure.
+    const burnedExit = attempts > 0 && !forced && !budgetExceeded && !sawLiveResponse && last?.policyBlocked === undefined;
     // #45 (codex r8): on a MIXED exhaustion (a live block then a dead exit) classify + surface the LAST LIVE
     // failure, not the dead final `last`, so the reason/class/message stay site-attributed (not nav-failed).
     // Only when NOT a timeout/burn (those override the class anyway) and the final snapshot is actually dead.
     const failSnap =
-    !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.responseReceived, last.status ?? null, last.url)
+    !budgetExceeded && !burnedExit && lastLive && last && isDeadExit(last.responseReceived, last.status ?? null, last.url, last.policyBlocked !== undefined)
       ? lastLive
       : last; // #67/#66: receipt-keyed dead check (the core now carries the receipt; status fallback for fixtures)
     // #45: skip the opt-in egress probe when we bailed on budget — it is one more proxied request past an
@@ -995,7 +1060,10 @@ export class GatewayDriveController implements DriveController {
     // under the deadline could overrun the call budget. The burned/site verdict is already computed above, so
     // a bounded probe only adds exit-org evidence; it never re-labels the (correct) burned-exit verdict.
     const exitCheck =
-      this.#verifyEgressEnabled && !budgetExceeded && budgetDeadlineMs - performance.now() > MIN_ATTEMPT_BUDGET_MS
+      // #80: skip the egress probe for a self-inflicted policy block — the exit was never the problem (our
+      // guard aborted the nav), so probing it opens ANOTHER proxied session for zero diagnostic value and
+      // delays an otherwise-immediate policy error.
+      this.#verifyEgressEnabled && !budgetExceeded && last?.policyBlocked === undefined && budgetDeadlineMs - performance.now() > MIN_ATTEMPT_BUDGET_MS
         ? await this.#verifyEgress(budgetDeadlineMs)
         : undefined;
     const dx = this.#escalationDiag({ proxyApplied: attempts > 0, forced, attempts, last: failSnap, attemptMs, exitCheck, burnedExit });
@@ -1005,7 +1073,11 @@ export class GatewayDriveController implements DriveController {
       ? `call budget exhausted escalating ${sanitizeUrlForError(url)} (${this.#timeouts.callBudgetMs}ms) after ${attempts} attempt(s)`
       : burnedExit
         ? `all ${attempts} proxied exit(s) died reaching ${sanitizeUrlForError(url)} (burned exits — none got a response)`
-        : `could not land a working proxied exit for ${sanitizeUrlForError(url)} after ${attempts} attempts`;
+        : // #80: a self-inflicted policy block terminated the loop — the exits were healthy, OUR guard aborted the
+          // nav to an off-policy target. Do NOT imply an exit-hunting failure (guardrail c: no fresh-exit advice).
+          failSnap?.policyBlocked !== undefined
+          ? `navigation to ${sanitizeUrlForError(url)} was blocked by gateway policy — a fresh exit cannot reach an off-allowlist/off-owner target`
+          : `could not land a working proxied exit for ${sanitizeUrlForError(url)} after ${attempts} attempts`;
     // #45 (codex r1): a budget timeout that bailed BEFORE any proxied snapshot (a forced request or a direct
     // attempt that consumed the budget → `last` undefined) STILL surfaces failureClass=timeout, so the MCP
     // error-kind reads it as an in-band block (a completed-but-timed-out call), not an internal transport error.
@@ -1074,6 +1146,13 @@ export class GatewayDriveController implements DriveController {
       // reputation block (4xx + thin) reached by the action as well as a visible challenge — neither
       // is handed back as success.
       if (navFailed(snap)) {
+        // #80: an ACTION (submit/click/Enter) that navigated OFF the allowlist / owner host is a SCOPE
+        // refusal — closing + reopening cannot make an off-policy target reachable and would needlessly
+        // discard the HEALTHY session/page. Surface the policy remediation (never "close + reopen"); the
+        // session is left intact (this path already never discards). Precedes the generic challenge error.
+        if (snap.policyBlocked !== undefined) {
+          throw attachFailure(this.#policyBlockedError(snap.policyBlocked), this.#failure(snap));
+        }
         throw attachFailure(
           new Error(
             "the action landed on a blocked/challenge page that did not clear — close and reopen the " +

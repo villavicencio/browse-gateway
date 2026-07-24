@@ -16,4 +16,4 @@ export {
   assembleTiming,
   FAILURE_DIAGNOSTICS_CAP,
 } from "./failure-diagnostics.js";
-export type { FailureDiagnostics, FailureDiagnosticsInput, FailureCarrier, WafVendor, FailureClass, Timing } from "./failure-diagnostics.js";
+export type { FailureDiagnostics, FailureDiagnosticsInput, FailureCarrier, WafVendor, FailureClass, SelfBlockedNav, Timing } from "./failure-diagnostics.js";

@@ -133,6 +133,11 @@ export function navFailed(snap: PageSnapshot): boolean {
   return (
     status === null ||
     snap.deadlineTruncated === true ||
+    // #80: a SELF-inflicted policy block (the gateway's own guard aborted this nav). Checked explicitly
+    // because an ACTION-triggered nav (click/submit) that the guard aborts produces NO new document
+    // response, so the snapshot can inherit the PREVIOUS page's non-null status — which every other arm
+    // here reads as healthy, letting #actAndSnap hand back the stale page as a successful action result.
+    snap.policyBlocked !== undefined ||
     snap.url.startsWith("chrome-error://") ||
     isVisiblyBlocked({ title: snap.title, text: snap.tree }) ||
     isHardBlock({ text: snap.tree }, status)

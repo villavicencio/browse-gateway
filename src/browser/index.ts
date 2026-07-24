@@ -11,6 +11,7 @@ export type {
   Category,
   DriveTarget,
   FieldState,
+  NavigationBlockInfo,
   NavigationDecision,
   NavigationGuard,
   NavigationRequest,

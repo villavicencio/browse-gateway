@@ -73,6 +73,13 @@ export type WafVendor =
  *                       rejection, not a block or a nav failure; carries NO WAF vendor and NEVER routes into
  *                       exit re-roll / credential remediation. The caller opens a SEPARATE drive session per
  *                       host (ratified contract: one warm drive session = one owner host).
+ *   - `policy-blocked`  (#80) a MAIN-FRAME navigation the gateway's OWN nav guard aborted
+ *                       (net::ERR_BLOCKED_BY_CLIENT — an off-owner / off-allowlist target; the guard is the
+ *                       sole client-blocker). A SELF-inflicted block, not a site/exit/credential fault: it
+ *                       NEVER suggests a fresh exit and NEVER enters exit re-roll / burned-exit escalation (a
+ *                       fresh exit cannot fix an off-allowlist target). Carries the guard's block reason via
+ *                       {@link FailureDiagnostics.selfBlockedNav}; NO WAF vendor. Top-frame-scoped — a benign
+ *                       off-allowlist SUBRESOURCE block (ads/analytics) never produces it.
  *   - `burned-exit`     (#45) a proxy escalation that EXHAUSTED every attempt without any exit reaching the
  *                       site (all dead-nav) — our residential exits died, distinct from the site blocking a
  *                       live exit. Emitted at the escalation SEAM (not by the single-page classifier, which
@@ -96,6 +103,7 @@ export type FailureClass =
   | "unsupported-browser"
   | "nav-failed"
   | "owner-host-mismatch"
+  | "policy-blocked"
   | "burned-exit"
   | "timeout"
   | "ok";
@@ -156,6 +164,18 @@ export function assembleTiming(measured: {
 }
 
 /**
+ * A self-inflicted policy block (#80): the gateway's OWN navigation guard aborted a MAIN-FRAME navigation
+ * (net::ERR_BLOCKED_BY_CLIENT — the guard is the sole client-blocker). `host` is the blocked target host;
+ * `reason` is the guard's own block reason, threaded from the guard's audit-record path via a decision-safe
+ * side-channel (a CLOSED-vocab guard string — e.g. "credential scope…" / "host not in consumer allowlist" —
+ * never page-derived free text). Drives the `policy-blocked` {@link FailureClass}.
+ */
+export interface SelfBlockedNav {
+  host: string;
+  reason?: string;
+}
+
+/**
  * The evidence envelope surfaced on EVERY failure of both the retrieve and drive paths, at parity.
  * All fields optional so a success shape is unchanged and a partial capture still carries what it has.
  */
@@ -176,6 +196,12 @@ export interface FailureDiagnostics {
   networkFailures?: string[];
   /** Base64 PNG (or a ref) — populated ONLY when the capture flag is on and under the size cap. */
   screenshotRef?: string;
+  /** #80 self-inflicted policy block: the gateway's own nav guard aborted this MAIN-FRAME navigation
+   *  (ERR_BLOCKED_BY_CLIENT). Carries the blocked `host` + the guard's closed-vocab block `reason`. Assembled
+   *  by {@link buildFailureDiagnostics} (an evidence field, not a redaction-seam slot); {@link
+   *  redactFailureDiagnostics} scrubs the host and passes the closed-vocab reason through. Drives the
+   *  `policy-blocked` {@link FailureClass}. */
+  selfBlockedNav?: SelfBlockedNav;
 
   // ---- PRE-DECLARED OPTIONAL SLOTS for downstream tickets (leave UNSET in this ticket) ----
   /** #40 mitigation/CAPTCHA vendor label — the {@link WafVendor} CLOSED vocabulary (the TYPE is the
@@ -229,6 +255,7 @@ export interface FailureDiagnosticsInput {
   consoleErrors?: readonly string[];
   networkFailures?: readonly string[];
   screenshotRef?: string;
+  selfBlockedNav?: SelfBlockedNav;
 }
 
 /** Upper bound on each free-text list (consoleErrors / networkFailures / redirectChain) surfaced in an
@@ -258,6 +285,7 @@ export function buildFailureDiagnostics(input: FailureDiagnosticsInput): Failure
     diag.networkFailures = input.networkFailures.slice(-FAILURE_DIAGNOSTICS_CAP);
   }
   if (input.screenshotRef !== undefined) diag.screenshotRef = input.screenshotRef;
+  if (input.selfBlockedNav !== undefined) diag.selfBlockedNav = input.selfBlockedNav;
   return diag;
 }
 
@@ -382,6 +410,17 @@ export function redactFailureDiagnostics(
   if (diag.redirectChain) out.redirectChain = diag.redirectChain.map(scrubUrl);
   if (diag.consoleErrors) out.consoleErrors = diag.consoleErrors.map(scrubText);
   if (diag.networkFailures) out.networkFailures = diag.networkFailures.map(scrubText);
+  // #80: scrub BOTH fields of the self-block through the secret pass. The producers (the policy guards) only
+  // ever write hardcoded reason strings + a structural hostname, but the {@link NavigationBlockInfo.reason}
+  // type permits any string — so a future/alternate guard writing free text (a URL/token) must NOT leak here.
+  // Defense-in-depth (redactSecrets is a no-op on the real hardcoded reasons): scrub the reason like the host,
+  // rather than relying on a closed-vocab assumption the type doesn't enforce.
+  if (diag.selfBlockedNav) {
+    out.selfBlockedNav = {
+      host: redactSecrets(diag.selfBlockedNav.host, secrets),
+      ...(diag.selfBlockedNav.reason !== undefined ? { reason: redactSecrets(diag.selfBlockedNav.reason, secrets) } : {}),
+    };
+  }
   return out;
 }
 
