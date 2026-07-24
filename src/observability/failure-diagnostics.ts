@@ -67,6 +67,12 @@ export type WafVendor =
  *                       block/shell, but STILL a no-content failure (isError:true), not a success.
  *   - `unsupported-browser` an unsupported-browser interstitial phrase.
  *   - `nav-failed`      no response captured (status===null) — off-allowlist/unreachable.
+ *   - `owner-host-mismatch` (#79) a WARM drive session (pinned to ONE credential owner host) was asked to
+ *                       navigate a DIFFERENT host — refused BEFORE the wire, so the owner-host clamp is never
+ *                       tripped and the session (with its live WAF clearance) is preserved. An EXPECTED scope
+ *                       rejection, not a block or a nav failure; carries NO WAF vendor and NEVER routes into
+ *                       exit re-roll / credential remediation. The caller opens a SEPARATE drive session per
+ *                       host (ratified contract: one warm drive session = one owner host).
  *   - `burned-exit`     (#45) a proxy escalation that EXHAUSTED every attempt without any exit reaching the
  *                       site (all dead-nav) — our residential exits died, distinct from the site blocking a
  *                       live exit. Emitted at the escalation SEAM (not by the single-page classifier, which
@@ -89,6 +95,7 @@ export type FailureClass =
   | "real-zero-results"
   | "unsupported-browser"
   | "nav-failed"
+  | "owner-host-mismatch"
   | "burned-exit"
   | "timeout"
   | "ok";

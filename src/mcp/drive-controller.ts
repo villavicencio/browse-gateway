@@ -11,7 +11,7 @@
  * without losing page state (KTD-5). The proxy override is resolved fresh per open, so a secret
  * rotation takes effect on the next session.
  */
-import { isHttpUrl, redactSecrets } from "../security/index.js";
+import { isHttpUrl, redactSecrets, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
 import { DEFAULT_CALL_TIMEOUTS } from "../gateway/index.js";
@@ -407,6 +407,19 @@ export class GatewayDriveController implements DriveController {
     // First navigate of a session: try direct, escalate to a proxied exit only on a block.
     if (!this.#pinned) {
       return this.#firstNavigate(url, forced, budgetDeadlineMs);
+    }
+    // R1 (#79) keystone — owner-host contract. A WARM session is security-clamped to ONE owner host (the
+    // credential owner). Asking it to navigate a DIFFERENT host would trip that clamp
+    // (net::ERR_BLOCKED_BY_CLIENT, a null-status nav) and the pinned handler below would read the
+    // self-refusal as a dead exit and #discardSession — destroying a still-valid session and its live WAF
+    // clearance. Refuse the cross-host nav HERE, BEFORE the wire, so the clamp is never tripped and the
+    // good context is untouched. This changes the RESPONSE to a forbidden nav, never the clamp's DECISION
+    // (policy/index.ts guardForCredentialHost still blocks it — a no-exfil boundary). Gated on #warmHost:
+    // a COLD pinned session's off-allowlist nav is a separate case (R2's post-wire capture). Canonicalize
+    // BOTH sides to mirror the clamp exactly (canonicalizeHost, no www-strip), so this pre-flight refuses
+    // precisely when the clamp would block — no false refusals, no missed ones.
+    if (this.#warmHost !== undefined && canonicalizeHost(new URL(url).hostname) !== canonicalizeHost(this.#warmHost)) {
+      throw this.#ownerHostMismatch(url);
     }
     // Pinned session (direct or proxied): one shot. Reopen first if an idle reap closed it (same
     // mode). A failed nav means the committed exit/IP went bad, so discard it — the next navigate
@@ -841,6 +854,31 @@ export class GatewayDriveController implements DriveController {
     return hostForcesProxy(new URL(url).hostname, this.#freshExitHosts)
       ? this.#warmFreshError(url, status)
       : this.#warmStaleError(url, status);
+  }
+
+  /**
+   * R1 (#79) keystone: a WARM drive session is pinned to ONE owner host, so a cross-host navigation is an
+   * EXPECTED scope rejection — not a session/credential failure and NOT "recovery" (nothing was burned).
+   * Return a typed `owner-host-mismatch` failure that the MCP surface renders as a clear scope error and
+   * that NEVER routes into exit re-roll or credential remediation (it is thrown BEFORE the wire, so the
+   * navFailed→#discardSession path is never reached and the warm session — with its live WAF clearance —
+   * survives). Sub-distinguish the two caller-actionable cases: (i) a host IN this consumer's scope but ≠
+   * the current warm owner → open a SEPARATE drive session for it; (ii) a host wholly OUTSIDE the
+   * consumer's scope. Ratified contract: one warm drive session = one owner host.
+   */
+  #ownerHostMismatch(url: string): Error {
+    const target = canonicalizeHost(new URL(url).hostname);
+    // #allowlist.allows strips a leading `www.` (the LOOSER host check, matching #buildWarmOverride's
+    // gate), so an in-scope host reads as in-scope regardless of www spelling. Warm-open cannot have set
+    // #warmHost without an allowlist, so the ?? false is unreachable — default to out-of-scope defensively.
+    const inScope = this.#allowlist?.allows(target) ?? false;
+    const advice = inScope
+      ? `open a separate drive session to navigate ${target}`
+      : `${target} is out of this consumer's scope`;
+    return attachFailure(
+      new Error(`owner-host mismatch: this warm drive session is pinned to ${this.#warmHost} — ${advice}`),
+      redactFailureDiagnostics({ finalUrl: url, status: null, failureClass: "owner-host-mismatch" }, this.#secrets),
+    );
   }
 
   /**
