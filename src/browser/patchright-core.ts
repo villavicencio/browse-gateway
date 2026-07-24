@@ -337,7 +337,12 @@ async function readChildFrames(page: PatchrightPage): Promise<string> {
  *  the instant it appears. A live challenge that already rendered its copy is caught on attempt 0 (~0 cost).
  *  Trade-off (accepted): a CLEARED page keeps its `px-captcha-modal` marker but never renders the copy, so it
  *  pays the full, bounded ceiling — correctness (never returning a live fat-frame challenge as healthy) over
- *  latency, and the cost is bounded and pxHint-scoped (a healthy page never reaches here). */
+ *  latency, and the cost is bounded and pxHint-scoped (a healthy page never reaches here).
+ *
+ *  EXPORTED for the deterministic poll unit test (test/px-frame-poll.test.mjs): a real-browser gate can't
+ *  isolate the poll — render()'s own settle wait outlasts a late injection, so a one-shot read would pass the
+ *  gate too — so the load-bearing regression guard is a fake-page unit test (blank→blank→copy) that fails if
+ *  this is reverted to a one-shot read. */
 const PX_FRAME_POLL_ATTEMPTS = 3;
 const PX_FRAME_POLL_INTERVAL_MS = 250; // ≤ PX_FRAME_POLL_ATTEMPTS × this = 750ms ceiling, only on a pxHint page
 
@@ -347,7 +352,7 @@ const PX_FRAME_POLL_INTERVAL_MS = 250; // ≤ PX_FRAME_POLL_ATTEMPTS × this = 7
  *  above the handful of blocks a real navigation produces, so a legitimate main-frame reason is never evicted
  *  before its requestfailed reads it. */
 const MAX_NAV_BLOCK_ENTRIES = 32;
-async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
+export async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
   let html = await readChildFrames(page);
   for (let i = 0; i < PX_FRAME_POLL_ATTEMPTS && !hasPerimeterXChallengeCopy(html); i++) {
     await page.waitForTimeout(PX_FRAME_POLL_INTERVAL_MS).catch(() => {});
