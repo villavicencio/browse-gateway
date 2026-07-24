@@ -731,6 +731,17 @@ export class GatewayDriveController implements DriveController {
       s.core.navigate(url, { ...(override.proxy ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs }),
     );
     if (navFailed(snap)) {
+      // #80: a self-inflicted policy block (a redirect hop off the owner host, or an origination-boundary
+      // refusal on the warm target) is a SCOPE refusal — NOT a stale/expired credential. The warm session is
+      // HEALTHY (opened + warmed on the owner host, its WAF clearance intact), so PIN + PRESERVE it (an
+      // in-scope retry reuses the clearance — the epic's don't-discard-live-clearance goal) and surface a
+      // policy-attributed error, BEFORE the #discardSession + budget/warm remediation that would wrongly
+      // DESTROY it and advise "re-capture this credential" (the exact mis-diagnosis R2 exists to fix). Mirrors
+      // the pinned path + R1's keystone: never destroy a healthy session for a scope refusal.
+      if (snap.policyBlocked !== undefined) {
+        this.#pinned = true;
+        throw attachFailure(this.#policyBlockedError(url, snap.policyBlocked), this.#failure(snap));
+      }
       await this.#discardSession();
       // #45 (codex r2): a warm navigate that hit the per-call deadline is a TIMEOUT — surface it as such and do
       // NOT issue the stale-login/re-capture remediation (#warmError), which is the wrong fix for a budget timeout.

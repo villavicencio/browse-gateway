@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classifyFailure, isDeadExit, resolveFailureReason, retrieve, navFailed } from "../dist/verbs/index.js";
 import { buildFailureDiagnostics, redactFailureDiagnostics, failureOf } from "../dist/observability/index.js";
-import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
+import { PolicyEngine, ConsumerRegistry, Allowlist } from "../dist/policy/index.js";
 import { DEFAULT_CALL_TIMEOUTS } from "../dist/gateway/index.js";
 import { SecretStore } from "../dist/security/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
@@ -234,4 +234,34 @@ test("drive: a click that triggers a policy-blocked nav is a FAILURE, not the st
   await c.navigate("https://good.com/"); // pins
   // Without Fix 1, navFailed(200, no visible block) is false → the click returns the stale page as success.
   await assert.rejects(() => c.click({ target: "e1", element: "x" }), /blocked|policy|challenge|did not clear/i, "the action-triggered policy block is surfaced, not swallowed");
+});
+
+// --- warm-open policy block (a redirect hop off the owner host) PRESERVES the warmed session (its clearance),
+//     surfaces a policy message, and NEVER advises re-capturing the credential ---
+test("drive: a warm-open policy block PRESERVES the warmed session — no re-capture advice, no discard", async () => {
+  const HOST = "owner.example";
+  const SESSION = {
+    cookies: [{ name: "sid", value: "x".repeat(40), domain: HOST, path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "Lax" }],
+    origins: [{ origin: `https://${HOST}`, localStorage: [] }],
+  };
+  const ENTRY = { session: SESSION, creds: { username: "u", password: "p".repeat(20) }, updatedAt: 1 };
+  const vaultOf = (e) => ({ get: () => e, has: () => !!e, put() {}, remove: () => false });
+  let n = 1;
+  const open = new Map();
+  const events = [];
+  const core = { async navigate(url) { return policyBlockedSnap(url); }, async snapshot() { return { url: `https://${HOST}/`, title: "ok", tree: "x", status: 200 }; } };
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() { const id = "h" + n++; open.set(id, { core }); events.push(["open", id]); return id; },
+    async useConsumerSession(_t, h, fn) { const s = open.get(h); if (!s) throw new Error("no session"); return fn(s); },
+    async closeConsumerSession(_t, h) { open.delete(h); events.push(["close", h]); },
+  };
+  const c = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok", { onDatacenterIp: false, vault: vaultOf(ENTRY), consumerId: "atlas", allowlist: new Allowlist([HOST]) });
+  const err = await c.navigate(`https://${HOST}/deep`).then(() => null, (e) => e); // warm-opens; target redirects off-owner → policy block
+  assert.ok(err instanceof Error, "the warm-open policy block rejects");
+  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed message");
+  assert.doesNotMatch(err.message, /re-capture/i, "does NOT advise re-capturing the credential (guardrail c) — the login is fine");
+  assert.equal(failureOf(err)?.failureClass, "policy-blocked", "classifies policy-blocked");
+  assert.equal(open.size, 1, "the WARMED session is PRESERVED (its WAF clearance survives) — not discarded");
+  assert.equal(events.filter((e) => e[0] === "close").length, 0, "no #discardSession on a warm-open policy block");
 });
