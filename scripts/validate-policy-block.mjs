@@ -116,6 +116,17 @@ try {
       const subBlocked = audit.records.some((r) => r.action === "navigate" && r.decision === "block" && canonicalizeHost(r.host ?? "") === OFF_HOST);
       check("2. the off-allowlist subresource WAS in fact blocked by the guard (leg is meaningful)", subBlocked);
     }
+
+    // --- Leg 3 (drive persistent page, CONSUME-ONCE): a DRIVE navigate to an off-allowlist host self-blocks
+    // and sets policyBlocked on THAT snapshot; a follow-up bare snapshot() of the SAME persistent page must
+    // NOT re-emit it (the marker is one-shot). Otherwise navFailed would reject every healthy action on the
+    // preserved page after a single policy block.
+    if (off) {
+      const navBlocked = await session.core.navigate(`${off.origin}/page`, { clearanceTimeoutMs: 6_000 });
+      check("3. drive navigate to an off-allowlist host sets policyBlocked on the snapshot", navBlocked.policyBlocked !== undefined);
+      const followup = await session.core.snapshot();
+      check("3. consume-once: a follow-up snapshot() does NOT re-emit policyBlocked (marker consumed)", followup.policyBlocked === undefined);
+    }
   });
 } finally {
   await gateway.shutdown().catch(() => {});

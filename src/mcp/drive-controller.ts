@@ -464,7 +464,7 @@ export class GatewayDriveController implements DriveController {
       // keystone: don't destroy a healthy session for a scope refusal. The guard aborts before any wait, so a
       // policy block is sub-second — it precedes even the budget/deadline branches (never a real timeout).
       if (snap.policyBlocked !== undefined) {
-        throw attachFailure(this.#policyBlockedError(url, snap.policyBlocked), this.#failure(snap));
+        throw attachFailure(this.#policyBlockedError(snap.policyBlocked), this.#failure(snap));
       }
       await this.#discardSession();
       // #45 (codex r2): a pinned single-shot navigate that hit the per-call deadline is a TIMEOUT, not the
@@ -740,7 +740,7 @@ export class GatewayDriveController implements DriveController {
       // the pinned path + R1's keystone: never destroy a healthy session for a scope refusal.
       if (snap.policyBlocked !== undefined) {
         this.#pinned = true;
-        throw attachFailure(this.#policyBlockedError(url, snap.policyBlocked), this.#failure(snap));
+        throw attachFailure(this.#policyBlockedError(snap.policyBlocked), this.#failure(snap));
       }
       await this.#discardSession();
       // #45 (codex r2): a warm navigate that hit the per-call deadline is a TIMEOUT — surface it as such and do
@@ -887,10 +887,13 @@ export class GatewayDriveController implements DriveController {
    *  (guardrail c: a fresh exit cannot reach an off-policy target). Carries the guard's own closed-vocab
    *  block reason. Mirrors the `policy-blocked` FailureClass on the attached envelope. Used on the cold /
    *  non-warm pinned path; the warm path's evidence-driven advice is R3 (#81). */
-  #policyBlockedError(url: string, block: { host: string; reason?: string }): Error {
-    // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
+  #policyBlockedError(block: { host: string; reason?: string }): Error {
+    // Keyed on the BLOCKED host — accurate for a redirect hop off the owner (where the requested URL differs
+    // from the actually-refused host) and for an action-triggered nav (no requested URL). `host` is a plain
+    // structural hostname (no URL-injection risk) and `reason` is the guard's closed-vocab string, so no
+    // sanitizeUrlForError is needed. NEVER suggests a fresh exit or a re-capture (guardrail c).
     return new Error(
-      `navigation blocked by gateway policy (${sanitizeUrlForError(url)}): ${block.reason ?? "the target is off this consumer's scope"} — ` +
+      `navigation to ${block.host} blocked by gateway policy: ${block.reason ?? "the target is off this consumer's scope"} — ` +
         `a fresh exit cannot reach an off-policy target; fix the scope/policy, not the exit or credential`,
     );
   }
@@ -1129,6 +1132,13 @@ export class GatewayDriveController implements DriveController {
       // reputation block (4xx + thin) reached by the action as well as a visible challenge — neither
       // is handed back as success.
       if (navFailed(snap)) {
+        // #80: an ACTION (submit/click/Enter) that navigated OFF the allowlist / owner host is a SCOPE
+        // refusal — closing + reopening cannot make an off-policy target reachable and would needlessly
+        // discard the HEALTHY session/page. Surface the policy remediation (never "close + reopen"); the
+        // session is left intact (this path already never discards). Precedes the generic challenge error.
+        if (snap.policyBlocked !== undefined) {
+          throw attachFailure(this.#policyBlockedError(snap.policyBlocked), this.#failure(snap));
+        }
         throw attachFailure(
           new Error(
             "the action landed on a blocked/challenge page that did not clear — close and reopen the " +

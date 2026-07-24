@@ -1688,6 +1688,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // opt-in + size-capped. Timing is NOT folded here — it rides the first-class `timing` field below and
     // is folded into the envelope at the surface seam (#failure), matching the #40/#41 slot pattern.
     const screenshotRef = await this.#maybeCaptureScreenshot(page);
+    // #80: CONSUME the self-block marker ONCE (like #pendingActionTiming below) — it is THIS navigation's
+    // result, not a sticky flag. On the PERSISTENT drive page it would otherwise re-emit on every later
+    // non-navigating snapshot()/action, making navFailed reject healthy actions on the (preserved) page.
+    const policyBlocked = this.#policyBlockedNav;
+    this.#policyBlockedNav = undefined;
     const diagnostics = buildFailureDiagnostics({
       finalUrl,
       title,
@@ -1696,7 +1701,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       consoleErrors: this.#consoleErrors,
       networkFailures: this.#networkFailures,
       ...(screenshotRef !== undefined ? { screenshotRef } : {}),
-      ...(this.#policyBlockedNav ? { selfBlockedNav: this.#policyBlockedNav } : {}), // #80
+      ...(policyBlocked ? { selfBlockedNav: policyBlocked } : {}), // #80 (consumed above)
     });
     const snapshotMs = performance.now() - t0;
     // #42: fold in any pending drive-action settle stages (consume-once), so a post-action snapshot after a
@@ -1721,7 +1726,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       ...(captchaKind ? { captchaKind } : {}),
       ...(solverEligible !== undefined ? { solverEligible } : {}),
       ...(captchaSolveReason ? { captchaSolveReason } : {}),
-      ...(this.#policyBlockedNav ? { policyBlocked: this.#policyBlockedNav } : {}), // #80
+      ...(policyBlocked ? { policyBlocked } : {}), // #80 (consumed above — one-shot per navigation)
     };
   }
 

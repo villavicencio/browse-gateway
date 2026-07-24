@@ -232,8 +232,14 @@ test("drive: a click that triggers a policy-blocked nav is a FAILURE, not the st
   };
   const c = new GatewayDriveController(gateway, new SecretStore(() => ({})), "tok");
   await c.navigate("https://good.com/"); // pins
-  // Without Fix 1, navFailed(200, no visible block) is false → the click returns the stale page as success.
-  await assert.rejects(() => c.click({ target: "e1", element: "x" }), /blocked|policy|challenge|did not clear/i, "the action-triggered policy block is surfaced, not swallowed");
+  // Without the navFailed policyBlocked arm, navFailed(200, no visible block) is false → the click returns
+  // the stale page as success. And the message must be POLICY remediation, NOT the generic "close + reopen"
+  // (reopening can't reach an off-policy target).
+  const err = await c.click({ target: "e1", element: "x" }).then(() => null, (e) => e);
+  assert.ok(err instanceof Error, "the action-triggered policy block is surfaced, not swallowed as success");
+  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed remediation");
+  assert.doesNotMatch(err.message, /close and reopen/i, "does NOT give the generic close+reopen advice for a policy block");
+  assert.equal(failureOf(err)?.failureClass, "policy-blocked");
 });
 
 // --- warm-open policy block (a redirect hop off the owner host) PRESERVES the warmed session (its clearance),
