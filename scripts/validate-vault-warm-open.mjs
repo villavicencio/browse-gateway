@@ -40,6 +40,7 @@ import { SecretStore, VaultStore, canonicalizeHost } from "../dist/security/inde
 import { createBrowserCore } from "../dist/browser/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { importLoginToVault, getVaultEntry, buildWarmOverride } from "../dist/mcp/vault-login.js";
+import { failureOf } from "../dist/observability/index.js";
 
 const TOKEN = "tok-warm-open";
 const COOKIE = "sid=warm-open-3d9f1a72"; // durable session cookie (not IP-bound → survives capture)
@@ -159,22 +160,25 @@ try {
     // Rail #6: EXACTLY ONE credentialed session-open audit for the warm open (no double-count, attributable).
     check("warm-open emits exactly one credentialed session-open audit (rail #6)", credOpens(aHost).length === 1);
 
-    // --- Leg 2: the credential nav-clamp on a LIVE warm session. The warm session is clamped to the
-    // owner host (127.0.0.1); a navigate to 127.0.0.2 must be refused by guardForCredentialHost.
+    // --- Leg 2: the owner-host contract on a LIVE warm session (R1 #79). The warm session is pinned to
+    // owner host 127.0.0.1; a top-level navigate to a DIFFERENT host (127.0.0.2) is now refused BEFORE
+    // THE WIRE by the controller's owner-host pre-flight — a typed `owner-host-mismatch` that PRESERVES
+    // the session, NOT the old clamp-abort→#discardSession (which destroyed a still-valid warm context
+    // and mis-diagnosed it as a stale credential). The clamp itself is UNCHANGED and still blocks a
+    // cross-host request at the wire — its remaining job is redirect hops (proven by
+    // validate-redirect-guard + the nav-guard unit tests); the full R1 sequence is validate-owner-host.
     if (b) {
-      let blocked = false;
-      try {
-        await c1.navigate(`${b.origin}/dashboard`); // off-owner host → guard aborts the navigation
-      } catch {
-        blocked = true;
-      }
-      check("warm session nav-clamp BLOCKS an off-owner host (R4 no-exfil, live)", blocked);
-      // Rail #4: prove the block was the CLAMP (not a netfail) via its audit reason — a regression that
-      // broke warm-open entirely could still throw, but only the clamp emits this credential-scope reason.
-      const clampBlock = audit.records.some(
-        (r) => r.action === "navigate" && r.decision === "block" && /credential scope/.test(r.reason ?? ""),
+      const before = credOpens(aHost).length;
+      const err = await c1.navigate(`${b.origin}/dashboard`).then(() => null, (e) => e); // off-owner → R1 pre-flight refuses
+      check("warm cross-host nav is REFUSED (owner-host contract, R1 #79 no-exfil)", err instanceof Error);
+      check("the refusal is a typed owner-host-mismatch, NOT a session-destroying clamp-abort", failureOf(err ?? {})?.failureClass === "owner-host-mismatch");
+      // The session SURVIVES the refusal (the whole point of R1): a follow-up navigate to the OWNER host
+      // lands AUTHENTICATED again on the SAME session — no #discardSession, no cold re-open.
+      const stillWarm = await c1.navigate(`${a.origin}/dashboard`);
+      check(
+        "the warm session SURVIVES the cross-host refusal (owner still AUTHENTICATED, no re-open)",
+        /AUTHENTICATED DASHBOARD/.test(text(stillWarm)) && credOpens(aHost).length === before,
       );
-      check("the off-host block was the credential clamp (audit reason), not a network failure", clampBlock);
     }
   } finally {
     await c1.close();
