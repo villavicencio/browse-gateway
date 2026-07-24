@@ -272,7 +272,7 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
       {
         title: "Navigate the drive session",
         description:
-          "Open a URL in the drive session and return a ref-annotated accessibility snapshot of the page. Starts a session if none is open.",
+          "Open a URL in the drive session and return a ref-annotated accessibility snapshot of the page. Starts a session if none is open. A logged-in (warm) session is pinned to one owner host: navigating a different host returns a typed owner-host-mismatch — open a separate drive session per host.",
         inputSchema: {
           url: z.string().url().describe("Absolute URL to open"),
           forceProxy: z

@@ -112,6 +112,21 @@ test("R1: a same-owner nav to a different PATH is NOT refused (host-level check 
   assert.equal(deep.status, 200, "same-owner different-path proceeds normally");
 });
 
+test("R1: apex↔www divergence — warm on www.X, nav apex X → REFUSED (canonicalize) AND in-scope (allowlist www-strip)", async () => {
+  // The trickiest branch: the refusal DECISION uses canonicalizeHost (does NOT strip www), so an apex
+  // nav on a www-pinned warm session IS cross-host (refused); the sub-case CLASSIFICATION uses
+  // #allowlist.allows (DOES strip www), so the same apex host reads as IN-SCOPE. The two intentionally
+  // divergent host checks (drive-controller comment at #ownerHostMismatch) must both hold. Pins them.
+  const g = makeGateway();
+  const c = warmCtl(g, ["totalwine.com"]); // allowlist by apex; allows() strips www → both www.X and X in-scope
+  await c.navigate(`https://${HOST}/account`); // warm-pins on www.totalwine.com (#warmHost = www.totalwine.com)
+  const err = await c.navigate("https://totalwine.com/x").then(() => null, (e) => e); // apex differs under canonicalizeHost
+  assert.ok(err, "apex nav on a www-owner warm session IS refused (canonicalizeHost does not strip www)");
+  assert.equal(failureOf(err)?.failureClass, "owner-host-mismatch", "own failure class");
+  assert.match(err.message, /open a separate drive session/i, "classified IN-SCOPE via the allowlist www-strip divergence");
+  assert.equal(g.open.size, 1, "session preserved");
+});
+
 test("R1: the refusal is WARM-ONLY — a COLD pinned session's cross-host nav is not owner-host-refused", async () => {
   // A cold session has no #warmHost, so R1's pre-flight never fires; the off-owner nav is a separate case
   // (R2's post-wire policy-block capture), NOT an owner-host mismatch. Here the fake has no clamp, so it
