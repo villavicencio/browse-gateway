@@ -168,6 +168,9 @@ export class GatewayDriveController implements DriveController {
       status: snap.status ?? null,
       cfHint: snap.cfHint,
       pxHint: snap.pxHint,
+      // #82: the shape-invariant PX-copy boolean, so classifyFailure/wafVendorFromFailure keep attributing
+      // `perimeterx` on a FAT-top-frame press-&-hold (the challenge in a child frame) — parity with retrieve.
+      pxCopy: snap.pxCopy,
       ddHint: snap.ddHint,
       captchaKind: snap.captchaKind,
       finalUrl: snap.url,

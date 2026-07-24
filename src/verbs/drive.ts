@@ -139,6 +139,12 @@ export function navFailed(snap: PageSnapshot): boolean {
     // here reads as healthy, letting #actAndSnap hand back the stale page as a successful action result.
     snap.policyBlocked !== undefined ||
     snap.url.startsWith("chrome-error://") ||
+    // #82: a shape-invariant PerimeterX press-&-hold — the challenge copy is in the page source / a
+    // px-captcha-modal child frame while the top frame is FAT (modal chrome), so isHardBlock (needs a thin
+    // body) and isVisiblyBlocked (top-doc innerText) miss it. `pxHint && pxCopy` mirrors retrieve's arm
+    // (retrieve.ts isRetrieveFailure), closing the drive↔retrieve detection-parity gap so the SAME 403
+    // classifies identically whether the top frame is thin or fat.
+    (snap.pxHint === true && snap.pxCopy === true) ||
     isVisiblyBlocked({ title: snap.title, text: snap.tree }) ||
     isHardBlock({ text: snap.tree }, status)
   );

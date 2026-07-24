@@ -294,6 +294,16 @@ export interface PageSnapshot {
    */
   pxHint?: boolean;
   /**
+   * #82 shape-invariant PerimeterX-copy flag: `true` when the "Press & Hold" challenge COPY was found in the
+   * page SOURCE (top HTML) or a cross-origin `px-captcha-modal` CHILD FRAME — the signal that survives a FAT
+   * top frame (modal chrome ≥200 chars) where the challenge lives in an iframe, which {@link pxHint} +
+   * isHardBlock (needs a THIN body) miss. A SCRUBBED boolean (never the raw frame HTML — drive is
+   * content-free), computed ONLY when {@link pxHint} is set (so ordinary pages with ad iframes never pay the
+   * child-frame walk). Drives the `(pxHint && pxCopy)` arm of {@link import("../verbs/index.js").navFailed},
+   * mirroring retrieve's shape-invariant PX detection (the drive↔retrieve detection-parity invariant).
+   */
+  pxCopy?: boolean;
+  /**
    * Scrubbed DataDome-hint flag: `true` when the page's HTML carried a DataDome marker (`datadome`,
    * `captcha-delivery`, `dd_cookie`). The DataDome sibling of {@link cfHint}/{@link pxHint} (issue #40),
    * surfaced as a boolean so the drive layer can attribute a DataDome block without carrying page
