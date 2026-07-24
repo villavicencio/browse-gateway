@@ -546,3 +546,20 @@ test("a successful drive navigate carries no failure line but DOES surface statu
   assert.ok(!/failure:/.test(res.content[0].text));
   assert.match(res.content[0].text, /status: 200/, "captured status is surfaced, no longer dropped");
 });
+
+test("formatSnapshot renders pxCopy alongside pxHint (#82: the async press-&-hold signal is not hidden)", async () => {
+  // A standalone browser_navigate whose snapshot carries the shape-invariant PX-copy signal (pxCopy) must
+  // surface it in the header — previously only pxHint rendered, hiding the load-bearing half of the
+  // (pxHint && pxCopy) block arm on a FAT-top-frame async challenge.
+  const pxSnap = { url: "https://px.example/", title: "", tree: "", status: 200, pxHint: true, pxCopy: true };
+  const drive = {
+    async open() {},
+    async navigate() { return pxSnap; },
+    async snapshot() { return pxSnap; },
+    async close() {},
+  };
+  const client = await connect({ drive });
+  const res = await client.callTool({ name: "browser_navigate", arguments: { url: "https://px.example/" } });
+  assert.match(res.content[0].text, /pxHint: true/, "pxHint still rendered");
+  assert.match(res.content[0].text, /pxCopy: true/, "pxCopy now rendered too");
+});

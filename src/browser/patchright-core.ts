@@ -317,17 +317,35 @@ async function pollSignal(page: PatchrightPage): Promise<Pick<PageSignal, "title
   return { title, text };
 }
 
-/**
- * Concatenated HTML of every child frame. `page.content()` serializes only the TOP document, so a
- * challenge rendered inside a child frame (PerimeterX's `px-captcha-modal`) is invisible to it.
- * Playwright reads a child frame's document even cross-origin (verified), so the press-&-hold copy is
- * recoverable here. Each frame is fetched best-effort — a detached/navigating frame yields "".
- */
-async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
+/** One synchronous read of every child frame's document — the raw, un-polled body of {@link
+ *  captureChildFrameHtml}. Each frame is fetched best-effort: a detached/navigating (or not-yet-committed
+ *  cross-origin) frame yields "" from the caught `content()`, and a page with no child frames yields "". */
+async function readChildFrames(page: PatchrightPage): Promise<string> {
   const children = page.frames().filter((f) => f !== page.mainFrame());
   if (children.length === 0) return "";
   const parts = await Promise.all(children.map((f) => f.content().catch(() => "")));
   return parts.join("\n");
+}
+
+/** A bounded poll over the child-frame read (only reached on a `hasPerimeterXHint` page, and only when the
+ *  TOP html lacks the copy — both callers short-circuit on it, so ordinary pages never pay it). The
+ *  `px-captcha-modal` marker is in the TOP document at DCL, but the challenge BODY renders inside a child
+ *  iframe on a LATER async tick — so a single one-shot read can hit a blank (not-yet-committed, or
+ *  not-yet-attached) frame and miss the press-&-hold copy. Re-read a few times while the concatenated frame
+ *  HTML is still blank. Exit on the FIRST non-blank read, NOT "poll until copy found": `pxHint` PERSISTS on a
+ *  cleared page, whose ad/tracking child frames are already loaded (non-blank) — so a cleared-PX snapshot
+ *  breaks on attempt 0 and pays ~0, while a genuinely late challenge is recovered. Worst case (a pxHint page
+ *  with NO child frame at all — an unusual cleared page with no ads) is the full, bounded 750ms ceiling; the
+ *  gate is pxHint-scoped so a healthy page never reaches it. */
+const PX_FRAME_POLL_ATTEMPTS = 3;
+const PX_FRAME_POLL_INTERVAL_MS = 250; // ≤ PX_FRAME_POLL_ATTEMPTS × this = 750ms ceiling, only on a pxHint page
+async function captureChildFrameHtml(page: PatchrightPage): Promise<string> {
+  let html = await readChildFrames(page);
+  for (let i = 0; i < PX_FRAME_POLL_ATTEMPTS && html.trim() === ""; i++) {
+    await page.waitForTimeout(PX_FRAME_POLL_INTERVAL_MS).catch(() => {});
+    html = await readChildFrames(page);
+  }
+  return html;
 }
 
 /**
@@ -541,12 +559,16 @@ export class PatchrightBrowserCore implements BrowserCore {
   #consoleErrors: string[] = [];
   #networkFailures: string[] = [];
   /**
-   * #80: the most recent Document-navigation BLOCK the guard emitted (blocked host + its reason), captured
-   * at the CDP decision seam. A holder consulted by the MAIN-FRAME requestfailed listener to attach the
-   * guard's reason to a self-block. Includes subframe-document blocks too; the PROMOTION to a first-class
-   * self-block is top-frame-scoped at the page listener, so a subframe entry is never surfaced. Per-nav reset.
+   * #80: the Document-navigation guard-block reasons for THIS navigation, keyed by blocked host, captured at
+   * the CDP decision seam. A holder consulted by the MAIN-FRAME requestfailed listener to attach the guard's
+   * reason to a self-block. Keyed by host (not a single slot) so concurrent CROSS-HOST Document blocks in one
+   * navigation — a main-frame redirect hop plus an off-allowlist subframe/popup — don't evict each other's
+   * reason before the requestfailed fires (a single slot lost the main-frame reason). Includes subframe-doc
+   * blocks; the PROMOTION to a first-class self-block is top-frame-scoped at the page listener, so a subframe
+   * entry is never surfaced. DIAGNOSTIC-only (write-only side channel; the fail-closed decision never reads
+   * it back). Per-nav reset. Bounded by the distinct blocked hosts within one navigation.
    */
-  #lastNavBlock?: { host: string; reason?: string };
+  #lastNavBlock = new Map<string, string>();
   /**
    * #80: THIS navigation was aborted by the gateway's OWN guard on the MAIN FRAME (net::ERR_BLOCKED_BY_CLIENT
    * — the sole client-blocker). Set by the top-frame-scoped requestfailed listener; folded into the snapshot
@@ -974,9 +996,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // #80: stash a BLOCKED Document-navigation's host + guard reason so the (top-frame-scoped) requestfailed
     // listener can attach the reason to a MAIN-FRAME self-block. `resourceType === "Document"` includes
     // subframe docs; the promotion to a first-class self-block is top-frame-scoped at the page listener.
-    if (decision === "block" && event.resourceType === "Document") {
-      const host = hostFromUrl(event.request?.url ?? "");
-      this.#lastNavBlock = { host, ...(blockInfo.reason !== undefined ? { reason: blockInfo.reason } : {}) };
+    if (decision === "block" && event.resourceType === "Document" && blockInfo.reason !== undefined) {
+      // Store per host (only when a reason exists — the read consults nothing else): a same-host overwrite is
+      // idempotent (guard reasons are deterministic per host), and a different-host block adds its own entry
+      // instead of clobbering this one.
+      this.#lastNavBlock.set(hostFromUrl(event.request?.url ?? ""), blockInfo.reason);
     }
     try {
       if (decision === "allow") {
@@ -1228,7 +1252,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     this.#redirectChain = [];
     this.#consoleErrors = [];
     this.#networkFailures = [];
-    this.#lastNavBlock = undefined; // #80: the guard-reason holder is per-navigation, like the buffers above
+    this.#lastNavBlock = new Map(); // #80: the guard-reason holder is per-navigation, like the buffers above
     this.#policyBlockedNav = undefined; // #80: a fresh navigation has not (yet) self-blocked
   }
 
@@ -1284,7 +1308,7 @@ export class PatchrightBrowserCore implements BrowserCore {
         // matched by host (a redirect hop's guard reason is deterministic per host).
         if (req.isNavigationRequest() && req.frame() === page.mainFrame() && /ERR_BLOCKED_BY_CLIENT/i.test(errText)) {
           const host = hostFromUrl(req.url());
-          const reason = this.#lastNavBlock?.host === host ? this.#lastNavBlock.reason : undefined;
+          const reason = this.#lastNavBlock.get(host);
           this.#policyBlockedNav = { host, ...(reason !== undefined ? { reason } : {}) };
         }
       } catch {

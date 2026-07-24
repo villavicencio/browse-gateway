@@ -110,6 +110,9 @@ function formatSnapshot(snap: PageSnapshot): string {
   if (snap.status != null) bits.push(`status: ${snap.status}`);
   if (snap.cfHint) bits.push("cfHint: true");
   if (snap.pxHint) bits.push("pxHint: true");
+  // #82: the shape-invariant press-&-hold signal (pxCopy) survives a FAT top frame where pxHint + isHardBlock
+  // miss — surface it alongside pxHint so a standalone browser_snapshot of an async PX challenge shows it.
+  if (snap.pxCopy) bits.push("pxCopy: true");
   if (snap.ddHint) bits.push("ddHint: true");
   // #48: a deep link that silently landed on the site's bare root — surfaced so an in-loop agent sees the
   // homepage-fallback rather than mistaking it for the requested page. Non-fatal (the snapshot is returned).

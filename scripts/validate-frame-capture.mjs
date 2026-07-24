@@ -64,6 +64,44 @@ try {
   await core.close();
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Late-loading child frame (F2, post-#78): the `px-captcha-modal` marker is in the top doc at DCL, but the
+// challenge BODY iframe is APPENDED on a later async tick. A one-shot child-frame read fires before the frame
+// commits and returns blank → the press-&-hold copy is missed; the bounded poll in captureChildFrameHtml
+// re-reads while blank and recovers it. This fixture proves the poll is load-bearing on the async race a real
+// PX press-&-hold exhibits (the top modal renders fat + clears the clearance poll immediately, so nothing
+// else waits for the frame).
+console.log("\n=== browse-gateway :: LATE-loading child-frame capture proof (F2) ===");
+const lateTopUrl =
+  "data:text/html," +
+  encodeURIComponent(
+    `<body><div id="px-captcha-modal"></div>` +
+      `<main>Total Wine &amp; More — Folsom, CA. ${"Store and product chrome around the modal. ".repeat(8)}</main>` +
+      `<script>setTimeout(function(){` +
+      `var f=document.createElement('iframe');f.src=${JSON.stringify(childUrl)};document.body.appendChild(f);` +
+      `},400);</script></body>`,
+  );
+const lateCore = await createBrowserCore({
+  channel: process.env.BGW_CHANNEL ?? "chrome",
+  noSandbox: process.env.BGW_NO_SANDBOX === "1",
+});
+try {
+  const render = await lateCore.render(lateTopUrl, { clearanceTimeoutMs: 3000 });
+  const copyInTop = hasPerimeterXChallengeCopy(render.html);
+  const copyInFrames = hasPerimeterXChallengeCopy(render.frameHtml ?? "");
+  const pxHint = hasPerimeterXHint(render.html);
+  const reason = classifyBlock({ title: render.title, text: render.text, status: 200, pxHint, pxCopy: copyInTop || copyInFrames });
+  console.log(
+    `  (text.len=${render.text.trim().length}, frameHtml.len=${(render.frameHtml ?? "").length}, pxHint=${pxHint}, status=${render.status})`,
+  );
+  check("pxHint is set from the top-doc px-captcha-modal element (present at DCL)", pxHint === true);
+  check("render.html (top frame) does NOT carry the challenge copy", copyInTop === false);
+  check("render.frameHtml carries the LATE-appended iframe copy — the bounded poll recovered it", copyInFrames === true);
+  check("classifyBlock → perimeterx-challenge on the late-frame challenge (parity with the inline case)", reason === "perimeterx-challenge");
+} finally {
+  await lateCore.close();
+}
+
 const verdict = failures === 0 ? "PASS ✅" : "FAIL ❌";
 console.log(`\n=== FRAME-CAPTURE GATE: ${verdict} (${failures} failure(s)) ===`);
 process.exit(failures === 0 ? 0 : 1);

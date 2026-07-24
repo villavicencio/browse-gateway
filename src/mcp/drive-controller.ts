@@ -32,6 +32,7 @@ import {
   parseExitOrg,
   isDeadExit,
   isHomeFallback,
+  genuineNetworkFailure,
   MIN_ATTEMPT_BUDGET_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
@@ -489,7 +490,7 @@ export class GatewayDriveController implements DriveController {
           failure,
         );
       }
-      if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null, failure), failure);
+      if (warm) throw attachFailure(this.#warmError(url, snap.status ?? null, snap.pxHint === true && snap.pxCopy === true, failure), failure);
       const proxyAvailable = this.#resolveProxyOverride() !== undefined;
       throw attachFailure(
         new Error(
@@ -774,7 +775,7 @@ export class GatewayDriveController implements DriveController {
           failure,
         );
       }
-      throw attachFailure(this.#warmError(url, snap.status ?? null, failure), failure);
+      throw attachFailure(this.#warmError(url, snap.status ?? null, snap.pxHint === true && snap.pxCopy === true, failure), failure);
     }
     this.#pinned = true;
     return snap;
@@ -869,10 +870,15 @@ export class GatewayDriveController implements DriveController {
    * split is preserved; a policy-block is normally pre-empted upstream (R2) but the mapper handles it
    * defensively. Used on BOTH the first-navigate warm path and the reopen-after-reap warm path.
    */
-  #warmError(url: string, status: number | null, failure?: FailureDiagnostics): Error {
+  #warmError(url: string, status: number | null, behavioralChallenge: boolean, failure?: FailureDiagnostics): Error {
     const advice = warmFailureAdvice({
       ...(failure?.failureClass ? { failureClass: failure.failureClass } : {}),
-      ...(failure?.wafVendor ? { wafVendor: failure.wafVendor } : {}),
+      // R3 behavioral gating: the LIVE press-&-hold shape (pxHint && pxCopy, derived at the call site from
+      // the snapshot), NOT the wafVendor label — which PERSISTS on a burned-exit 403 a fresh exit would clear.
+      behavioralChallenge,
+      // R3 transport failures: a genuine conn-reset/unreachable on the SAME envelope's networkFailures, so a
+      // nav-failed on a non-fresh host is advised "retry the transport", not "re-capture the credential".
+      genuineNetworkFailure: genuineNetworkFailure(failure?.networkFailures),
       freshExitHost: hostForcesProxy(new URL(url).hostname, this.#freshExitHosts),
     });
     // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.
