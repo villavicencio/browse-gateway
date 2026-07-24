@@ -106,8 +106,14 @@ test("buildFailureDiagnostics + redact: selfBlockedNav carries host+reason; host
   assert.equal(
     red.selfBlockedNav.reason,
     "credential scope: navigation is not the credential owner host",
-    "the closed-vocab guard reason passes redaction untouched",
+    "a hardcoded guard reason passes redaction unchanged (redactSecrets is a no-op on it)",
   );
+  // R9 defense-in-depth: a secret in a hypothetical FREE-TEXT reason (the type permits any string) is scrubbed
+  const red2 = redactFailureDiagnostics(
+    buildFailureDiagnostics({ status: null, selfBlockedNav: { host: "off.example", reason: "blocked (token=s3cr3tvalue)" } }),
+    secrets,
+  );
+  assert.ok(!red2.selfBlockedNav.reason.includes("s3cr3tvalue"), "a secret embedded in the reason is redacted (not trusted as closed-vocab)");
 });
 
 // --- P2: resolveFailureReason surfaces `policy-blocked` so the reason AGREES with the class ---
@@ -211,6 +217,22 @@ test("drive: a COLD pinned session's off-allowlist nav → policy message, no fr
   const back = await c.navigate("https://good.com/ok");
   assert.equal(back.status, 200, "returning to an allowlisted target succeeds");
   assert.equal(g.events.filter((e) => e[0] === "open").length, opensAfterPin, "reused the preserved session — no re-open");
+});
+
+// --- cold FIRST navigate to an off-allowlist host → policy message (no proxy-escalation implication), preserved ---
+test("drive: a COLD FIRST navigate to an off-allowlist host → policy message, no proxy-escalation implication, PRESERVED", async () => {
+  const g = makeTrackingGateway((url) => policyBlockedSnap(url)); // the very first navigate self-blocks
+  // Proxy configured → the OLD #firstNavigate generic path would append "no residential proxy configured to
+  // escalate to" ONLY when NO proxy; with a proxy it would silently imply escalation. Either way, the policy
+  // branch must pre-empt the escalation/generic path.
+  const c = new GatewayDriveController(g.gateway, new SecretStore(() => ({ BGW_PROXY_URL: "http://p:8080", BGW_PROXY_PASSWORD: "proxypass" })), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  const err = await c.navigate("https://off.example/deep").then(() => null, (e) => e);
+  assert.ok(err instanceof Error, "the cold first-nav off-allowlist policy block rejects");
+  assert.match(err.message, /blocked by gateway policy/i, "policy-attributed message");
+  assert.doesNotMatch(err.message, /no residential proxy configured to escalate|could not land a working proxied exit/i, "does NOT imply a proxy exit would help");
+  assert.equal(failureOf(err)?.failureClass, "policy-blocked");
+  assert.equal(g.open.size, 1, "the healthy session is PRESERVED (pinned), not discarded");
+  assert.equal(g.events.filter((e) => e[0] === "close").length, 0, "no #discardSession on a cold first-nav policy block");
 });
 
 // --- Fix 1 (integration): an ACTION (click) that triggers a policy-blocked nav is surfaced as a failure ---

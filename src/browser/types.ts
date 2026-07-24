@@ -369,11 +369,15 @@ export type NavigationDecision = "allow" | "block";
 
 /**
  * DECISION-SAFE side-channel (#80): a write-only out-param a {@link NavigationGuard} MAY fill when it
- * returns `"block"`, carrying the guard's own block `reason` (the same closed-vocab string it records to
- * the audit log). The returned decision is computed INDEPENDENTLY and never reads this object, so the
- * fail-closed invariant is preserved — the interception layer reads it purely for DIAGNOSTICS (to classify
- * a main-frame self-block as `policy-blocked`). Optional everywhere: a guard called without an `out` (the
- * decision-only callers + tests) behaves exactly as before.
+ * returns `"block"`, carrying the guard's own block `reason`. The returned decision is computed
+ * INDEPENDENTLY and never reads this object, so the fail-closed invariant is preserved — the interception
+ * layer reads it purely for DIAGNOSTICS (to classify a main-frame self-block as `policy-blocked`). Optional
+ * everywhere: a guard called without an `out` (the decision-only callers + tests) behaves exactly as before.
+ *
+ * REDACTION (R9): `reason` is typed as a bare `string` — the shipped guards only ever write hardcoded reason
+ * strings, but this type does NOT enforce a closed vocabulary, so every caller-visible seam that surfaces it
+ * (the `selfBlockedNav` envelope via {@link import("../observability/index.js").redactFailureDiagnostics},
+ * and the drive `policy-blocked` error message) scrubs it through the secret pass rather than trusting it.
  */
 export interface NavigationBlockInfo {
   reason?: string;

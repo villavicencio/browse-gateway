@@ -410,11 +410,16 @@ export function redactFailureDiagnostics(
   if (diag.redirectChain) out.redirectChain = diag.redirectChain.map(scrubUrl);
   if (diag.consoleErrors) out.consoleErrors = diag.consoleErrors.map(scrubText);
   if (diag.networkFailures) out.networkFailures = diag.networkFailures.map(scrubText);
-  // #80: scrub the blocked host through the secret pass (parity with the KEPT-host residual — a hostname is
-  // the essential "which target was blocked" diagnostic, but a secret encoded in it is still redacted); the
-  // `reason` is a CLOSED-vocab guard string (never page text), so it passes through untouched like wafVendor.
+  // #80: scrub BOTH fields of the self-block through the secret pass. The producers (the policy guards) only
+  // ever write hardcoded reason strings + a structural hostname, but the {@link NavigationBlockInfo.reason}
+  // type permits any string — so a future/alternate guard writing free text (a URL/token) must NOT leak here.
+  // Defense-in-depth (redactSecrets is a no-op on the real hardcoded reasons): scrub the reason like the host,
+  // rather than relying on a closed-vocab assumption the type doesn't enforce.
   if (diag.selfBlockedNav) {
-    out.selfBlockedNav = { ...diag.selfBlockedNav, host: redactSecrets(diag.selfBlockedNav.host, secrets) };
+    out.selfBlockedNav = {
+      host: redactSecrets(diag.selfBlockedNav.host, secrets),
+      ...(diag.selfBlockedNav.reason !== undefined ? { reason: redactSecrets(diag.selfBlockedNav.reason, secrets) } : {}),
+    };
   }
   return out;
 }

@@ -540,6 +540,16 @@ export class GatewayDriveController implements DriveController {
       this.#pinned = true; // direct works → commit it (no residential GB spent)
       return direct;
     }
+    // #80: a self-inflicted policy block on the FIRST cold navigate — the guard refused an off-allowlist
+    // target. The session is HEALTHY (our guard aborted the nav, the direct exit is fine), so PIN + PRESERVE
+    // it (a subsequent in-scope navigate reuses it) and surface the policy remediation — BEFORE the discard +
+    // escalation/generic branches below, whose "no residential proxy configured to escalate to" clause
+    // wrongly implies a fresh proxy exit would help (it can never reach an off-allowlist target). Parity with
+    // the pinned + warm-open paths; mirrors R1's keystone (never destroy a healthy session for a scope refusal).
+    if (direct.policyBlocked !== undefined) {
+      this.#pinned = true;
+      throw attachFailure(this.#policyBlockedError(direct.policyBlocked), this.#failure(direct));
+    }
     // Direct failed. Escalate to a proxied exit ONLY on a qualifying block — a visible challenge or a
     // hard reputation block, the two a clean residential exit can clear. A bare null-status failure
     // (an off-allowlist abort or an unreachable host) is surfaced directly: a fresh exit won't fix it,
@@ -889,11 +899,15 @@ export class GatewayDriveController implements DriveController {
    *  non-warm pinned path; the warm path's evidence-driven advice is R3 (#81). */
   #policyBlockedError(block: { host: string; reason?: string }): Error {
     // Keyed on the BLOCKED host — accurate for a redirect hop off the owner (where the requested URL differs
-    // from the actually-refused host) and for an action-triggered nav (no requested URL). `host` is a plain
-    // structural hostname (no URL-injection risk) and `reason` is the guard's closed-vocab string, so no
-    // sanitizeUrlForError is needed. NEVER suggests a fresh exit or a re-capture (guardrail c).
+    // from the actually-refused host) and for an action-triggered nav (no requested URL). Both fields are
+    // scrubbed through the secret pass (#80): the guards only write a structural hostname + a hardcoded reason,
+    // but the NavigationBlockInfo.reason type permits any string, and this message is thrown OUTSIDE #run's
+    // redaction re-wrap — so scrub here rather than trust a closed-vocab assumption. NEVER suggests a fresh
+    // exit or a re-capture (guardrail c).
+    const host = redactSecrets(block.host, this.#secrets);
+    const reason = block.reason !== undefined ? redactSecrets(block.reason, this.#secrets) : "the target is off this consumer's scope";
     return new Error(
-      `navigation to ${block.host} blocked by gateway policy: ${block.reason ?? "the target is off this consumer's scope"} — ` +
+      `navigation to ${host} blocked by gateway policy: ${reason} — ` +
         `a fresh exit cannot reach an off-policy target; fix the scope/policy, not the exit or credential`,
     );
   }
