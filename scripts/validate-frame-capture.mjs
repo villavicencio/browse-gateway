@@ -65,21 +65,31 @@ try {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Late-loading child frame (F2, post-#78): the `px-captcha-modal` marker is in the top doc at DCL, but the
-// challenge BODY iframe is APPENDED on a later async tick. A one-shot child-frame read fires before the frame
-// commits and returns blank → the press-&-hold copy is missed; the bounded poll in captureChildFrameHtml
-// re-reads while blank and recovers it. This fixture proves the poll is load-bearing on the async race a real
-// PX press-&-hold exhibits (the top modal renders fat + clears the clearance poll immediately, so nothing
-// else waits for the frame).
-console.log("\n=== browse-gateway :: LATE-loading child-frame capture proof (F2) ===");
+// LATE-copy child frame + an unrelated non-empty iframe (F2, post-#78): the challenge frame commits an EMPTY
+// body at DCL and injects the press-&-hold copy on a later async tick, WHILE an unrelated (ad-like) child
+// iframe is non-empty from the start. A one-shot read — or a poll that exits on "any non-blank markup" —
+// finishes on attempt 0 (the ad frame is non-blank; the challenge frame's skeleton is non-blank) and MISSES
+// the copy, returning a live fat-frame challenge as a healthy snapshot. The copy-polling captureChildFrameHtml
+// keeps re-reading until the actual press-&-hold copy appears. This is the real PX shape: the modal iframe is
+// present early but its challenge copy renders after a network/JS tick.
+console.log("\n=== browse-gateway :: LATE-copy child-frame capture proof (F2, poll-for-copy) ===");
+// Unrelated ad frame: non-empty immediately, NO PX copy — proves the exit isn't "any non-blank frame".
+const adUrl = "data:text/html," + encodeURIComponent("<body><div>Sponsored — totally unrelated ad content here.</div></body>");
+// Challenge frame: commits an empty body, then its OWN script injects the press-&-hold copy at ~400ms
+// (cross-origin, so only the child itself can populate it; the parent reads it via frame.content()).
+const lateCopyChildUrl =
+  "data:text/html," +
+  encodeURIComponent(
+    "<body></body><script>setTimeout(function(){var d=document.createElement('div');" +
+      "d.textContent='Press & Hold to confirm you are a human (and not a bot).';" +
+      "document.body.appendChild(d);},400);</script>",
+  );
 const lateTopUrl =
   "data:text/html," +
   encodeURIComponent(
     `<body><div id="px-captcha-modal"></div>` +
       `<main>Total Wine &amp; More — Folsom, CA. ${"Store and product chrome around the modal. ".repeat(8)}</main>` +
-      `<script>setTimeout(function(){` +
-      `var f=document.createElement('iframe');f.src=${JSON.stringify(childUrl)};document.body.appendChild(f);` +
-      `},400);</script></body>`,
+      `<iframe src="${adUrl}"></iframe><iframe src="${lateCopyChildUrl}"></iframe></body>`,
   );
 const lateCore = await createBrowserCore({
   channel: process.env.BGW_CHANNEL ?? "chrome",
@@ -96,8 +106,8 @@ try {
   );
   check("pxHint is set from the top-doc px-captcha-modal element (present at DCL)", pxHint === true);
   check("render.html (top frame) does NOT carry the challenge copy", copyInTop === false);
-  check("render.frameHtml carries the LATE-appended iframe copy — the bounded poll recovered it", copyInFrames === true);
-  check("classifyBlock → perimeterx-challenge on the late-frame challenge (parity with the inline case)", reason === "perimeterx-challenge");
+  check("render.frameHtml carries the LATE-injected copy despite a non-empty ad frame + empty skeleton — poll-for-copy recovered it", copyInFrames === true);
+  check("classifyBlock → perimeterx-challenge on the late-copy challenge (parity with the inline case)", reason === "perimeterx-challenge");
 } finally {
   await lateCore.close();
 }
