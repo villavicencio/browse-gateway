@@ -102,6 +102,7 @@ export {
 } from "./captcha.js";
 export {
   FINGERPRINT_COLLECTOR_JS,
+  CDP_TIMING_RAW_JS,
   collectFingerprint,
   flattenFingerprint,
   classifyAxis,
@@ -110,6 +111,8 @@ export {
   type FingerprintSnapshot,
   type FingerprintDiff,
   type AxisSeverity,
+  type CdpRawSeries,
+  type CdpRawTimingReport,
 } from "./fingerprint.js";
 export {
   buildWindowsUaOverride,
