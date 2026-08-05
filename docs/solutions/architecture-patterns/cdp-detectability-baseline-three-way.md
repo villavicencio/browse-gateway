@@ -121,13 +121,14 @@ Two consequences:
   what the probes find") is now backed by data rather than asserted.
 - Any mitigation work is aimed **upstream at the driver's request path**, not at our policy hook.
 
-## Three runs, and what the later ones taught
+## Four runs, and the recommendation they overturned
 
-The report refuses to let one run become a threshold, so it was run three times on the same host —
-the third after an adversarial review round changed the collector, because a conclusion drawn from
-a build that no longer exists is not a conclusion.
+The report refuses to let one run become a threshold, so it was run four times on the same host —
+the third after an adversarial review changed the collector, the fourth after a second review
+hardened the gate logic itself. A conclusion drawn from a build that no longer exists is not a
+conclusion.
 
-Stable across all three runs — identical values, identical verdicts:
+Rock stable in all four runs — identical values, identical verdicts:
 
 | Probe | A | B | C |
 |---|---|---|---|
@@ -135,51 +136,46 @@ Stable across all three runs — identical values, identical verdicts:
 | `consoleProxy.invocations` | 0 | 0 | 100 |
 | `collector.cdp.consoleProxy.fired` | 0/6 | 0/6 | 6/6 |
 
-Stable in VERDICT, not in value — B-OUTLIER in all three runs, but B's own label moved in run 3:
+The finding is stable. **Its carrier is not:**
 
-| Probe | run 1 | run 2 | run 3 |
+| run | `harness.stallWarmP50Ms` | `harness.stallWarmMeanMs` | `collector.cdp.resourceTiming.stallMedianBucket` |
 |---|---|---|---|
-| `collector.cdp.resourceTiming.stallMedianBucket` (B) | `{1to4}` | `{1to4}` | `{1to4, 4to16}` |
+| 1 | indeterminate | **B-OUTLIER** | **B-OUTLIER** |
+| 2 | **B-OUTLIER** | indeterminate | **B-OUTLIER** |
+| 3 | indeterminate | **B-OUTLIER** | **B-OUTLIER** |
+| 4 | **B-OUTLIER** | **B-OUTLIER** | indeterminate — A itself read `{1to4, lt1}` |
 
-Not stable — the verdict flipped between runs:
+The underlying measurement never moved: B at 3.263 / 3.150 / 3.592 / 3.621 ms against A at
+0.505 / 0.479 / 0.489 / 0.532 ms. Every run found the divergence. **No single probe found it in
+every run.**
 
-| Probe | run 1 | run 2 | run 3 |
-|---|---|---|---|
-| `harness.stallWarmMeanMs` | B-OUTLIER | INDETERMINATE | B-OUTLIER |
-| `harness.stallWarmP50Ms` | INDETERMINATE | B-OUTLIER | INDETERMINATE |
+### The recommendation this overturns
 
-**The underlying measurement did not move** — B read 2.90/3.26 ms and 2.90/3.15 ms against A's
-0.50/0.505 ms and 0.45/0.479 ms. What moved is which raw-millisecond *variant* cleared the
-separation bar, because A's own noise band sits right at the probe's resolution floor and crossed it
-in one run and not the other.
+Runs 1–2 supported "hand the gate the bucket leaf, not a millisecond" — the quantized label looked
+stable while the raw variants flipped. **Run 4 falsified that.** The control arm straddled the
+ladder edge, and the same near-edge instability that had been observed in our own arm appeared in
+the reference. A quantized label is not more stable than the number under it; it is the same number
+with a discontinuity added.
 
-The lesson generalizes: **the quantized label probe carried the finding stably; the raw millisecond
-probes did not.** Hand #102 the bucket leaf. A millisecond threshold here would be a gate whose
-colour depends on which side of a 0.05 ms floor the control's noise happened to land — i.e. a flaky
-stealth gate, which gets disabled, which is worse than not having one.
+**Corrected: gate on the discrete validators only.** Booleans and integer counts — 0 vs 6, 0 vs
+exactly 100 — reproduced perfectly across four runs because they are discrete *by nature* rather
+than quantized from a continuum. That distinction is the whole lesson, and it now has a rule behind
+it in the harness: a quantized timing label may REPORT a difference but may not CERTIFY that the
+instrument works unless a raw numeric measurement independently separates with real headroom.
 
-**Run 3 added one more caveat, and it cuts against the paragraph above.** It reproduced the headline
-and every validator identically, but `collector.cdp.resourceTiming.stallMedianBucket` reported B as
-`{1to4, 4to16}` — our own stack's label varying *across rounds within one run*, where runs 1 and 2
-held `{1to4}`. B's warm stall sits at ~3.2–3.6 ms, right against the ladder's 4 ms edge.
-
-A median is robust to a single jittering outlier — that is why the max was removed — but not to
-sitting near an edge. No ladder makes that go away; it only moves which values are exposed. Two
-consequences:
-
-- **The #102 gate on this leaf must assert a BAND the stack is clearly outside** (`expect lt1`),
-  never equality with whatever label was observed. The separation from A and C is unaffected either
-  way, which is what makes the finding safe to act on.
-- **A snapshot diff of a page whose stall lands near an edge can report this axis as divergent when
-  nothing changed.** Read it next to the raw series in `CDP_TIMING_RAW_JS`, which has no edges.
+**The stall divergence is a tracked FINDING, not a gate leg.** It is robust enough to act on and
+too unstable to gate on. A gate that changes colour between runs on unchanged code gets disabled
+within a month, which is worse than not having it.
 
 ## Resolution
 
-- **#102 UNBLOCKED.** Three probes offer a usable threshold: `consoleProxy.fired`,
-  `consoleProxy.invocations`, `collector.cdp.consoleProxy.fired`. A fourth,
-  `collector.cdp.resourceTiming.stallMedianBucket` ∈ `{lt1}`, **fails the current stack by design** —
-  it is the divergence to close, not a baseline we hold. Wire it knowingly or not at all; a red gate
-  nobody intends to fix gets disabled. Do **not** wire a raw-millisecond stall threshold: see above.
+- **#102 UNBLOCKED**, on three probes and only those three: `consoleProxy.fired`,
+  `consoleProxy.invocations`, `collector.cdp.consoleProxy.fired`. All discrete, all reproduced
+  exactly in four runs.
+- **Do NOT wire a stall threshold of any kind** — neither a raw millisecond value nor the quantized
+  bucket. Four runs disagree about which of them carries the divergence, and in the fourth the
+  reference arm itself straddled the bucket edge. The divergence belongs in #103 as a finding to
+  act on, not in #102 as a line to hold.
 - **#103 (conditional mitigation) SHOULD OPEN.** The baseline found separation, which is its stated
   trigger. Scope it to the driver's request path.
 - **#92 does not close verify-and-close.** Its "we are clean" branch applies to the protocol tells

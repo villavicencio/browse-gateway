@@ -87,9 +87,13 @@
  *   INPUT_REALISM_OUT=<path>    write the full structured record as JSON here (default: no file)
  *   INPUT_REALISM_MODE=auto|stdio|inprocess   force a path (default auto: stdio, fallback in-process)
  *   INPUT_REALISM_TEXT=<string> the string browser_type sends (default "Blue Widget 7" — mixed
- *                               case, a digit and spaces, so per-character completeness is visible)
+ *                               case, a digit and spaces, so per-character completeness is visible;
+ *                               >= 2 chars, no control characters — \r/\n are stripped by the input
+ *                               and \t is typed as a focus move, so either would make a genuine
+ *                               per-character fill read as having typed nothing)
  *   INPUT_REALISM_KEY=<key>     the key browser_press_key sends (default "9")
- *   INPUT_REALISM_FLUSH_MS=<n>  per-phase quiescence wait, ms (default 500; the page debounces 200)
+ *   INPUT_REALISM_FLUSH_MS=<n>  per-phase quiescence wait, ms (default 500; the page debounces 200,
+ *                               and this must be >= 2x that or phase attribution silently breaks)
  *   INPUT_REALISM_HOST=<host>   override the synthetic fixture hostname (default input-fixture.example)
  *   BGW_CHANNEL / BGW_NO_SANDBOX / BGW_HEADLESS / DISPLAY   passed through to the browser as usual
  */
@@ -116,7 +120,9 @@ const SELECT_VALUE = "bravo";
 
 /**
  * "Travelled" threshold for Q4, in CSS pixels: the widest separation between any two points on a
- * click's pointer approach must reach this for the click to count as having travelled.
+ * click's pointer APPROACH — the movement recorded strictly before the first mousedown — must reach
+ * this for the click to count as having travelled. Movement after the press is measured and
+ * published, but cannot satisfy this: pressing first and moving afterwards is not an approach.
  *
  * Module scope because the trajectory is computed well before the ACCEPT table is built, and
  * because the number is the whole substance of the question — a reader looking for "what counts as
@@ -139,6 +145,23 @@ const FLUSH_MS = Number(process.env.INPUT_REALISM_FLUSH_MS || 500);
 const SETTLE_ROUNDS = 4;
 /** Hard cap on recorded events so a pathological mousemove storm can't grow the page unbounded. */
 const MAX_EVENTS = 6000;
+/**
+ * How many characters of a field's value ride along with each editing event. The type-body
+ * acceptance rule has to answer "did the field end up holding what we typed?", and a LENGTH alone
+ * cannot: the fixture never clears the field between real phases, so a fill that inserted nothing
+ * can still be observed against a field whose length came from an earlier phase. The value string
+ * settles it. Capped so a pathological paste cannot bloat the JSON record.
+ * Nothing sensitive is captured: the fixture is local and every value driven into it is a harness
+ * constant that the report already prints.
+ *
+ * DERIVED FROM TEXT, not a bare 200. INPUT_REALISM_TEXT is operator-overridable with no upper bound,
+ * so a fixed cap below its length makes the containment test PERMANENTLY unprovable: the captured
+ * prefix can never contain a string longer than itself, and with the rule below now refusing to pass
+ * an unprovable capture (see the type-body rule), a long TEXT would silently turn every run into
+ * CANNOT DECIDE. The +200 headroom is for accumulation — the fixture does not clear the field between
+ * phases, so the value under test is "whatever was already there, plus TEXT".
+ */
+const VALUE_CAPTURE_CHARS = Math.max(200, TEXT.length + 200);
 const MODE = process.env.INPUT_REALISM_MODE || "auto";
 const MODES = ["auto", "stdio", "inprocess"];
 const CALL_TIMEOUT_MS = 120_000;
@@ -169,6 +192,19 @@ const EVENT_TYPES = [
  * these mistakes degrades into a plausible-looking measurement rather than an error:
  *   - a non-numeric FLUSH_MS serializes as JSON `null`, every `browser_wait_for` is rejected by its
  *     schema, no phase ever waits out the page's debounce, and every phase records zero events;
+ *   - a FLUSH_MS SHORTER THAN THE PAGE'S OWN DEBOUNCE misattributes whole phases while every health
+ *     check stays green. Phase boundaries are `highestIndex(run) + 1` — the highest index the
+ *     SERVER has received — and `settle()` declares quiescence when one wait window passes with that
+ *     index unchanged. An index that has not ARRIVED yet is indistinguishable from one that does not
+ *     exist: the page may still be sitting on its PAGE_FLUSH_MS debounce, or have a POST in flight,
+ *     when the window closes. The phase that produced those events then records ZERO and the NEXT
+ *     phase inherits both populations — and nothing downstream notices, because `missing` looks for
+ *     interior index GAPS and `dropped` for page-cap losses, and a late batch produces neither. A
+ *     zero in the browser_type phase is the single most damaging reading this instrument can print,
+ *     so the floor is enforced here rather than left to the operator: 2 x PAGE_FLUSH_MS is the worst
+ *     case of "a POST was already in flight when the last event of a phase landed, so that event
+ *     waits out a fresh debounce behind it". The default (500 vs 200) clears it with margin; this
+ *     refuses the override that would not, e.g. INPUT_REALISM_FLUSH_MS=50;
  *   - an empty/one-char TEXT makes the per-character acceptance rule pass VACUOUSLY. That rule is
  *     `keydown >= TEXT.length * ACCEPT.keydownsPerChar`, so at TEXT="" it reads `0 >= 0` and a fill
  *     that emitted no keystroke whatsoever is judged "PER-CHARACTER keystroke sequence" — which then
@@ -181,7 +217,27 @@ const EVENT_TYPES = [
  */
 const configErrors = [];
 if (!Number.isFinite(FLUSH_MS) || FLUSH_MS <= 0) configErrors.push(`INPUT_REALISM_FLUSH_MS must be a positive number, got ${JSON.stringify(process.env.INPUT_REALISM_FLUSH_MS)}`);
+else if (FLUSH_MS < 2 * PAGE_FLUSH_MS) configErrors.push(`INPUT_REALISM_FLUSH_MS must be at least twice the page's own ${PAGE_FLUSH_MS}ms debounce (>= ${2 * PAGE_FLUSH_MS}), got ${FLUSH_MS} — below that a phase can end before its batch has been POSTed, its events are attributed to the NEXT phase, and every health check still passes because a late batch leaves no index gap`);
 if (TEXT.length < 2) configErrors.push(`INPUT_REALISM_TEXT must be at least 2 characters (it sets the per-character discriminator threshold), got ${JSON.stringify(TEXT)}`);
+// A CONTROL CHARACTER in TEXT would make a GENUINE per-character fill read as a failure, which is the
+// opposite error from the one this block usually guards and just as damaging: the field ends SHORTER
+// than the string that was typed, and the type-body rule below — which requires the field to actually
+// hold what was typed — would report "keystrokes without an edit" against a remedy that worked
+// perfectly. Refused here rather than special-cased in the rule, because the rule must stay a plain
+// statement about the data.
+//
+// The class is every C0/C1 control (\p{Cc}), not just \r\n, because the two ways a control character
+// vanishes are different and BOTH produce the same false failure — a review pass found the guard
+// covering only the first:
+//   - \r and \n are removed by the text input's own value-sanitization algorithm, so even a value-set
+//     path loses them;
+//   - \t (and the rest of C0) never reaches the value at all on a per-character KEYBOARD path, which
+//     is the exact shape #110's remedy is expected to take: `keyboard.type()` presses Tab as a FOCUS
+//     MOVE, so the characters after it are typed into a different element and the field ends short.
+//     Under the current fill()-based value-set path a tab survives, so this only bites the day the
+//     remedy lands — i.e. precisely when a false "the fix types nothing" verdict is most expensive.
+// Default TEXT contains none of these, so this refuses operator overrides only.
+if (/\p{Cc}/u.test(TEXT)) configErrors.push(`INPUT_REALISM_TEXT must not contain control characters (a text input strips \\r and \\n, and a per-character keyboard path types \\t as a focus move rather than an insertion — either way the field would end shorter than the typed string and a genuine per-character fill would be judged as having typed nothing), got ${JSON.stringify(TEXT)}`);
 if (PRESS_KEY.length < 1) configErrors.push("INPUT_REALISM_KEY must be a non-empty key name");
 if (!MODES.includes(MODE)) configErrors.push(`INPUT_REALISM_MODE must be one of ${MODES.join("|")}, got ${JSON.stringify(MODE)}`);
 if (configErrors.length) {
@@ -291,6 +347,13 @@ const PAGE_JS = `
       rec.inputType = typeof e.inputType === "string" ? e.inputType : null;
       rec.data = typeof e.data === "string" ? e.data : null;
       rec.valueLength = t && typeof t.value === "string" ? t.value.length : null;
+      // The value ITSELF, not only its length. The acceptance rule for the fill body must be able to
+      // say "the field contains what we typed" rather than "the field is long enough": the likely
+      // shape of #110's remedy is per-character CDP Input.dispatchKeyEvent, which inserts NO TEXT
+      // when its text field is omitted, and a length test can be satisfied by content this phase
+      // never put there (the fixture does not clear the field between phases). Bounded by
+      // cfg.valueChars; see VALUE_CAPTURE_CHARS for why this is not a secrets-handling question.
+      rec.value = t && typeof t.value === "string" ? t.value.slice(0, cfg.valueChars) : null;
     }
     EVENTS.push(rec);
     schedule();
@@ -615,6 +678,7 @@ const server = http.createServer((req, res) => {
       types: EVENT_TYPES,
       flushMs: PAGE_FLUSH_MS,
       maxEvents: MAX_EVENTS,
+      valueChars: VALUE_CAPTURE_CHARS,
       text: TEXT,
       pressKey: PRESS_KEY,
       selectValue: SELECT_VALUE,
@@ -891,14 +955,83 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const PORT = server.address().port;
 
 const hostsState = MODE === "inprocess" ? { ok: false, error: "INPUT_REALISM_MODE=inprocess" } : ensureHostsEntry();
-// The finally block only runs on the normal path; a signal kills the process straight past it. A
-// local run that is Ctrl-C'd would then leave `127.0.0.1 <fixture host>` behind in the OPERATOR's
-// /etc/hosts permanently. Restore first, then re-raise so the exit status still reads as "killed".
+
+/** The live MCP connection, declared out here so the signal path can tear it down too. */
+let conn = null;
+/**
+ * Everything the normal path's `finally` used to do inline, extracted so the SIGNAL path can run it
+ * as well. A narrower patch is not possible: closing the browser is inherently async (an MCP call
+ * plus a transport close) and the in-process path's mkdtemp root is a local inside connectInProcess,
+ * reachable only through the `close` it returns.
+ *
+ * MEMOIZED, not flagged. Both paths can reach it — a Ctrl-C during an awaited verb call runs it from
+ * the handler while the main body is still suspended, and the main body then runs its `finally` too —
+ * and a `cleanedUp = true` set at ENTRY made the second caller return INSTANTLY, while the first was
+ * still inside `browser_close` / `server.close()`. Review caught the race that produces: on Ctrl-C the
+ * main body's `finally` would fall straight through, print the report, write the JSON record and hit
+ * the explicit `process.exit()` below — terminating the process mid-teardown, and with an exit code
+ * of its own rather than the signal-shaped status the handler exists to produce. Handing every caller
+ * the SAME promise makes "the two teardowns cannot drift apart" true for the second caller as well:
+ * it awaits the in-flight teardown instead of racing it, and the work still runs exactly once.
+ */
+let cleanupPromise = null;
+const cleanup = () => (cleanupPromise ??= runCleanup());
+async function runCleanup() {
+  if (conn) {
+    // Best-effort tidy close of the drive session before tearing the transport down, so the browser
+    // is released deliberately rather than by killing its parent.
+    await conn.client.callTool({ name: "browser_close", arguments: {} }, undefined, { timeout: 30_000 }).catch(() => {});
+    await conn.close().catch(() => {});
+  }
+  // Chrome's keep-alive sockets would otherwise hold `close()` open past the browser's exit.
+  server.closeAllConnections?.();
+  await new Promise((r) => server.close(r));
+}
+
+/** How long the signal path waits for `cleanup()` before re-raising anyway. Bounded because a
+ *  wedged browser close must not turn Ctrl-C into a hang — the hosts file is already restored by
+ *  then, so the worst case of giving up here is a leaked Chrome, not a modified operator machine. */
+const SIGNAL_CLEANUP_TIMEOUT_MS = 10_000;
+// The finally block only runs on the normal path; a signal kills the process straight past it. Two
+// separate consequences, and the older handler fixed only the first:
+//   1. a local run that is Ctrl-C'd would leave `127.0.0.1 <fixture host>` behind in the OPERATOR's
+//      /etc/hosts permanently. That step is SYNCHRONOUS AND FIRST here on purpose: it is the one
+//      piece of teardown that must survive a browser close that never returns.
+//   2. re-raising immediately killed the process before the finally block ran, so the browser close,
+//      the MCP transport close, the gateway shutdown and the mkdtemp root removal were all skipped.
+//      Worse: `removeAllListeners(sig)` dropped the driver's OWN SIGINT/SIGTERM graceful-close
+//      handler (installed at browser launch, i.e. after ours), and the synchronous `process.kill()`
+//      one line later then terminated the process before that handler could run on this delivery.
+//      On the local non-container fallback path the browser runs in THIS process and the driver
+//      spawns Chrome detached, so the tty's Ctrl-C never reaches Chrome by itself — which made the
+//      old handler strictly WORSE THAN HAVING NO HANDLER AT ALL: with no handler of ours, the
+//      driver's would have closed Chrome. In-container under `docker run --rm --init` the impact is
+//      nil, since the namespace reaps everything; that is why this is low blast radius, not why it
+//      is acceptable. Returning from our handler instead of killing inside it also lets the driver's
+//      handler run on the same delivery, which is the behavior we wanted from it all along.
+// So: restore hosts, then run the same cleanup the normal path runs, then re-raise.
 for (const sig of ["SIGINT", "SIGTERM"]) {
+  // `once`, not `on`: after the first delivery our listener is gone, so a second Ctrl-C is no longer
+  // intercepted by us and reaches whatever is left (the driver's handler, or default disposition if
+  // it has none) — a free escape hatch if cleanup wedges, with /etc/hosts already restored.
   process.once(sig, () => {
     restoreHostsEntry(hostsState);
-    process.removeAllListeners(sig);
-    process.kill(process.pid, sig);
+    let raised = false;
+    const raise = () => {
+      if (raised) return;
+      raised = true;
+      clearTimeout(watchdog);
+      // Only NOW, and deliberately still `removeAllListeners`: the re-raise has to reach the default
+      // disposition so the exit status stays signal-shaped, and ANY surviving listener (ours is
+      // already gone, the driver's may not be) swallows the signal instead, leaving the process
+      // alive until the event loop happens to empty.
+      process.removeAllListeners(sig);
+      process.kill(process.pid, sig);
+    };
+    // NOT unref'd: this timer is the only thing that still has to fire if `cleanup()` never
+    // settles, and an unref'd watchdog would let the loop empty out from under the await.
+    const watchdog = setTimeout(raise, SIGNAL_CLEANUP_TIMEOUT_MS);
+    void cleanup().then(raise, raise);
   });
 }
 let resolvedTo = null;
@@ -955,7 +1088,6 @@ const mustPass = (label, ok, detail, failMsg) => {
   return ok;
 };
 
-let conn = null;
 try {
   conn = useStdio ? await connectStdio(token) : await connectInProcess(token);
   const client = conn.client;
@@ -1025,8 +1157,20 @@ try {
 
   /**
    * Cut every phase of a run from the final event log. Boundaries are the phases' own start indices,
-   * so an event lands in the phase that was open when the PAGE recorded it, regardless of when the
-   * batch carrying it arrived. `endI` closes the last phase: for the real run that is the teardown
+   * so an event lands in the phase that was open when the PAGE recorded it: deferring the slice to
+   * here is what makes the CONTENTS of a slice independent of when the batch carrying an event
+   * arrived, since a late-POSTed event still sorts into place by its own index.
+   *
+   * WHAT THAT DOES NOT COVER — an earlier version of this comment said "regardless of when the batch
+   * carrying it arrived" full stop, which is true of the contents and false of the BOUNDARIES, and an
+   * overclaiming comment here is exactly how the next reader concludes late arrival is already
+   * handled. `startI` is `highestIndex(run) + 1`, the highest index the SERVER has received at the
+   * moment the phase opens, so it is only the right number if the previous phase had already
+   * delivered everything it produced. `settle()` cannot distinguish "the page sent everything" from
+   * "the page has not sent it yet"; what makes the boundary trustworthy is FLUSH_MS being at least
+   * twice the page's own debounce, which the configuration validator enforces at startup.
+   *
+   * `endI` closes the last phase: for the real run that is the teardown
    * boundary, so the unload tail (a blur, and a change if the field's value moved) is reported as
    * its own bucket instead of being folded into the last verb's slice and read as part of what that
    * verb emits.
@@ -1670,6 +1814,16 @@ try {
 
   console.log("");
   console.log("--- Q2  sequence completeness ---------------------------------------------------");
+  /**
+   * The last event in the type phase that observed the field AFTER an edit landed. `beforeinput` is
+   * excluded on purpose: it fires BEFORE the value changes, so its `valueLength` is by definition
+   * the pre-edit reading, and taking "the final value" off one would understate the field by exactly
+   * the last character — turning a genuine per-character fill into a length mismatch. On the run
+   * already published the last editing event was an `input`, so this exclusion changes none of its
+   * numbers; it closes the case where a phase boundary or a cancelled edit leaves a `beforeinput`
+   * last, which is precisely the case where "the field was edited" is NOT true.
+   */
+  const lastTypeEdit = [...typePhase].reverse().find((e) => typeof e.valueLength === "number" && e.type !== "beforeinput") ?? null;
   const perChar = {
     chars: TEXT.length,
     keydown: countOf(typePhase, "keydown"),
@@ -1678,7 +1832,10 @@ try {
     beforeinput: countOf(typePhase, "beforeinput"),
     input: countOf(typePhase, "input"),
     change: countOf(typePhase, "change"),
-    finalValueLength: [...typePhase].reverse().find((e) => typeof e.valueLength === "number")?.valueLength ?? null,
+    finalValueLength: lastTypeEdit?.valueLength ?? null,
+    // Null when nothing edited the field — which is the state a keystroke path that inserts no text
+    // leaves behind, so null must never be read as a pass. See the type-body rule.
+    finalValue: typeof lastTypeEdit?.value === "string" ? lastTypeEdit.value : null,
   };
   // Three outcomes, not two. "the phase captured nothing at all" is a DIFFERENT measurement from
   // "one value-set and no keystrokes", and collapsing them lets an empty phase print the most
@@ -1700,7 +1857,7 @@ try {
     { ok: canSee("beforeinput", "input"), why: "the self-test could not prove the editing channel is observable" },
   ]);
   console.log(`  browser_type (text field, submit:false) over ${TEXT.length} character(s):`);
-  console.log(`    keydown=${perChar.keydown}  keypress=${perChar.keypress}  keyup=${perChar.keyup}  beforeinput=${perChar.beforeinput}  input=${perChar.input}  change=${perChar.change}  finalValueLen=${perChar.finalValueLength}`);
+  console.log(`    keydown=${perChar.keydown}  keypress=${perChar.keypress}  keyup=${perChar.keyup}  beforeinput=${perChar.beforeinput}  input=${perChar.input}  change=${perChar.change}  finalValueLen=${perChar.finalValueLength}  finalValue=${perChar.finalValue === null ? "(never observed — nothing edited the field)" : JSON.stringify(perChar.finalValue)}`);
   console.log(`    shape: ${typeGate.verdict(typeShape)}`);
 
   /**
@@ -1921,50 +2078,113 @@ try {
 
   console.log("");
   console.log("--- Q4  pointer trajectory ------------------------------------------------------");
-  const pointerPaths = clickPhases.map((events, idx) => {
-    const moves = events.filter((e) => e.type === "mousemove" || e.type === "pointermove");
-    const down = events.find((e) => e.type === "mousedown");
-    const path = moves.map((e) => ({ type: e.type, x: e.clientX, y: e.clientY, sx: e.screenX, sy: e.screenY, ts: r3(typeof e.eventTs === "number" ? e.eventTs : e.obsMs) }));
-    const distinct = new Set(path.map((p) => `${p.x},${p.y}`)).size;
-    // SPAN, NOT DISTINCTNESS. Counting distinct (x,y) pairs looked right and was wrong: the first
-    // in-container run reported "travelled" for a path of
-    //   (222.89999389648438, 124.37000274658203) -> (222, 124)
-    // which is ONE logical position reported at two precisions — the pointer event carries
-    // sub-pixel coordinates and the mouse event carries integers, so the pair differs by under a
-    // pixel and satisfies "two distinct positions" while the pointer plainly never travelled. That
-    // is the flattering-but-wrong reading this question exists to avoid, so the test is the widest
-    // separation between any two points on the approach, against a threshold well above both
-    // sub-pixel rounding and any plausible jitter.
-    let spanPx = 0;
+  const isMoveEvent = (e) => e.type === "mousemove" || e.type === "pointermove";
+  const toPathPoint = (e) => ({ type: e.type, x: e.clientX, y: e.clientY, sx: e.screenX, sy: e.screenY, ts: r3(typeof e.eventTs === "number" ? e.eventTs : e.obsMs) });
+  /**
+   * SPAN, NOT DISTINCTNESS — the widest separation between any two points on a path, in CSS px.
+   * Counting distinct (x,y) pairs looked right and was wrong: the first in-container run reported
+   * "travelled" for a path of
+   *   (222.89999389648438, 124.37000274658203) -> (222, 124)
+   * which is ONE logical position reported at two precisions — the pointer event carries sub-pixel
+   * coordinates and the mouse event carries integers, so the pair differs by under a pixel and
+   * satisfies "two distinct positions" while the pointer plainly never travelled. That is the
+   * flattering-but-wrong reading this question exists to avoid, so the test is a DISTANCE against a
+   * threshold well above both sub-pixel rounding and any plausible jitter.
+   */
+  const spanOfPath = (path) => {
+    let span = 0;
     for (let i = 0; i < path.length; i++) {
       for (let j = i + 1; j < path.length; j++) {
         const d = Math.hypot(path[i].x - path[j].x, path[i].y - path[j].y);
-        if (d > spanPx) spanPx = d;
+        if (d > span) span = d;
       }
     }
+    return span;
+  };
+  const pointerPaths = clickPhases.map((events, idx) => {
+    const down = events.find((e) => e.type === "mousedown");
+    const firstDownIdx = events.findIndex((e) => e.type === "mousedown");
+    /**
+     * THE APPROACH, not the whole phase. Q4's question — the file header's wording, and the rule
+     * comment below it — is whether the pointer travelled TO the element BEFORE pressing it. Taking
+     * the span over every movement event in the phase answers a different question and answers it
+     * flatteringly: a driver that teleports onto the target, presses, and then moves 8+px before
+     * releasing scores span >= threshold and is published as "travelled", with the approach — the
+     * only part a behavioral vendor reads as an approach — never examined. `movesBeforeFirstMouseDown`
+     * was already computed for the Q2 table and used in no predicate at all; this is that number
+     * becoming load-bearing.
+     *
+     * NO MOUSEDOWN AT ALL falls back to the whole phase deliberately: Q2's click rule already fails
+     * that phase as an incomplete mouse sequence, and slicing to "everything before an event that
+     * does not exist" would hand Q4 an empty path and double-fail the same defect under a second,
+     * wrong mechanism.
+     */
+    const approachEvents = firstDownIdx === -1 ? events : events.slice(0, firstDownIdx);
+    const moves = approachEvents.filter(isMoveEvent);
+    const allMoves = events.filter(isMoveEvent);
+    const path = moves.map(toPathPoint);
+    const wholePath = allMoves.map(toPathPoint);
+    const distinct = new Set(path.map((p) => `${p.x},${p.y}`)).size;
+    const spanPx = spanOfPath(path);
+    // Retained as published data, not as an input to the verdict: post-press movement is real
+    // behavior (a drag, a slow release) and dropping it from the record would make this change
+    // invisible to anyone re-reading an old run against a new one. Reuses the approach span when
+    // the two populations are the same array (no mousedown, or nothing moved after it) — the span
+    // is O(n^2) in the number of move events and MAX_EVENTS allows 6000 of them, so the healthy
+    // case must not pay for the pathological one twice.
+    const spanPxWholePhase = allMoves.length === moves.length ? spanPx : spanOfPath(wholePath);
     const travelled = spanPx >= MIN_POINTER_SPAN_PX;
     return {
       index: idx,
       label: clickEntries[idx].label,
+      // Approach moves — the population `spanPx` is computed over. The whole-phase count rides
+      // alongside so the two can never be confused for each other in the JSON record.
       moveCount: moves.length,
+      moveCountWholePhase: allMoves.length,
       distinctPositions: distinct,
       spanPx: r3(spanPx),
+      spanPxWholePhase: r3(spanPxWholePhase),
       landedAt: down ? { x: down.clientX, y: down.clientY } : null,
+      // Kept because it is published, and now equal to `moveCount` by construction (it is the same
+      // count arrived at from the Q2 order array). Left in place rather than removed: an existing
+      // consumer of the JSON record should not lose a field to an internal refactor.
       movesBeforeFirstMouseDown: clickShapes[idx]?.movesBeforeFirstMouseDown ?? null,
-      // A teleport is "the pointer never travelled a meaningful distance on the way in" — a single
+      // A teleport is "the pointer never travelled a meaningful distance ON THE WAY IN" — a single
       // jump straight onto the target counts, so does no movement at all, and so does a cluster of
       // points inside one pixel. The mechanisms are named separately because they are different
-      // things with the same verdict: no move events at all; moves that never left one position;
-      // and moves whose whole span is sub-threshold.
+      // things with the same verdict, and filing one under another's name publishes a wrong
+      // mechanism inside a correct verdict:
+      //   no-move-events            nothing moved, anywhere in the phase;
+      //   single-position           moves on the approach that never left one coordinate;
+      //   sub-pixel-cluster         approach moves spread over LESS THAN ONE PIXEL — the same point
+      //                             reported at two precisions, which is not travel at all;
+      //   below-travel-threshold    the approach really did move, by a real but sub-threshold
+      //                             distance (1px up to MIN_POINTER_SPAN_PX). A materially different
+      //                             observation from a sub-pixel cluster, and the label used to lie
+      //                             about it: `sub-pixel-cluster` was the catch-all for every
+      //                             sub-threshold span with two distinct positions, so a 7.9px
+      //                             approach was published as "one position at two precisions". Same
+      //                             verdict either way — this is the wrong-mechanism-inside-a-correct-
+      //                             verdict defect named above, caught by review;
+      //   movement-only-after-press the approach is sub-threshold but the phase's movement reaches
+      //                             it — i.e. the pointer teleported on, pressed, and THEN moved.
+      //                             This is the case the old whole-phase span scored as "travelled".
       teleported: !travelled,
-      kind: moves.length === 0
-        ? "no-move-events"
-        : travelled
-          ? "travelled"
-          : distinct <= 1
-            ? "single-position"
-            : "sub-pixel-cluster",
+      kind: travelled
+        ? "travelled"
+        : spanPxWholePhase >= MIN_POINTER_SPAN_PX
+          ? "movement-only-after-press"
+          : moves.length === 0
+            ? "no-move-events"
+            : distinct <= 1
+              ? "single-position"
+              : spanPx < 1
+                ? "sub-pixel-cluster"
+                : "below-travel-threshold",
       path: path.slice(0, 200),
+      // The movement the approach path deliberately excludes, so excluding it from the VERDICT does
+      // not also delete it from the RECORD.
+      pathAfterPress: wholePath.slice(path.length, path.length + 200),
       reported: clickGates[idx].ok,
     };
   });
@@ -1974,16 +2194,28 @@ try {
     clicks: pointerPaths,
   };
   console.log(`  reading taken in: ${headless ? "HEADLESS" : "HEADFUL"} mode (DISPLAY=${process.env.DISPLAY ?? "unset"}) — headful-under-Xvfb may differ from headless, so the mode is part of the reading.`);
+  console.log(`  spans below are the APPROACH — movement strictly BEFORE the first mousedown (the whole-phase span is printed beside it as context, and is what a post-press drag would inflate).`);
   pointerPaths.forEach((p, i) => {
-    const reading = p.kind === "no-move-events"
-      ? "TELEPORT (no move events at all)"
-      : p.kind === "single-position"
-        ? "TELEPORT (moves, but never left one position)"
-        : p.kind === "sub-pixel-cluster"
-          ? `TELEPORT (moves span only ${p.spanPx}px — one position at two precisions, not travel)`
-          : "travelled";
-    console.log(`  click #${i + 1}: moves=${p.moveCount} spanPx=${p.spanPx} distinctPositions=${p.distinctPositions} beforeMouseDown=${p.movesBeforeFirstMouseDown} landedAt=${p.landedAt ? `(${p.landedAt.x},${p.landedAt.y})` : "n/a"} => ${clickGates[i].verdict(reading)}`);
-    if (p.path.length) console.log(`    path: ${p.path.slice(0, 12).map((q) => `(${q.x},${q.y})`).join(" -> ")}${p.path.length > 12 ? ` ... +${p.path.length - 12}` : ""}`);
+    // Keyed off "travelled" FIRST, with the teleport kinds as the fallbacks. Written the other way
+    // round — a chain of teleport tests defaulting to "travelled" — the next `kind` added to the
+    // classifier above would print as TRAVELLED until someone noticed, publishing the most flattering
+    // possible reading for a case nobody has looked at yet. This ordering fails the other way: an
+    // unhandled kind prints as a teleport whose mechanism is spelled out, which is conservative and
+    // self-describing.
+    const reading = p.kind === "travelled"
+      ? "travelled"
+      : p.kind === "no-move-events"
+        ? "TELEPORT (no move events at all)"
+        : p.kind === "movement-only-after-press"
+          ? `TELEPORT ON THE APPROACH (only ${p.spanPx}px before the press; the ${p.spanPxWholePhase}px of movement in this phase happened at or after mousedown, which is not an approach)`
+          : p.kind === "single-position"
+            ? "TELEPORT (moves, but never left one position)"
+            : p.kind === "sub-pixel-cluster"
+              ? `TELEPORT (approach spans only ${p.spanPx}px — one position at two precisions, not travel)`
+              : `TELEPORT (approach spans ${p.spanPx}px over ${p.distinctPositions} distinct positions — real movement, but under the ${MIN_POINTER_SPAN_PX}px travel threshold) [${p.kind}]`;
+    console.log(`  click #${i + 1}: approachMoves=${p.moveCount}/${p.moveCountWholePhase} spanPx=${p.spanPx} (whole phase ${p.spanPxWholePhase}) distinctPositions=${p.distinctPositions} landedAt=${p.landedAt ? `(${p.landedAt.x},${p.landedAt.y})` : "n/a"} => ${clickGates[i].verdict(reading)}`);
+    if (p.path.length) console.log(`    approach: ${p.path.slice(0, 12).map((q) => `(${q.x},${q.y})`).join(" -> ")}${p.path.length > 12 ? ` ... +${p.path.length - 12}` : ""}`);
+    if (p.pathAfterPress.length) console.log(`    after the press: ${p.pathAfterPress.slice(0, 12).map((q) => `(${q.x},${q.y})`).join(" -> ")}${p.pathAfterPress.length > 12 ? ` ... +${p.pathAfterPress.length - 12}` : ""}`);
   });
 
   // ---------------------------------------------------------------------------------------
@@ -2007,7 +2239,7 @@ try {
   // Compact per-click: an ungated click reads as its shape, a gated one as a bare UNVERIFIED. The
   // full reason is one section up and in the JSON record — repeating it once per click here would
   // bury the four summary lines this block exists to make scannable.
-  console.log(`  Q4 trajectory   : ${pointerPaths.map((p, i) => (clickGates[i].ok ? `click#${i + 1} ${p.moveCount} move(s) [${p.kind}]` : `click#${i + 1} UNVERIFIED`)).join(", ") || "no clicks measured"} [${headless ? "headless" : "headful"}]`);
+  console.log(`  Q4 trajectory   : ${pointerPaths.map((p, i) => (clickGates[i].ok ? `click#${i + 1} ${p.moveCount} pre-press move(s) [${p.kind}]` : `click#${i + 1} UNVERIFIED`)).join(", ") || "no clicks measured"} [${headless ? "headless" : "headful"}]`);
   if (!foundationOk) console.log(`  gating          : ${foundationWhy.join("; ")}`);
   console.log(`  evidence path   : ${useStdio ? "real stdio launcher + real policy/egress" : "IN-PROCESS FALLBACK (weaker evidence — see the transport section)"}`);
 
@@ -2048,6 +2280,29 @@ try {
      *  a keystroke-cadence model with fewer samples than the value length implies — itself a tell,
      *  and at zero it leaves the model with nothing at all. */
     keydownsPerChar: 1,
+    /**
+     * EDITING EVIDENCE, per character, required ALONGSIDE the keystrokes. A keystroke-only rule can
+     * certify a fix that types nothing, and this is not hypothetical: the likely shape of #110's
+     * remedy is per-character CDP `Input.dispatchKeyEvent`, which inserts NO TEXT when its
+     * `text`/`unmodifiedText` field is omitted. That path emits trusted keydown/keyup pairs at
+     * human-plausible intervals, zero `beforeinput`, zero `input`, and leaves the field empty — so
+     * against a keydown/keyup-only rule it scores "per-character sequence — ACCEPTABLE", sails
+     * through the cadence rule for free, and hands #110 CLOSE-AS-NOT-NEEDED for a remedy that types
+     * nothing. This was found by review, not by a run: the rule and the SHAPE classifier disagreed
+     * (the classifier already required `input >= chars`), so the report would have printed
+     * "shape: PARTIAL" one screen above a verdict of ACCEPTABLE — and the machine decision reads the
+     * verdict.
+     *
+     * `beforeinput` is required as well as `input` because it is the one that separates real editing
+     * from a page-script `.value +=` loop with a dispatched `input` per character: Chrome fires
+     * beforeinput and input 1:1 for insertText editing, and a dispatched Event carries neither the
+     * trust bit nor a beforeinput at all — the same discriminator the negative-control table uses.
+     *
+     * NOT `keypress`, deliberately: only printable characters fire it and INPUT_REALISM_TEXT is
+     * operator-overridable, so gating on it would FALSE-FAIL a genuine per-character path driven
+     * with a non-printable key. It is reported in the reason string instead of gated on.
+     */
+    editEventsPerChar: 1,
     /** Three intervals is the smallest thing that is a distribution rather than two numbers. */
     minKeystrokeIntervalSamples: 3,
     /** Human inter-keystroke medians cluster around 60-250ms. The accepted band is much wider so a
@@ -2075,12 +2330,13 @@ try {
      */
     instantPointerDwellMedianMs: 1,
     minPointerDwellMedianMs: 30,
-    /** "Travelled" = the widest separation between any two points on the approach is at least this
-     *  many CSS pixels. Distance, not a count of distinct coordinate pairs: the first in-container
-     *  run reported "travelled" off a 0.95px gap between a pointer event's sub-pixel coordinates
-     *  and the mouse event's integer ones — one logical position at two precisions. 8px is far
-     *  above sub-pixel rounding and any plausible jitter, and far below the tens-to-hundreds of
-     *  pixels a pointer crossing a page would cover, so neither error is close to the line. */
+    /** "Travelled" = the widest separation between any two points on the APPROACH — the movement
+     *  before the first mousedown, not the whole click phase — is at least this many CSS pixels.
+     *  Distance, not a count of distinct coordinate pairs: the first in-container run reported
+     *  "travelled" off a 0.95px gap between a pointer event's sub-pixel coordinates and the mouse
+     *  event's integer ones — one logical position at two precisions. 8px is far above sub-pixel
+     *  rounding and any plausible jitter, and far below the tens-to-hundreds of pixels a pointer
+     *  crossing a page would cover, so neither error is close to the line. */
     minPointerSpanPx: MIN_POINTER_SPAN_PX,
   };
   record.acceptability = { thresholds: ACCEPT, questions: {} };
@@ -2139,7 +2395,13 @@ try {
 
   // --- Q2 -------------------------------------------------------------------------------------
   // RULES, per surface (Q2 overall is the worst of them):
-  //   type body : ACCEPTABLE iff keydown >= chars AND keyup >= chars (a per-character sequence);
+  //   type body : ACCEPTABLE iff keydown >= chars AND keyup >= chars (a per-character sequence)
+  //               AND beforeinput >= chars AND input >= chars AND the field ended up holding the
+  //               string that was typed. The editing half is not decoration: keystroke counts alone
+  //               certify a per-character path that inserts NO TEXT, and that is the likely shape of
+  //               the very remedy this rule will be re-run to verify. A run that has the keystrokes
+  //               but not the edit gets its OWN NOT-ACCEPTABLE reason, because "typed nothing" is a
+  //               different defect from "emitted no keystrokes".
   //               INDETERMINATE if the phase captured nothing at all, which is a statement about
   //               the instrument and not about the fill.
   //   type+submit: ACCEPTABLE iff the Enter emitted a keydown AND a keyup AND both are trusted.
@@ -2171,10 +2433,83 @@ try {
         // decision rule already says it wants: an unverified instrument must not close a ticket,
         // and it must not open one either.
         if (typeEmpty) return { verdict: INDETERMINATE, reason: "the type phase produced no events at all, so the shape of the fill body cannot be characterized — this is an instrument/fixture question first (the verb reported success and the page observed nothing), not a measurement of the keystroke path" };
-        if (perChar.keydown >= TEXT.length * ACCEPT.keydownsPerChar && perChar.keyup >= TEXT.length * ACCEPT.keydownsPerChar) {
-          return { verdict: ACCEPTABLE, reason: `per-character sequence — keydown=${perChar.keydown} keyup=${perChar.keyup} over ${TEXT.length} character(s)` };
+        // Three conditions, not one, and they are separated so the reason string can say WHICH failed
+        // — "no keystrokes" and "keystrokes that edited nothing" are different findings about a
+        // different remedy and must not be collapsed into one sentence.
+        const keystrokesOk = perChar.keydown >= TEXT.length * ACCEPT.keydownsPerChar && perChar.keyup >= TEXT.length * ACCEPT.keydownsPerChar;
+        const editsOk = perChar.beforeinput >= TEXT.length * ACCEPT.editEventsPerChar && perChar.input >= TEXT.length * ACCEPT.editEventsPerChar;
+        // `>=`, never `===`: this fixture does not clear the field between real phases (the only
+        // assignment that does is the negative control's, on its own page load), so a fill that ran
+        // against a field already holding text legitimately ends LONGER than TEXT, and an equality
+        // test would false-fail it. `null` is the case that must not pass: finalValueLength is
+        // sampled off editing events only, so null means nothing was ever observed to edit the
+        // field — the exact state a dispatchKeyEvent-without-text remedy leaves behind.
+        const valueLongEnough = typeof perChar.finalValueLength === "number" && perChar.finalValueLength >= TEXT.length;
+        /**
+         * Containment is TRI-STATE, and the two failure directions must not be collapsed into one:
+         *   proven     the captured prefix contains TEXT. Conclusive on its own even if the capture
+         *              was truncated — a prefix that already holds the string is not made less
+         *              conclusive by there being more field beyond it.
+         *   unprovable the capture is truncated (or no value string was captured at all) AND the
+         *              prefix does not contain TEXT. Says nothing in either direction.
+         *   refuted    a COMPLETE capture that does not contain TEXT. A real finding.
+         *
+         * The previous rule folded "unprovable" into "proven": truncation was an unconditional PASS,
+         * and it keyed off the FIELD's length rather than TEXT's, so it was reachable without a long
+         * TEXT at all. A review pass replayed a 5000-character field whose captured 200-character
+         * prefix contained nothing that had been typed and got ACCEPTABLE out of it — a fill that
+         * inserted nothing, certified against content it never put there, which is exactly the
+         * "keystrokes without an edit" case this surface exists to catch. Truncation is now the
+         * instrument saying it could not see, which routes #110 to CANNOT DECIDE: the same treatment
+         * an empty phase already gets, for the same reason. Not reachable from today's fixture (the
+         * field starts empty on every run and VALUE_CAPTURE_CHARS is derived from TEXT), so no
+         * published number moves — it closes the hole ahead of an operator override or a fixture edit.
+         */
+        const valueCaptured = typeof perChar.finalValue === "string";
+        // Truncation is decided off finalValueLength — the field's TRUE, uncapped length — never off
+        // the captured string's own length: `finalValue.length >= cap` cannot tell a field that is
+        // exactly cap characters long from one that is longer, and would call a COMPLETE capture
+        // truncated, handing an unprovable verdict to a reading that was fully observed.
+        const captureTruncated = !valueCaptured || (typeof perChar.finalValueLength === "number" && perChar.finalValueLength > VALUE_CAPTURE_CHARS);
+        const containment = valueCaptured && perChar.finalValue.includes(TEXT)
+          ? "proven"
+          : captureTruncated
+            ? "unprovable"
+            : "refuted";
+        const valueOk = valueLongEnough && containment === "proven";
+        // keypress is REPORTED and never gated on — see ACCEPT.editEventsPerChar for why gating on
+        // it would false-fail a genuine per-character path driven with a non-printable key.
+        const counts = `keydown=${perChar.keydown} keypress=${perChar.keypress} keyup=${perChar.keyup} beforeinput=${perChar.beforeinput} input=${perChar.input} finalValueLen=${perChar.finalValueLength ?? "never observed"} over ${TEXT.length} character(s)`;
+        if (keystrokesOk && editsOk && valueOk) {
+          return { verdict: ACCEPTABLE, reason: `per-character sequence that actually edited the field — ${counts}` };
         }
-        return { verdict: NOT_ACCEPTABLE, reason: `${perChar.keydown} keydown / ${perChar.keyup} keyup over ${TEXT.length} character(s) (shape: ${record.questions.Q2.type.shape}) — a detector counting keystrokes against the value length sees the mismatch directly` };
+        // The one case where every DIRECTLY OBSERVED condition passed and the only thing missing is a
+        // reading the instrument could not take. Placed above the two NOT-ACCEPTABLE branches because
+        // both of those assert a fact about the fill, and "the field is longer than the capture cap"
+        // is a fact about the CAPTURE. Deliberately narrow: a keystroke-count or edit-count shortfall
+        // is observed directly and stays NOT-ACCEPTABLE no matter what the value capture could see.
+        if (keystrokesOk && editsOk && valueLongEnough && containment === "unprovable") {
+          return { verdict: INDETERMINATE, reason: `the field ended ${perChar.finalValueLength} character(s) long — past the ${VALUE_CAPTURE_CHARS}-character value-capture cap — and the captured prefix does not contain the typed string, so whether the fill actually inserted what it typed CANNOT BE DECIDED from this run. ${counts}. Raise the cap or shorten INPUT_REALISM_TEXT and re-run; do not read this as a pass` };
+        }
+        if (keystrokesOk) {
+          // A DIFFERENT — and more alarming — finding than "0 keydown", so it gets its own reason
+          // rather than falling into the count-mismatch sentence below. This is what a remedy that
+          // emits per-character key events WITHOUT inserting text looks like: the cadence surface
+          // goes ACCEPTABLE, the form stays empty, and the consumer's fill silently does nothing.
+          const why = [];
+          if (!editsOk) why.push(`the field reported only ${perChar.beforeinput} beforeinput / ${perChar.input} input event(s) for ${TEXT.length} character(s)`);
+          if (perChar.finalValueLength === null) why.push("no editing event fired at all, so the field's value was never observed to change");
+          else if (!valueLongEnough) why.push(`the field ended ${perChar.finalValueLength} character(s) long, shorter than the ${TEXT.length} that were typed`);
+          // "refuted" and "unprovable" get different sentences on purpose: this branch is reachable
+          // with an unprovable capture (when the edit counts are what failed), and printing "does not
+          // contain the string that was typed" against a value the instrument only saw a prefix of
+          // would be an assertion the data does not support — the same wrong-mechanism-inside-a-
+          // correct-verdict defect the trajectory section names.
+          else if (containment === "refuted") why.push(`the field ended as ${JSON.stringify(perChar.finalValue)}, which does not contain the string that was typed`);
+          else if (containment === "unprovable") why.push(`the field is ${perChar.finalValueLength} character(s) long, past the ${VALUE_CAPTURE_CHARS}-character capture cap, so whether it contains the string that was typed could not be checked`);
+          return { verdict: NOT_ACCEPTABLE, reason: `KEYSTROKES WITHOUT AN EDIT — the per-character keydown/keyup sequence is present but ${why.join("; and ")}. ${counts}. Keystrokes that insert no text (CDP Input.dispatchKeyEvent with its text field omitted) read as human to a cadence model while leaving the field untouched` };
+        }
+        return { verdict: NOT_ACCEPTABLE, reason: `${counts} (shape: ${record.questions.Q2.type.shape}) — a detector counting keystrokes against the value length sees the mismatch directly` };
       }),
     },
     {
@@ -2270,22 +2605,25 @@ try {
   const jQ3 = worstOf(q3Parts);
 
   // --- Q4 -------------------------------------------------------------------------------------
-  // RULE: ACCEPTABLE iff every measured click's approach spans >= minPointerSpanPx. Distance, not
-  //       a count of distinct coordinate pairs — see the threshold's comment for the sub-pixel
-  //       false-positive this replaced. No movement, one position, and a sub-pixel cluster are all
-  //       teleports; only the reason string distinguishes them.
+  // RULE: ACCEPTABLE iff every measured click's APPROACH — the movement strictly before the first
+  //       mousedown — spans >= minPointerSpanPx. Distance, not a count of distinct coordinate pairs
+  //       (see the threshold's comment for the sub-pixel false-positive this replaced), and the
+  //       approach window rather than the whole phase (see the pointerPaths comment for the
+  //       teleport-then-move false pass that one produced). No movement, one position, a sub-pixel
+  //       cluster and movement only after the press are all teleports; the `kind` and the reason
+  //       string distinguish the mechanisms.
   const jQ4 = judged(clicksGate, () => {
     if (pointerPaths.length === 0) return { verdict: INDETERMINATE, reason: "no click was measured" };
     const teleports = pointerPaths.filter((p) => p.teleported);
-    if (teleports.length) return { verdict: NOT_ACCEPTABLE, reason: `${teleports.length}/${pointerPaths.length} click(s) teleported: ${teleports.map((p) => `#${p.index + 1} ${p.kind} (span ${p.spanPx}px over ${p.moveCount} move(s), threshold ${ACCEPT.minPointerSpanPx}px)`).join(", ")}` };
-    return { verdict: ACCEPTABLE, reason: `all ${pointerPaths.length} click(s) travelled — min approach span ${Math.min(...pointerPaths.map((p) => p.spanPx))}px` };
+    if (teleports.length) return { verdict: NOT_ACCEPTABLE, reason: `${teleports.length}/${pointerPaths.length} click(s) teleported: ${teleports.map((p) => `#${p.index + 1} ${p.kind} (approach span ${p.spanPx}px over ${p.moveCount} pre-press move(s), whole phase ${p.spanPxWholePhase}px, threshold ${ACCEPT.minPointerSpanPx}px)`).join(", ")}` };
+    return { verdict: ACCEPTABLE, reason: `all ${pointerPaths.length} click(s) travelled before pressing — min approach span ${Math.min(...pointerPaths.map((p) => p.spanPx))}px` };
   });
 
   const judgements = [
     { q: "Q1 trustedness", measured: verbOnlyEvents.length ? `${verbOnlyUntrusted.length}/${verbOnlyEvents.length} verb-generated events untrusted` : "no verb-generated events", ...jQ1 },
     { q: "Q2 completeness", measured: `type=${record.questions.Q2.type.shape}, submitEnter=${submitShape.enterKeyEvents} key event(s), clicks=${clickShapes.filter((c) => c.hasMouseDownUpClick).length}/${clickShapes.length} complete, select ${selectShape.change >= 1 ? "fires change" : "fires no change"}`, ...jQ2 },
     { q: "Q3 timing", measured: `${interKeystroke ? `inter-keystroke median=${interKeystroke.median}ms stddev=${interKeystroke.stddev}ms n=${interKeystroke.n}` : "no inter-keystroke intervals"}; ${pointerDwell ? `pointer dwell median=${pointerDwell.median}ms` : "no pointer dwell"}`, ...jQ3 },
-    { q: "Q4 trajectory", measured: pointerPaths.length ? pointerPaths.map((p) => `click#${p.index + 1} ${p.moveCount} move(s)/${p.spanPx}px span`).join(", ") : "no clicks measured", ...jQ4 },
+    { q: "Q4 trajectory", measured: pointerPaths.length ? pointerPaths.map((p) => `click#${p.index + 1} ${p.moveCount} pre-press move(s)/${p.spanPx}px approach span (whole phase ${p.spanPxWholePhase}px)`).join(", ") : "no clicks measured", ...jQ4 },
   ];
   console.log("");
   for (const j of judgements) {
@@ -2336,12 +2674,28 @@ try {
     ? { decision: "CANNOT DECIDE", reason: `type body: ${typeBody.verdict} (${typeBody.reason}); cadence: ${jQ3Cadence.verdict} (${jQ3Cadence.reason})` }
     : typeBody.verdict === ACCEPTABLE && jQ3Cadence.verdict === ACCEPTABLE
       ? { decision: "CLOSE AS NOT-NEEDED", reason: `the fill body already emits a per-character keystroke sequence (${typeBody.reason}) and its cadence is human-plausible (${jQ3Cadence.reason}), so a conditional timing model would have nothing to add` }
-      : { decision: "SHOULD OPEN", reason: `${typeBody.verdict === ACCEPTABLE ? "the fill body types per-character but" : `the fill body does not type per-character (${typeBody.reason}) and`} the cadence is ${jQ3Cadence.verdict} (${jQ3Cadence.reason})` };
+      // The NOT-ACCEPTABLE side says "is NOT-ACCEPTABLE", never "does not type per-character": that
+      // phrasing hardcoded ONE of the two mechanisms this surface can fail on, and review found it
+      // contradicting its own parenthetical in exactly the case the type-body rule was extended to
+      // catch — "the fill body does not type per-character (KEYSTROKES WITHOUT AN EDIT — the
+      // per-character keydown/keyup sequence IS PRESENT but ...)". A reader who stops at the headline
+      // takes away the wrong remedy: #110's timing model is the fix for "no per-character sequence",
+      // and it is NOT the fix for "per-character keystrokes that insert no text" — that one is a bug
+      // in the fill body, and a timing model bolted onto it would make a broken fill look more human
+      // while still typing nothing. The mechanism belongs to `typeBody.reason`, which states it.
+      : { decision: "SHOULD OPEN", reason: `${typeBody.verdict === ACCEPTABLE ? "the fill body types per-character but" : `the fill body is NOT-ACCEPTABLE (${typeBody.reason}) and`} the cadence is ${jQ3Cadence.verdict} (${jQ3Cadence.reason})` };
   console.log("");
   console.log("--- hand-off to #110 (conditional timing model) ---------------------------------");
   console.log(`  DECISION: #110 ${decision110.decision}`);
   console.log(`  because : ${decision110.reason}`);
-  console.log(`  facts   : browser_type body emitted ${perChar.keydown} keydown / ${perChar.keyup} keyup over ${TEXT.length} character(s);`);
+  // The EDITING channel rides alongside the keystroke channel, because the keystroke counts alone no
+  // longer determine the verdict: a fill can emit a full per-character keydown/keyup sequence and
+  // still insert nothing, and this block's whole purpose is that nobody has to re-derive the decision
+  // from the tables above. Review found that case printing "13 keydown / 13 keyup" next to SHOULD
+  // OPEN with no trace of the beforeinput/input/finalValueLen readings that actually drove it —
+  // evidence pointing at the opposite conclusion from the one being handed over.
+  console.log(`  facts   : browser_type body emitted ${perChar.keydown} keydown / ${perChar.keyup} keyup over ${TEXT.length} character(s),`);
+  console.log(`            and ${perChar.beforeinput} beforeinput / ${perChar.input} input event(s) — the field ${perChar.finalValueLength === null ? "was never observed to be edited at all" : `ended ${perChar.finalValueLength} character(s) long`};`);
   console.log(`            the submit:true Enter emitted ${submitShape.enterKeyEvents} key event(s) through press("Enter"), a different mechanism;`);
   console.log(`            inter-keystroke intervals available to model: ${interKeystroke ? interKeystroke.n : 0}.`);
   if (decision110.decision === "SHOULD OPEN") {
@@ -2361,15 +2715,22 @@ try {
   }
   if (instrumentFailures === 0) instrumentFailures++;
 } finally {
-  if (conn) {
-    // Best-effort tidy close of the drive session before tearing the transport down, so the browser
-    // is released deliberately rather than by killing its parent.
-    await conn.client.callTool({ name: "browser_close", arguments: {} }, undefined, { timeout: 30_000 }).catch(() => {});
-    await conn.close();
-  }
-  // Chrome's keep-alive sockets would otherwise hold `close()` open past the browser's exit.
-  server.closeAllConnections?.();
-  await new Promise((r) => server.close(r));
+  // The same routine the signal path runs, so the two teardowns cannot drift apart. Hosts last here
+  // (the signal path restores it FIRST, before a browser close that might wedge) — on this path the
+  // close has already returned, so the ordering carries no risk either way.
+  //
+  // The `.catch` is not decoration. Now that `cleanup()` hands every caller the same promise, this
+  // await can observe a rejection the old entry-flag version swallowed by returning early — and an
+  // exception thrown from a `finally` escapes the try/catch it belongs to, so it would kill the
+  // process BEFORE the report is printed and the JSON record is written: a teardown fault would
+  // silently destroy the measurement it was tearing down. Recorded as an instrument failure instead,
+  // which is loud (it flips the exit code and prints in the failure line) and non-destructive. Hosts
+  // restoration then still runs, which is the one step that must not be skipped on an operator's own
+  // machine.
+  await cleanup().catch((err) => {
+    fail(`teardown error: ${err instanceof Error ? err.message : String(err)}`);
+    instrumentFailures++;
+  });
   restoreHostsEntry(hostsState);
 }
 

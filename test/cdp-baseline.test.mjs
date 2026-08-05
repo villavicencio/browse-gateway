@@ -30,6 +30,7 @@ import {
   assertEmbeddable,
   assertLeafContract,
   assertProbeContracts,
+  assertProbeSpecInvariants,
   assessCapture,
   assessRendererParity,
   attributeToGuard,
@@ -38,10 +39,12 @@ import {
   COLLECTOR_LEAF_CONTRACT,
   deadLeafFailures,
   declaredLeafPaths,
+  gateUsable,
   harnessStalls,
   internalConsistencyFailures,
   median,
   positionNumeric,
+  probeCoverage,
   PROBE_SPECS,
   RAW_LEAF_CONTRACT,
   rankEffects,
@@ -51,10 +54,13 @@ import {
   separateLabel,
   separateNumeric,
   separateRate,
+  signalExitCode,
   stallByReuse,
   summarizeLabel,
   summarizeNumeric,
   summarizeRate,
+  teardownAll,
+  validationEligibility,
 } from "../scripts/measure-cdp-baseline.mjs";
 import { assertLocalCdpOnly } from "../dist/security/index.js";
 import {
@@ -754,13 +760,20 @@ test("HEADLINE: a label probe fed by sub-resolution medians cannot unblock #102 
   assert.equal(result.protocolValidated, false);
   assert.equal(result.gateBlocked, true);
 
-  // a real bucket difference on the same probe still validates: the refusal is about the label's
-  // meaning, not about the collector being coarse
+  // A real bucket difference on the same probe is still SEPARATED — the sub-resolution refusal is
+  // about the label's meaning, not about the collector being coarse. It no longer VALIDATES, and
+  // that is the stricter rule this test was updated to encode (see the quantized-label case below):
+  // two real bucket labels one ladder step apart are still two quantizations of a timing median, and
+  // a median pair straddling a ladder edge produces exactly this shape.
   const real = analyze(
     [...rounds("A", 6, { ratioLabel: "lt1_5x" }), ...rounds("B", 6, { ratioLabel: "lt1_5x" }), ...rounds("C", 6, { ratioLabel: "8to32x" })],
     { positiveControlAttached: true },
   );
-  assert.equal(real.protocolValidated, true);
+  const realRatio = real.probes.find((p) => p.spec.key === "collector.cdp.consoleTiming.ratioBucket");
+  assert.equal(realRatio.separation.separated, true, "the bucket difference is real and stays in the report");
+  assert.equal(real.protocolValidated, false, "but a label cut out of a timing continuum may not certify the suite on its own");
+  assert.ok(real.reportOnlyValidators.some((p) => p.spec.key === "collector.cdp.consoleTiming.ratioBucket"));
+  assert.equal(real.gateBlocked, true);
 });
 
 test("HEADLINE: the robust validators — a boolean and a count — DO unblock #102", () => {
@@ -787,6 +800,379 @@ test("HEADLINE: the robust validators — a boolean and a count — DO unblock #
 
   assert.equal(result.protocolValidated, true);
   assert.equal(result.gateBlocked, false);
+});
+
+// ── separating vs certifying: three ways a real difference is not evidence the suite works ────────
+
+test("COVERAGE: a probe that read only part of the run cannot validate the suite or reach usableThresholds", () => {
+  // THE CASCADE. Four mechanisms, each correct on its own, compose into a false green: the
+  // summaries DROP null readings (a capture whose probe threw genuinely has no value), the
+  // separation rules accept n>=2 per arm, the thin-capture guard counts whole CAPTURES rather than
+  // per-probe READINGS, and the dead-leaf guard fires only when EVERY reading in every arm is
+  // absent. So six valid captures per arm in which one probe read null in four of them yields
+  // A=[false,false] vs C=[true,true] — a protocol-family validator, a "usable" rate threshold, and
+  // an UNBLOCKED gate, off a probe that failed in two thirds of the run. Nothing in the old output
+  // said so: the table cell reads "2" and the headline counts what survived.
+  const blind = (c) => {
+    c.payload.raw.consoleProxy.fired = null;
+    c.payload.raw.consoleProxy.invocations = null;
+    c.payload.collector.cdp.consoleProxy.fired = null;
+  };
+  const arms = { A: rounds("A", 6), B: rounds("B", 6), C: rounds("C", 6, { proxyFired: true }) };
+  for (const arm of Object.values(arms)) for (const c of arm.slice(2)) blind(c);
+  const result = analyze([...arms.A, ...arms.B, ...arms.C], { positiveControlAttached: true });
+
+  const fired = result.probes.find((p) => p.spec.key === "consoleProxy.fired");
+  // The separation is REAL on the rounds that reported, and it is still reported — the fix is an
+  // exclusion from certification, not a deletion of the finding.
+  assert.equal(fired.separation.separated, true, "the two readings per arm really do sit at opposite ends");
+  assert.equal(fired.coverage.complete, false);
+  assert.deepEqual(fired.coverage.byConfig.A, { observed: 2, expected: 6, missing: 4 });
+  assert.equal(fired.eligibility.eligible, false);
+  assert.match(fired.eligibility.reasons.join(" "), /PARTIAL COVERAGE \(A 2\/6, B 2\/6, C 2\/6\)/);
+
+  // and it cannot certify anything or hand #102 a number
+  assert.equal(result.protocolDiscriminating.length, 0);
+  assert.equal(result.protocolValidated, false);
+  assert.deepEqual(result.usableThresholds, []);
+  assert.equal(result.gateBlocked, true);
+  // the exclusion is REPORTED with its numbers — a silently dropped probe is how a suite quietly
+  // stops measuring while the headline keeps its shape
+  assert.deepEqual(
+    result.reportOnlyValidators.map((p) => p.spec.key).sort(),
+    ["collector.cdp.consoleProxy.fired", "consoleProxy.fired", "consoleProxy.invocations"],
+  );
+  assert.match(result.gateBlockedReasons.join(" "), /REPORT-ONLY/);
+  assert.match(result.gateBlockedReasons.join(" "), /A 2\/6/);
+  assert.ok(result.coverageIncomplete.some((p) => p.spec.key === "consoleProxy.fired"));
+  assert.match(result.headline, /What DID separate: .*REPORT-ONLY/);
+  assert.doesNotMatch(result.headline, /\(\)/, "the inadequacy headline must name what separated, not render an empty list");
+
+  // FULL coverage on the identical shape still validates and still unblocks — the rule bites the
+  // missing readings, not the probe. This is the published run's shape.
+  const full = analyze([...rounds("A", 6), ...rounds("B", 6), ...rounds("C", 6, { proxyFired: true })], { positiveControlAttached: true });
+  assert.equal(full.protocolValidated, true);
+  assert.equal(full.gateBlocked, false);
+  assert.deepEqual(full.reportOnlyValidators, []);
+  assert.deepEqual(full.coverageIncomplete, []);
+});
+
+test("probeCoverage measures readings against the run's own valid-capture count, per graded arm", () => {
+  const summaries = { A: { n: 6 }, B: { n: 4 }, C: { n: 6 }, B0: { n: 1 } };
+  const values = { A: new Array(6), B: new Array(6), C: new Array(6), B0: new Array(6) };
+  const cov = probeCoverage(summaries, values);
+  assert.equal(cov.complete, false);
+  assert.equal(cov.byConfig.B.missing, 2);
+  // B0 is a DIAGNOSTIC arm and is outside GRADED_CONFIGS: a thin B0 must not be able to mark a
+  // probe incomplete, exactly as it cannot fail the run in `analyze`.
+  assert.equal(cov.byConfig.B0, undefined);
+  assert.equal(cov.detail, "A 6/6, B 4/6, C 6/6");
+
+  assert.equal(probeCoverage({ A: { n: 3 }, B: { n: 3 }, C: { n: 3 } }, { A: new Array(3), B: new Array(3), C: new Array(3) }).complete, true);
+  // an arm that went entirely dark is incomplete even though the dead-leaf guard (which needs EVERY
+  // arm dark) stays quiet
+  assert.equal(probeCoverage({ A: { n: 0 }, B: { n: 3 }, C: { n: 3 } }, { A: [], B: new Array(3), C: new Array(3) }).complete, false);
+});
+
+test("QUANTIZED LABEL: a bucket edge may report a difference but may not certify the instrument", () => {
+  // THE THIRD APPEARANCE OF ONE ROOT CAUSE, fixed as a class this time. A quantized timing label
+  // separates whenever the two arms' medians fall either side of a ladder edge — 0.99ms and 1.01ms
+  // become the stable, disjoint labels `lt1` and `1to4` — and `separateLabel` sees only "the sets are
+  // disjoint": no spread, no distance from the edge, no headroom. Two quantized console-cost leaves
+  // were already removed from the diffed snapshot for churning across that exact edge between two
+  // captures of one unchanged environment, and this run's own output had reported the same churn as
+  // 'varies' within a single configuration. A sub-resolution difference must not be able to set
+  // protocolValidated single-handedly.
+  const labelOnly = analyze(
+    [
+      ...rounds("A", 6, { ratioLabel: "lt1_5x" }),
+      ...rounds("B", 6, { ratioLabel: "lt1_5x" }),
+      ...rounds("C", 6, { ratioLabel: "8to32x" }),
+    ],
+    { positiveControlAttached: true },
+  );
+  const ratio = labelOnly.probes.find((p) => p.spec.key === "collector.cdp.consoleTiming.ratioBucket");
+  assert.equal(ratio.separation.separated, true, "the label difference is real and stays in the report");
+  assert.equal(ratio.eligibility.eligible, false);
+  assert.match(ratio.eligibility.reasons.join(" "), /QUANTIZED TIMING LABEL/);
+  assert.match(ratio.eligibility.reasons.join(" "), /console\.richOverPlainRatio/, "the refusal names the raw measurement that would have to carry it");
+  assert.equal(labelOnly.protocolValidated, false);
+  assert.deepEqual(labelOnly.usableThresholds, []);
+  assert.equal(labelOnly.gateBlocked, true);
+  // The headline NAMES it rather than rendering the old "CRUDE CONTROLS ()" — that sentence was
+  // built from the non-protocol families alone, so a protocol-family probe refused certification
+  // used to leave an empty parenthetical offered as the reason the suite is inadequate, above the
+  // flatly false claim that every preview-serialization probe "measured nothing".
+  assert.match(labelOnly.headline, /What DID separate: collector\.cdp\.consoleTiming\.ratioBucket \[protocol, REPORT-ONLY/);
+  assert.doesNotMatch(labelOnly.headline, /\(\)/);
+
+  // WITH the raw ratio separating on its own — an observed band in both arms, disjoint ranges, and
+  // headroom above one noise width — the label is admitted again. This is not a blanket ban on
+  // categorical gates; it is a demand that something unquantized carry the claim.
+  const ratioSeries = (caps, ratios) =>
+    caps.map((c, i) => {
+      const plain = c.payload.raw.consoleTiming.plainSummary.mean;
+      c.payload.raw.consoleTiming.richSummary.mean = plain * ratios[i];
+      return c;
+    });
+  const backed = analyze(
+    [
+      ...ratioSeries(rounds("A", 6, { ratioLabel: "lt1_5x" }), [1.0, 1.2, 1.4, 1.6, 1.8, 2.0]),
+      ...ratioSeries(rounds("B", 6, { ratioLabel: "lt1_5x" }), [1.0, 1.2, 1.4, 1.6, 1.8, 2.0]),
+      ...ratioSeries(rounds("C", 6, { ratioLabel: "8to32x" }), [5.0, 5.2, 5.4, 5.6, 5.8, 6.0]),
+    ],
+    { positiveControlAttached: true },
+  );
+  const raw = backed.probes.find((p) => p.spec.key === "console.richOverPlainRatio");
+  assert.equal(raw.separation.separated, true);
+  assert.ok(raw.gate.headroomWidths >= 1, "the raw probe must carry usable headroom, not merely separate");
+  assert.ok(
+    backed.protocolDiscriminating.map((p) => p.spec.key).includes("collector.cdp.consoleTiming.ratioBucket"),
+    "with a measured number behind it, the ladder step is evidence again",
+  );
+  assert.equal(backed.gateBlocked, false);
+
+  // BOOLEANS AND INTEGER COUNTS ARE UNTOUCHED, and that asymmetry is the point rather than an
+  // oversight: they are discrete BY NATURE, not a continuum chopped into steps, so there is no edge
+  // for a thousandth of a millisecond to straddle — and they are what validated the real run.
+  const discrete = analyze([...rounds("A", 6), ...rounds("B", 6), ...rounds("C", 6, { proxyFired: true })], { positiveControlAttached: true });
+  assert.deepEqual(
+    discrete.protocolDiscriminating.map((p) => p.spec.key).sort(),
+    ["collector.cdp.consoleProxy.fired", "consoleProxy.fired", "consoleProxy.invocations"],
+  );
+  assert.equal(discrete.gateBlocked, false);
+});
+
+test("RATE ENDPOINTS: a control that disagreed with its own rule is refused a threshold AND refused certification", () => {
+  // THE FLAKY VALIDATOR. RATE_BAND is 0.2, so at the default six rounds A=1/6 true and C=5/6 true
+  // counts as "rates at opposite ends". The run then treated that probe as a protocol-family
+  // validator AND recommended "expect false — fail when the probe reads true", with the tolerance
+  // "0 of 6 rounds may disagree" — while configuration A, the browser with nothing attached, had
+  // already read true once in those very six rounds. The gate would have been unblocked by a
+  // validator whose own proposed threshold the run had watched flake, on the failing side.
+  const setFired = (c, fired) => {
+    c.payload.raw.consoleProxy.fired = fired;
+    c.payload.raw.consoleProxy.invocations = fired ? 50 : 0;
+    c.payload.collector.cdp.consoleProxy.fired = fired;
+  };
+  const arms = { A: rounds("A", 6), B: rounds("B", 6), C: rounds("C", 6, { proxyFired: true }) };
+  setFired(arms.A[0], true); // the negative control fires once
+  setFired(arms.C[5], false); // and the positive control misses once
+  const result = analyze([...arms.A, ...arms.B, ...arms.C], { positiveControlAttached: true });
+
+  const fired = result.probes.find((p) => p.spec.key === "consoleProxy.fired");
+  assert.equal(fired.separation.separated, true, "the loose band still REPORTS the split — that exploratory result is kept");
+  assert.equal(fired.gate.refused, true);
+  assert.equal(fired.gate.refusedBecause, "negative-control-disagrees-with-its-own-rule");
+  assert.equal(fired.gate.threshold, null);
+  assert.match(fired.gate.rule, /NO THRESHOLD OFFERED/);
+  // the refusal states the observed rates, so a reader sees WHICH control wobbled
+  assert.match(fired.gate.rule, /A read 1\/6 true, C read 5\/6 true/);
+  assert.match(fired.eligibility.reasons.join(" "), /RATE ENDPOINTS NOT EXACT \(A 1\/6 true, C 5\/6 true\)/);
+
+  assert.equal(result.protocolValidated, false);
+  assert.deepEqual(result.usableThresholds, []);
+  assert.equal(result.gateBlocked, true);
+  // A refused threshold on a probe the loose band called separated is NOT a rule contradiction:
+  // `separateRate` and `recommendGate` are answering different questions and both are right here.
+  assert.deepEqual(result.instrumentFailures, []);
+  assert.notEqual(result.status, "INSTRUMENT-FAILED");
+
+  // EXACT, REPRODUCED endpoints — the published run's shape — still threshold and still certify.
+  const exact = analyze([...rounds("A", 6), ...rounds("B", 6), ...rounds("C", 6, { proxyFired: true })], { positiveControlAttached: true });
+  const exactFired = exact.probes.find((p) => p.spec.key === "consoleProxy.fired");
+  assert.equal(exactFired.gate.refused, undefined);
+  assert.equal(exactFired.gate.rule, "expect false — fail when the probe reads true");
+  assert.equal(exactFired.eligibility.eligible, true);
+  assert.equal(exact.gateBlocked, false);
+
+  // A positive control that missed a round is refused for its own reason, not the negative one's.
+  const cWobble = { A: rounds("A", 6), B: rounds("B", 6), C: rounds("C", 6, { proxyFired: true }) };
+  setFired(cWobble.C[3], false);
+  const cResult = analyze([...cWobble.A, ...cWobble.B, ...cWobble.C], { positiveControlAttached: true });
+  const cFired = cResult.probes.find((p) => p.spec.key === "consoleProxy.fired");
+  assert.equal(cFired.gate.refusedBecause, "positive-control-endpoint-not-exact");
+  assert.equal(cFired.eligibility.eligible, false);
+});
+
+test("validationEligibility fails CLOSED on a label whose basis was never declared", () => {
+  // The class rule, not the two sites it currently applies to. A label probe added later with no
+  // declared basis must be report-only by default — the alternative is that the next quantized
+  // ladder somebody adds silently regains the power to certify the suite from a bucket edge.
+  const undeclared = {
+    spec: { key: "collector.cdp.somethingBucket", kind: "label", family: "protocol" },
+    coverage: { complete: true, byConfig: {}, detail: "A 6/6, B 6/6, C 6/6" },
+    summaries: {},
+    separation: { separated: true },
+  };
+  const verdict = validationEligibility(undeclared, new Map());
+  assert.equal(verdict.eligible, false);
+  assert.match(verdict.reasons.join(" "), /UNDECLARED LABEL BASIS/);
+
+  // and the declared-discrete escape hatch works, for a label whose values are categories by nature
+  const discreteLabel = { ...undeclared, spec: { ...undeclared.spec, labelBasis: "discrete" } };
+  assert.equal(validationEligibility(discreteLabel, new Map()).eligible, true);
+
+  // ...and a NON-protocol label is exempt, because `assertProbeSpecInvariants` exempts it at startup:
+  // the two rules must not disagree about whose specs the label-basis contract binds. The harness
+  // comparability ladders were being recorded in the JSON artifact as `eligible:false, "UNDECLARED
+  // LABEL BASIS"` — a spec-rule violation asserted against probes the startup check says need not
+  // satisfy it. Nothing rested on it (family alone already bars them from certifying), which is why it
+  // would have survived: a rule that fires where it does not apply teaches a reader to discount it
+  // where it does.
+  for (const family of ["harness", "control", "context"]) {
+    const verdict = validationEligibility({ ...undeclared, spec: { ...undeclared.spec, family } }, new Map());
+    assert.equal(verdict.eligible, true, `${family}-family labels must not be charged with the protocol-family label-basis rule`);
+    assert.deepEqual(verdict.reasons, []);
+  }
+});
+
+test("the #102 GATE SECTION carries the REPORT-ONLY marker, and the rate tolerance stops claiming rounds it never read", () => {
+  // THE SAME MARKER DEFECT, REACHED THROUGH A THIRD DOOR. The comparison table marks a report-only
+  // probe, the eligibility section explains it, the blocked-gate reason repeats it — and the ONE
+  // section a reader lifts a number out of, "recommended #102 gate thresholds", printed the threshold
+  // bare. With `consoleProxy.fired` reading two of six rounds the run printed "rule: expect false" and
+  // "0 of 2 rounds may disagree (A was 0/2 true, C 2/2) — both controls reproduced their reading in
+  // every round", the last clause being both flatly false about four sixths of the run AND the exact
+  // sentence written to make the zero tolerance credible.
+  const blind = (c) => {
+    c.payload.raw.consoleProxy.fired = null;
+    c.payload.raw.consoleProxy.invocations = null;
+    c.payload.collector.cdp.consoleProxy.fired = null;
+  };
+  // B sits with C, so the run also produces a FINDING- headline authored entirely by probes the
+  // instrument refused to stand behind — under CDP_BASELINE_STRICT=1 that headline exits 1.
+  const arms = { A: rounds("A", 6), B: rounds("B", 6, { proxyFired: true }), C: rounds("C", 6, { proxyFired: true }) };
+  for (const arm of Object.values(arms)) for (const c of arm.slice(2)) blind(c);
+  const result = analyze([...arms.A, ...arms.B, ...arms.C], { positiveControlAttached: true });
+
+  const fired = result.probes.find((p) => p.spec.key === "consoleProxy.fired");
+  assert.equal(fired.coverage.complete, false);
+  // the marker rides on the GATE OBJECT, so it survives being copied out of the JSON record on its own
+  assert.match(fired.gate.reportOnlyBecause.join(" "), /PARTIAL COVERAGE \(A 2\/6, B 2\/6, C 2\/6\)/);
+  assert.match(fired.gate.tolerance, /every round THEY REPORTED \(A n=2, C n=2\)/);
+  assert.doesNotMatch(
+    fired.gate.tolerance,
+    /reproduced their reading in every round,/,
+    "the unqualified claim is the defect — it must not survive anywhere in the sentence",
+  );
+
+  // and the finding headline names the probes AS report-only rather than bare
+  assert.equal(result.status, "FINDING-B-MATCHES-C");
+  assert.match(result.headline, /consoleProxy\.fired \(REPORT-ONLY: PARTIAL COVERAGE\)/);
+
+  // THE FULLY-COVERED RUN — the published run's shape — is untouched: no marker, and the tolerance
+  // still makes the zero-tolerance claim, because there it is true.
+  const full = analyze([...rounds("A", 6), ...rounds("B", 6), ...rounds("C", 6, { proxyFired: true })], { positiveControlAttached: true });
+  const fullFired = full.probes.find((p) => p.spec.key === "consoleProxy.fired");
+  assert.equal(fullFired.gate.reportOnlyBecause, undefined);
+  assert.match(fullFired.gate.tolerance, /A was 0\/6 true, C 6\/6/);
+  assert.match(fullFired.gate.tolerance, /every round THEY REPORTED \(A n=6, C n=6\)/);
+  assert.doesNotMatch(full.headline, /REPORT-ONLY/);
+});
+
+test("a quantized label names the clause its raw counterpart ACTUALLY failed, not whichever reason was nearest", () => {
+  // THE REFUSAL WHOSE OWN EVIDENCE SAID THE OPPOSITE OF THE REFUSAL. The eligibility gate on a
+  // quantized label is a conjunction of four independent conditions (the raw probe separated, was not
+  // resolution-limited, read the whole run, and carries a usable threshold), and the message printed
+  // the raw probe's SEPARATION reason whichever one failed. A raw probe barred purely on COVERAGE
+  // therefore rendered "the raw measurement it is cut from did NOT independently separate with an
+  // observed band and usable headroom — disjoint ranges and gap=4.70 >= 2x tighter-arm noise 0.0960".
+  // The operator's next move differs per clause — more rounds fixes coverage, a coarser probe fixes
+  // resolution, neither fixes a headroom under one noise width — so printing the wrong clause sends a
+  // twenty-minute re-run at the wrong problem.
+  //
+  // The trigger is realistic rather than contrived: the protocol-family stall probes read only the
+  // rows whose connection was REUSED, so a single capture that recovered nothing but a cold row (the
+  // in-container shape when a connection is not reused) is exactly this state.
+  const coldOnly = (c) => { c.payload.meta.resourceTiming = c.payload.meta.resourceTiming.slice(0, 1); };
+  const a = rounds("A", 6, { stall: 0.2, stallBucket: "lt1" });
+  coldOnly(a[5]);
+  const result = analyze(
+    [...a, ...rounds("B", 6, { stall: 0.2, stallBucket: "lt1" }), ...rounds("C", 6, { stall: 5, stallBucket: "4to16" })],
+    { positiveControlAttached: true },
+  );
+
+  const raw = result.probes.find((p) => p.spec.key === "harness.stallWarmP50Ms");
+  assert.equal(raw.separation.separated, true, "the raw stall really did separate 25x — that is what makes the old message wrong");
+  assert.equal(raw.coverage.complete, false);
+  assert.deepEqual(raw.coverage.byConfig.A, { observed: 5, expected: 6, missing: 1 });
+
+  const label = result.probes.find((p) => p.spec.key === "collector.cdp.resourceTiming.stallMedianBucket");
+  const reason = label.eligibility.reasons.join(" ");
+  assert.match(reason, /QUANTIZED TIMING LABEL/);
+  assert.match(reason, /it read only part of the run \(A 5\/6, B 6\/6, C 6\/6\)/);
+  assert.doesNotMatch(reason, /did not separate the controls/, "the raw probe DID separate; saying otherwise is the defect");
+  assert.doesNotMatch(reason, /disjoint ranges/, "a separation reason that reads as success must not be offered as the evidence for a refusal");
+
+  // The coverage exclusion is still an exclusion, not a deletion: the separation stays in the report
+  // and the gate is blocked with the reason spelled out, which is the fail-closed direction.
+  assert.equal(result.protocolValidated, false);
+  assert.equal(result.gateBlocked, true);
+  assert.match(result.gateBlockedReasons.join(" "), /PARTIAL COVERAGE \(A 5\/6/);
+
+  // WITHOUT the hole the same run certifies — the rule bites the missing reading, not the probe.
+  const whole = analyze(
+    [
+      ...rounds("A", 6, { stall: 0.2, stallBucket: "lt1" }),
+      ...rounds("B", 6, { stall: 0.2, stallBucket: "lt1" }),
+      ...rounds("C", 6, { stall: 5, stallBucket: "4to16" }),
+    ],
+    { positiveControlAttached: true },
+  );
+  assert.equal(whole.protocolValidated, true);
+  assert.equal(whole.gateBlocked, false);
+  assert.ok(whole.protocolDiscriminating.map((p) => p.spec.key).includes("collector.cdp.resourceTiming.stallMedianBucket"));
+});
+
+test("a cancelled run cannot exit 0 even where the re-raised signal is discarded", () => {
+  // PID 1 IS NOT A HYPOTHETICAL FOR THIS SCRIPT. The interrupt handler re-raises the signal instead of
+  // calling process.exit so the status stays signal-shaped, and `main()` cooperates by declining to
+  // call process.exit once `cancelled` is set. Under a bare `docker run` (node itself as PID 1, no
+  // `--init`) the kernel DISCARDS a signal whose disposition is default when the target is init, so
+  // the re-raise is a no-op, the loop drains, and the process exits 0 — a cancelled run reporting
+  // success, which is indistinguishable downstream from a clean run that measured nothing. The handler
+  // now sets process.exitCode before re-raising; only the encoding is unit-testable, since the branch
+  // that matters needs a real signal on a real PID 1.
+  assert.equal(signalExitCode("SIGINT"), 130, "the status a shell reports for a SIGINT-killed process");
+  assert.equal(signalExitCode("SIGTERM"), 143);
+  assert.notEqual(signalExitCode("SIGINT"), 0);
+  // an unknown name must still be non-zero rather than falling back to a green exit
+  assert.ok(signalExitCode("NOT-A-SIGNAL") > 128);
+});
+
+test("assertProbeSpecInvariants makes an undeclared or dangling label basis a startup failure", () => {
+  // Fail-closed is safe but silent: an undeclared label would be quietly report-only forever, and a
+  // typo in quantizedFrom would make the eligibility rule permanently unsatisfiable. This is the
+  // difference between failing closed and failing closed OUT LOUD, and it costs one second before a
+  // ~20-minute run rather than a puzzled reading of the output afterwards.
+  assert.doesNotThrow(() => assertProbeSpecInvariants());
+  const shipped = assertProbeSpecInvariants();
+  assert.deepEqual(shipped.quantizedLabels.sort(), [
+    "collector.cdp.consoleTiming.ratioBucket",
+    "collector.cdp.resourceTiming.stallMedianBucket",
+  ]);
+
+  assert.throws(
+    () => assertProbeSpecInvariants([{ key: "x.bucket", kind: "label", family: "protocol" }]),
+    /must declare quantizedFrom/,
+  );
+  assert.throws(
+    () => assertProbeSpecInvariants([{ key: "x.bucket", kind: "label", family: "protocol", quantizedFrom: "typo.key" }]),
+    /is not a NUMERIC probe/,
+  );
+  // a harness-family label carries no certification power, so it needs no declaration
+  assert.doesNotThrow(() => assertProbeSpecInvariants([{ key: "x.bucket", kind: "label", family: "harness" }]));
+});
+
+test("gateUsable holds only the NUMERIC kind to a headroom figure", () => {
+  assert.equal(gateUsable(null), false);
+  assert.equal(gateUsable({ refused: true, kind: "rate" }), false);
+  assert.equal(gateUsable({ kind: "rate", headroomWidths: null }), true, "a rate tolerance is '0 of n rounds', which has no width");
+  assert.equal(gateUsable({ kind: "label", headroomWidths: null }), true);
+  assert.equal(gateUsable({ kind: "numeric", headroomWidths: null }), false, "'we could not compute it' is not the same claim as 'it is wide'");
+  assert.equal(gateUsable({ kind: "numeric", headroomWidths: 0.5 }), false);
+  assert.equal(gateUsable({ kind: "numeric", headroomWidths: 1 }), true);
 });
 
 test("HEADLINE: an instrument-validity failure blocks the gate instead of printing next to a green verdict", () => {
@@ -836,9 +1222,17 @@ test("HEADLINE: a validated suite that can hand #102 no usable threshold still B
   // TWO ROUTES TO "UNBLOCKED" PRINTED ABOVE ITS OWN CONTRADICTION, closed by one rule.
   //
   // Route 1 — A REFUSED THRESHOLD. The collector's ratio ladder is protocol-family, so a mixed
-  // {below-resolution, lt1_5x} arm separating from C sets protocolValidated on its own; its
+  // {below-resolution, lt1_5x} arm separating from C used to set protocolValidated on its own; its
   // threshold is then refused for containing a label that means "unmeasurable", and the run used to
   // print "#102 gate: UNBLOCKED" with "NO THRESHOLD OFFERED" forty lines below it.
+  //
+  // UPDATED, AND STRICTLY TIGHTENED: a quantized timing label can no longer set protocolValidated at
+  // all (see the quantized-label case below), so route 1's premise — "validated by a label, then
+  // refused a threshold" — is unreachable by construction rather than merely blocked downstream. The
+  // assertions below now pin the stronger outcome: the separation is still reported, the threshold
+  // is still refused, the gate is still blocked, and it is still NOT an instrument failure. Route 2,
+  // which reaches the same block through a genuinely validating NUMERIC probe with unusable
+  // headroom, is untouched and is what still exercises "validated but no number".
   const mixed = (cfg, labels) => labels.map((ratioLabel, i) => capture(cfg, { ratioLabel }, i));
   const refusedRun = analyze(
     [
@@ -850,11 +1244,11 @@ test("HEADLINE: a validated suite that can hand #102 no usable threshold still B
   );
   const ratio = refusedRun.probes.find((p) => p.spec.key === "collector.cdp.consoleTiming.ratioBucket");
   assert.equal(ratio.separation.separated, true, "the separation is real and stays in the report");
-  assert.equal(refusedRun.protocolValidated, true, "the suite IS validated — that claim is untouched");
   assert.equal(ratio.gate.refused, true);
-  assert.equal(refusedRun.gateBlocked, true, "but no number can be shipped, so #102 stays blocked");
-  assert.match(refusedRun.gateBlockedReasons.join(" "), /no usable threshold/);
-  assert.match(refusedRun.gateBlockedReasons.join(" "), /REFUSED: threshold-would-accept-a-sub-resolution-label/);
+  assert.equal(ratio.gate.refusedBecause, "threshold-would-accept-a-sub-resolution-label");
+  assert.equal(refusedRun.protocolValidated, false, "and a quantized timing label cannot certify the suite either — the older, weaker rule let it");
+  assert.ok(refusedRun.reportOnlyValidators.some((p) => p.spec.key === "collector.cdp.consoleTiming.ratioBucket"));
+  assert.equal(refusedRun.gateBlocked, true, "no certification and no number, so #102 stays blocked");
   // and it is a BLOCKED GATE, not an instrument failure: both rules were right at the same time
   assert.deepEqual(refusedRun.instrumentFailures, []);
   assert.notEqual(refusedRun.status, "INSTRUMENT-FAILED");
@@ -1568,6 +1962,66 @@ test("configuration A's warm-up page hands the SAME run to the probe URL and mea
   assert.match(page, /setTimeout\(function\(\)\{location\.replace\('\/probe'\+location\.search\)\},1500\)/);
   // It must not touch anything the probes read: no console traffic, no fetch, no timing API.
   assert.ok(!/console\.|fetch\(|performance\./.test(page), `the warm-up page must stay inert: ${page}`);
+});
+
+// ── what an operator interrupt has to reap ────────────────────────────────────────────────────────
+
+test("teardownAll reaps every owned process group, closes the core, and removes the EXACT tmp root", async () => {
+  // WHY THIS EXISTS. The run takes ~20 minutes, so Ctrl-C is a NORMAL event, and every Chrome here
+  // is spawned `detached: true` — its own process group, so the whole tree can be reaped by group
+  // signal, and so the tty's Ctrl-C never reaches it. Without a handler node's default action exits
+  // immediately, main()'s async finally never runs, and a headful Chrome under Xvfb survives holding
+  // the display: it wedges every capture of the NEXT run, and gigabytes of profile dirs stay behind.
+  //
+  // The ordering is asserted because it is load-bearing: browsers first (they are what wedges the
+  // display), then the driver-owned core (no pid of ours can reach that one), then the fixture
+  // server, then the temporary root — which must be the EXACT recorded path, never a glob.
+  const order = [];
+  const handles = new Set([{ id: "A-r1" }, { id: "C-r1" }]);
+  const cores = new Set([{ close: async () => { order.push("core.close"); } }]);
+  const removed = [];
+  let serverClosed = false;
+
+  const summary = await teardownAll({
+    handles,
+    cores,
+    fixture: { server: { close: () => { order.push("server.close"); serverClosed = true; } } },
+    tmpRoot: "/tmp/bgw-cdp-baseline-deadbeef",
+    killHandle: async (h) => { order.push(`kill:${h.id}`); handles.delete(h); },
+    sweep: () => order.push("sweep"),
+    removeTree: async (dir) => { order.push("rm"); removed.push(dir); },
+  });
+
+  assert.deepEqual(order, ["kill:A-r1", "kill:C-r1", "sweep", "core.close", "server.close", "rm"]);
+  assert.deepEqual(removed, ["/tmp/bgw-cdp-baseline-deadbeef"], "the exact recorded root, not a pattern");
+  assert.equal(serverClosed, true);
+  assert.equal(cores.size, 0, "a core left in the registry would be reaped twice by a second interrupt");
+  assert.deepEqual(summary, { handlesKilled: 2, coresClosed: 1, tmpRootRemoved: true, tmpRoot: "/tmp/bgw-cdp-baseline-deadbeef" });
+});
+
+test("teardownAll keeps going when a kill throws, a core refuses to close, or the root cannot be removed", async () => {
+  // A teardown that abandons the rest of its work on the first failure is worse than none: the
+  // resource it did not reach is a headful Chrome holding the display for every later run. The
+  // group SIGKILL sweep is the backstop for a kill that threw, and `core.kill()` is the backstop for
+  // a `close()` that rejected — the same two-step the capture path uses, which is the point of
+  // routing both the normal end and the interrupt through ONE function.
+  let swept = false;
+  let hardKilled = false;
+  const summary = await teardownAll({
+    handles: new Set([{ id: "wedged" }]),
+    cores: new Set([{ close: async () => { throw new Error("driver is not responding"); }, kill: async () => { hardKilled = true; } }]),
+    fixture: { server: { close: () => { throw new Error("already closed"); } } },
+    tmpRoot: "/tmp/bgw-cdp-baseline-locked",
+    killHandle: async () => { throw new Error("ESRCH"); },
+    sweep: () => { swept = true; },
+    removeTree: async () => { throw new Error("EBUSY"); },
+  });
+  assert.equal(swept, true, "the sweep must still run after a kill throws");
+  assert.equal(hardKilled, true, "a core that will not close is killed");
+  assert.equal(summary.handlesKilled, 0);
+  assert.equal(summary.coresClosed, 1);
+  assert.equal(summary.tmpRootRemoved, false, "and the caller is told the root survived rather than being told nothing");
+  assert.equal(summary.tmpRoot, "/tmp/bgw-cdp-baseline-locked");
 });
 
 // ── the production-reachability boundary the ticket got wrong ──────────────────────────────────────

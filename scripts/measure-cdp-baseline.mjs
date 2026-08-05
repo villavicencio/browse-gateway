@@ -47,6 +47,30 @@
  * beside it — and is barred from `protocolValidated`. `context` is not a soft `protocol`: for the
  * gate it counts exactly as `harness` does, i.e. not at all.
  *
+ * SEPARATING AND CERTIFYING ARE TWO DIFFERENT PERMISSIONS, AND THE SECOND IS THE NARROW ONE. A probe
+ * that separated the controls has shown a difference; only some differences are evidence that this
+ * SUITE can see an attached consumer, which is the claim that unblocks #102. Three classes are
+ * reported and refused certification (`validationEligibility`), each because a cross-provider review
+ * traced a run in which it alone would have opened the gate:
+ *   - PARTIAL COVERAGE. Per-probe failures surface as null leaves, the summaries drop them, and the
+ *     separation rules accept two readings per arm — so a probe that failed in two thirds of a
+ *     six-round run could validate the suite while the thin-capture guard (which counts CAPTURES)
+ *     and the dead-leaf guard (which needs EVERY reading absent) both stayed quiet. Coverage is now
+ *     tracked per probe per graded configuration against that configuration's valid-capture count.
+ *   - A QUANTIZED TIMING LABEL. A bucket ladder cut out of a continuum separates whenever a
+ *     sub-resolution difference straddles an edge — 0.99ms and 1.01ms become the stable, disjoint
+ *     labels `lt1` and `1to4` — and a label comparison shows no spread, no edge distance and no
+ *     headroom. This is the THIRD appearance of that one root cause here (two quantized console-cost
+ *     leaves were already removed from the diffed snapshot for churning across the same edge), so it
+ *     is refused as a CLASS: a timing-derived label may report, and may certify only if the raw
+ *     numeric measurement behind it separated on its own with an observed band and usable headroom.
+ *     BOOLEANS AND INTEGER COUNTS ARE UNTOUCHED — they are discrete by nature rather than quantized
+ *     from a continuum, there is no edge for them to straddle, and they are what actually validated
+ *     the real run.
+ *   - A RATE ENDPOINT A CONTROL DID NOT REPRODUCE. RATE_BAND lets A=1/6 and C=5/6 count as opposite
+ *     ends at six rounds, so the run could certify on a probe whose negative control had already
+ *     broken the very rule ("expect false, zero tolerated disagreements") the same run recommends.
+ *
  * AND THE TICKET'S AXIS IS NOT THE WHOLE ANSWER. "Is B closer to A or to C" presumes the two controls
  * differ. For request-interception latency they do not: naive automation does not intercept requests,
  * so C has no more pre-dispatch delay than A, and an A-vs-C test reports INDETERMINATE no matter what
@@ -129,6 +153,16 @@
  * side of a real probe) is DATA: it prints as a CRITICAL finding and still exits 0, because #102 is
  * the ticket that acts on it. Set CDP_BASELINE_STRICT=1 to make a B-matches-C verdict fail too.
  *
+ * INTERRUPTING IT IS A NORMAL EVENT AND IS HANDLED. The run takes ~20 minutes, and every browser here
+ * is spawned into its OWN process group so it can be reaped by group signal — which also means the
+ * tty's Ctrl-C never reaches it. One-shot SIGINT/SIGTERM handlers are installed before the first
+ * launch; they reap every owned process group through the same `killChrome` the capture path uses,
+ * close any live BrowserCore (whose Chrome the driver owns, so no pid of ours can reach it), close
+ * the fixture server, remove this run's exact temporary root, and then RE-RAISE the signal so the
+ * exit status stays signal-shaped. A second interrupt kills immediately. A cancelled run produces no
+ * analysis and writes no record: an interrupt lands mid-round, which is the same per-configuration
+ * position bias that blocks the gate on an unbalanced round count.
+ *
  * CONFIGURATION C IS A TEST FIXTURE AND CANNOT BE REACHED FROM PRODUCTION — but not for the reason
  * the ticket assumed. `assertLocalCdpOnly` (src/security/cdp.ts) rejects only
  * `--remote-debugging-address=<non-local>`; it does not look at `--remote-debugging-port` at all.
@@ -199,7 +233,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access } from "node:fs/promises";
 import { constants as FS } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, constants as OS_CONSTANTS } from "node:os";
 import { join } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
@@ -636,11 +670,65 @@ export function recommendGate(spec, a, b, c, separation) {
   if (!separation.separated) return null;
   if (spec.kind === "rate") {
     const expectTrue = a.rate >= 1 - RATE_BAND;
+    // A GATE WHOSE OWN NEGATIVE CONTROL ALREADY BROKE IT, IN THE SAME RUN THAT PROPOSED IT.
+    //
+    // `separateRate` accepts endpoints within RATE_BAND (0.2) of 0 and 1, which at the default six
+    // rounds means A=1/6 true and C=5/6 true counts as "rates at opposite ends". The threshold built
+    // from that reads "expect false — fail when the probe reads true", with the tolerance sentence
+    // "0 of 6 rounds may disagree" — while configuration A, the browser with NOTHING attached, read
+    // true once in those very six rounds. #102 would ship a gate that the run recommending it had
+    // already observed flaking, and the flake is on the side that fails the gate. Worse, the same
+    // loose band is what let the probe into `protocolDiscriminating`, so a validator that cannot
+    // reproduce its own endpoint was also the evidence that the suite works.
+    //
+    // A rate probe is a BOOLEAN observed n times: its whole claim to being the sturdiest instrument
+    // in this suite (immune to clock coarsening and to scheduling noise, see separateNumeric's
+    // discrete exemption) rests on the arms REPRODUCING their reading every round. An arm that did
+    // not is not an endpoint, it is a coin. So a threshold is offered only for exact, reproduced
+    // endpoints — A all-false or all-true, C the opposite — and the refusal prints the observed
+    // counts so a reader sees which control wobbled rather than being told "no threshold" with no
+    // number behind it.
+    //
+    // The loose band is deliberately left alone in `separateRate`: an exploratory 1/6-vs-5/6 split is
+    // a real lead for a run with more rounds, and deleting it would lose that. What it may no longer
+    // do is certify (see `validationEligibility`) or ship a number (here). Both refusals are listed
+    // in NON_CONTRADICTORY_REFUSALS because the separation rule and the threshold rule are answering
+    // different questions and are both right — this is a blocked gate, not a rule disagreement.
+    const exactEnd = (s) => s && s.n > 0 && (s.trueCount === 0 || s.trueCount === s.n);
+    const aExact = exactEnd(a);
+    const cExact = exactEnd(c);
+    if (!aExact || !cExact) {
+      const observed = `A read ${a.trueCount}/${a.n} true, C read ${c.trueCount}/${c.n} true`;
+      return {
+        kind: "rate",
+        refused: true,
+        refusedBecause: !aExact ? "negative-control-disagrees-with-its-own-rule" : "positive-control-endpoint-not-exact",
+        rule: !aExact
+          ? `NO THRESHOLD OFFERED — the rule this separation implies is "expect ${expectTrue ? "true" : "false"}", and configuration A (the browser with NO protocol attached) DISAGREED with it in ${expectTrue ? a.n - a.trueCount : a.trueCount} of its ${a.n} rounds (${observed}). RATE_BAND ${RATE_BAND} lets a control that could not reproduce its own reading count as an endpoint; a gate built on it is known to flake before it ships, and it flakes on the failing side. Re-run with more rounds, or gate on a probe whose controls reproduce exactly.`
+          : `NO THRESHOLD OFFERED — the POSITIVE control did not reproduce its own reading (${observed}), so the run has no exact opposite endpoint to threshold against. A rate probe's only claim over the timing probes is that its arms reproduce every round; one that does not has nothing left to offer #102. Re-run with more rounds.`,
+        threshold: null,
+        tolerance: `${observed} — an exact endpoint is 0/n or n/n in BOTH controls; this run produced neither${aExact ? " on the positive control" : " on the negative control"}`,
+        bMargin: b.n ? `B read ${b.trueCount}/${b.n} true — recorded, not thresholded` : "B produced no reading",
+        headroomWidths: null,
+      };
+    }
     return {
       kind: "rate",
       rule: `expect ${expectTrue ? "true" : "false"} — fail when the probe reads ${expectTrue ? "false" : "true"}`,
       threshold: expectTrue,
-      tolerance: `0 of ${a.n} rounds may disagree (A was ${a.trueCount}/${a.n} true, C ${c.trueCount}/${c.n})`,
+      // "IN EVERY ROUND THEY REPORTED", NOT "IN EVERY ROUND" — AND THE THREE MISSING WORDS WERE THE
+      // ENTIRE CLAIM. `a.n` counts the rounds in which this probe RETURNED a reading, not the rounds
+      // the run produced; the two are the same number only when coverage is complete. A probe that
+      // read two of six rounds arrives here with a.n=2 and used to render "0 of 2 rounds may disagree
+      // (A was 0/2 true, C 2/2) — both controls reproduced their reading in every round", which is
+      // flatly false about four sixths of the run and is precisely the sentence written to make the
+      // zero tolerance credible. Found by review rather than by a run, in the ONE section a reader
+      // lifts a number out of: the comparison table marks a partially-covered probe and the
+      // eligibility section explains it, but the gate section printed the threshold unmarked. The
+      // counts are now named as readings with their n, and `printGateRecommendations` prints the
+      // probe's REPORT-ONLY reasons ABOVE this line, so partial coverage can no longer reach #102
+      // wearing a full-coverage sentence.
+      tolerance: `0 of ${a.n} rounds may disagree (A was ${a.trueCount}/${a.n} true, C ${c.trueCount}/${c.n}) — both controls reproduced their reading in every round THEY REPORTED (A n=${a.n}, C n=${c.n}); compare those n against the run's round count, and read any REPORT-ONLY line printed with this gate, before lifting the number`,
       bMargin: b.n ? `B read ${b.trueCount}/${b.n} true` : "B produced no reading",
       headroomWidths: null,
     };
@@ -847,6 +935,22 @@ export function harnessStalls(meta) {
  * `floorBasis` records where the probe's `floor` came from, and it is not decoration: `recommendGate`
  * refuses to build a #102 threshold whose margin would be counted in widths of a provisional floor.
  *
+ * `quantizedFrom` / `labelBasis` do the same job for a LABEL probe, and they are REQUIRED on every
+ * protocol-family label (asserted by `assertProbeSpecInvariants`, which runs before any browser is
+ * launched). A bucket label computed from a timing measurement is a continuum passed through a
+ * ladder, so two arms whose medians differ by a thousandth of a millisecond land on different labels
+ * whenever that thousandth straddles an edge — and `separateLabel` sees only "the sets are disjoint",
+ * with no spread, no edge distance and no headroom for a reader to check. That is the SAME root
+ * cause that already forced two quantized console-cost leaves out of the diffed snapshot for
+ * churning across the 1ms edge between captures of one unchanged environment. Declaring the basis
+ * makes the class visible: `quantizedFrom: "<numeric probe key>"` says "this label is a quantization
+ * of that raw measurement", and `validationEligibility` then refuses to let the label certify the
+ * instrument unless the RAW probe separated on its own with an observed band and usable headroom.
+ * `labelBasis: "discrete"` is the escape hatch for a label whose values are categories by nature
+ * rather than buckets cut out of a continuum; there are none today, and adding one should require
+ * arguing the case. A protocol-family label that declares neither is treated as report-only and says
+ * so, so the fail-closed direction is the default for anything added later.
+ *
  * `mayBeEmpty: true` marks a probe DOCUMENTED to read null everywhere, so the dead-leaf check (which
  * treats "null in every capture of every arm" as a renamed-upstream-leaf instrument failure) does not
  * fire on a known upstream gap.
@@ -954,6 +1058,22 @@ export const PROBE_SPECS = [
     floorBasis: FLOOR_PROVISIONAL,
     family: "protocol",
     note: "rich/plain mean ratio — unitless, so it is the one console figure with a chance of surviving a host change.",
+    // THE NULL BELOW IS A COVERAGE EVENT WITH A PRICE, AND THE PRICE IS PAID TWICE. `plain` is the mean
+    // of fifty console.debug(string) calls on a clock Chrome coarsens to ~100us (see the "clock" line
+    // in the residual-confounds section): a fast host in which not one of those fifty calls crossed a
+    // tick produces mean 0 legitimately, and the ratio is then undefined rather than small. Returning
+    // null is right — an undefined quantity has no reading — but a single such round in a single arm
+    // makes this probe partially-covered, which bars it from certifying the suite AND, because it is
+    // the declared `quantizedFrom` counterpart of `collector.cdp.consoleTiming.ratioBucket`, bars that
+    // label too. One quantization event therefore costs the run both halves of the console-ratio pair.
+    //
+    // DELIBERATELY NOT EXEMPTED. An "absence is a legitimate reading" opt-out was considered and
+    // refused: the exempted probes would be precisely the ones most likely to be a run's sole
+    // certifier, the exemption would have to be granted before knowing which rounds go missing, and
+    // any tolerance ("80% coverage is enough") would be a constant with no measurement behind it — the
+    // same provenance this file refuses for a headroom basis. A blocked gate says "re-run"; a
+    // certified gate built on rounds the probe never read says something much worse. The cost is
+    // documented here so it is read as designed rather than discovered mid-container-run.
     read: (c) => {
       const rich = num(c.raw?.consoleTiming?.richSummary?.mean);
       const plain = num(c.raw?.consoleTiming?.plainSummary?.mean);
@@ -1176,6 +1296,11 @@ export const PROBE_SPECS = [
     key: "collector.cdp.consoleTiming.ratioBucket",
     kind: "label",
     family: "protocol",
+    // The raw measurement this ladder is cut out of. `console.richOverPlainRatio` reads the same
+    // rich/plain mean ratio as an unquantized number, off the same two console series in the same
+    // capture, so it is the probe that can say whether a label difference is an effect or an edge:
+    // it carries a spread, a gap and a headroom figure, all of which a label comparison hides.
+    quantizedFrom: "console.richOverPlainRatio",
     // The ladder that motivated RESOLUTION_LIMITED_LABELS. Its `below-resolution` label is emitted
     // when either median fails a resolution floor, replacing an earlier `b<=0 -> 'flat'/'unbounded'`
     // discontinuity in which two arms that both measured nothing could land on DIFFERENT labels and
@@ -1202,6 +1327,13 @@ export const PROBE_SPECS = [
     key: "collector.cdp.resourceTiming.stallMedianBucket",
     kind: "label",
     family: "protocol",
+    // Same quantity, unquantized: the harness's own median pre-dispatch stall. The raw probe splits
+    // by connection reuse and this ladder does not, so they are not identical samples — but the warm
+    // regime is the one an interception pause lands in, the cold half is barred from the gate as
+    // context-family anyway, and the point of the link is that a bucket edge must not be the only
+    // evidence in the run. If the raw stall cannot separate the controls with an observed band, a
+    // ladder step computed off the same requests has not measured anything the raw number missed.
+    quantizedFrom: "harness.stallWarmP50Ms",
     note: "quantized pre-dispatch stall (requestStart - fetchStart) over the requests the page already made, as the SHIPPED collector sees it — passively, without issuing traffic of its own. This is the leaf a #102 gate written against the snapshot would actually read.",
     read: (c) => c.collector?.cdp?.resourceTiming?.stallMedianBucket ?? null,
   },
@@ -1335,6 +1467,48 @@ export function assertCacheBusterContract(source, token = RAW_CACHE_BUSTER) {
 }
 
 /**
+ * The spec list's own invariants, checked before a browser is launched rather than discovered by a
+ * reader of the output.
+ *
+ * ONE RULE, AND IT IS ABOUT A CLASS RATHER THAN A SITE. Every protocol-family LABEL probe must
+ * declare where its buckets came from: `quantizedFrom` naming the raw numeric probe that measures
+ * the same quantity unquantized, or `labelBasis: "discrete"` for values that are categories rather
+ * than ladder steps cut out of a continuum. Without the declaration a label probe is report-only at
+ * run time (`validationEligibility` fails closed), which is safe but silent — a probe added in six
+ * months would quietly stop being able to certify and nobody would know why. Failing here costs a
+ * second and names the spec that needs a decision.
+ *
+ * The `quantizedFrom` target is checked for existence and for being NUMERIC, because a typo or a
+ * pointer at another label would leave the eligibility rule permanently unsatisfiable — again the
+ * safe direction, again invisible. This assertion is the difference between "fail-closed" and
+ * "fail-closed and say so".
+ */
+export function assertProbeSpecInvariants(specs = PROBE_SPECS) {
+  const numericKeys = new Set(specs.filter((s) => s.kind === "numeric").map((s) => s.key));
+  const problems = [];
+  for (const spec of specs) {
+    if (spec.kind !== "label") continue;
+    if ((spec.family ?? "protocol") !== "protocol") continue;
+    if (spec.labelBasis === "discrete") continue;
+    if (!spec.quantizedFrom) {
+      problems.push(
+        `${spec.key}: a protocol-family label probe must declare quantizedFrom:"<numeric probe key>" (a bucket ladder cut out of a continuum) or labelBasis:"discrete" (categories by nature). A quantized timing label separates whenever a sub-resolution difference straddles a ladder edge, with no spread, no edge distance and no headroom for a reader to check`,
+      );
+      continue;
+    }
+    if (!numericKeys.has(spec.quantizedFrom)) {
+      problems.push(
+        `${spec.key}: quantizedFrom names "${spec.quantizedFrom}", which is not a NUMERIC probe in this suite — the eligibility rule would then be permanently unsatisfiable and this probe would be silently report-only forever. Numeric probes available: ${[...numericKeys].sort().join(", ")}`,
+      );
+    }
+  }
+  if (problems.length) {
+    throw new Error(`PROBE_SPECS invariants failed (${problems.length}): ${problems.join(" | ")}`);
+  }
+  return { checked: specs.length, quantizedLabels: specs.filter((s) => s.quantizedFrom).map((s) => s.key) };
+}
+
+/**
  * The startup gate for both imported sources. Called from `main()` before anything is spawned, and
  * from the unit tests against the built sources, so the two can never disagree about the shape.
  */
@@ -1401,6 +1575,57 @@ export function recommendOutlierGate(spec, a, b) {
 }
 
 /**
+ * DID THIS PROBE ACTUALLY READ THE RUN, OR ONLY PART OF IT?
+ *
+ * THE HOLE THIS CLOSES, AND WHY IT IS A CASCADE RATHER THAN A ROUNDING ERROR. A per-probe failure
+ * surfaces as a null leaf in one capture, and FOUR independent mechanisms each let that through:
+ * `summarizeRate`/`summarizeNumeric`/`summarizeLabel` DROP nulls (correctly — a capture whose probe
+ * threw has no reading), `separateRate`/`separateNumeric`/`separateLabel` accept as few as two
+ * readings per arm, the thin-capture guard in `analyze` counts whole CAPTURES rather than per-probe
+ * READINGS, and `deadLeafFailures` fires only when EVERY reading in every arm is absent. Compose
+ * them and six otherwise-valid captures per arm with A = [false,false,null,null,null,null] and
+ * C = [true,true,null,null,null,null] produce a protocol-family validator and a "usable" #102
+ * threshold — a probe that failed in two thirds of the run unblocking the gate, with the four
+ * guards each behaving exactly as designed. The symptom is invisible: the comparison table prints
+ * n=2 in a cell nobody reads as a coverage figure, and the headline says the suite is validated.
+ *
+ * So coverage is tracked PER PROBE PER GRADED CONFIGURATION, against the number of VALID captures
+ * that configuration actually produced — which is the same array `analyzeProbe` was handed, so the
+ * expected count needs no extra plumbing and cannot drift from the captures the summaries were
+ * built from.
+ *
+ * EXCLUSION, NOT AN OUTRIGHT BLOCK, AND THE CHOICE IS DELIBERATE. Blocking the whole instrument on
+ * any partial coverage would let one flaky leaf in one arm declare six rounds of good data from
+ * every OTHER probe "not a measurement" — a false red, which this file argues throughout is exactly
+ * as bad as a false green, and which would hit hardest on the slow in-container run that is the only
+ * reading that counts. The dangerous shape is specifically "a partially-read probe CERTIFIES the
+ * suite or ships a number", and that is closed at the point of certification: an incomplete probe is
+ * barred from `protocolDiscriminating` and therefore from `usableThresholds`, its separation is
+ * still reported as data, and the exclusion is printed with its coverage numbers — because a
+ * silently excluded probe is how a suite quietly stops measuring and still prints green.
+ */
+export function probeCoverage(summaries, valuesByConfig, configs = GRADED_CONFIGS) {
+  const byConfig = {};
+  let complete = true;
+  for (const cfg of configs) {
+    if (!(cfg in (valuesByConfig ?? {}))) continue;
+    const expected = (valuesByConfig[cfg] ?? []).length;
+    const observed = summaries?.[cfg]?.n ?? 0;
+    byConfig[cfg] = { observed, expected, missing: Math.max(0, expected - observed) };
+    // `observed === 0` is caught here as well as by the dead-leaf guard: that guard only fires when
+    // EVERY graded arm read nothing, so an arm that went entirely dark while the others reported
+    // would otherwise sail through as a two-arm comparison of a three-arm run.
+    if (observed === 0 || observed < expected) complete = false;
+  }
+  const keys = Object.keys(byConfig);
+  return {
+    complete,
+    byConfig,
+    detail: keys.length ? keys.map((cfg) => `${cfg} ${byConfig[cfg].observed}/${byConfig[cfg].expected}`).join(", ") : "no graded configuration in this comparison",
+  };
+}
+
+/**
  * Summarize one probe across every configuration, then grade B.
  *
  * TWO INDEPENDENT QUESTIONS, and the second one is the reason this function does more than the
@@ -1443,7 +1668,10 @@ export function analyzeProbe(spec, valuesByConfig) {
   // separated from would be a contradiction dressed as reassurance.
   const verdict = bOutlier ? "B-OUTLIER" : separation.separated ? position.verdict : "INDETERMINATE";
   const gate = bOutlier && !separation.separated ? recommendOutlierGate(spec, a, b) : recommendGate(spec, a, b, c, separation);
-  return { spec, summaries, separation, separationAB, separationBC, bOutlier, position, verdict, gate };
+  // Computed from the values this call was handed, so "how many readings did this probe produce"
+  // and "how many valid captures were there to read" can never be taken from two different places.
+  const coverage = probeCoverage(summaries, valuesByConfig);
+  return { spec, summaries, coverage, separation, separationAB, separationBC, bOutlier, position, verdict, gate };
 }
 
 /**
@@ -1462,7 +1690,7 @@ export const GRADED_CONFIGS = ["A", "B", "C"];
  * finding about our stack. Instrument validity is not allowed to be displaced by a finding.
  */
 const INADEQUACY_PREFIX =
-  "OUR PROTOCOL PROBES ARE INADEQUATE (no protocol-family probe separated the positive control from the negative control, so nothing here shows this suite can see an attached consumer at all) — and, separately: ";
+  "OUR PROTOCOL PROBES ARE INADEQUATE (no protocol-family probe both separated the positive control from the negative control AND was eligible to certify the suite, so nothing here shows this suite can see an attached consumer at all) — and, separately: ";
 
 /**
  * The contradiction the completeness critic predicted, made unreachable rather than merely unlikely.
@@ -1490,7 +1718,16 @@ const INADEQUACY_PREFIX =
  * as a contradiction would abort a run over a correctly-refused threshold and, worse, would print a
  * message blaming a noise band that was never the issue.
  */
-const NON_CONTRADICTORY_REFUSALS = new Set(["threshold-would-accept-a-sub-resolution-label"]);
+const NON_CONTRADICTORY_REFUSALS = new Set([
+  "threshold-would-accept-a-sub-resolution-label",
+  // The two rate refusals are the same shape as the label one: `separateRate` answers "did the two
+  // controls sit at opposite ends within RATE_BAND", `recommendGate` answers "can a zero-tolerance
+  // rule be built from arms that reproduced their reading every round", and a 1/6-vs-5/6 split makes
+  // both answers correct at once. Treating that as a contradiction would abort the run over a
+  // correctly-refused threshold and print a message blaming a noise band that rate probes do not have.
+  "negative-control-disagrees-with-its-own-rule",
+  "positive-control-endpoint-not-exact",
+]);
 
 export function internalConsistencyFailures(probes) {
   const failures = [];
@@ -1594,6 +1831,182 @@ export function deadLeafFailures(
  * dishonest one ("the probe is quiet, our stack is invisible") are the same words. Naming the probes
  * makes the difference visible in the headline itself, which is the part that gets quoted.
  */
+/**
+ * Is this gate a NUMBER #102 could ship?
+ *
+ * A NUMERIC gate with no headroom figure at all counts as unusable, not as usable-by-default: the
+ * headroom is the only thing that says whether the threshold survives a busy host, and "we could not
+ * compute it" is not the same claim as "it is wide". Rate and label gates legitimately carry a null
+ * headroom — their tolerance is "0 of n rounds may disagree" / an accept-set, which has no width —
+ * so only the numeric kind is held to the number.
+ *
+ * Module-scope rather than a closure inside `analyze` because `validationEligibility` needs the same
+ * predicate when it asks whether a quantized label's RAW counterpart is worth anything: two copies of
+ * "is this gate usable" that can drift is the defect one level up from the one they each guard.
+ */
+export function gateUsable(gate) {
+  if (!gate || gate.refused) return false;
+  if (gate.kind !== "numeric") return true;
+  return typeof gate.headroomWidths === "number" && Number.isFinite(gate.headroomWidths) && gate.headroomWidths >= 1;
+}
+
+/**
+ * MAY THIS SEPARATION CERTIFY THAT THE INSTRUMENT WORKS?
+ *
+ * `separation.separated` answers "did the two controls differ". This answers the much narrower
+ * question the epic's headline check actually rests on: is THIS probe's difference the kind of
+ * evidence that can stand behind "our probes can see an attached consumer", i.e. behind unblocking
+ * #102. Three ways a separation can be real and still not be that evidence, all of which used to
+ * flow straight into `protocolDiscriminating`:
+ *
+ *  1. PARTIAL COVERAGE. The probe read only part of the run (see `probeCoverage`). Two readings per
+ *     arm out of six clear every guard in the file and certify the suite.
+ *  2. A QUANTIZED TIMING LABEL. A bucket ladder cut out of a continuum separates whenever a
+ *     sub-resolution difference straddles an edge — medians of 0.99ms and 1.01ms become the stable,
+ *     disjoint labels `lt1` and `1to4` — and the label comparison exposes no spread, no edge
+ *     distance and no headroom for a reader to catch it. This is the THIRD appearance of one root
+ *     cause in this work: two quantized console-cost leaves already had to be removed from the
+ *     diffed snapshot for churning across the 1ms edge between two captures of one unchanged
+ *     environment, and this run's own output had reported the same churn as 'varies' WITHIN a single
+ *     configuration. So it is fixed as a class: a label quantized from a timing measurement may
+ *     REPORT its difference but may not certify unless the RAW numeric probe behind it separated on
+ *     its own, with an observed noise band (which `separateNumeric` already demands of a continuous
+ *     probe) and a headroom #102 could ship.
+ *
+ *     BOOLEANS AND INTEGER COUNTS ARE UNAFFECTED, AND THE DISTINCTION IS THE WHOLE POINT. They are
+ *     discrete BY NATURE — an ownKeys trap either fired or it did not, a count is 0 or 50 — not a
+ *     continuum chopped into steps, so there is no edge for a thousandth of a millisecond to
+ *     straddle. They are also what actually validated the real run. Do NOT "restore symmetry" by
+ *     re-admitting labels here: the asymmetry is the finding.
+ *  3. RATE ENDPOINTS THAT ARE NOT EXACT. RATE_BAND lets A=1/6 and C=5/6 count as opposite ends, so a
+ *     control that contradicted itself inside the same run can be the validator. See the refusal in
+ *     `recommendGate`, which withholds the number; this withholds the certification.
+ *
+ * All three are EXCLUSIONS with a stated reason, never deletions: the separation stays in
+ * `discriminating`, in the table and in the JSON record, and `analyze` prints the exclusion with its
+ * numbers. What it may not do is be the reason the gate opens.
+ */
+export function validationEligibility(probe, probesByKey = new Map()) {
+  const spec = probe?.spec ?? {};
+  const reasons = [];
+  // The same exclusions as short tags, in the same order. The prose reasons are what a reader needs in
+  // the eligibility section and in the blocked-gate line; a HEADLINE that names a report-only probe
+  // needs the fact, not the paragraph, or the marker is dropped for being too long to fit — which is
+  // how the marker went missing from the headline lists in the first place. Kept as a parallel array
+  // rather than by parsing a prefix back out of the prose, because a parser over a sentence that a
+  // future edit rewords is a marker that silently stops appearing.
+  const codes = [];
+  const exclude = (code, reason) => { codes.push(code); reasons.push(reason); };
+  const coverage = probe?.coverage;
+  if (coverage && !coverage.complete) {
+    exclude(
+      "PARTIAL COVERAGE",
+      `PARTIAL COVERAGE (${coverage.detail}): this probe produced fewer readings than the run produced valid captures, so its comparison rests on a subset of the rounds while every other column rests on all of them`,
+    );
+  }
+  // NON-PROTOCOL LABELS ARE EXEMPT FROM THE LABEL-BASIS RULE, and the exemption is not a softening —
+  // it is agreement with `assertProbeSpecInvariants`, which deliberately checks the same rule only for
+  // protocol-family labels because only a protocol-family probe can ever certify the suite. Without
+  // this line the two harness comparability ladders (`collector.cdp.resourceTiming.entriesBucket` and
+  // `.timedBucket`, which exist to say whether the three arms' stall buckets were computed from
+  // comparable samples at all) were recorded in the JSON artifact as `eligible:false, "UNDECLARED
+  // LABEL BASIS: ..."` — a spec-rule violation asserted against probes the startup invariant says need
+  // not satisfy it, in the file that gets pasted into the ticket. Nothing rested on it (family alone
+  // already bars them from `protocolDiscriminating`), which is exactly why it would have survived: a
+  // rule that fires where it does not apply teaches a reader to discount it where it does.
+  if (spec.kind === "label" && (spec.family ?? "protocol") === "protocol" && spec.labelBasis !== "discrete") {
+    const raw = spec.quantizedFrom ? probesByKey.get(spec.quantizedFrom) : null;
+    if (!spec.quantizedFrom) {
+      exclude(
+        "UNDECLARED LABEL BASIS",
+        `UNDECLARED LABEL BASIS: a label probe must declare quantizedFrom:"<numeric probe key>" or labelBasis:"discrete" before it may certify the instrument (see assertProbeSpecInvariants) — an undeclared bucket ladder is treated as quantized, which is the fail-closed direction`,
+      );
+    } else if (!raw) {
+      exclude("QUANTIZED TIMING LABEL", `QUANTIZED TIMING LABEL: its declared raw counterpart ${spec.quantizedFrom} is not present in this run, so nothing independent supports the bucket difference`);
+    } else {
+      // WHICH OF THE FOUR CONDITIONS FAILED, NAMED — because the message used to print the raw probe's
+      // SEPARATION reason whatever the failing condition was, and the four do not fail for the same
+      // reason or call for the same fix. Constructed and observed by review: a run in which one
+      // capture recovered no warm Resource Timing rows leaves `harness.stallWarmP50Ms` separated 25x
+      // and merely partially-covered, and the label refusal then rendered "the raw measurement it is
+      // cut from did NOT independently separate with an observed band and usable headroom — disjoint
+      // ranges and gap=4.70 >= 2x tighter-arm noise 0.0960" — a refusal whose own stated evidence says
+      // the opposite of the refusal. A reader either disbelieves the instrument or re-runs against the
+      // wrong problem: more rounds fixes coverage, a coarser probe fixes resolution, neither fixes a
+      // headroom under one noise width. The clause IS the message.
+      //
+      // The gate clause is suppressed when the raw probe did not separate at all, because
+      // `recommendGate` returns null in exactly that case — reporting "it produced no #102 threshold"
+      // beside "it did not separate the controls" would be reporting one fact twice and inviting a
+      // reader to hunt for a second, independent defect that does not exist.
+      const blockers = [];
+      if (raw.separation?.separated !== true) {
+        blockers.push(`it did not separate the controls (${raw.separation?.reason ?? "no comparison was made"})`);
+      } else {
+        if (raw.separation?.resolutionLimited === true) blockers.push(`its separation was RESOLUTION-LIMITED (${raw.separation.reason})`);
+        if (!gateUsable(raw.gate)) {
+          blockers.push(
+            raw.gate?.refused
+              ? `its own #102 threshold was REFUSED (${raw.gate.refusedBecause ?? "reason not recorded"})`
+              : raw.gate
+                ? `its #102 threshold carries no usable headroom (headroomWidths=${raw.gate.headroomWidths ?? "not computed"}; under one width of A's own noise a gate flakes on a busy host)`
+                : "it produced no #102 threshold at all",
+          );
+        }
+      }
+      if (raw.coverage?.complete === false) {
+        blockers.push(
+          `it read only part of the run (${raw.coverage.detail}), so the raw comparison rests on a subset of the rounds this label was computed across — the raw number cannot vouch for rounds it never read`,
+        );
+      }
+      if (blockers.length) {
+        exclude(
+          "QUANTIZED TIMING LABEL",
+          `QUANTIZED TIMING LABEL: the raw measurement it is cut from (${spec.quantizedFrom}) cannot independently support this bucket difference — ${blockers.join("; ")}. A ladder step is not evidence that the raw difference is real, and this suite has already been bitten twice by leaves churning across a bucket edge`,
+        );
+      }
+    }
+  }
+  if (spec.kind === "rate") {
+    const a = probe?.summaries?.A;
+    const c = probe?.summaries?.C;
+    const exactEnd = (s) => Boolean(s) && s.n > 0 && (s.trueCount === 0 || s.trueCount === s.n);
+    if (!exactEnd(a) || !exactEnd(c)) {
+      exclude(
+        "RATE ENDPOINTS NOT EXACT",
+        `RATE ENDPOINTS NOT EXACT (A ${a?.trueCount ?? 0}/${a?.n ?? 0} true, C ${c?.trueCount ?? 0}/${c?.n ?? 0} true): RATE_BAND ${RATE_BAND} accepts an endpoint a control did not reproduce, so this validator wobbled inside the very run it is being asked to certify`,
+      );
+    }
+  }
+  return { eligible: reasons.length === 0, reasons, codes };
+}
+
+/**
+ * A probe's key AS IT MAY APPEAR IN A HEADLINE — which is to say, carrying its report-only status.
+ *
+ * A REPORT-ONLY PROBE COULD STILL BE THE SOLE AUTHOR OF A `FINDING-` HEADLINE, AND THE HEADLINE IS THE
+ * ONE LINE THAT GETS QUOTED. `validationEligibility` decides whether a separation may CERTIFY the
+ * suite, and `INADEQUACY_PREFIX` correctly says the suite certified nothing — but the finding sentence
+ * that follows it named the probe keys bare, so a run whose `consoleProxy.fired` read two of six
+ * rounds printed "OUR STACK SITS ON THE NAIVE-AUTOMATION SIDE: consoleProxy.fired, ..." with no hint
+ * that the instrument had refused to stand behind either reading, and under CDP_BASELINE_STRICT=1 that
+ * sentence exits 1. Not a false green — the prefix is there — but a CRITICAL finding attributed to
+ * data the same run disowned two paragraphs later.
+ *
+ * The tag is the eligibility CODE rather than the full reason: the reasons are sentences and a
+ * headline carrying three of them is a headline nobody reads to the end of. The full text is printed
+ * in the eligibility section, in the blocked-gate reason, and now beside the gate itself.
+ *
+ * Applied through one helper used by EVERY headline that enumerates probes, not at the two sites the
+ * review happened to name. Every marker defect in this file so far has been the same marker missing
+ * from a third surface — the table had it, the eligibility section had it, the gate section did not —
+ * so the fix is a single function the next enumeration has to go through.
+ */
+function headlineKey(p) {
+  const codes = p.eligibility?.codes ?? [];
+  return codes.length ? `${p.spec.key} (REPORT-ONLY: ${codes.join(", ")})` : p.spec.key;
+}
+
 function resolutionSuffix(protocolResolutionLimited) {
   if (!protocolResolutionLimited.length) return "";
   return ` NOTE: ${protocolResolutionLimited.length} protocol-family probe(s) were RESOLUTION-LIMITED rather than quiet (${protocolResolutionLimited.map((p) => p.spec.key).join(", ")}): at least one arm produced no noise band above the probe's own stated floor, so the comparison could not be made at all. That is a call for more rounds or a coarser-resolution probe, NOT evidence that nothing is there.`;
@@ -1611,12 +2024,52 @@ export function analyze(captures, opts = {}) {
     return analyzeProbe(spec, values);
   });
 
+  // Which separations may CERTIFY the instrument, and which are reported without certifying. The
+  // map is built over every probe rather than only the separating ones because a quantized label's
+  // eligibility depends on its raw counterpart, and that counterpart may not have separated at all —
+  // which is precisely the case the rule exists to catch.
+  const probesByKey = new Map(probes.map((p) => [p.spec.key, p]));
+  for (const p of probes) p.eligibility = validationEligibility(p, probesByKey);
+  // THE VERDICT IS STAMPED ONTO THE GATE OBJECT, not only onto the probe, because the gate is the part
+  // that LEAVES this process. `printGateRecommendations` renders it under "recommended #102 gate
+  // thresholds" and the JSON record carries it as a self-contained {rule, threshold, tolerance} triple
+  // that a ticket author copies out on its own. Every other surface marked a report-only probe — the
+  // comparison table, the eligibility section, the blocked-gate reason — and the one section written
+  // to be lifted verbatim did not, so a probe that read two of six rounds handed #102 a zero-tolerance
+  // rule with nothing on it saying so. Marking the section would fix the symptom; marking the OBJECT
+  // means the next surface that prints a gate inherits the marker instead of re-introducing the hole.
+  for (const p of probes) {
+    if (p.gate && !p.eligibility.eligible) p.gate.reportOnlyBecause = p.eligibility.reasons;
+  }
+
   const discriminating = probes.filter((p) => p.separation.separated);
   // Only a PROTOCOL-family separation validates the suite. A crude control that separates proves
   // the two browsers differ, which we already knew — it says nothing about whether the probes
   // aimed at preview serialization and request interception can see anything. `context` is excluded
   // by the same expression: a cold-start-confounded number is not a protocol observation either.
-  const protocolDiscriminating = discriminating.filter((p) => (p.spec.family ?? "protocol") === "protocol");
+  // AND the separation must be eligible to certify — full coverage, an exact rate endpoint, a raw
+  // measurement behind any quantized label. See `validationEligibility`: three different ways a
+  // real difference is nonetheless not evidence that this suite can see an attached consumer.
+  const protocolDiscriminating = discriminating.filter(
+    (p) => (p.spec.family ?? "protocol") === "protocol" && p.eligibility.eligible,
+  );
+  // Separations that WOULD have validated the suite and were excluded. Surfaced as their own list,
+  // in the printed output and in the JSON record, because a silently excluded probe is how a suite
+  // quietly stops measuring while its headline stays the same shape.
+  const reportOnlyValidators = discriminating.filter(
+    (p) => (p.spec.family ?? "protocol") === "protocol" && !p.eligibility.eligible,
+  );
+  // Every probe that read less of the run than the run produced, separating or not. `mayBeEmpty`
+  // probes are exempt (their emptiness is a documented upstream gap this baseline exists to
+  // evidence), and so is the all-arms-dead shape, which `deadLeafFailures` already blocks with a
+  // much more specific diagnosis than "partial coverage" would give.
+  const coverageIncomplete = probes.filter(
+    (p) =>
+      !p.spec.mayBeEmpty &&
+      p.coverage &&
+      !p.coverage.complete &&
+      GRADED_CONFIGS.some((cfg) => (p.summaries[cfg]?.n ?? 0) > 0),
+  );
   const controlOnly = discriminating.filter((p) => p.spec.family === "control");
   // Comparisons the instrument REFUSED to call separations because at least one arm produced no
   // observable noise band (or, for a label probe, produced only sub-resolution labels). These are the
@@ -1693,10 +2146,10 @@ export function analyze(captures, opts = {}) {
     // our stack is uniquely identifiable, and it is invisible to the A-vs-C axis the ticket framed.
   } else if (protocolOutliers.length) {
     status = "FINDING-B-OUTLIER";
-    headline = `${probesInadequate ? INADEQUACY_PREFIX : ""}OUR STACK IS DISTINGUISHABLE FROM BOTH CONTROLS on ${protocolOutliers.length} protocol probe(s): ${protocolOutliers.map((p) => p.spec.key).join(", ")}. Neither an undriven Chrome nor naive automation produces this — it is a signature specific to what we ship, and no A-vs-C comparison can see it because the two controls agree with each other.`;
+    headline = `${probesInadequate ? INADEQUACY_PREFIX : ""}OUR STACK IS DISTINGUISHABLE FROM BOTH CONTROLS on ${protocolOutliers.length} protocol probe(s): ${protocolOutliers.map(headlineKey).join(", ")}. Neither an undriven Chrome nor naive automation produces this — it is a signature specific to what we ship, and no A-vs-C comparison can see it because the two controls agree with each other.`;
   } else if (bMatchesC.length) {
     status = "FINDING-B-MATCHES-C";
-    headline = `${probesInadequate ? INADEQUACY_PREFIX : ""}${discriminating.length} probe(s) discriminate, and on ${bMatchesC.length} of them OUR STACK SITS ON THE NAIVE-AUTOMATION SIDE: ${bMatchesC.map((p) => p.spec.key).join(", ")}.`;
+    headline = `${probesInadequate ? INADEQUACY_PREFIX : ""}${discriminating.length} probe(s) discriminate, and on ${bMatchesC.length} of them OUR STACK SITS ON THE NAIVE-AUTOMATION SIDE: ${bMatchesC.map(headlineKey).join(", ")}.`;
   } else if (discriminating.length === 0) {
     status = "PROBES-INADEQUATE";
     headline =
@@ -1704,10 +2157,23 @@ export function analyze(captures, opts = {}) {
       resolutionSuffix(protocolResolutionLimited);
   } else if (probesInadequate) {
     status = "PROBES-INADEQUATE";
-    headline = `OUR PROTOCOL PROBES ARE INADEQUATE. The only probe(s) that separated the controls are CRUDE CONTROLS, INSTRUMENT SELF-CHECKS or CONFOUNDED CONTEXT (${nonProtocolDiscriminating.map((p) => `${p.spec.key} [${p.spec.family ?? "protocol"}]`).join(", ")}), which reflect the automation surface, this harness's own load, or a difference in browser age rather than protocol attachment. Every probe aimed at preview serialization and request-interception latency measured nothing, so this run cannot certify that our stack is protocol-invisible — it can only say that our stack is not naive automation, which navigator.webdriver already told us.${resolutionSuffix(protocolResolutionLimited)}`;
+    // EVERY SEPARATION THAT CANNOT VALIDATE IS NAMED HERE, INCLUDING THE PROTOCOL-FAMILY ONES THAT
+    // WERE REFUSED CERTIFICATION. Building this sentence from `nonProtocolDiscriminating` alone was
+    // right when the only way to separate-but-not-validate was a family tag; once a protocol-family
+    // probe can be report-only (partial coverage, a quantized label, a rate endpoint a control did
+    // not reproduce) the same list renders "CRUDE CONTROLS ()" — an empty parenthetical offered as
+    // the reason the suite is inadequate — and the follow-on sentence "every probe aimed at preview
+    // serialization measured nothing" becomes flatly false: one of them measured something and was
+    // refused. That is the same defect this branch was fixed for once already, reached through a
+    // second door, so the list is built from BOTH sources and each entry says which one it came from.
+    const separatedButCannotValidate = [
+      ...nonProtocolDiscriminating.map((p) => `${p.spec.key} [${p.spec.family ?? "protocol"}]`),
+      ...reportOnlyValidators.map((p) => `${p.spec.key} [protocol, REPORT-ONLY — ${p.eligibility.reasons.join("; ")}]`),
+    ];
+    headline = `OUR PROTOCOL PROBES ARE INADEQUATE. Nothing in this run both separated the controls AND was eligible to certify the suite. What DID separate: ${separatedButCannotValidate.join(", ")}. Those are CRUDE CONTROLS, INSTRUMENT SELF-CHECKS, CONFOUNDED CONTEXT, or a protocol-family separation the instrument REFUSED to count as validation — i.e. the automation surface, this harness's own load, a difference in browser age, or a difference the run could not stand behind. None of them is a demonstration that the probes aimed at preview serialization and request-interception latency can see an attached consumer. So this run cannot certify that our stack is protocol-invisible; at most it says our stack is not naive automation, which navigator.webdriver already told us.${resolutionSuffix(protocolResolutionLimited)}`;
   } else if (bBetween.length) {
     status = "FINDING-B-BETWEEN";
-    headline = `${discriminating.length} probe(s) discriminate (${protocolDiscriminating.length} protocol-family); our stack is measurably between the controls on ${bBetween.length} of them: ${bBetween.map((p) => p.spec.key).join(", ")}.`;
+    headline = `${discriminating.length} probe(s) discriminate (${protocolDiscriminating.length} protocol-family); our stack is measurably between the controls on ${bBetween.length} of them: ${bBetween.map(headlineKey).join(", ")}.`;
   } else {
     status = "B-MATCHES-A";
     headline = `${discriminating.length} probe(s) discriminate (${protocolDiscriminating.length} protocol-family), and our stack sits with the no-protocol control on all of them.`;
@@ -1720,7 +2186,21 @@ export function analyze(captures, opts = {}) {
   const protocolValidated = protocolDiscriminating.length > 0;
   const gateBlockedReasons = [];
   if (status === "INSTRUMENT-FAILED") gateBlockedReasons.push("the instrument failed");
-  if (!protocolValidated) gateBlockedReasons.push("no protocol-family probe separated the controls");
+  if (!protocolValidated) {
+    // The exclusions are named IN the blocking reason, not only in their own section. "No
+    // protocol-family probe separated the controls" is false-sounding and actively misleading on a
+    // run where several did and were refused certification — the operator's next move (more rounds
+    // for a coverage gap, a raw-timing probe for a bucket edge, an exact endpoint for a wobbling
+    // control) is different in each case and is derivable only from the reason.
+    gateBlockedReasons.push(
+      "no protocol-family probe separated the controls and was eligible to certify the suite" +
+        (reportOnlyValidators.length
+          ? ` — ${reportOnlyValidators.length} protocol-family probe(s) DID separate but are REPORT-ONLY: ${reportOnlyValidators
+              .map((p) => `${p.spec.key} (${p.eligibility.reasons.join("; ")})`)
+              .join(" | ")}`
+          : ""),
+    );
+  }
   // The analysis cannot see the capture ORDER — it only ever receives the values — so the runner has
   // to declare it, and only an explicit `false` counts as the confound. With A always first and C
   // always last in every round, within-round host drift is indistinguishable from the A-vs-C
@@ -1760,16 +2240,8 @@ export function analyze(captures, opts = {}) {
   // Blocking is the honest reading: the suite is validated (that stays in the headline and in
   // `protocolValidated`) but the run produced no threshold #102 could write down, which is a reason
   // to re-run with more rounds or a coarser probe rather than to open the ticket.
-  // A NUMERIC gate with no headroom figure at all counts as unusable, not as usable-by-default: the
-  // headroom is the only thing that says whether the threshold survives a busy host, and "we could
-  // not compute it" is not the same claim as "it is wide". Rate and label gates legitimately carry a
-  // null headroom — their tolerance is "0 of n rounds may disagree" / an accept-set, which has no
-  // width — so only the numeric kind is held to the number.
-  const gateUsable = (gate) => {
-    if (!gate || gate.refused) return false;
-    if (gate.kind !== "numeric") return true;
-    return typeof gate.headroomWidths === "number" && Number.isFinite(gate.headroomWidths) && gate.headroomWidths >= 1;
-  };
+  // `gateUsable` is module-scope (see its own comment): the same predicate decides whether a
+  // quantized label's raw counterpart is worth anything, and two copies could drift.
   const usableThresholds = protocolDiscriminating.filter((p) => gateUsable(p.gate));
   if (protocolValidated && usableThresholds.length === 0) {
     const why = (p) => {
@@ -1789,6 +2261,7 @@ export function analyze(captures, opts = {}) {
   const gateBlocked = gateBlockedReasons.length > 0;
   return {
     probes, discriminating, protocolDiscriminating, controlOnly, nonProtocolDiscriminating,
+    reportOnlyValidators, coverageIncomplete,
     resolutionLimited, protocolResolutionLimited, contextProbes,
     bMatchesA, bBetween, bMatchesC, bOutliers, protocolOutliers,
     counts, status, headline, gateBlocked, gateBlockedReasons, protocolValidated, probesInadequate,
@@ -2127,7 +2600,24 @@ function startFixture() {
 
 // ═══ process plumbing ════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Everything this process owns and must not leak, plus the one teardown that reaps it.
+ *
+ * `spawned` holds HANDLES rather than bare children so the teardown can await each exit through the
+ * same `killChrome` the capture path uses; a set of children could only be swept with an unawaited
+ * group SIGKILL, which is the backstop, not the procedure. `liveCores` exists because a BrowserCore
+ * owns a Chrome this process never spawned (the driver did) and so cannot be reached by pid at all —
+ * an interrupt during configuration B would otherwise leave a fully live driver-owned browser.
+ * `activeFixture` / `activeTmpRoot` are the two other resources whose lifetime is the whole run.
+ */
 const spawned = new Set();
+const liveCores = new Set();
+let activeFixture = null;
+let activeTmpRoot = null;
+/** Set by the interrupt handler so the capture loop stops launching browsers into a teardown. */
+let cancelled = false;
+/** Single-flight teardown: the signal handler and main's finally must never run two of them. */
+let teardownPromise = null;
 
 /** argv of a live process, or null where /proc is unavailable (any non-Linux host). */
 async function readCmdline(pid) {
@@ -2166,7 +2656,6 @@ async function findBrowserByUserDataDir(dir) {
 /** Spawn Chrome in its own process group so the whole tree can be reaped by group signal. */
 function spawnChrome(execPath, args) {
   const child = spawn(execPath, args, { detached: true, stdio: ["ignore", "pipe", "pipe"] });
-  spawned.add(child);
   const stderr = [];
   child.stderr?.on("data", (d) => {
     if (stderr.length < 40) stderr.push(String(d));
@@ -2179,7 +2668,12 @@ function spawnChrome(execPath, args) {
     child.once("exit", (code, signal) => resolve({ code, signal, error: null }));
     child.once("error", (err) => resolve({ code: null, signal: null, error: String(err?.message ?? err) }));
   });
-  return { child, stderr, exited };
+  // The HANDLE is what gets registered, not the child: the interrupt teardown reuses killChrome,
+  // which needs `exited` to be able to await the group actually going away rather than firing a
+  // signal and hoping.
+  const handle = { child, stderr, exited };
+  spawned.add(handle);
+  return handle;
 }
 
 /**
@@ -2200,15 +2694,141 @@ async function killChrome(handle) {
   ]);
   if (!exited) signalGroup("SIGKILL");
   try { await Promise.race([handle.exited, new Promise((r) => setTimeout(r, KILL_GRACE_MS))]); } catch { /* ignore */ }
-  spawned.delete(handle.child);
+  spawned.delete(handle);
 }
 
 /** Last-resort sweep so an early throw cannot leave a headful Chrome holding the display. */
 function sweepSpawned() {
-  for (const child of spawned) {
-    try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+  for (const handle of spawned) {
+    const pid = handle?.child?.pid;
+    if (!pid) continue;
+    try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
   }
   spawned.clear();
+}
+
+/**
+ * THE ONE TEARDOWN. Both the normal end of the run and an operator interrupt come through here.
+ *
+ * WHY AN INTERRUPT NEEDS IT AT ALL. This is a ~20 minute diagnostic, so Ctrl-C is a NORMAL event
+ * rather than an exotic one — and every Chrome here is spawned `detached: true`, i.e. in its own
+ * process group, precisely so the whole tree can be reaped by group signal. That same detachment
+ * means the tty's Ctrl-C is delivered to this process and NOT to the browsers: without a handler,
+ * node's default action exits immediately, the async `finally` in `main()` never runs, and a headful
+ * Chrome under Xvfb survives holding the display — which wedges every capture of the NEXT run, plus
+ * the temporary profile root (gigabytes of headful profiles) is left behind.
+ *
+ * WHY IT IS ONE FUNCTION AND NOT A SECOND PATH. A separate emergency cleanup is a second teardown
+ * that can disagree with the first — the classic version of that bug is the emergency path firing a
+ * bare group SIGKILL while the normal path also closes the BrowserCore, so the two orders differ and
+ * only one of them is ever exercised. Here the interrupt path IS the normal path: same `killChrome`
+ * (SIGTERM, await the group, SIGKILL), same `sweepSpawned` backstop, same core close/kill fallback,
+ * same `rm` of the EXACT recorded root — never a glob, never a pattern.
+ *
+ * Collaborators are injectable so a unit test can drive the ordering and the failure branches without
+ * spawning anything; the defaults are the real registries, so production has exactly one path.
+ */
+export async function teardownAll({
+  handles = spawned,
+  cores = liveCores,
+  fixture = activeFixture,
+  tmpRoot = activeTmpRoot,
+  killHandle = killChrome,
+  sweep = sweepSpawned,
+  removeTree = (dir) => rm(dir, { recursive: true, force: true }),
+} = {}) {
+  let handlesKilled = 0;
+  // Awaited one at a time: killChrome's whole value is that it CONFIRMS the group is gone, and a
+  // Promise.all here would interleave the grace timers so a slow group's SIGKILL could land after
+  // the process has already been told to re-raise.
+  for (const handle of [...handles]) {
+    try {
+      await killHandle(handle);
+      handlesKilled++;
+    } catch { /* the sweep below is the backstop for exactly this */ }
+  }
+  sweep();
+  let coresClosed = 0;
+  for (const core of [...cores]) {
+    // Removed from the registry FIRST: if close() hangs and a second interrupt arrives, the next
+    // pass must not sit on the same wedged core again.
+    cores.delete(core);
+    try {
+      await core.close();
+      coresClosed++;
+    } catch {
+      try { await core.kill(5_000); coresClosed++; } catch { /* nothing left to do */ }
+    }
+  }
+  try { fixture?.server?.close(); } catch { /* already closed */ }
+  let tmpRootRemoved = false;
+  if (tmpRoot) await removeTree(tmpRoot).then(() => { tmpRootRemoved = true; }, () => {});
+  return { handlesKilled, coresClosed, tmpRootRemoved, tmpRoot: tmpRoot ?? null };
+}
+
+/** Single-flight, so the interrupt handler and `main()`'s finally share one teardown, not two. */
+function teardownOnce() {
+  teardownPromise ??= teardownAll();
+  return teardownPromise;
+}
+
+/**
+ * One-shot SIGINT/SIGTERM handlers, installed BEFORE the first launch.
+ *
+ * `process.once` is deliberate on both counts: it means the first interrupt runs the full teardown,
+ * and it means a SECOND interrupt — the operator's response to a cleanup that is taking too long —
+ * finds no listener and gets node's default immediate kill. Cleanup that can hang must never be able
+ * to trap the operator in it.
+ *
+ * The signal is RE-RAISED at the end rather than `process.exit(130)`: an interrupted run must exit
+ * signal-shaped so a shell, a CI runner or a wrapping script sees "killed by SIGINT" instead of an
+ * ordinary non-zero status that reads as "the instrument failed". `main()` cooperates by declining to
+ * call `process.exit` once `cancelled` is set, so the exit belongs to this path alone.
+ */
+/**
+ * The status a shell would have reported for a process killed by this signal (130 for SIGINT, 143 for
+ * SIGTERM). Exported and pure only so a unit test can pin the encoding: the branch that USES it is
+ * reachable only from a real signal on a real PID 1, which no in-process test can stand up.
+ */
+export function signalExitCode(signal) {
+  return 128 + (OS_CONSTANTS.signals?.[signal] ?? 2);
+}
+
+function installInterruptHandlers() {
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.once(signal, () => {
+      cancelled = true;
+      console.error(`\n${signal} — cancelling: reaping spawned browsers, closing the driver, removing the temporary profile root. A second ${signal} kills immediately.`);
+      const finish = (line) => {
+        console.error(line);
+        // THE EXIT CODE IS SET BEFORE THE RE-RAISE, BECAUSE THE RE-RAISE CAN BE DISCARDED ENTIRELY.
+        //
+        // On an ordinary host the comment this replaces was right: `process.once` removed this
+        // listener, node restores the signal's default disposition, and the kill lands as "terminated
+        // by SIGINT" (empirically exit 130) — the status a shell or CI runner reads as "cancelled"
+        // rather than "the instrument failed". PID 1 is the documented exception, and this script's
+        // only real home is a container: the kernel silently DISCARDS a signal whose disposition is
+        // default when the target is init, so under a bare `docker run` (node itself as PID 1, no
+        // `--init`, no tini) the re-raise is a no-op. Control then falls out of this handler, `main()`
+        // declines to call `process.exit` because `cancelled` is set — deliberately, so the exit
+        // belongs to this path — the loop drains, and the process exits **0**. A cancelled run
+        // reporting success is the one status a measurement instrument must never produce: it is
+        // indistinguishable, to anything downstream, from a clean run that measured nothing.
+        //
+        // 128+signum is the conventional encoding a shell would have produced for the same signal
+        // (130 for SIGINT, 143 for SIGTERM), so the fallback status is the same number the working
+        // path yields. It costs nothing when the re-raise works — the process is already gone before
+        // this code could matter — and it is the only thing standing between an ignored signal and a
+        // green exit when it does not.
+        process.exitCode = signalExitCode(signal);
+        process.kill(process.pid, signal);
+      };
+      teardownOnce().then(
+        (s) => finish(`torn down: ${s.handlesKilled} process group(s), ${s.coresClosed} browser core(s), temporary root ${s.tmpRootRemoved ? `removed (${s.tmpRoot})` : s.tmpRoot ? `NOT removed (${s.tmpRoot}) — delete it by hand` : "never created"}. Re-raising ${signal}.`),
+        (err) => finish(`teardown FAILED (${String(err?.message ?? err)}) — a browser or the temporary root may have survived; re-raising ${signal} anyway.`),
+      );
+    });
+  }
 }
 
 async function resolveChromePath() {
@@ -2372,6 +2992,9 @@ async function captureB(ctx, runId, dir, { withGuard = true } = {}) {
     userDataDir: dir,
     navigationTimeoutMs: 30_000,
   });
+  // Registered for the interrupt teardown: this Chrome was launched by the DRIVER, not by us, so it
+  // is not in `spawned` and cannot be reached by pid — only the core can close it.
+  liveCores.add(core);
   try {
     // Without this call the core installs NO interception at all (fail-open) and never opens its
     // browser-level CDP session — so the guardless arm is not "B with a smaller guard", it is the
@@ -2428,6 +3051,7 @@ async function captureB(ctx, runId, dir, { withGuard = true } = {}) {
       },
     };
   } finally {
+    liveCores.delete(core);
     try {
       await core.close();
     } catch {
@@ -2751,6 +3375,10 @@ function printComparisonTable(analysis, configs) {
   // says the instrument could not make the measurement, the other says the measurement came back
   // negative. Only the second is evidence about our stack.
   const sepCell = (sep) => (sep.separated ? "YES" : sep.resolutionLimited ? "res" : "no");
+  // A row whose A|C cell says YES while the probe was refused certification is the one shape a
+  // reader cannot reconstruct from this table: the cell is honest, the gate is blocked, and nothing
+  // in between says why. Marked here and explained in full in its own section below.
+  const reportOnly = new Set((analysis.reportOnlyValidators ?? []).map((p) => p.spec.key));
   for (const p of analysis.probes) {
     const row =
       pad(p.spec.key, keyWidth) +
@@ -2760,7 +3388,8 @@ function printComparisonTable(analysis, configs) {
       padL(sepCell(p.separation), 6) +
       padL(sepCell(p.separationAB), 6) +
       "  " +
-      p.verdict;
+      p.verdict +
+      (reportOnly.has(p.spec.key) ? "  <-- REPORT-ONLY (separated, but may not certify the suite)" : "");
     console.log(row);
   }
   console.log("\n  fam: prot = protocol-presence mechanism (the only family that can validate the suite)");
@@ -2770,6 +3399,7 @@ function printComparisonTable(analysis, configs) {
   console.log("  A|C: did the probe discriminate the controls at all? (the epic's validity check)");
   console.log("  A|B: is OUR STACK separated from the no-protocol control? (the column #102 would gate on)");
   console.log("  res: RESOLUTION-LIMITED — an arm produced no noise band above the probe's stated floor, so the comparison could not be made. NOT the same as 'no'.");
+  console.log("  REPORT-ONLY: the separation is real and is reported, but it may not certify the suite — partial coverage, a quantized timing label with no raw measurement behind it, or a rate endpoint a control did not reproduce.");
   console.log("  cells: rate probes show true/total; label probes show the observed label set; numeric probes show the median across rounds.");
 }
 
@@ -2928,6 +3558,35 @@ function printResolutionLimited(analysis) {
   }
 }
 
+/**
+ * Separations that were real and still may not certify the instrument, plus every probe that read
+ * less of the run than the run produced.
+ *
+ * Its own section, above the gate recommendations, because the failure this prevents is SILENCE: a
+ * probe dropped from `protocolDiscriminating` leaves no trace in the comparison table (its A|C cell
+ * still says YES) and none in the headline (which counts what is left). A reader would see a green
+ * table row and a blocked gate and have nothing to connect them. The numbers are printed with each
+ * reason because the operator's next move differs per reason — more rounds for a coverage gap, a
+ * raw-timing probe for a bucket edge, an exact endpoint for a control that wobbled.
+ */
+function printValidationEligibility(analysis) {
+  if (!analysis.reportOnlyValidators.length && !analysis.coverageIncomplete.length) {
+    console.log("  none — every protocol-family separation in this run is eligible to certify the suite, and every probe read every valid capture.");
+    return;
+  }
+  for (const p of analysis.reportOnlyValidators) {
+    console.log(`\n  ${p.spec.key}  [${p.spec.family ?? "protocol"}]  SEPARATED, but REPORT-ONLY: it cannot validate the suite or hand #102 a number`);
+    for (const reason of p.eligibility.reasons) console.log(`    - ${reason}`);
+    console.log(`    coverage: ${p.coverage?.detail ?? "n/a"}`);
+    console.log(`    A vs C:   ${p.separation.reason}`);
+  }
+  const alsoIncomplete = analysis.coverageIncomplete.filter((p) => !analysis.reportOnlyValidators.includes(p));
+  for (const p of alsoIncomplete) {
+    console.log(`\n  ${p.spec.key}  [${p.spec.family ?? "protocol"}]  PARTIAL COVERAGE — ${p.coverage.detail}`);
+    console.log("    it did not separate the controls, so nothing here rests on it — but it read fewer rounds than the run produced, which is worth knowing before the next run is sized.");
+  }
+}
+
 /** B0's whole reason for existing: attributing a B-vs-A separation to the guard or to the driver. */
 function printGuardAttribution(analysis, configs) {
   const rows = attributeToGuard(analysis.probes);
@@ -2980,6 +3639,20 @@ function printGateRecommendations(analysis) {
   for (const p of gated) {
     const family = p.spec.family ?? "protocol";
     console.log(`\n  ${p.spec.key}  [${family}]${family !== "protocol" ? "  <-- NOT a protocol-presence signal; gating on it would test the wrong thing" : ""}`);
+    // PRINTED BEFORE THE RULE AND THE TOLERANCE, DELIBERATELY. This is the section a reader lifts a
+    // number out of, and a caveat printed UNDER a threshold is read after the threshold has already
+    // been copied into the ticket. It was also the only marked-everywhere-else exclusion that this
+    // section did not carry: with a probe at 2/6 coverage the run printed "rule: expect false" and "0
+    // of 2 rounds may disagree ... both controls reproduced their reading in every round" under the
+    // heading "recommended #102 gate thresholds", while the table two sections up marked the same
+    // probe REPORT-ONLY. The reasons are the full sentences rather than the short codes because this
+    // is the detail view: the operator's next move (more rounds, a raw-timing probe, an exact
+    // endpoint) is derivable only from the reason, and it is the move that has to happen before any
+    // number here becomes a gate.
+    if (p.gate.reportOnlyBecause?.length) {
+      console.log(`    REPORT-ONLY: ${p.gate.reportOnlyBecause.join("; ")}`);
+      console.log("               ^ this probe was NOT eligible to certify the suite, so the numbers below are this run's DATA, not a threshold #102 may ship as it stands.");
+    }
     if (p.gate.refused) console.log(`    REFUSED:   no threshold is offered for this probe (${p.gate.refusedBecause ?? "reason not recorded"}).`);
     if (p.gate.failsToday) console.log("    NOTE:      this threshold FAILS the current stack by design — it is the divergence to close, not a baseline we hold.");
     console.log(`    rule:      ${p.gate.rule}`);
@@ -3027,6 +3700,10 @@ async function main() {
   let exitCode = 0;
 
   try {
+    // BEFORE THE FIRST LAUNCH, which on this script is the calibration core a few dozen lines below.
+    // Installed inside the try only because everything it protects is created inside the try; it
+    // holds no resources itself, so an early throw costs nothing.
+    installInterruptHandlers();
     // BEFORE ANYTHING IS SPAWNED. This asserts that both imported probe sources still declare every
     // leaf the probe specs read out of them. A leaf renamed upstream — `cdp.fetchProbe.*` becoming
     // `cdp.resourceTiming.*` is exactly the change that prompted this — reads as undefined in every
@@ -3035,6 +3712,9 @@ async function main() {
     // broken wire. Failing here costs a second and names the path.
     const contracts = assertProbeContracts({ withCollector: WITH_COLLECTOR });
     record.leafContracts = contracts;
+    // The spec list's own invariants, same reasoning and same second: a protocol-family label probe
+    // with no declared basis is silently report-only for the rest of its life otherwise.
+    record.specInvariants = assertProbeSpecInvariants();
     const loose = [...contracts.raw.loose, ...(contracts.collector.loose ?? [])];
     if (loose.length) {
       console.log(`note: ${loose.length} probe leaf/leaves matched loosely (declared as object keys rather than as assignments): ${loose.join(", ")}`);
@@ -3042,6 +3722,10 @@ async function main() {
 
     fixture = startFixture();
     tmpRoot = await mkdtemp(join(tmpdir(), "bgw-cdp-baseline-"));
+    // Mirrored to module scope the moment they exist, so the interrupt teardown removes THIS run's
+    // exact temporary root rather than guessing at a pattern, and closes the fixture this run opened.
+    activeFixture = fixture;
+    activeTmpRoot = tmpRoot;
     await new Promise((r) => fixture.server.listen(0, "127.0.0.1", r));
     const port = fixture.server.address().port;
     const base = `http://127.0.0.1:${port}`;
@@ -3067,12 +3751,19 @@ async function main() {
       let core = null;
       try {
         core = await createBrowserCore({ headless: HEADLESS, channel: "chrome", noSandbox: NO_SANDBOX, userDataDir: calibDir });
+        // Calibration is the FIRST launch of the run and is exactly as leakable as a capture: an
+        // interrupt here would otherwise strand a driver-owned headful Chrome before a single
+        // measurement had been taken.
+        liveCores.add(core);
         await core.setNavigationGuard(guardAllowLoopback);
         measured = await findBrowserByUserDataDir(calibDir);
       } catch (err) {
         calibError = String(err?.message ?? err);
       } finally {
-        if (core) { try { await core.close(); } catch { try { await core.kill(5_000); } catch { /* ignore */ } } }
+        if (core) {
+          liveCores.delete(core);
+          try { await core.close(); } catch { try { await core.kill(5_000); } catch { /* ignore */ } }
+        }
       }
     }
 
@@ -3152,10 +3843,15 @@ async function main() {
     const configs = WITH_NOGUARD_ARM ? ["A", "B0", "B", "C"] : ["A", "B", "C"];
     console.log(`\n--- captures (interleaved ${configs.join(",")} per round${ROTATE ? ", A/B/C rotated" : ""}${WITH_NOGUARD_ARM ? "; B0 runs last, outside the rotation" : ""}) ---`);
     for (let round = 1; round <= ROUNDS; round++) {
+      // Cancellation is checked at both loop levels: the teardown may already be reaping browsers
+      // while this loop is resuming from an await, and launching a fresh headful Chrome into a
+      // teardown is how an interrupt leaves behind the very process it was asked to remove.
+      if (cancelled) break;
       const rotatedGraded = ROTATE ? gradedOrder.map((_, i) => gradedOrder[(i + round - 1) % gradedOrder.length]) : gradedOrder;
       const order = WITH_NOGUARD_ARM ? [...rotatedGraded, "B0"] : rotatedGraded;
       const line = [];
       for (const cfg of order) {
+        if (cancelled) break;
         const runId = randomUUID();
         const dir = join(tmpRoot, `${cfg}-r${round}`);
         await mkdir(dir, { recursive: true });
@@ -3215,6 +3911,18 @@ async function main() {
         await rm(dir, { recursive: true, force: true }).catch(() => {});
       }
       console.log(`  round ${round}:  ${line.join("   ")}`);
+    }
+
+    // A CANCELLED RUN PRODUCES NO ANALYSIS, and that is not pedantry. The rotation is what keeps
+    // within-round drift from masquerading as an A-vs-C separation, and it only works over WHOLE
+    // rounds; an interrupt lands mid-round, leaving one configuration an extra turn in the quietest
+    // slot — the exact per-configuration bias `roundsBalanced` blocks the gate over. Grading a
+    // partial run would hand the ticket a number produced by the confound this file spends a
+    // hundred lines removing.
+    if (cancelled) {
+      console.error(`\nCANCELLED after ${record.captures.length} capture(s) — no analysis is produced from a partial run: an interrupt lands mid-round, which is the same per-configuration position bias that blocks the gate on an unbalanced round count.`);
+      exitCode = 1;
+      return;
     }
 
     // ── instrument validity, before any interpretation ───────────────────────────────────────────
@@ -3306,9 +4014,47 @@ async function main() {
       `harness recovered Resource Timing rows in every capture`,
       reporting.length > 0 && noRt.length === 0,
       noRt.map((c) => `${c.config}/r${c.round}`).join(", "),
-      // Blocking only when a whole configuration produced none: a single capture without rows just
-      // contributes a null to that probe's series, which the summaries already count.
+      // Blocking only when a WHOLE CONFIGURATION produced none. A single capture without rows is not
+      // free, and the previous version of this comment said it was — "just contributes a null to that
+      // probe's series, which the summaries already count" — which stopped being true the moment
+      // coverage became an eligibility condition. A null is a MISSING READING: `probeCoverage` counts
+      // readings against the valid captures that arm produced, so one row-less capture makes every
+      // probe reading those rows partially-covered, and a partially-covered probe may not certify the
+      // suite or ship a #102 number. On a run whose only protocol-family separation is the pre-dispatch
+      // stall, that single capture is the whole difference between "gate unblocked" and "gate blocked,
+      // re-run" — measured on a constructed 25x separation, where making ONE configuration-A capture
+      // recover no warm rows flipped protocolValidated true->false.
+      //
+      // It stays NON-blocking below the whole-configuration bar because the analysis already responds
+      // proportionally (the affected probe goes REPORT-ONLY with its coverage numbers printed, every
+      // other family keeps its data), while INSTRUMENT-FAILED would declare the entire run "not a
+      // measurement" over one arm's connection reuse — a false red on the slow in-container run, which
+      // this file argues throughout is exactly as bad as a false green. What is fixed is the claim,
+      // not the threshold: the cost is now stated here and in the warm-row check below.
       { blocking: reporting.length === 0 || rtByConfig.length > 0 },
+    );
+    // THE SAME READ RESTRICTED TO THE WARM HALF — and this is not a refinement of the check above, it
+    // is the condition that check cannot see. `usable` counts every row that carried timing at all;
+    // the two PROTOCOL-family stall probes (`harness.stallWarmP50Ms`, `harness.stallWarmMeanMs`) read
+    // only the rows whose connection was REUSED, because that is the regime an interception pause
+    // lands in. So a capture that recovered nothing but COLD rows passes the check above with
+    // usable > 0 and still contributes no reading to either protocol probe — the exact partial-coverage
+    // event described above, invisible to the one check whose job is to catch missing Resource Timing
+    // data. Found by review; it would have surfaced in a container run as an unexplained REPORT-ONLY on
+    // the one family that survives the V8 fixes.
+    //
+    // Reported, never blocking, and not even when a whole configuration is warm-less: an arm that
+    // never reused a connection makes the warm probes uncomparable in that arm, which the eligibility
+    // rule already handles by refusing to certify from them. Escalating here would throw away the
+    // console and discrete families over it.
+    const noWarmRt = reporting.filter((c) => harnessStalls(c.payload?.meta).warm.length === 0);
+    check(
+      `harness recovered WARM (reused-connection) Resource Timing rows in every capture — the only rows the protocol-family stall probes read`,
+      noWarmRt.length === 0,
+      noWarmRt.length
+        ? `${noWarmRt.map((c) => `${c.config}/r${c.round}`).join(", ")} — each of those contributes NO reading to harness.stallWarm*, which makes those probes partially-covered and therefore REPORT-ONLY: they may still report a difference but may not certify the suite or hand #102 a threshold. Re-run if the pre-dispatch stall is the separation this run exists to establish.`
+        : "",
+      { blocking: false },
     );
     const probeRt = reporting.filter((c) => (c.payload?.raw?.fetchProbe?.stallMs?.length ?? 0) > 0);
     console.log(
@@ -3424,6 +4170,18 @@ async function main() {
       // a shippable threshold" are different claims, and a reader working from the JSON alone would
       // otherwise have to re-derive the second one from the per-probe gate blocks.
       usableThresholds: analysis.usableThresholds.map((p) => p.spec.key),
+      // Protocol-family separations the run REFUSED to count as validation, with the reason. In the
+      // record because a reader working from the JSON would otherwise see a probe with
+      // separated:true that is absent from protocolDiscriminating and have no way to tell whether
+      // that was a rule or a bug.
+      reportOnlyValidators: analysis.reportOnlyValidators.map((p) => ({
+        key: p.spec.key,
+        family: p.spec.family ?? "protocol",
+        reasons: p.eligibility.reasons,
+        coverage: p.coverage ?? null,
+      })),
+      // Every probe that produced fewer readings than there were valid captures to read.
+      coverageIncomplete: analysis.coverageIncomplete.map((p) => ({ key: p.spec.key, coverage: p.coverage })),
       controlOnlyDiscriminating: analysis.controlOnly.map((p) => p.spec.key),
       // Comparisons the instrument REFUSED to make. In the record because "not separated" and
       // "could not be evaluated" are different facts and only the first one belongs in a sentence
@@ -3445,6 +4203,8 @@ async function main() {
         unit: p.spec.unit ?? null,
         note: p.spec.note,
         summaries: p.summaries,
+        coverage: p.coverage,
+        eligibility: p.eligibility,
         separation: p.separation,
         separationAB: p.separationAB,
         separationBC: p.separationBC,
@@ -3463,6 +4223,9 @@ async function main() {
 
     console.log("\n--- comparisons the instrument REFUSED to make (resolution-limited: not the same as 'quiet') ---");
     printResolutionLimited(analysis);
+
+    console.log("\n--- separations that may NOT certify the suite (report-only), and probes that read only part of the run ---");
+    printValidationEligibility(analysis);
 
     console.log("\n--- context-family probes: measured, reported, and BARRED from the #102 gate ---");
     printContextProbes(analysis);
@@ -3499,6 +4262,12 @@ async function main() {
     console.log("  on a macOS, headless, constructed-args smoke run of n=2-3. A threshold whose margin would");
     console.log("  be counted in widths of one is REFUSED rather than softened, so any headroom printed below");
     console.log("  is either this run's own measured variance or an exact integer quantum.");
+    console.log("  RATE RULE: a boolean threshold is offered only where BOTH controls reproduced their reading in");
+    console.log("  every round. A rule that says '0 of n rounds may disagree' cannot come from a run in which a");
+    console.log("  control already disagreed; those are refused above with the observed counts.");
+    console.log("  LABEL RULE: a bucket label quantized from a timing measurement may report a difference but may");
+    console.log("  not certify the suite unless its raw numeric counterpart separated on its own — a ladder edge");
+    console.log("  is not a measurement, and leaves have already been observed churning across one.");
     printGateRecommendations(analysis);
 
     // ── residual confounds, stated rather than papered over ──────────────────────────────────────
@@ -3570,12 +4339,16 @@ async function main() {
     record.instrumentError = String(err?.message ?? err);
     exitCode = 1;
   } finally {
-    sweepSpawned();
-    if (tmpRoot) await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
-    fixture?.server.close();
+    // The SAME teardown the interrupt handler runs, single-flighted: if a signal arrived mid-run
+    // this awaits that teardown rather than starting a competing one.
+    await teardownOnce();
     record.finishedAt = new Date().toISOString();
     record.fixtureStats = fixture?.stats ?? null;
-    if (OUT_PATH) {
+    // No record from a cancelled run. The file is written to be pasted into a ticket, and a
+    // half-populated one carrying a `captures` array that stops mid-rotation is indistinguishable
+    // from a completed short run once it is out of this process.
+    if (cancelled && OUT_PATH) console.error(`\nrun was cancelled — ${OUT_PATH} was NOT written (a partial record reads as a completed short run once it leaves this process)`);
+    if (OUT_PATH && !cancelled) {
       try {
         // Redacted on the way out, never in memory: the analysis above needs the real values (the
         // A-vs-B environment diff is computed from the collector snapshots), and this file is the
@@ -3588,7 +4361,10 @@ async function main() {
     }
   }
 
-  process.exit(exitCode);
+  // On a cancelled run the exit belongs to the interrupt handler, which re-raises the signal so the
+  // status stays signal-shaped. Calling process.exit here would race it and turn "killed by SIGINT"
+  // into an ordinary non-zero status that reads as "the instrument failed".
+  if (!cancelled) process.exit(exitCode);
 }
 
 // Importable for unit tests without launching a browser: the verdict math above is the part most
