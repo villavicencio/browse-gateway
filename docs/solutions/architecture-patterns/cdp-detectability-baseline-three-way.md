@@ -93,6 +93,9 @@ Our stack is separated from **both** controls on two protocol-family probes:
 | `harness.stallWarmMeanMs` | 0.505 ms | **3.263 ms** | 0.508 ms | **6.5×**, 32.7 noise widths |
 | `collector.cdp.resourceTiming.stallMedianBucket` | `{lt1}` | **`{1to4}`** | `{lt1}` | disjoint labels |
 
+Reproduced across all three runs: A 0.505 / 0.479 / 0.489 ms against B 3.263 / 3.150 / 3.592 ms,
+with C tracking A at 0.508 / 0.476 / 0.492 ms.
+
 `stall` is `requestStart − fetchStart` — the pre-dispatch window, measured inside the browser before
 the network starts, which is exactly where a paused-and-continued request lands.
 
@@ -118,9 +121,11 @@ Two consequences:
   what the probes find") is now backed by data rather than asserted.
 - Any mitigation work is aimed **upstream at the driver's request path**, not at our policy hook.
 
-## Two runs, and what the second one taught
+## Three runs, and what the later ones taught
 
-The report refuses to let one run become a threshold, so it was run twice on the same host.
+The report refuses to let one run become a threshold, so it was run three times on the same host —
+the third after an adversarial review round changed the collector, because a conclusion drawn from
+a build that no longer exists is not a conclusion.
 
 Stable across both runs — identical values, identical verdicts:
 
@@ -147,6 +152,21 @@ The lesson generalizes: **the quantized label probe carried the finding stably; 
 probes did not.** Hand #102 the bucket leaf. A millisecond threshold here would be a gate whose
 colour depends on which side of a 0.05 ms floor the control's noise happened to land — i.e. a flaky
 stealth gate, which gets disabled, which is worse than not having one.
+
+**Run 3 added one more caveat, and it cuts against the paragraph above.** It reproduced the headline
+and every validator identically, but `collector.cdp.resourceTiming.stallMedianBucket` reported B as
+`{1to4, 4to16}` — our own stack's label varying *across rounds within one run*, where runs 1 and 2
+held `{1to4}`. B's warm stall sits at ~3.2–3.6 ms, right against the ladder's 4 ms edge.
+
+A median is robust to a single jittering outlier — that is why the max was removed — but not to
+sitting near an edge. No ladder makes that go away; it only moves which values are exposed. Two
+consequences:
+
+- **The #102 gate on this leaf must assert a BAND the stack is clearly outside** (`expect lt1`),
+  never equality with whatever label was observed. The separation from A and C is unaffected either
+  way, which is what makes the finding safe to act on.
+- **A snapshot diff of a page whose stall lands near an edge can report this axis as divergent when
+  nothing changed.** Read it next to the raw series in `CDP_TIMING_RAW_JS`, which has no edges.
 
 ## Resolution
 

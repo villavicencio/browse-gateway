@@ -513,6 +513,18 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // A cross-origin entry without Timing-Allow-Origin reports requestStart as 0; those are
       // skipped rather than read as an impossibly fast dispatch. On a page with no sub-resources
       // every leaf here is null — correctly "nothing to measure", not "measured clean".
+      //
+      // KNOWN LIMIT, stated rather than discovered later: a median is robust to a single jittering
+      // outlier (which is why the max was removed) but NOT to sitting near a ladder edge. Measured
+      // in the three-way baseline: our own stack's warm stall lands around 3.2-3.6ms against the
+      // 4ms edge, and its label was observed varying {1to4, 4to16} across rounds of one run. That
+      // is inherent to quantizing a continuous quantity — no ladder makes it go away, only moves
+      // which values are exposed — and it is not a reason to delete the one probe that measures
+      // our own added surface. Two consequences worth carrying: a gate on this leaf must assert a
+      // BAND the stack is clearly outside ("expect lt1"), never equality with whatever label was
+      // observed; and a snapshot diff of a page whose stall sits near an edge can report this axis
+      // as divergent when nothing changed. Read it alongside the raw series in CDP_TIMING_RAW_JS,
+      // which has no edges.
       if (!overBudget()) try {
         if (rtEntries) {
           const list = rtEntries.list;
