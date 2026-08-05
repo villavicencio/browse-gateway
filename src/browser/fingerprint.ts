@@ -56,6 +56,29 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
   const out = {};
   const nav = navigator;
 
+  // Resource Timing is sampled HERE, at a fixed point before any variable-duration probe, and the
+  // cdp section reads this snapshot rather than the live list. The WebRTC probe below finishes
+  // anywhere between immediately and its 8s timeout, so a cdp section reading the live list would
+  // see a different set of a dynamic page's lazy images, ads and late scripts on every capture —
+  // entriesBucket and the stall buckets would cross bands because ICE happened to complete at a
+  // different moment, which diffFingerprints reports as an environment change. Sampling at a fixed
+  // point makes the reading "what this page had loaded when the capture began", which is
+  // reproducible. Bounded: a page with thousands of sub-resources must not turn a diagnostic into
+  // an unbounded loop, and the cap is far above any realistic page.
+  const RT_MAX_ENTRIES = 2000;
+  let rtEntries = null;
+  try {
+    if (typeof performance !== 'undefined' && performance && typeof performance.getEntriesByType === 'function') {
+      const raw = performance.getEntriesByType('resource');
+      if (raw && typeof raw.length === 'number' && isFinite(raw.length)) {
+        const n = Math.min(raw.length, RT_MAX_ENTRIES);
+        const kept = [];
+        for (let i = 0; i < n; i++) kept.push(raw[i]);
+        rtEntries = { total: raw.length, capped: raw.length > RT_MAX_ENTRIES, list: kept };
+      }
+    }
+  } catch (e) { rtEntries = null; }
+
   out.userAgent = nav.userAgent;
   out.appVersion = nav.appVersion;
   out.platform = nav.platform;
@@ -250,8 +273,16 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // CDP_TIMING_RAW_JS. If this ever reads true the section grew something unbounded.
       budgetExceeded: false,
       sectionOk: true,
-      errorStack: { fired: null, invocations: null, consoleBucket: null },
-      consoleProxy: { fired: null, invocations: null, consoleBucket: null },
+      // NO consoleBucket ON EITHER. These two probes' SIGNAL is the boolean and the count;
+      // the cost of making the call was carried here as a bucket and it CHURNED — observed
+      // in-container flipping lt1<->1to4 across two captures of one unchanged environment,
+      // and the three-way baseline independently reported the errorStack one as 'varies'
+      // within a single configuration. The console cost on this browser sits right on the
+      // ladder's 1ms edge, so ordinary scheduling noise crosses it. The raw per-sample
+      // numbers still exist in CDP_TIMING_RAW_JS, which is where threshold work reads them;
+      // a churning leaf in a DIFFED snapshot is noise that buries the axes that matter.
+      errorStack: { fired: null, invocations: null },
+      consoleProxy: { fired: null, invocations: null },
       consoleTiming: {
         iterations: null, getterFired: null, getterInvocations: null,
         richMedianBucket: null, plainMedianBucket: null, ratioBucket: null,
@@ -377,7 +408,6 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
         const b = bucketize(t1 - t0, CONSOLE_EDGES);
         cdp.errorStack.fired = hits > 0;
         cdp.errorStack.invocations = hits;
-        cdp.errorStack.consoleBucket = b;
       } catch (e) { /* leaves stay null */ }
 
       // ── Probe B: prototype-chain Proxy ownKeys trap ───────────────────────────────────────
@@ -400,7 +430,6 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
         const b = bucketize(t1 - t0, CONSOLE_EDGES);
         cdp.consoleProxy.fired = hits > 0;
         cdp.consoleProxy.invocations = hits;
-        cdp.consoleProxy.consoleBucket = b;
       } catch (e) { /* leaves stay null */ }
 
       // ── Probe C: console-method timing under an instrumented argument ─────────────────────
@@ -465,21 +494,34 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // skipped rather than read as an impossibly fast dispatch. On a page with no sub-resources
       // every leaf here is null — correctly "nothing to measure", not "measured clean".
       try {
-        if (typeof performance !== 'undefined' && performance && typeof performance.getEntriesByType === 'function') {
-          const ents = performance.getEntriesByType('resource') || [];
+        if (rtEntries) {
+          const list = rtEntries.list;
           const stall = [];
-          for (let i = 0; i < ents.length; i++) {
-            const ent = ents[i];
+          for (let i = 0; i < list.length; i++) {
+            const ent = list[i];
             if (ent && ent.requestStart > 0 && ent.fetchStart > 0 && ent.requestStart >= ent.fetchStart) {
               stall.push(ent.requestStart - ent.fetchStart);
             }
           }
-          cdp.resourceTiming.entriesBucket = countBucket(ents.length);
-          cdp.resourceTiming.timedBucket = countBucket(stall.length);
-          if (stall.length) {
-            cdp.resourceTiming.stallMedianBucket = bucketize(median(stall), STALL_EDGES);
-            cdp.resourceTiming.stallMaxBucket = bucketize(Math.max.apply(null, stall), STALL_EDGES);
+          // ASSIGN-AT-END, per this section's stated rule, and it is not decorative here: an
+          // earlier draft wrote the two count leaves and the median before computing the max, so a
+          // throw in the max left a HALF-WRITTEN probe behind a true sectionOk — a partial
+          // reading is indistinguishable from a complete one once it is in the snapshot.
+          // Math.max.apply is also gone: it spreads the array onto the call stack and throws
+          // RangeError past a length limit, which is exactly the input a resource-heavy page
+          // supplies. A bounded loop has no such limit.
+          let maxStall = null;
+          for (let i = 0; i < stall.length; i++) {
+            if (maxStall === null || stall[i] > maxStall) maxStall = stall[i];
           }
+          const entriesBucket = countBucket(rtEntries.total);
+          const timedBucket = countBucket(stall.length);
+          const stallMedianBucket = stall.length ? bucketize(median(stall), STALL_EDGES) : null;
+          const stallMaxBucket = maxStall === null ? null : bucketize(maxStall, STALL_EDGES);
+          cdp.resourceTiming.entriesBucket = entriesBucket;
+          cdp.resourceTiming.timedBucket = timedBucket;
+          cdp.resourceTiming.stallMedianBucket = stallMedianBucket;
+          cdp.resourceTiming.stallMaxBucket = stallMaxBucket;
         }
       } catch (e) { /* leaves stay null */ }
 

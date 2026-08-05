@@ -17,6 +17,13 @@ test("FINGERPRINT_COLLECTOR_JS: a self-contained async IIFE expression", () => {
   assert.ok(FINGERPRINT_COLLECTOR_JS.trimEnd().endsWith("()"));
   // No template-interpolation that would break page.evaluate(string).
   assert.ok(!FINGERPRINT_COLLECTOR_JS.includes("${"));
+  // And no RAW BACKTICK anywhere, including inside a comment. These constants are TypeScript
+  // template literals, so a backtick used for prose emphasis in a comment TERMINATES the string
+  // and the file stops compiling — twice during this section's development, both times from a
+  // comment rather than from code. `${'`'}` is not a character to spend debugging time on again.
+  for (const [name, src] of [["FINGERPRINT_COLLECTOR_JS", FINGERPRINT_COLLECTOR_JS], ["CDP_TIMING_RAW_JS", CDP_TIMING_RAW_JS]]) {
+    assert.ok(!src.includes("`"), `${name} must not contain a raw backtick (it would close the template literal)`);
+  }
   // Touches the axes the diff classifies as high-severity tells.
   for (const probe of ["WEBGL_debug_renderer_info", "srflx", "canvasHash", "fonts", "timeZone"]) {
     assert.ok(FINGERPRINT_COLLECTOR_JS.includes(probe), `collector should reference ${probe}`);
@@ -339,10 +346,8 @@ const CDP_PATHS = [
   "cdp.sectionOk",
   "cdp.errorStack.fired",
   "cdp.errorStack.invocations",
-  "cdp.errorStack.consoleBucket",
   "cdp.consoleProxy.fired",
   "cdp.consoleProxy.invocations",
-  "cdp.consoleProxy.consoleBucket",
   "cdp.consoleTiming.iterations",
   "cdp.consoleTiming.getterFired",
   "cdp.consoleTiming.getterInvocations",
@@ -397,9 +402,26 @@ test("FINGERPRINT_COLLECTOR_JS: the cdp section's probe names are in the shipped
   // request.
   const codeOnly = (s) =>
     s.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  // SCOPED TO THE cdp SECTION, DELIBERATELY. An earlier version of this assertion searched the
+  // WHOLE collector for `fetch(` and called the result "the snapshot collector issues no requests
+  // of its own" — which is false, and falsely reassuring: the pre-existing WebRTC probe opens an
+  // RTCPeerConnection against a public STUN server on every capture. Certifying the whole
+  // collector as passive off a search for one function name is precisely the silent-pass failure
+  // these probes exist to detect, so the claim is narrowed to the section this work added, and
+  // the STUN exception is named rather than hidden.
+  const cdpSection = codeOnly(FINGERPRINT_COLLECTOR_JS).split("out.cdp = await")[1] ?? "";
+  assert.ok(cdpSection.length > 500, "failed to isolate the cdp section — the anchor moved");
+  for (const requestPrimitive of ["fetch(", "XMLHttpRequest", "sendBeacon", "new EventSource", "new WebSocket", "RTCPeerConnection", "import("]) {
+    assert.ok(
+      !cdpSection.includes(requestPrimitive),
+      `the cdp section must not issue requests of its own (found ${requestPrimitive})`,
+    );
+  }
+  // And the collector as a whole is NOT passive — this pins the one exception so nobody later
+  // reads the narrowed assertion above as a whole-collector guarantee.
   assert.ok(
-    !codeOnly(FINGERPRINT_COLLECTOR_JS).includes("fetch("),
-    "the snapshot collector must not issue requests of its own",
+    codeOnly(FINGERPRINT_COLLECTOR_JS).includes("RTCPeerConnection"),
+    "the WebRTC probe is the collector's one deliberate network exception; if it is gone, widen the passivity claim",
   );
   assert.ok(
     codeOnly(CDP_TIMING_RAW_JS).includes("fetch("),
@@ -473,7 +495,6 @@ test("cdp: one probe throwing nulls only that probe; the rest of the capture is 
       nulled: [
         "cdp.errorStack.fired",
         "cdp.errorStack.invocations",
-        "cdp.errorStack.consoleBucket",
         "cdp.consoleTiming.iterations",
         "cdp.consoleTiming.getterFired",
         "cdp.consoleTiming.getterInvocations",
@@ -488,7 +509,6 @@ test("cdp: one probe throwing nulls only that probe; the rest of the capture is 
       nulled: [
         "cdp.consoleProxy.fired",
         "cdp.consoleProxy.invocations",
-        "cdp.consoleProxy.consoleBucket",
       ],
     },
     {
@@ -566,10 +586,8 @@ test("cdp: differing raw timings that quantize the same produce ZERO diffs", asy
     .map((d) => d.path)
     .sort();
   assert.deepEqual(moved, [
-    "cdp.consoleProxy.consoleBucket",
     "cdp.consoleTiming.plainMedianBucket",
     "cdp.consoleTiming.richMedianBucket",
-    "cdp.errorStack.consoleBucket",
     "cdp.resourceTiming.stallMaxBucket",
     "cdp.resourceTiming.stallMedianBucket",
   ]);

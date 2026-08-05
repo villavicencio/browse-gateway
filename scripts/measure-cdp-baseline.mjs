@@ -1165,20 +1165,13 @@ export const PROBE_SPECS = [
     note: "the same live probe as read through FINGERPRINT_COLLECTOR_JS, at its lower iteration count.",
     read: (c) => bool(c.collector?.cdp?.consoleProxy?.fired),
   },
-  {
-    key: "collector.cdp.errorStack.consoleBucket",
-    kind: "label",
-    family: "protocol",
-    note: "quantized console cost, 4x ladder.",
-    read: (c) => c.collector?.cdp?.errorStack?.consoleBucket ?? null,
-  },
-  {
-    key: "collector.cdp.consoleProxy.consoleBucket",
-    kind: "label",
-    family: "protocol",
-    note: "quantized console cost, 4x ladder.",
-    read: (c) => c.collector?.cdp?.consoleProxy?.consoleBucket ?? null,
-  },
+  // The two quantized console-cost labels were REMOVED from the collector after they were
+  // observed churning between two captures of one unchanged environment (lt1 <-> 1to4 — the
+  // console cost on this browser sits on the ladder's 1ms edge). This run's own output had
+  // already reported the errorStack one as 'varies' inside a single configuration, which is the
+  // same defect seen from the other side. The signal those probes carry is the boolean and the
+  // invocation count, both of which are read above and both of which validated the suite; the raw
+  // per-sample cost still lives in CDP_TIMING_RAW_JS for threshold work.
   {
     key: "collector.cdp.consoleTiming.ratioBucket",
     kind: "label",
@@ -1268,8 +1261,7 @@ export const RAW_LEAF_CONTRACT = [
 ];
 
 export const COLLECTOR_LEAF_CONTRACT = [
-  ["consoleProxy", "fired"], ["consoleProxy", "consoleBucket"],
-  ["errorStack", "consoleBucket"],
+  ["consoleProxy", "fired"],
   ["consoleTiming", "ratioBucket"],
   ["resourceTiming", "stallMedianBucket"], ["resourceTiming", "stallMaxBucket"],
   ["resourceTiming", "entriesBucket"], ["resourceTiming", "timedBucket"],
