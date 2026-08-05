@@ -127,21 +127,26 @@ The report refuses to let one run become a threshold, so it was run three times 
 the third after an adversarial review round changed the collector, because a conclusion drawn from
 a build that no longer exists is not a conclusion.
 
-Stable across both runs — identical values, identical verdicts:
+Stable across all three runs — identical values, identical verdicts:
 
 | Probe | A | B | C |
 |---|---|---|---|
 | `consoleProxy.fired` | 0/6 | 0/6 | 6/6 |
 | `consoleProxy.invocations` | 0 | 0 | 100 |
 | `collector.cdp.consoleProxy.fired` | 0/6 | 0/6 | 6/6 |
-| `collector.cdp.resourceTiming.stallMedianBucket` | `{lt1}` | `{1to4}` | `{lt1}` — **B-OUTLIER both runs** |
 
-Not stable — the verdict flipped between the two runs:
+Stable in VERDICT, not in value — B-OUTLIER in all three runs, but B's own label moved in run 3:
 
-| Probe | run 1 | run 2 |
-|---|---|---|
-| `harness.stallWarmMeanMs` | B-OUTLIER | INDETERMINATE |
-| `harness.stallWarmP50Ms` | INDETERMINATE | B-OUTLIER |
+| Probe | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `collector.cdp.resourceTiming.stallMedianBucket` (B) | `{1to4}` | `{1to4}` | `{1to4, 4to16}` |
+
+Not stable — the verdict flipped between runs:
+
+| Probe | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `harness.stallWarmMeanMs` | B-OUTLIER | INDETERMINATE | B-OUTLIER |
+| `harness.stallWarmP50Ms` | INDETERMINATE | B-OUTLIER | INDETERMINATE |
 
 **The underlying measurement did not move** — B read 2.90/3.26 ms and 2.90/3.15 ms against A's
 0.50/0.505 ms and 0.45/0.479 ms. What moved is which raw-millisecond *variant* cleared the
