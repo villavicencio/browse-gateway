@@ -1206,13 +1206,6 @@ export const PROBE_SPECS = [
     read: (c) => c.collector?.cdp?.resourceTiming?.stallMedianBucket ?? null,
   },
   {
-    key: "collector.cdp.resourceTiming.stallMaxBucket",
-    kind: "label",
-    family: "protocol",
-    note: "the WORST sub-resource's pre-dispatch stall, same ladder. A per-request interception pause lands on every request, so if the median moves the max should move with it; a max that separates while the median does not means only some requests were paused, which is a different mechanism and a different gate.",
-    read: (c) => c.collector?.cdp?.resourceTiming?.stallMaxBucket ?? null,
-  },
-  {
     key: "collector.cdp.resourceTiming.entriesBucket",
     kind: "label",
     family: "harness",
@@ -1263,8 +1256,7 @@ export const RAW_LEAF_CONTRACT = [
 export const COLLECTOR_LEAF_CONTRACT = [
   ["consoleProxy", "fired"],
   ["consoleTiming", "ratioBucket"],
-  ["resourceTiming", "stallMedianBucket"], ["resourceTiming", "stallMaxBucket"],
-  ["resourceTiming", "entriesBucket"], ["resourceTiming", "timedBucket"],
+  ["resourceTiming", "stallMedianBucket"],   ["resourceTiming", "entriesBucket"], ["resourceTiming", "timedBucket"],
 ];
 
 /** `<root>.<section>.<leaf>` paths a probe source assigns into, as written in its source text. */

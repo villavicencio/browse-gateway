@@ -207,16 +207,24 @@ function makeSandbox(opts = {}) {
       ];
     },
   };
+  // `stallSpread` makes the stubbed resources HETEROGENEOUS, and that is the point: with one
+  // uniform stall for every entry, a stability test can only move the whole distribution at once,
+  // so it can never express the case where a single tail request jitters across a bucket edge
+  // while the rest of the page holds still. That case is what removed stallMaxBucket from the
+  // diffed surface, and the test below could not have caught it before this parameter existed.
+  const stallSpread = opts.stallSpread ?? 0;
+  let entryIndex = 0;
   function entry(name) {
+    const s = stallMs + (stallSpread ? stallSpread * (entryIndex++ % 2) : 0);
     return {
       name,
       startTime: 100,
       fetchStart: 100,
       domainLookupStart: 100,
       connectStart: 100,
-      requestStart: 100 + stallMs,
-      responseStart: 100 + stallMs + 5,
-      responseEnd: 100 + stallMs + 9,
+      requestStart: 100 + s,
+      responseStart: 100 + s + 5,
+      responseEnd: 100 + s + 9,
     };
   }
 
@@ -351,13 +359,10 @@ const CDP_PATHS = [
   "cdp.consoleTiming.iterations",
   "cdp.consoleTiming.getterFired",
   "cdp.consoleTiming.getterInvocations",
-  "cdp.consoleTiming.richMedianBucket",
-  "cdp.consoleTiming.plainMedianBucket",
   "cdp.consoleTiming.ratioBucket",
   "cdp.resourceTiming.entriesBucket",
   "cdp.resourceTiming.timedBucket",
   "cdp.resourceTiming.stallMedianBucket",
-  "cdp.resourceTiming.stallMaxBucket",
   "cdp.controls.webdriver",
   "cdp.controls.cdcKeys",
   "cdp.controls.puppeteerKeys",
@@ -463,7 +468,6 @@ test("cdp: a clean run reads clean-false, not null, and the self-tests fire", as
   assert.equal(cdp.resourceTiming.entriesBucket, "3to9");
   assert.equal(cdp.resourceTiming.timedBucket, "3to9");
   assert.equal(cdp.resourceTiming.stallMedianBucket, "lt1");
-  assert.equal(cdp.resourceTiming.stallMaxBucket, "lt1");
 
   assert.equal(cdp.controls.webdriver, false);
   assert.equal(cdp.controls.cdcKeys, 0);
@@ -498,8 +502,6 @@ test("cdp: one probe throwing nulls only that probe; the rest of the capture is 
         "cdp.consoleTiming.iterations",
         "cdp.consoleTiming.getterFired",
         "cdp.consoleTiming.getterInvocations",
-        "cdp.consoleTiming.richMedianBucket",
-        "cdp.consoleTiming.plainMedianBucket",
         "cdp.consoleTiming.ratioBucket",
       ],
     },
@@ -518,7 +520,6 @@ test("cdp: one probe throwing nulls only that probe; the rest of the capture is 
         "cdp.resourceTiming.entriesBucket",
         "cdp.resourceTiming.timedBucket",
         "cdp.resourceTiming.stallMedianBucket",
-        "cdp.resourceTiming.stallMaxBucket",
       ],
     },
     {
@@ -586,9 +587,6 @@ test("cdp: differing raw timings that quantize the same produce ZERO diffs", asy
     .map((d) => d.path)
     .sort();
   assert.deepEqual(moved, [
-    "cdp.consoleTiming.plainMedianBucket",
-    "cdp.consoleTiming.richMedianBucket",
-    "cdp.resourceTiming.stallMaxBucket",
     "cdp.resourceTiming.stallMedianBucket",
   ]);
 });
@@ -633,9 +631,31 @@ test("cdp: the floor does NOT swallow a genuine large inflation", async () => {
   const hot = await runInSandbox(FINGERPRINT_COLLECTOR_JS, {
     clockStep: 0.02, coarsenMs: 0.1, richCostMs: 40,
   });
+  // The ratio is the only console-timing leaf left in the diffed surface — the raw rich/plain
+  // buckets were removed for the edge-crossing churn documented on the shape above, so the floor
+  // behaviour is asserted where it now lives.
   assert.equal(hot.cdp.consoleTiming.ratioBucket, "ge32x");
-  assert.equal(hot.cdp.consoleTiming.richMedianBucket, "16to64");
-  assert.equal(hot.cdp.consoleTiming.plainMedianBucket, "lt1");
+});
+
+test("cdp: one tail request jittering across a bucket edge does NOT diff the snapshot", async () => {
+  // The regression the second review round produced, reproduced as a test rather than trusted.
+  // A MAXIMUM is decided by one request, so an outlier moving 3.9ms -> 4.1ms crossed the STALL
+  // ladder's 4ms edge and flipped stallMaxBucket while the median, the counts and every other
+  // cdp.* leaf held still — an unchanged page reporting an environment change on the strength of
+  // one jittery request. stallMaxBucket is gone from the diffed surface; this pins that it stays
+  // gone, and that what remains is robust to the same perturbation.
+  const a = await runInSandbox(FINGERPRINT_COLLECTOR_JS, { stallMs: 0.3, stallSpread: 3.6 });
+  const b = await runInSandbox(FINGERPRINT_COLLECTOR_JS, { stallMs: 0.3, stallSpread: 3.8 });
+  const churn = diffFingerprints(a, b).filter((d) => d.path.startsWith("cdp."));
+  assert.deepEqual(churn, [], "a single tail request crossing an edge must not diff the snapshot");
+
+  // ...and the control: the leaf that used to carry this is genuinely absent, not merely equal.
+  const flat = flattenFingerprint(a);
+  assert.ok(!("cdp.resourceTiming.stallMaxBucket" in flat), "stallMaxBucket must not be back");
+  assert.ok(!("cdp.consoleTiming.richMedianBucket" in flat), "richMedianBucket must not be back");
+  assert.ok(!("cdp.consoleTiming.plainMedianBucket" in flat), "plainMedianBucket must not be back");
+  assert.ok(!("cdp.errorStack.consoleBucket" in flat), "errorStack.consoleBucket must not be back");
+  assert.ok(!("cdp.consoleProxy.consoleBucket" in flat), "consoleProxy.consoleBucket must not be back");
 });
 
 test("cdp: a throwing performance.now costs the section, never the capture", async () => {
@@ -673,7 +693,7 @@ test("cdp: a throwing performance.now costs the section, never the capture", asy
 test("classifyAxis: every cdp.* path is info — #100 measures, it does not grade", async () => {
   const out = await runInSandbox(FINGERPRINT_COLLECTOR_JS);
   const paths = Object.keys(flattenFingerprint(out)).filter((p) => p.startsWith("cdp."));
-  assert.ok(paths.length >= 25, `expected the full cdp surface, saw ${paths.length}`);
+  assert.ok(paths.length >= 20, `expected the full cdp surface, saw ${paths.length}`);
   for (const p of paths) assert.equal(classifyAxis(p), "info", `${p} should be ungraded`);
   assert.equal(classifyAxis("cdp"), "info");
   for (const p of [...AXIS_SEVERITY.high, ...AXIS_SEVERITY.geo]) {

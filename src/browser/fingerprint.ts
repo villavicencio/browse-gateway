@@ -268,9 +268,13 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       probeVersion: 2,
       chromeMajor: null,
       budgetMs: CDP_BUDGET_MS,
-      // Retained as a stable leaf (dropping it would be a schema change mid-baseline) and, by
-      // construction, always false: the only probe that could overrun the cap now lives in
-      // CDP_TIMING_RAW_JS. If this ever reads true the section grew something unbounded.
+      // ENFORCED, not asserted. An earlier version of this comment claimed the flag was "always
+      // false by construction" because the one network-bound probe had moved out — and that was
+      // simply wrong: a review demonstrated a 2962ms section against this 2500ms cap still
+      // returning budgetExceeded:false, sectionOk:true. cdpT0 was computed and never read, so
+      // the declared budget bound nothing. Declaring a cap and not enforcing it is worse than
+      // having no cap, because the output then states something untrue. It is now checked between
+      // probes and derived from final elapsed time before returning.
       budgetExceeded: false,
       sectionOk: true,
       // NO consoleBucket ON EITHER. These two probes' SIGNAL is the boolean and the count;
@@ -283,13 +287,28 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // a churning leaf in a DIFFED snapshot is noise that buries the axes that matter.
       errorStack: { fired: null, invocations: null },
       consoleProxy: { fired: null, invocations: null },
+      // THEME SWEEP, not a one-off removal. Three leaves were cut from this diffed surface after
+      // two independent demonstrations of the same defect: a quantized TIMING value whose typical
+      // reading sits near a ladder edge crosses it on ordinary scheduling noise, and
+      // diffFingerprints reports that as an environment change.
+      //   - the two console-cost labels: observed in-container flipping lt1<->1to4 between two
+      //     captures of one unchanged environment;
+      //   - richMedianBucket / plainMedianBucket: the same sub-millisecond console measurement
+      //     against the same 1ms first edge, so the same exposure — removed on the evidence for
+      //     their sibling rather than waiting to observe each one flip;
+      //   - stallMaxBucket: a MAXIMUM is decided by a single request, so one outlier moving
+      //     3.99ms -> 4.01ms flips the bucket while the median and every other leaf hold still.
+      // What survives here is discrete by nature (booleans, integer counts), or floored so the
+      // sub-resolution regime reports one stable label (ratioBucket), or robust to a single
+      // outlier (a median). The raw distributions — means, p90s, per-sample arrays, the tail —
+      // all still exist in CDP_TIMING_RAW_JS, which never enters a snapshot and is where the
+      // threshold work reads them. A snapshot axis has to be quiet to be useful; a raw series
+      // does not.
       consoleTiming: {
-        iterations: null, getterFired: null, getterInvocations: null,
-        richMedianBucket: null, plainMedianBucket: null, ratioBucket: null,
+        iterations: null, getterFired: null, getterInvocations: null, ratioBucket: null,
       },
       resourceTiming: {
-        entriesBucket: null, timedBucket: null,
-        stallMedianBucket: null, stallMaxBucket: null,
+        entriesBucket: null, timedBucket: null, stallMedianBucket: null,
       },
       controls: {
         webdriver: null, cdcKeys: null, puppeteerKeys: null, playwrightKeys: null,
@@ -315,6 +334,9 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       try { return Date.now(); } catch (e) { return 0; }
     };
     const cdpT0 = now();
+    // True once the section has spent its cap. Consulted between probes so a slow environment
+    // stops scheduling further work rather than silently overrunning.
+    function overBudget() { return (now() - cdpT0) > CDP_BUDGET_MS; }
 
     function bucketize(ms, edges) {
       if (typeof ms !== 'number' || !isFinite(ms)) return null;
@@ -420,7 +442,7 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // failure injection points instead of one shared dependency.
       // EXPIRY: this is a V8 bug with an upstream fix already landed. When it stops firing, that
       // is a Chrome update, NOT a stealth improvement — hence chromeMajor above.
-      try {
+      if (!overBudget()) try {
         let hits = 0;
         const trap = new Proxy({}, { ownKeys: function () { hits++; return []; } });
         const carrier = Object.create(trap);
@@ -440,7 +462,7 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // partway through inflates both arms equally and cannot masquerade as a serialization
       // cost. The getter-invocation count rides along as the crisp discrete companion to the
       // fuzzy timing.
-      try {
+      if (!overBudget()) try {
         let hits = 0;
         const rich = {};
         Object.defineProperty(rich, 'probed', {
@@ -464,8 +486,6 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
         cdp.consoleTiming.iterations = CONSOLE_ITERATIONS;
         cdp.consoleTiming.getterFired = hits > 0;
         cdp.consoleTiming.getterInvocations = hits;
-        cdp.consoleTiming.richMedianBucket = rb;
-        cdp.consoleTiming.plainMedianBucket = pb;
         cdp.consoleTiming.ratioBucket = ratio;
       } catch (e) { /* leaves stay null */ }
 
@@ -493,7 +513,7 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // A cross-origin entry without Timing-Allow-Origin reports requestStart as 0; those are
       // skipped rather than read as an impossibly fast dispatch. On a page with no sub-resources
       // every leaf here is null — correctly "nothing to measure", not "measured clean".
-      try {
+      if (!overBudget()) try {
         if (rtEntries) {
           const list = rtEntries.list;
           const stall = [];
@@ -510,18 +530,12 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
           // Math.max.apply is also gone: it spreads the array onto the call stack and throws
           // RangeError past a length limit, which is exactly the input a resource-heavy page
           // supplies. A bounded loop has no such limit.
-          let maxStall = null;
-          for (let i = 0; i < stall.length; i++) {
-            if (maxStall === null || stall[i] > maxStall) maxStall = stall[i];
-          }
           const entriesBucket = countBucket(rtEntries.total);
           const timedBucket = countBucket(stall.length);
           const stallMedianBucket = stall.length ? bucketize(median(stall), STALL_EDGES) : null;
-          const stallMaxBucket = maxStall === null ? null : bucketize(maxStall, STALL_EDGES);
           cdp.resourceTiming.entriesBucket = entriesBucket;
           cdp.resourceTiming.timedBucket = timedBucket;
           cdp.resourceTiming.stallMedianBucket = stallMedianBucket;
-          cdp.resourceTiming.stallMaxBucket = stallMaxBucket;
         }
       } catch (e) { /* leaves stay null */ }
 
@@ -535,7 +549,7 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // isolated world whose global is a DIFFERENT object from the page's window, so a JS-level
       // expando planted in the main world is not visible here and these counts are structurally
       // biased toward zero. navigator.webdriver is a Blink-backed property and does read through.
-      try {
+      if (!overBudget()) try {
         let cdc = 0;
         let pup = 0;
         let pw = 0;
@@ -600,6 +614,11 @@ export const FINGERPRINT_COLLECTOR_JS = `(async () => {
       // a value change rather than a schema change.
       cdp.sectionOk = false;
     }
+    // Derived from what actually elapsed, never from an assumption about what the probes cost.
+    // This is the leaf that says "the reading above may be incomplete" — a probe skipped by the
+    // guard leaves its leaves null, and this is how a reader tells that apart from a probe that
+    // ran and found nothing.
+    try { cdp.budgetExceeded = (now() - cdpT0) > CDP_BUDGET_MS; } catch (e) { /* leaf stays false */ }
     return cdp;
   })().catch(function (e) {
     // Belt-and-braces for anything that could throw BEFORE the section's own try opens (the
@@ -942,6 +961,11 @@ export const CDP_TIMING_RAW_JS = `(async () => {
   } catch (e) { report.selfTest.error = String(e); }
 
   report.durationMs = now() - t0all;
+  // Reconcile the flag with reality: the per-iteration checks only fire BEFORE starting the next
+  // unit of work, so a final fetch that ran long crossed the cap without ever setting it. A
+  // duration past the budget with budgetExceeded:false is a report contradicting itself, and the
+  // baseline harness reads this flag to decide whether to warn.
+  if (report.durationMs > BUDGET_MS) report.budgetExceeded = true;
   return report;
 })()`;
 
