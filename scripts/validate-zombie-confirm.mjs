@@ -6,18 +6,26 @@
  * all-zombie group can persist — which is exactly why this bug lived in production for days while every
  * unit test stayed green.
  *
- * RUN IT WITHOUT AN INIT SHIM. `docker run` with `--init` gives the container a reaping PID 1, the
- * zombies vanish, and the gate cannot see the thing it exists to check. It DETECTS that case and exits
- * non-zero rather than reporting a meaningless pass — a gate that silently self-neuters in the
- * environment we actually ship is worse than no gate (see
+ * RUN IT WITH A NON-REAPING PID 1. Any reaping init collects the zombies, and the gate then cannot see
+ * the thing it exists to check. It DETECTS that case and exits non-zero rather than reporting a
+ * meaningless pass — a gate that silently self-neuters in the environment we actually ship is worse
+ * than no gate (see
  * docs/solutions/best-practices/a-test-whose-stub-guarantees-the-assertion-proves-nothing.md).
  *
- *   docker run --rm --platform linux/amd64 <img> node scripts/validate-zombie-confirm.mjs   # no --init
+ * SINCE #131 PIECE 2 THE IMAGE BAKES tini AS ITS ENTRYPOINT, so overriding the entrypoint is now
+ * MANDATORY — omitting `--init` is no longer enough:
+ *
+ *   docker run --rm --platform linux/amd64 \
+ *     --entrypoint /usr/local/bin/entrypoint.sh <img> node scripts/validate-zombie-confirm.mjs
+ *
+ * This gate and `validate-container-init.mjs` have OPPOSITE PID-1 requirements by design — one proves
+ * the accounting survives a broken reaper, the other proves the shipped image has a working one. That
+ * is satisfied per-invocation, not per-image; do not "fix" either by relaxing its detection.
  *
  * INVOKE IT AS PID 1 DIRECTLY — `node scripts/…`, never `sh -c 'node scripts/…'`. A shell wrapper
  * becomes PID 1 itself and reaps adopted orphans through its own `wait`, so the zombies vanish and the
- * gate reports inconclusive. Same failure as running with `--init`, different cause; the detection
- * below catches both, but the wrapper is the easier mistake to make.
+ * gate reports inconclusive. Same failure as a reaping init, different cause; the detection below
+ * catches both, but the wrapper is the easier mistake to make.
  */
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
@@ -59,7 +67,8 @@ console.log(`group ${pgid}: ${members.length} member(s) — ${JSON.stringify(mem
 if (members.length === 0) {
   fail(
     "the group was fully reaped, so the all-zombie scenario could not be built. " +
-      "This container has a reaping PID 1 (an init shim) — re-run WITHOUT --init. " +
+      "This container has a reaping PID 1. Since #131 piece 2 the image bakes tini, so re-run with "
+      + "--entrypoint /usr/local/bin/entrypoint.sh (omitting --init is no longer sufficient). " +
       "Reporting inconclusive rather than passing.",
   );
 }

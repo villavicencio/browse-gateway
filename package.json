@@ -26,6 +26,7 @@
     "validate:teardown": "npm run build && node scripts/validate-teardown.mjs",
     "validate:call-budget": "npm run build && node scripts/validate-call-budget.mjs",
     "validate:zombie-confirm": "npm run build && node scripts/validate-zombie-confirm.mjs",
+    "validate:container-init": "npm run build && node scripts/validate-container-init.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {

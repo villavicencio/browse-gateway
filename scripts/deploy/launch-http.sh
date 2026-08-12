@@ -75,3 +75,26 @@ docker run -d --name "$CONTAINER" \
   ${vault_args[@]+"${vault_args[@]}"} \
   "${env_args[@]}" \
   "$BGW_DEPLOY_IMAGE" node dist/mcp/http-main.js
+
+# Issue #131: assert the container actually came up with a reaping PID 1. Since piece 2 the image
+# bakes tini as its ENTRYPOINT, so this should always hold — but that is exactly the kind of
+# "should" that wedged production for 2.5 days, and this script can still deploy an OLDER image tag
+# that predates the change. Reads PID 1's identity from inside the container rather than trusting
+# HostConfig, because a --init flag and a baked entrypoint are two different mechanisms and only the
+# process table knows which (if either) took effect.
+sleep 1
+pid1="$(docker exec "$CONTAINER" cat /proc/1/comm 2>/dev/null | tr -d '\n' || true)"
+case "$pid1" in
+  tini|docker-init)
+    echo "launch-http: PID 1 is ${pid1} — orphan reaping active"
+    ;;
+  "")
+    echo "launch-http: WARNING could not read /proc/1/comm (container not up yet?) — verify reaping manually" >&2
+    ;;
+  *)
+    echo "launch-http: WARNING PID 1 is '${pid1}', not a known reaping init." >&2
+    echo "launch-http:   Exited browser children will accumulate as zombies, the teardown confirmation" >&2
+    echo "launch-http:   will never confirm, and the session pool will saturate with zero live browsers." >&2
+    echo "launch-http:   See issue #131. Expect tini (baked into the image) or docker-init (--init)." >&2
+    ;;
+esac

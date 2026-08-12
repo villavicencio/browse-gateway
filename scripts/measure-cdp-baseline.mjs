@@ -2809,7 +2809,15 @@ function installInterruptHandlers() {
         // rather than "the instrument failed". PID 1 is the documented exception, and this script's
         // only real home is a container: the kernel silently DISCARDS a signal whose disposition is
         // default when the target is init, so under a bare `docker run` (node itself as PID 1, no
-        // `--init`, no tini) the re-raise is a no-op. Control then falls out of this handler, `main()`
+        // `--init`, no tini) the re-raise is a no-op.
+        //
+        // NOTE (#131 piece 2): as of the tini ENTRYPOINT, node is NO LONGER PID 1 in the shipped
+        // image, so that premise no longer describes the default invocation — it still describes a
+        // run whose entrypoint is overridden (`--entrypoint /usr/local/bin/entrypoint.sh`), which is
+        // how the zombie gate is run. The belt-and-braces below stays: it costs nothing, and this
+        // script must never exit 0 on a cancelled run whatever PID it happens to hold.
+        //
+        // Control then falls out of this handler, `main()`
         // declines to call `process.exit` because `cancelled` is set — deliberately, so the exit
         // belongs to this path — the loop drains, and the process exits **0**. A cancelled run
         // reporting success is the one status a measurement instrument must never produce: it is

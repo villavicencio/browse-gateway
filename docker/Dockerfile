@@ -43,6 +43,22 @@ COPY scripts ./scripts
 COPY test ./test
 RUN npm run build
 
+# A reap-safe PID 1, baked into the IMAGE (issue #131 piece 2).
+#
+# This used to be a comment asking whoever created the container to pass `--init`. A hand-written
+# `docker run` dropped the flag, node became PID 1, and node never reaps reparented orphans — so every
+# exited Chrome child became a permanent zombie. A zombie still answers `kill(-pgid, 0)`, so the
+# teardown's group-empty confirmation could never confirm, sessions were retained in `#unconfirmed`
+# forever, and the pool saturated at maxSessions with zero live browsers. A property of the image
+# cannot be forgotten at the call site; a comment can.
+#
+# Its own layer, deliberately AFTER the Chrome layer: that block also fetches
+# google-chrome-stable_current_amd64.deb, so editing it would let a PID-1 change move the browser
+# version — and the browser version is the stealth surface.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
@@ -66,7 +82,21 @@ ENV BGW_CHANNEL=chrome \
     DISPLAY=:99
 RUN ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime && echo "America/New_York" > /etc/timezone
 
-# The entrypoint provisions the Xvfb display, then exec's the command (the kill-gate by
-# default). Run with `--init` so a proper init reaps the browser's child processes.
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# tini is PID 1 and reaps reparented orphans; the entrypoint then provisions the Xvfb display and
+# exec's the command (the kill-gate by default), so the command is tini's direct child and receives
+# SIGTERM for its graceful drain. Reaping is now a property of the IMAGE — `--init` is still passed by
+# the deploy path and is harmless (see below), but nothing depends on remembering it.
+#
+# `-s` (subreaper) matters only under DOUBLE init: `docker run --init` puts docker-init at PID 1, and
+# without `-s` the inner tini prints "Tini is not running as PID 1 … zombie reaping won't work" on
+# every boot — a false statement, in exactly the incident class this change closes. `-s` silences it
+# and is a no-op when tini IS PID 1. Note the side effect: under double init, orphans reparent to the
+# inner tini rather than to PID 1, so a runbook grepping for PPID 1 zombies needs updating.
+#
+# DO NOT add `-g` / TINI_KILL_PROCESS_GROUP. It forwards SIGTERM to the whole process group, which
+# includes the Xvfb this entrypoint backgrounds — measured: Xvfb goes state S -> Z at T+0 while node is
+# still draining, manufacturing the in-flight-work-dies-instantly symptom of issue #129 from a brand
+# new cause. It also does not reach Chrome, which patchright spawns detached as its own group leader,
+# so it buys nothing in exchange.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["node", "scripts/validate-stealth.mjs"]
