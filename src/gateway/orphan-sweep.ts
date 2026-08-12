@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readProcStat } from "../browser/index.js";
+import { readProcStat, groupIsAllZombies } from "../browser/index.js";
 
 /** Outcome of one sweep attempt over a profile dir. */
 export type SweepResult = "confirmed" | "unconfirmed" | "unsupported";
@@ -320,6 +320,10 @@ export async function sweepOrphanProcesses(
       const stat = readProcStat(pgrp, procRoot);
       if (stat && stat.pgrp === pgrp && stat.startTime !== rep.startTime) return true; // recycled group
     }
+    // #131: signal 0 cannot tell a zombie from a live process, and a group of nothing but zombies has
+    // already exited — it is only awaiting a reap a non-reaping PID 1 will never perform. The sweep must
+    // free that capacity, or an unreaped tree blocks a slot for the container's lifetime.
+    if (groupIsAllZombies(pgrp, procRoot)) return true;
     return false;
   };
 

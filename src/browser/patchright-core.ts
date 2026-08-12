@@ -31,7 +31,7 @@ import {
   type ResolvedCoreOptions,
 } from "./launch-options.js";
 import type { ChildProcess } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import type {
   BrowserCore,
   BrowserCoreOptions,
@@ -114,19 +114,55 @@ export function computeForceKillAvailable(
  * leader (issue #50 r5). Fields are parsed after the last ')' so a comm with spaces/parens can't shift
  * offsets. Returns `undefined` when /proc is unavailable (e.g. macOS CLI) or the pid is gone.
  */
-export function readProcStat(pid: number, procRoot = "/proc"): { pgrp: number; startTime: string } | undefined {
+export function readProcStat(
+  pid: number,
+  procRoot = "/proc",
+): { pgrp: number; startTime: string; state: string } | undefined {
   // Exported for the #54 Part 2 orphan sweep (same generation discipline keyed off a SCANNED pid);
   // `procRoot` is injectable there so the parse is unit-testable against a fake proc tree.
   try {
     const stat = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
     const after = stat.slice(stat.lastIndexOf(")") + 2).split(" "); // [state, ppid, pgrp, ... starttime@idx19]
+    const state = after[0];
     const pgrp = after[2];
     const startTime = after[19];
-    if (pgrp === undefined || startTime === undefined) return undefined;
-    return { pgrp: Number(pgrp), startTime };
+    if (pgrp === undefined || startTime === undefined || state === undefined) return undefined;
+    return { pgrp: Number(pgrp), startTime, state };
   } catch {
     return undefined;
   }
+}
+
+/**
+ * True when a process group still has members but EVERY one of them is a zombie (issue #131).
+ *
+ * A zombie has already exited — it is more certainly dead than a process that merely fails to answer a
+ * signal — but it keeps its process-table entry until its parent reaps it, so `kill(-pgid, 0)` SUCCEEDS
+ * on a group of nothing but zombies. That made the group-empty confirmation unable to ever confirm:
+ * in a container whose PID 1 does not reap reparented orphans (node as PID 1, no init shim), every
+ * teardown left the group permanently "alive", the session was retained in `#unconfirmed` forever, and
+ * the pool saturated at maxSessions with zero live browsers. Observed in production over ~2.5 days.
+ *
+ * Reading `/proc` directly is the only way to tell the two apart: a signal cannot distinguish a zombie
+ * from a running process. Returns false when /proc is unavailable (macOS CLI) or the group has no
+ * discoverable members — callers keep their existing conservative behaviour in both cases.
+ */
+export function groupIsAllZombies(pgid: number, procRoot = "/proc"): boolean {
+  let names: string[];
+  try {
+    names = readdirSync(procRoot);
+  } catch {
+    return false; // no /proc (macOS CLI) — say nothing rather than guess
+  }
+  let members = 0;
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const stat = readProcStat(Number(name), procRoot);
+    if (!stat || stat.pgrp !== pgid) continue;
+    members++;
+    if (stat.state !== "Z") return false; // a genuinely live member — the group is not gone
+  }
+  return members > 0;
 }
 
 function captureBrowserProcess(
@@ -1890,6 +1926,12 @@ export class PatchrightBrowserCore implements BrowserCore {
       // Recycled group: pid present, IS a group leader (pgrp === pid), DIFFERENT generation → not ours.
       if (stat && stat.pgrp === pid && stat.startTime !== this.#leaderStartTime) return true;
     }
+    // #131: the probe above cannot distinguish a zombie from a live process — signal 0 succeeds on both.
+    // Every member being a zombie means the whole tree has already EXITED and is merely awaiting a reap
+    // that a non-reaping PID 1 will never perform. Without this the group never reads empty, the session
+    // is retained in `#unconfirmed` forever, and the pool leaks a slot per teardown until it saturates.
+    // Checked AFTER the recycle test so a recycled group still short-circuits on its own evidence.
+    if (groupIsAllZombies(pid)) return true;
     return false; // ours (leader alive, or a lingering child, or reuse-check unavailable) → non-empty
   }
 

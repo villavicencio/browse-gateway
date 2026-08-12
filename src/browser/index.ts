@@ -34,6 +34,7 @@ export {
   computeForceKillAvailable,
   deadlineBoundedTimeout,
   readProcStat,
+  groupIsAllZombies,
 } from "./patchright-core.js";
 export {
   assess,

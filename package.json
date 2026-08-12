@@ -25,6 +25,7 @@
     "validate:failure-envelope": "npm run build && node scripts/validate-failure-envelope.mjs",
     "validate:teardown": "npm run build && node scripts/validate-teardown.mjs",
     "validate:call-budget": "npm run build && node scripts/validate-call-budget.mjs",
+    "validate:zombie-confirm": "npm run build && node scripts/validate-zombie-confirm.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
