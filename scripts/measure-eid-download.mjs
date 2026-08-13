@@ -28,17 +28,29 @@
  * `context` getter ("Escape hatch for the policy layer's integration checks"). The shipping verbs,
  * policy guard and session lifecycle run unmodified.
  *
+ * ATTRIBUTION IS DEFERRED, NOT SLICED. Downloads are asynchronous: an attachment navigation returns
+ * before its transfer finishes, and the `download` event can land after the leg, after the NEXT leg,
+ * or after the surface is done. So every event goes into ONE persistent ledger tagged with the core
+ * that saw it (and therefore the surface), and rows are filled only at report time — after every
+ * download has settled and every observed core's teardown has completed. A record is filed by EXACT
+ * parsed URL pathname; anything that cannot be filed is COUNTED as unattributed and invalidates the
+ * run rather than quietly turning a real attachment into a `download: no` row.
+ *
  * THE FIXTURE IS LOCAL AND DETERMINISTIC. A loopback `http.createServer` serves every case with
  * fixed bytes and fixed headers, so a reading never depends on a live site, a WAF, or the network.
- * The policy egress filter denies loopback as anti-SSRF, so the PolicyEngine is constructed with the
+ * Bind and self-check are both bounded — a stalled fixture fails the run instead of hanging it. The
+ * policy egress filter denies loopback as anti-SSRF, so the PolicyEngine is constructed with the
  * TEST-ONLY `egress: () => false` override — the same hook, for the same reason, as
  * `validate-vault-host-login.mjs` (`policyEgress: () => false`). It is passed in-process only; no
  * deployed entrypoint can reach it.
  *
- * WHAT IT REFUSES TO PRINT. PDF bytes, cookies, source query strings, absolute temp paths, and the
- * consumer token never enter the report. Error TEXT is never carried either — it interpolates the
- * requested URL — only `err.name` plus a CLOSED-vocabulary marker ({@link errorMarker}). A final
- * hygiene guard greps the serialized report for each of those and fails the run if one appears.
+ * WHAT IT REFUSES TO PRINT. PDF bytes, cookies, source query strings, absolute paths (of any shape:
+ * POSIX, `file://`, Windows drive or UNC), and the consumer token never enter the report. Error TEXT
+ * is never carried either — it interpolates the requested URL — only a sanitized `err.name` plus a
+ * CLOSED-vocabulary marker ({@link errorMarker}). Two things enforce that: absolute paths are omitted
+ * BY CONSTRUCTION (no row field carries one; the observer holds the path privately), and EVERY line
+ * this process prints goes through {@link scrubLine}, including the top-level failure path — an
+ * uncaught throw is caught, sanitized and reported as INVALID rather than allowed to print a stack.
  *
  * EXIT CODE IS ABOUT THE MEASUREMENT, NOT THE BEHAVIOUR. 0 = the reading is VALID (whatever it
  * says); 1 = the reading is INVALID — the apparatus, the fixture or the hygiene guard failed, so
@@ -48,7 +60,7 @@
  * a time so each can be watched going RED (see docs/solutions/.../eid-download-current-behaviour):
  *   break-fixture   — the fixture serves the wrong Content-Disposition   -> fixture self-check RED
  *   mute-observer   — the download listener is never attached            -> positive control RED
- *   forge-download  — a download is synthesized on every page            -> negative control RED
+ *   forge-download  — a download is synthesized on every navigation      -> negative control RED
  *   leak-temp-path  — the absolute temp path is copied into the report   -> hygiene guard RED
  *
  * Env:
@@ -56,6 +68,7 @@
  *   BGW_EID_MEASURE_SURFACES=a,b       restrict surfaces (default `browser,retrieve,drive`)
  *   BGW_EID_MEASURE_JSON=0             suppress the machine-readable JSON block
  *   BGW_CHANNEL / BGW_NO_SANDBOX       browser channel + sandbox (the container sets both)
+ *   BGW_HEADLESS=1                     debugging only — a headless run is reported INVALID
  */
 import http from "node:http";
 import { existsSync, statSync } from "node:fs";
@@ -139,8 +152,14 @@ const CLEARANCE_TIMEOUT_MS = 3_000;
 const CALL_BUDGET_MS = 30_000;
 /** How long a download's `path()` / `failure()` may take before the file state reads `unknown`. */
 const DOWNLOAD_SETTLE_MS = 8_000;
-/** Grace after a leg for a `download` event still in flight, so it lands in the right row. */
+/**
+ * Grace after a leg. NOT an attribution boundary — attribution is by pathname at report time — only
+ * a courtesy so a transfer that is nearly done gets to finish before the next navigation starts.
+ */
 const LEG_SETTLE_MS = 750;
+/** Bounds on the fixture itself: a measurement that can hang is not reproducible. */
+const FIXTURE_LISTEN_TIMEOUT_MS = 5_000;
+const FIXTURE_REQUEST_TIMEOUT_MS = 5_000;
 
 // ---------------------------------------------------------------------------------------------
 // Pure helpers — everything below is unit-tested in test/eid-download-measure.test.mjs.
@@ -158,6 +177,20 @@ export function redactUrl(raw) {
     return `${u.protocol}//${u.host}${u.pathname}`;
   } catch {
     return "<unparseable-url>";
+  }
+}
+
+/**
+ * The EXACT parsed pathname, or null. Attribution compares pathnames for equality: `endsWith` would
+ * file `/decoy/attachment.pdf` against the `/attachment.pdf` case, which is fine for four fixed
+ * fixture routes and wrong as a primitive.
+ */
+export function pathnameOf(redactedUrl) {
+  if (typeof redactedUrl !== "string" || redactedUrl.length === 0) return null;
+  try {
+    return new URL(redactedUrl).pathname;
+  } catch {
+    return null;
   }
 }
 
@@ -182,8 +215,8 @@ export function safeFilename(raw) {
 
 /**
  * Three-valued on purpose. `unknown` means the driver never gave us a path to stat (the download
- * failed, or never settled inside {@link DOWNLOAD_SETTLE_MS}) — reporting that as `absent` would
- * manufacture a finding ("the file is already gone") out of an unanswered question.
+ * failed, never settled inside {@link DOWNLOAD_SETTLE_MS}, or the stat itself threw) — reporting that
+ * as `absent` would manufacture a finding ("the file is already gone") out of an unanswered question.
  */
 export function tempFileState(pathKnown, exists) {
   if (!pathKnown) return "unknown";
@@ -215,45 +248,177 @@ export function errorMarker(message) {
   return "other";
 }
 
+/** An error class name is normally a token, but it is settable — so it is validated, not trusted. */
+const SAFE_ERROR_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
 /**
- * Attribute a download to a case by PATH. Counting events between two timestamps would mis-file any
- * download that lands after its leg returned (they are asynchronous, and an attachment navigation
- * returns before the transfer finishes); the served path is the one identifier both sides agree on.
+ * Everything a thrown value may contribute to output: a validated name and a closed-vocabulary
+ * marker. Nothing else — no message, no stack, no `cause`, no properties. This is the ONLY shape in
+ * which a failure reaches the console or the report.
  */
-export function downloadsForCase(downloads, casePath) {
-  return downloads.filter((d) => d.redactedUrl.endsWith(casePath));
+export function sanitizeFailure(err) {
+  if (!(err instanceof Error)) return { name: "non-error-throw", marker: "none" };
+  const name = typeof err.name === "string" && SAFE_ERROR_NAME_RE.test(err.name) ? err.name : "unsafe-error-name";
+  return { name, marker: errorMarker(typeof err.message === "string" ? err.message : "") };
+}
+
+/** Downloads whose EXACT pathname is this case's path. */
+export function downloadsForCase(records, casePath) {
+  return records.filter((d) => !d.accessorError && pathnameOf(d.redactedUrl) === casePath);
+}
+
+/**
+ * File every ledger record against a (surface, case) key. A record with no surface, no parseable
+ * pathname, a failed accessor, or a pathname that is not a case is UNATTRIBUTED — returned, never
+ * dropped, because "we saw a download and could not say where it came from" is a reason to distrust
+ * the whole reading, not a detail to round away.
+ */
+export function attributeLedger(records, cases = CASES) {
+  const byKey = new Map();
+  const unattributed = [];
+  for (const record of records) {
+    const pathname = record.accessorError ? null : pathnameOf(record.redactedUrl);
+    const match = pathname === null ? undefined : cases.find((c) => c.path === pathname);
+    if (!match || typeof record.surface !== "string" || record.surface.length === 0) {
+      unattributed.push(record);
+      continue;
+    }
+    const key = `${record.surface}\u0000${match.id}`;
+    const bucket = byKey.get(key);
+    if (bucket) bucket.push(record);
+    else byKey.set(key, [record]);
+  }
+  return { byKey, unattributed };
+}
+
+/** Collapse per-record values: one value when they agree, `mixed` when they do not. */
+function agree(values) {
+  const unique = [...new Set(values)];
+  if (unique.length === 0) return null;
+  return unique.length === 1 ? unique[0] : "mixed";
+}
+
+/** One record's temp-file reading for a side, honouring a stat that failed. */
+function recordTempState(record, side) {
+  if (record.statError) return "unknown";
+  const value = side === "before" ? record.existsBeforeClose : record.existsAfterClose;
+  // A reading that was never TAKEN (`null` — the core never closed, or the stat never ran) is
+  // `unknown`, exactly like a path that never resolved. Only a stat that actually ran says `absent`.
+  return tempFileState(record.pathKnown && value !== null, value === true);
+}
+
+/**
+ * Fold a case's records into the row's reportable download block.
+ *
+ * Called at REPORT time, never at leg time — the temp-file readings are written by the teardown
+ * hooks when the core closes, and on the browser/drive surfaces that happens AFTER the leg returns
+ * (one core serves every case). Folding at leg time captured the pre-close nulls and rendered them
+ * as a confident `absent`, i.e. "the driver wrote no file", a finding the run had not made.
+ *
+ * Every field aggregates ALL of the case's records. Reporting only the first would let an event
+ * count of 3 sit beside one event's filename and temp state as though they described each other.
+ */
+export function downloadBlock(records, fault) {
+  if (records.length === 0) {
+    return {
+      eventCount: 0,
+      suggestedFilename: null,
+      filenameWithheldReason: null,
+      reportedFailure: null,
+      tempFileBeforeClose: null,
+      tempFileAfterClose: null,
+      tempFileNonEmpty: null,
+      statErrors: 0,
+      settleErrors: 0,
+    };
+  }
+  const rawNames = [...new Set(records.map((r) => r.suggestedFilenameRaw))];
+  const named = rawNames.length === 1 ? safeFilename(rawNames[0]) : { safe: false, value: null, reason: "multiple-distinct" };
+  return {
+    eventCount: records.length,
+    suggestedFilename: named.value,
+    filenameWithheldReason: named.reason,
+    reportedFailure: agree(records.map((r) => r.reportedFailure)),
+    tempFileBeforeClose: agree(records.map((r) => recordTempState(r, "before"))),
+    tempFileAfterClose: agree(records.map((r) => recordTempState(r, "after"))),
+    tempFileNonEmpty: agree(records.map((r) => (r.statError ? null : r.sizeMatchesServed))),
+    statErrors: records.filter((r) => r.statError).length,
+    settleErrors: records.filter((r) => r.settleError).length,
+    // FAULT: the absolute path in the row is what the hygiene guard must refuse to publish.
+    ...(fault?.leakTempPath ? { tempFilePath: records[0].absolutePath } : {}),
+  };
+}
+
+/**
+ * Fill every row's download block from the persistent ledger, AFTER all downloads have settled and
+ * every observed core's teardown has completed. Returns plain, serializable rows plus the number of
+ * records that could not be filed — including records filed against a (surface, case) that produced
+ * no row, which is exactly the "a measured row went missing" failure the validity guard must catch.
+ */
+export function finalizeRows(rows, records, fault) {
+  const { byKey, unattributed } = attributeLedger(records);
+  const claimed = new Set();
+  const finalRows = rows.map((row) => {
+    const key = `${row.surface}\u0000${row.case}`;
+    claimed.add(key);
+    return { ...row, download: downloadBlock(byKey.get(key) ?? [], fault) };
+  });
+  let orphaned = 0;
+  for (const [key, bucket] of byKey) if (!claimed.has(key)) orphaned += bucket.length;
+  return { rows: finalRows, unattributed: unattributed.length + orphaned };
 }
 
 /**
  * The measurement's own guard. It answers "can this reading be trusted", never "did the stack
  * behave well" — a row saying no download fired is a finding; a row saying the INSTRUMENT never
  * fired is a broken instrument. Every arm is reachable: see the fault modes in the file header.
+ *
+ * `env` carries what is not in a row: the surfaces that were SELECTED (so a surface that produced no
+ * rows at all is caught), the unattributed-download count, the observation-failure counters, the
+ * per-core teardown states, and the browser mode. It is read fail-closed — an unstated field reads
+ * as bad news, because an apparatus that cannot say what it did has not said it was fine.
  */
-export function measurementValidity(rows, fixture) {
+export function measurementValidity(rows, fixture, env = {}) {
   const problems = [];
   if (!fixture.ok) {
     for (const detail of fixture.problems) problems.push({ code: "fixture-self-check", detail });
+  }
+  // Headful is not a preference: the shipping stack runs headful under Xvfb, and a headless Chrome
+  // is a different browser with different download behaviour. An unstated mode is not headful.
+  if (env.headless !== false) {
+    problems.push({ code: "headless-run", detail: "the browser did not run headful — a headless reading does not describe the shipping stack" });
   }
   if (rows.length === 0) {
     problems.push({ code: "no-legs-ran", detail: "no surface produced a row" });
     return { valid: false, problems };
   }
-  for (const surface of [...new Set(rows.map((r) => r.surface))]) {
+
+  const surfaces = Array.isArray(env.surfaces) && env.surfaces.length ? env.surfaces : [...new Set(rows.map((r) => r.surface))];
+  for (const surface of surfaces) {
     const of = (caseId) => rows.find((r) => r.surface === surface && r.case === caseId);
+    for (const testCase of CASES) {
+      const row = of(testCase.id);
+      if (!row) {
+        // Split by role so the codes stay legible: a lost MEASURED row is the race this guards.
+        const code =
+          testCase.id === POSITIVE_CONTROL ? "positive-control-missing" : testCase.id === NEGATIVE_CONTROL ? "negative-control-missing" : "measured-row-missing";
+        problems.push({ code, surface, detail: `${testCase.id} produced no row on this surface` });
+        continue;
+      }
+      if (row.navigationEvidence !== true) {
+        problems.push({ code: "no-navigation-evidence", surface, detail: `${testCase.id} produced a row with no evidence the navigation was attempted` });
+      }
+    }
     const pos = of(POSITIVE_CONTROL);
     const neg = of(NEGATIVE_CONTROL);
-    if (!pos) {
-      problems.push({ code: "positive-control-missing", surface, detail: `${POSITIVE_CONTROL} did not run` });
-    } else if (pos.download.eventCount < 1) {
+    if (pos && pos.download.eventCount < 1) {
       problems.push({
         code: "positive-control-silent",
         surface,
         detail: "an octet-stream attachment produced NO download event — the observer is not measuring anything on this surface, so every quiet row is uninterpretable",
       });
     }
-    if (!neg) {
-      problems.push({ code: "negative-control-missing", surface, detail: `${NEGATIVE_CONTROL} did not run` });
-    } else if (neg.download.eventCount > 0) {
+    if (neg && neg.download.eventCount > 0) {
       problems.push({
         code: "negative-control-fired",
         surface,
@@ -264,6 +429,41 @@ export function measurementValidity(rows, fixture) {
       problems.push({ code: "no-core-observed", surface, detail: "no browser core was observed on this surface — the injection seam did not take" });
     }
   }
+
+  const unattributed = env.unattributedDownloads;
+  if (typeof unattributed !== "number" || unattributed > 0) {
+    problems.push({
+      code: "unattributed-download",
+      detail: `${unattributed ?? "an unstated number of"} download events could not be filed against a case — a quiet row cannot be read as "no download happened"`,
+    });
+  }
+
+  for (const key of ["statErrors", "accessorErrors", "settleErrors"]) {
+    const count = env[key];
+    if (typeof count !== "number" || count > 0) {
+      problems.push({ code: "observation-failed", detail: `${key}=${count ?? "unstated"} — an observation that threw cannot be reported as a reading` });
+    }
+  }
+
+  const teardown = Array.isArray(env.teardown) ? env.teardown : null;
+  if (!teardown) {
+    problems.push({ code: "teardown-incomplete", detail: "no teardown observations were reported" });
+  } else {
+    for (const t of teardown) {
+      if (t.hookErrors?.length) {
+        problems.push({ code: "teardown-hook-failed", surface: t.surface, detail: `a teardown hook threw (${t.hookErrors.map((h) => `${h.phase}:${h.name}`).join(", ")})` });
+      }
+      // A core that observed no download has nothing to stat; one that did must have both sides.
+      if (t.downloadCount > 0 && (t.beforeClose !== "ok" || t.afterClose !== "ok")) {
+        problems.push({
+          code: "teardown-incomplete",
+          surface: t.surface,
+          detail: `a core that observed ${t.downloadCount} download(s) never completed its teardown observations (before=${t.beforeClose}, after=${t.afterClose})`,
+        });
+      }
+    }
+  }
+
   return { valid: problems.length === 0, problems };
 }
 
@@ -275,45 +475,143 @@ export function literalViolations(serialized, forbidden) {
   return forbidden.filter((f) => typeof f.value === "string" && f.value.length > 0 && serialized.includes(f.value)).map((f) => f.label);
 }
 
-/** Shape-based leaks — the classes that have no fixed literal to grep for. */
+/** The literals this run must never emit — used for the report AND for every console line. */
+export const FORBIDDEN_LITERALS = [
+  { label: "fixture-cookie", value: FIXTURE_COOKIE },
+  { label: "fixture-cookie-value", value: "COOKIE-MUST-NOT-BE-REPORTED" },
+  { label: "query-string-literal", value: FIXTURE_QUERY },
+  { label: "query-string-signature", value: "QUERYSTRING-MUST-NOT-BE-REPORTED" },
+  { label: "consumer-token", value: CONSUMER_TOKEN },
+  { label: "octet-payload", value: OCTET_BYTES.toString("utf8").trim() },
+];
+
+/**
+ * The report's own vocabulary: the fixture routes and media types it is SUPPOSED to name. They are
+ * blanked before the path patterns run, so `/attachment.pdf` in a fixture problem does not read as a
+ * leaked filesystem path. Nothing here is user- or site-controlled — it is a fixed list of tokens
+ * this file itself authored.
+ */
+export const DOCUMENTED_VOCABULARY = [...CASES.map((c) => c.path), "application/octet-stream", "application/pdf", "text/html"];
+
+export function withoutDocumentedVocabulary(serialized) {
+  let out = serialized;
+  for (const token of DOCUMENTED_VOCABULARY) out = out.split(token).join("<vocab>");
+  return out;
+}
+
+/**
+ * Shape-based leaks — the classes that have no fixed literal to grep for. `scope: "vocab"` patterns
+ * run against the vocabulary-blanked text so the harness can still name its own routes; the rest run
+ * against the raw text. Absolute paths of EVERY shape are covered, not just temp prefixes: a driver
+ * that writes to `/home/node/.cache/...` leaks exactly as completely as one that writes to `/tmp`.
+ */
 export const STRUCTURAL_FORBIDDEN = [
-  { label: "pdf-content", re: /%PDF-/ },
-  { label: "absolute-temp-path", re: /(^|[^A-Za-z0-9])(\/tmp\/|\/var\/folders\/|\/var\/tmp\/)/ },
-  { label: "playwright-artifact-path", re: /playwright-artifacts|\.playwright/ },
-  { label: "query-string", re: /\?[A-Za-z0-9_.-]+=/ },
+  { label: "pdf-content", re: /%PDF-/, scope: "raw" },
+  { label: "query-string", re: /\?[A-Za-z0-9_.-]+=/, scope: "raw" },
+  { label: "playwright-artifact-path", re: /playwright-artifacts|\.playwright/, scope: "raw" },
+  { label: "file-url", re: /file:\/\//i, scope: "raw" },
+  { label: "absolute-temp-path", re: /(^|[^A-Za-z0-9])(\/tmp\/|\/var\/folders\/|\/var\/tmp\/|\/dev\/shm\/|\/private\/)/, scope: "vocab" },
+  // Any POSIX absolute path of two or more segments. One segment is not matched: the fixture's own
+  // routes are one segment, and blanking the vocabulary is what keeps them from being matched here.
+  { label: "absolute-posix-path", re: /(^|[^A-Za-z0-9_.\\/-])\/[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)+/, scope: "vocab" },
+  // `C:\Users\x` and `D:/x`, in raw and JSON-escaped form (JSON.stringify doubles every backslash).
+  { label: "windows-absolute-path", re: /(^|[^A-Za-z0-9])[A-Za-z]:(\\{1,2}|\/)[A-Za-z0-9_.$-]/, scope: "vocab" },
+  { label: "windows-unc-path", re: /\\{2,4}[A-Za-z0-9_.$-]+\\{1,2}[A-Za-z0-9_.$-]/, scope: "raw" },
 ];
 
 export function structuralViolations(serialized) {
-  return STRUCTURAL_FORBIDDEN.filter((f) => f.re.test(serialized)).map((f) => f.label);
+  const stripped = withoutDocumentedVocabulary(serialized);
+  return STRUCTURAL_FORBIDDEN.filter((f) => f.re.test(f.scope === "vocab" ? stripped : serialized)).map((f) => f.label);
 }
+
+/**
+ * Every line this process prints goes through here. A line that carries a forbidden literal or a
+ * forbidden shape is REPLACED by its labels — the hygiene contract covers the whole of stdout, not
+ * only the serialized report, because a library detail interpolated into a log line leaks the same
+ * way a report field does.
+ */
+export function scrubLine(line, forbidden = FORBIDDEN_LITERALS) {
+  const text = String(line);
+  const violations = [...literalViolations(text, forbidden), ...structuralViolations(text)];
+  return violations.length === 0 ? text : `  <line withheld by the hygiene guard: ${violations.join(", ")}>`;
+}
+
+const emit = (line = "") => {
+  console.log(scrubLine(line));
+};
 
 /**
  * Wrap a core's teardown so the harness can stat the driver's temp file on BOTH sides of the close
  * without owning the close. Assigning own properties shadows the prototype methods while leaving the
  * instance (its private fields, its `context`/`forceKillAvailable` getters) untouched, so the session
- * manager still drives the real core — the wrapper only delays the close by the stat.
+ * manager still drives the real core.
  *
- * Both `close` and `kill` are wrapped: a teardown that escalates past the grace period would
- * otherwise skip the hooks and leave every file state reading `unknown` for no stated reason. The
- * latch makes a close-then-kill sequence run them exactly once.
+ * It is a state machine over BOTH entry points (`close`, `kill`), because four things must hold:
+ *   - `beforeClose` is a BARRIER: every entry point awaits it before touching the real core, so a
+ *     concurrent kill cannot delete the temp file before the before-close stat has read it;
+ *   - the hooks run exactly ONCE and in order — `beforeClose` before any real teardown, `afterClose`
+ *     only once every real teardown in flight has settled — so a close-then-kill sequence cannot
+ *     overwrite a before-close reading with an after-close one;
+ *   - a hook that THROWS never skips the real teardown and never propagates into the caller's
+ *     lifecycle: it is recorded on the returned state, and the validity guard reads it as invalid.
+ *     A wedged teardown must not be able to quietly become an `unknown` file reading;
+ *   - the barrier is on the HOOKS, not a queue over the real ops. `Session.teardown` abandons a
+ *     wedged `core.close()` at the grace deadline and escalates to `core.kill()` (src/gateway/
+ *     session.ts). Queueing that kill behind the abandoned close would deadlock the one escalation
+ *     path that exists precisely because the close may never resolve.
  */
 export function wrapCoreTeardown(core, hooks) {
-  let settled = false;
-  const run = async (real, args) => {
-    const first = !settled;
-    settled = true;
-    if (first) await hooks.beforeClose();
-    try {
-      return await real(...args);
-    } finally {
-      if (first) await hooks.afterClose();
+  let beforeBarrier = null;
+  let afterOnce = null;
+  let inFlight = 0;
+  const tasks = new Set();
+  const drain = async () => {
+    while (tasks.size) {
+      const pending = [...tasks];
+      tasks.clear();
+      await Promise.all(pending);
     }
+  };
+  const state = {
+    beforeClose: "pending",
+    afterClose: "pending",
+    hookErrors: [],
+    teardownCalls: 0,
+    /** Resolves when every teardown started so far has finished, hooks included. */
+    settled: drain,
+  };
+  const runHook = async (phase) => {
+    try {
+      await hooks[phase]();
+      state[phase] = "ok";
+    } catch (err) {
+      state[phase] = "failed";
+      state.hookErrors.push({ phase, ...sanitizeFailure(err) });
+    }
+  };
+  const run = (real, args) => {
+    state.teardownCalls += 1;
+    const task = (async () => {
+      if (!beforeBarrier) beforeBarrier = runHook("beforeClose");
+      await beforeBarrier;
+      inFlight += 1;
+      try {
+        return await real(...args);
+      } finally {
+        inFlight -= 1;
+        if (inFlight === 0 && !afterOnce) afterOnce = runHook("afterClose");
+        // The caller's teardown resolves only once the after-close reading has been taken.
+        if (afterOnce) await afterOnce;
+      }
+    })();
+    tasks.add(task.then(() => {}, () => {}));
+    return task;
   };
   const realClose = core.close.bind(core);
   const realKill = typeof core.kill === "function" ? core.kill.bind(core) : undefined;
   core.close = (...args) => run(realClose, args);
   if (realKill) core.kill = (...args) => run(realKill, args);
-  return core;
+  return state;
 }
 
 /** Resolve the fault mode, rejecting an unknown one loudly — a typo must not read as `none`. */
@@ -387,6 +685,28 @@ export function createFixtureServer({ breakFixture = false } = {}) {
 }
 
 /**
+ * Bind with an error path and a bound. `server.listen(port, host, cb)` alone reports a failed bind
+ * as an unhandled `error` event — which, in a harness that must fail closed, is the worst possible
+ * shape. The rejection carries the errno CODE only; a bind message can name a path.
+ */
+export function listenBounded(server, port, host, timeoutMs = FIXTURE_LISTEN_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn, arg) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      server.removeListener("error", onError);
+      fn(arg);
+    };
+    const onError = (err) => finish(reject, new Error(`fixture listen failed: ${err?.code ?? "unknown"}`));
+    const timer = setTimeout(() => finish(reject, new Error("fixture listen failed: timeout")), timeoutMs);
+    server.once("error", onError);
+    server.listen(port, host, () => finish(resolve, undefined));
+  });
+}
+
+/**
  * What each route MUST answer before a browser is launched. A run whose fixture drifted would
  * otherwise produce confident rows about a shape it never served.
  */
@@ -400,6 +720,7 @@ export const FIXTURE_EXPECTATIONS = [
 /** Compare one fixture response against its expectation. Pure, so the self-check is unit-tested. */
 export function fixtureRouteProblems(expected, actual) {
   const problems = [];
+  if (actual.error) problems.push(`${expected.path}: request ${actual.error}`);
   if (actual.status !== expected.status) problems.push(`${expected.path}: status ${actual.status} (expected ${expected.status})`);
   if (!String(actual.contentType ?? "").startsWith(expected.contentType)) {
     problems.push(`${expected.path}: content-type "${actual.contentType ?? "<absent>"}" (expected ${expected.contentType})`);
@@ -413,18 +734,41 @@ export function fixtureRouteProblems(expected, actual) {
   return problems;
 }
 
+/**
+ * One self-check request, bounded on both axes: a stalled loopback socket resolves as `timeout` and
+ * a refused one as `request-error`. A measurement that can hang forever is not reproducible, and a
+ * fixture probe is the one place where "wait indefinitely" is never the right answer.
+ */
+export function probeRoute(base, path, { timeoutMs = FIXTURE_REQUEST_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        req.destroy();
+      } catch {
+        // destroy() on an already-dead socket is not a measurement problem.
+      }
+      finish({ status: null, contentType: null, disposition: null, error: "timeout" });
+    }, timeoutMs);
+    const req = http.get(`${base}${path}?${FIXTURE_QUERY}`, (res) => {
+      res.resume(); // drain: the bytes are not needed and must not be buffered into this process
+      finish({ status: res.statusCode, contentType: res.headers["content-type"], disposition: res.headers["content-disposition"], error: null });
+    });
+    req.on("error", () => finish({ status: null, contentType: null, disposition: null, error: "request-error" }));
+  });
+}
+
 /** Fetch each route over plain HTTP — no browser — and check it against its expectation. */
 async function selfCheckFixture(base) {
   const problems = [];
   for (const expected of FIXTURE_EXPECTATIONS) {
-    const actual = await new Promise((resolve) => {
-      const req = http.get(`${base}${expected.path}?${FIXTURE_QUERY}`, (res) => {
-        res.resume(); // drain: the bytes are not needed and must not be buffered into this process
-        resolve({ status: res.statusCode, contentType: res.headers["content-type"], disposition: res.headers["content-disposition"] });
-      });
-      req.on("error", () => resolve({ status: null, contentType: null, disposition: null }));
-    });
-    problems.push(...fixtureRouteProblems(expected, actual));
+    problems.push(...fixtureRouteProblems(expected, await probeRoute(base, expected.path)));
   }
   return { ok: problems.length === 0, problems };
 }
@@ -450,102 +794,188 @@ async function withTimeout(promise, ms, fallback) {
 }
 
 /**
+ * Read the two SITE-controlled accessors defensively. Each is called inside its own boundary and the
+ * failure is REPORTED, because the alternative — the old outer try/catch around record construction —
+ * dropped the whole event when an accessor threw on a torn-down page, and a dropped event is
+ * indistinguishable from "no download happened".
+ */
+export function readDownloadIdentity(dl) {
+  let redactedUrl = null;
+  let suggestedFilenameRaw = null;
+  let accessorError = false;
+  try {
+    redactedUrl = redactUrl(dl.url());
+  } catch {
+    accessorError = true;
+  }
+  try {
+    suggestedFilenameRaw = typeof dl.suggestedFilename === "function" ? dl.suggestedFilename() : "";
+  } catch {
+    accessorError = true;
+  }
+  return { redactedUrl, suggestedFilenameRaw, accessorError };
+}
+
+/**
+ * Stat one side of the teardown. A stat that THROWS — the file vanished between the existence check
+ * and the stat, the path became unreadable — is an explicit `error`, never a silent `absent`: the
+ * whole point of this reading is whether the file survives the close, so a failed look must not be
+ * reported as a look that found nothing.
+ */
+export function probeTempFile(absolutePath, fs = { existsSync, statSync }) {
+  try {
+    if (!fs.existsSync(absolutePath)) return { exists: false, nonEmpty: false, error: false };
+    return { exists: true, nonEmpty: fs.statSync(absolutePath).size > 0, error: false };
+  } catch {
+    return { exists: null, nonEmpty: null, error: true };
+  }
+}
+
+/**
  * Watches every core the run creates. Attaches `page.on("download")` through the core's public
  * `context` getter and stats the driver's temp file on both sides of the teardown — passively: it
  * navigates nothing, cancels nothing, and saves nothing.
+ *
+ * Every event lands in ONE persistent ledger tagged with its core (and therefore its surface); no
+ * leg ever slices it. `beginSurface()` names the surface a core created next belongs to, which is
+ * how a core the gateway factory builds mid-call is attributed without the gateway knowing anything
+ * about this harness.
  */
 function createObserver(fault) {
-  const downloads = [];
+  const records = [];
   const cores = [];
   let coreSeq = 0;
+  let currentSurface = null;
+  const counters = { statErrors: 0, accessorErrors: 0, settleErrors: 0 };
 
-  const capture = (dl, coreId) => {
+  const capture = (dl, coreId, surface) => {
+    // The record is pushed BEFORE anything site-controlled is read, so an accessor that throws
+    // leaves an unattributable record (which invalidates the run) instead of no record at all.
     const record = {
       coreId,
-      redactedUrl: redactUrl(dl.url()),
-      suggestedFilenameRaw: typeof dl.suggestedFilename === "function" ? dl.suggestedFilename() : "",
+      surface,
+      redactedUrl: null,
+      suggestedFilenameRaw: null,
+      accessorError: false,
       forged: false,
       pathKnown: false,
       reportedFailure: "unknown",
       existsBeforeClose: null,
       existsAfterClose: null,
       sizeMatchesServed: null,
+      statError: false,
+      settleError: false,
       // The absolute path stays HERE and never reaches a row (except under the leak-temp-path
       // fault, which exists to prove the hygiene guard notices).
       absolutePath: null,
-      settled: (async () => {
-        const failure = await withTimeout(Promise.resolve(dl.failure()), DOWNLOAD_SETTLE_MS, "unknown");
-        record.reportedFailure = failure === "unknown" ? "unknown" : failure === null ? false : true;
-        const p = await withTimeout(Promise.resolve(dl.path()), DOWNLOAD_SETTLE_MS, undefined);
-        if (typeof p === "string" && p.length > 0) {
-          record.pathKnown = true;
-          record.absolutePath = p;
-        }
-      })(),
+      settled: null,
     };
-    downloads.push(record);
+    records.push(record);
+    const identity = readDownloadIdentity(dl);
+    record.redactedUrl = identity.redactedUrl;
+    record.suggestedFilenameRaw = identity.suggestedFilenameRaw;
+    record.accessorError = identity.accessorError;
+    if (identity.accessorError) counters.accessorErrors += 1;
+    record.settled = (async () => {
+      const call = async (fn, fallback) => {
+        try {
+          return await withTimeout(Promise.resolve(fn()), DOWNLOAD_SETTLE_MS, fallback);
+        } catch {
+          record.settleError = true;
+          counters.settleErrors += 1;
+          return fallback;
+        }
+      };
+      const failure = await call(() => dl.failure(), "unknown");
+      record.reportedFailure = failure === "unknown" ? "unknown" : failure === null ? false : true;
+      const p = await call(() => dl.path(), undefined);
+      if (typeof p === "string" && p.length > 0) {
+        record.pathKnown = true;
+        record.absolutePath = p;
+      }
+    })();
     return record;
   };
 
   const statSide = (side, coreId) => {
-    for (const d of downloads) {
+    for (const d of records) {
       if (d.coreId !== coreId || !d.pathKnown || d.forged) continue;
-      const exists = existsSync(d.absolutePath);
+      if (side === "before" ? d.existsBeforeClose !== null : d.existsAfterClose !== null) continue;
+      const probe = probeTempFile(d.absolutePath);
+      if (probe.error) {
+        if (!d.statError) counters.statErrors += 1;
+        d.statError = true;
+        continue;
+      }
       if (side === "before") {
-        if (d.existsBeforeClose === null) {
-          d.existsBeforeClose = exists;
-          d.sizeMatchesServed = exists ? statSync(d.absolutePath).size > 0 : false;
-        }
-      } else if (d.existsAfterClose === null) {
-        d.existsAfterClose = exists;
+        d.existsBeforeClose = probe.exists;
+        d.sizeMatchesServed = probe.nonEmpty;
+      } else {
+        d.existsAfterClose = probe.exists;
       }
     }
   };
 
   return {
-    downloads,
+    records,
     get coreCount() {
       return cores.length;
+    },
+    get statErrors() {
+      return counters.statErrors;
+    },
+    get accessorErrors() {
+      return counters.accessorErrors;
+    },
+    get settleErrors() {
+      return counters.settleErrors;
+    },
+    coresOnSurface(surface) {
+      return cores.filter((c) => c.surface === surface).length;
+    },
+    /** Name the surface that owns every core created from here on. */
+    beginSurface(surface) {
+      currentSurface = surface;
     },
     /** Attach to a real core. Returns the core so it can be used as a CoreFactory tail call. */
     observe(core) {
       const coreId = ++coreSeq;
-      cores.push(coreId);
+      const surface = currentSurface;
       const context = core.context;
       const wirePage = (page) => {
         if (fault.forgeDownload) {
-          // FAULT: synthesize a download on every page, including the HTML control — the negative
-          // control must catch an over-firing observer.
-          downloads.push({
-            coreId,
-            redactedUrl: redactUrl(page.url() || "http://forged.invalid/"),
-            suggestedFilenameRaw: "forged.bin",
-            forged: true,
-            pathKnown: false,
-            reportedFailure: "unknown",
-            existsBeforeClose: null,
-            existsAfterClose: null,
-            sizeMatchesServed: null,
-            absolutePath: null,
-            settled: Promise.resolve(),
+          // FAULT: synthesize a download on every NAVIGATION — including the HTML control's, which
+          // is what makes the negative control the arm that catches an over-firing observer. (Per
+          // page would forge only on `about:blank`, which files against no case at all.)
+          page.on("domcontentloaded", () => {
+            records.push({
+              coreId,
+              surface,
+              redactedUrl: redactUrl(page.url() || "http://forged.invalid/"),
+              suggestedFilenameRaw: "forged.bin",
+              accessorError: false,
+              forged: true,
+              pathKnown: false,
+              reportedFailure: "unknown",
+              existsBeforeClose: null,
+              existsAfterClose: null,
+              sizeMatchesServed: null,
+              statError: false,
+              settleError: false,
+              absolutePath: null,
+              settled: Promise.resolve(),
+            });
           });
         }
         if (fault.muteObserver) return; // FAULT: deaf apparatus — the positive control must catch it.
-        page.on("download", (dl) => {
-          try {
-            capture(dl, coreId);
-          } catch {
-            // A download object can throw on access if its page died first; a lost record is
-            // preferable to killing the run, and the controls would surface a systematic loss.
-          }
-        });
+        page.on("download", (dl) => capture(dl, coreId, surface));
       };
       for (const page of context.pages()) wirePage(page);
       context.on("page", wirePage);
-      wrapCoreTeardown(core, {
+      const teardown = wrapCoreTeardown(core, {
         beforeClose: async () => {
           await withTimeout(
-            Promise.all(downloads.filter((d) => d.coreId === coreId).map((d) => d.settled)),
+            Promise.all(records.filter((d) => d.coreId === coreId && d.settled).map((d) => d.settled)),
             DOWNLOAD_SETTLE_MS + 1_000,
             undefined,
           );
@@ -555,42 +985,29 @@ function createObserver(fault) {
           statSide("after", coreId);
         },
       });
+      cores.push({ coreId, surface, teardown });
       return core;
     },
-    /** Forge-mode records aside, resolve any still-pending path lookups (end-of-run safety net). */
-    async settleAll() {
-      await withTimeout(Promise.all(downloads.map((d) => d.settled)), DOWNLOAD_SETTLE_MS + 1_000, undefined);
+    /** The per-core teardown observations, as the validity guard reads them. */
+    teardownStates() {
+      return cores.map((c) => ({
+        coreId: c.coreId,
+        surface: c.surface,
+        beforeClose: c.teardown.beforeClose,
+        afterClose: c.teardown.afterClose,
+        hookErrors: c.teardown.hookErrors,
+        downloadCount: records.filter((r) => r.coreId === c.coreId).length,
+      }));
     },
-  };
-}
-
-/**
- * Fold a leg's downloads into the row's reportable download block.
- *
- * Called at REPORT time, never at leg time. The temp-file readings are written by the teardown hooks
- * when the core closes, and on the browser/drive surfaces that happens AFTER the leg returns (one
- * core serves every case) — folding at leg time captured the pre-close nulls and rendered them as a
- * confident `absent`, i.e. "the driver wrote no file", which is a finding the run had not made.
- */
-function downloadBlock(records, fault) {
-  if (records.length === 0) {
-    return { eventCount: 0, suggestedFilename: null, filenameWithheldReason: null, reportedFailure: null, tempFileBeforeClose: null, tempFileAfterClose: null, tempFileNonEmpty: null };
-  }
-  const first = records[0];
-  const named = safeFilename(first.suggestedFilenameRaw);
-  // A reading that was never TAKEN (`null` — the core never closed, or the stat never ran) is
-  // `unknown`, exactly like a path that never resolved. Only a stat that actually ran can say `absent`.
-  const statTaken = (side) => first.pathKnown && side !== null;
-  return {
-    eventCount: records.length,
-    suggestedFilename: named.value,
-    filenameWithheldReason: named.reason,
-    reportedFailure: first.reportedFailure,
-    tempFileBeforeClose: tempFileState(statTaken(first.existsBeforeClose), first.existsBeforeClose === true),
-    tempFileAfterClose: tempFileState(statTaken(first.existsAfterClose), first.existsAfterClose === true),
-    tempFileNonEmpty: first.sizeMatchesServed,
-    // FAULT: the absolute path in the row is what the hygiene guard must refuse to publish.
-    ...(fault.leakTempPath ? { tempFilePath: first.absolutePath } : {}),
+    /**
+     * The barrier attribution waits on: every queued teardown finished, then every download settled.
+     * Nothing is filed into a row before this resolves, which is what lets a late event still land
+     * in the correct row.
+     */
+    async settleAll() {
+      await withTimeout(Promise.all(cores.map((c) => c.teardown.settled())), DOWNLOAD_SETTLE_MS + 1_000, undefined);
+      await withTimeout(Promise.all(records.filter((d) => d.settled).map((d) => d.settled)), DOWNLOAD_SETTLE_MS + 1_000, undefined);
+    },
   };
 }
 
@@ -603,25 +1020,22 @@ const NO_SANDBOX = process.env.BGW_NO_SANDBOX === "1";
 const HEADLESS = process.env.BGW_HEADLESS === "1"; // the container runs headful under Xvfb
 
 /**
- * One row per (surface × case), in the shape both the table and the JSON block read.
+ * One row per (surface × case), in the shape both the table and the JSON block read. It carries NO
+ * download records — the ledger holds those, and {@link finalizeRows} fills `download` once every
+ * core has closed. That is also why no absolute path can reach the report: a row has no field for
+ * one, by construction.
  *
- * `coresObserved` counts the cores seen on this SURFACE up to and including this leg (the validity
- * guard reads it to catch an injection seam that never took); `coresLaunchedDuringLeg` is the delta
- * for THIS leg — non-zero on the drive surface exactly when the controller discarded its session and
- * launched a replacement.
+ * `navigationEvidence` is the row's proof that the leg actually happened: the guard saw a request
+ * for this path (browser), or the policy layer audited a navigate decision (retrieve/drive). A row
+ * without it is a row about nothing, and the validity guard rejects the whole reading.
  */
-function makeRow(surface, testCase, nav, records, cores, guard, elapsedMs, _fault) {
+function makeRow(surface, testCase, nav, navigationEvidence, cores, guard, elapsedMs) {
   return {
     surface,
     case: testCase.id,
     role: testCase.role,
     nav,
-    // Held by REFERENCE and folded by finalizeRows() once every core has closed — the temp-file
-    // readings do not exist yet at leg time. finalizeRows destructures it away, so the live records
-    // (which hold the absolute temp path) can never reach the serialized report.
-    get records() {
-      return records;
-    },
+    navigationEvidence,
     download: null,
     guard,
     coresObserved: cores.observed,
@@ -630,23 +1044,20 @@ function makeRow(surface, testCase, nav, records, cores, guard, elapsedMs, _faul
   };
 }
 
-/** Fold every row's download block AFTER all cores have closed. Returns plain, serializable rows. */
-export function finalizeRows(rows, fault) {
-  return rows.map(({ records, ...rest }) => ({ ...rest, download: downloadBlock(records, fault) }));
-}
-
 /** Everything a thrown navigation may contribute, with no free text. */
 function navFromError(err) {
+  const sanitized = sanitizeFailure(err);
   return {
     outcome: "threw",
     status: null,
-    errorName: err instanceof Error ? err.name : "non-error-throw",
-    errorMarker: errorMarker(err instanceof Error ? err.message : ""),
+    errorName: sanitized.name,
+    errorMarker: sanitized.marker,
     failureClass: failureOf(err)?.failureClass ?? null,
   };
 }
 
-async function runBrowserSurface({ base, observer, fault, rows }) {
+async function runBrowserSurface({ base, observer, rows }) {
+  observer.beginSurface("browser");
   const core = await createBrowserCore({ headless: HEADLESS, channel: CHANNEL, noSandbox: NO_SANDBOX, navigationTimeoutMs: NAV_TIMEOUT_MS });
   observer.observe(core);
   // The shipping stack never renders without a navigation guard installed (the policy layer installs
@@ -657,14 +1068,10 @@ async function runBrowserSurface({ base, observer, fault, rows }) {
     guardLog.push({ host: nav.host, isNavigationRequest: nav.isNavigationRequest, resourceType: nav.resourceType, path: redactUrl(nav.url) });
     return nav.host === FIXTURE_HOST ? "allow" : "block";
   });
-  const coresAtSurfaceStart = observer.coreCount - 1; // the core opened just above belongs to this surface
   try {
     for (const testCase of CASES) {
       const guardAt = guardLog.length;
-      const coresAt = observer.coreCount;
-      // Slice from HERE so a download observed on an earlier leg (or an earlier surface) can never be
-      // counted again on this one; the path match then files it against the right case within the leg.
-      const downloadsAt = observer.downloads.length;
+      const coresAt = observer.coresOnSurface("browser");
       const t0 = performance.now();
       let nav;
       try {
@@ -674,18 +1081,18 @@ async function runBrowserSurface({ base, observer, fault, rows }) {
         nav = navFromError(err);
       }
       const elapsed = performance.now() - t0;
-      await sleep(LEG_SETTLE_MS);
+      await sleep(LEG_SETTLE_MS); // courtesy, not a boundary: attribution happens at report time
       const hops = guardLog.slice(guardAt);
+      const sawThisPath = hops.some((h) => pathnameOf(h.path) === testCase.path);
       rows.push(
         makeRow(
           "browser",
           testCase,
           nav,
-          downloadsForCase(observer.downloads.slice(downloadsAt), testCase.path),
-          { observed: observer.coreCount - coresAtSurfaceStart, launchedDuringLeg: observer.coreCount - coresAt },
-          { sawNavigationRequest: hops.some((h) => h.isNavigationRequest && h.path.endsWith(testCase.path)), requestsSeen: hops.length },
+          sawThisPath,
+          { observed: observer.coresOnSurface("browser"), launchedDuringLeg: observer.coresOnSurface("browser") - coresAt },
+          { sawNavigationRequest: hops.some((h) => h.isNavigationRequest && pathnameOf(h.path) === testCase.path), requestsSeen: hops.length },
           elapsed,
-          fault,
         ),
       );
     }
@@ -694,12 +1101,11 @@ async function runBrowserSurface({ base, observer, fault, rows }) {
   }
 }
 
-async function runRetrieveSurface({ base, gateway, secrets, audit, observer, fault, rows, timeouts }) {
-  const coresAtSurfaceStart = observer.coreCount;
+async function runRetrieveSurface({ base, gateway, secrets, audit, observer, rows, timeouts }) {
+  observer.beginSurface("retrieve");
   for (const testCase of CASES) {
     const auditAt = audit.records.length;
-    const coresAt = observer.coreCount;
-    const downloadsAt = observer.downloads.length;
+    const coresAt = observer.coresOnSurface("retrieve");
     const t0 = performance.now();
     let nav;
     try {
@@ -731,24 +1137,22 @@ async function runRetrieveSurface({ base, gateway, secrets, audit, observer, fau
         "retrieve",
         testCase,
         nav,
-        downloadsForCase(observer.downloads.slice(downloadsAt), testCase.path),
-        { observed: observer.coreCount - coresAtSurfaceStart, launchedDuringLeg: observer.coreCount - coresAt },
+        decisions.length > 0,
+        { observed: observer.coresOnSurface("retrieve"), launchedDuringLeg: observer.coresOnSurface("retrieve") - coresAt },
         { guardAllows: decisions.filter((d) => d.decision === "allow").length, guardBlocks: decisions.filter((d) => d.decision === "block").length },
         elapsed,
-        fault,
       ),
     );
   }
 }
 
-async function runDriveSurface({ base, gateway, secrets, audit, observer, fault, rows, timeouts }) {
+async function runDriveSurface({ base, gateway, secrets, audit, observer, rows, timeouts }) {
+  observer.beginSurface("drive");
   const drive = new GatewayDriveController(gateway, secrets, CONSUMER_TOKEN, { timeouts });
-  const coresAtSurfaceStart = observer.coreCount;
   try {
     for (const testCase of CASES) {
       const auditAt = audit.records.length;
-      const coresAt = observer.coreCount;
-      const downloadsAt = observer.downloads.length;
+      const coresAt = observer.coresOnSurface("drive");
       const t0 = performance.now();
       let nav;
       try {
@@ -772,13 +1176,12 @@ async function runDriveSurface({ base, gateway, secrets, audit, observer, fault,
           "drive",
           testCase,
           nav,
-          downloadsForCase(observer.downloads.slice(downloadsAt), testCase.path),
+          decisions.length > 0,
           // A drive session discarded mid-run (the controller's failure path) launches a replacement
           // core; `launchedDuringLeg` is how that shows up in the reading.
-          { observed: observer.coreCount - coresAtSurfaceStart, launchedDuringLeg: observer.coreCount - coresAt },
+          { observed: observer.coresOnSurface("drive"), launchedDuringLeg: observer.coresOnSurface("drive") - coresAt },
           { guardAllows: decisions.filter((d) => d.decision === "allow").length, guardBlocks: decisions.filter((d) => d.decision === "block").length },
           elapsed,
-          fault,
         ),
       );
     }
@@ -809,9 +1212,9 @@ function printTable(rows) {
   ]);
   const widths = head.map((h, i) => Math.max(h.length, ...body.map((b) => b[i].length)));
   const line = (cells) => "  " + cells.map((c, i) => c.padEnd(widths[i])).join("  ");
-  console.log(line(head));
-  console.log(line(widths.map((w) => "-".repeat(w))));
-  for (const b of body) console.log(line(b));
+  emit(line(head));
+  emit(line(widths.map((w) => "-".repeat(w))));
+  for (const b of body) emit(line(b));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -822,13 +1225,13 @@ export async function main() {
   const fault = resolveFault(process.env.BGW_EID_MEASURE_FAULT);
   const surfaces = resolveSurfaces(process.env.BGW_EID_MEASURE_SURFACES);
 
-  console.log("=== browse-gateway :: EID download behaviour MEASUREMENT (task 0) ===");
-  console.log(`  surfaces=${surfaces.join(",")} fault=${fault.mode} channel=${CHANNEL} headless=${HEADLESS}`);
-  console.log("  measures only — no download capture is implemented by this script\n");
-  if (fault.mode !== "none") console.log(`  !! FAULT INJECTION ACTIVE (${fault.mode}) — this run is expected to report INVALID\n`);
+  emit("=== browse-gateway :: EID download behaviour MEASUREMENT (task 0) ===");
+  emit(`  surfaces=${surfaces.join(",")} fault=${fault.mode} channel=${CHANNEL} headless=${HEADLESS}`);
+  emit("  measures only — no download capture is implemented by this script\n");
+  if (fault.mode !== "none") emit(`  !! FAULT INJECTION ACTIVE (${fault.mode}) — this run is expected to report INVALID\n`);
 
   const server = createFixtureServer({ breakFixture: fault.breakFixture });
-  await new Promise((r) => server.listen(0, FIXTURE_HOST, r));
+  await listenBounded(server, 0, FIXTURE_HOST);
   const base = `http://${FIXTURE_HOST}:${server.address().port}`;
 
   const rows = [];
@@ -852,27 +1255,38 @@ export async function main() {
 
   try {
     fixture = await selfCheckFixture(base);
-    console.log(`  fixture self-check: ${fixture.ok ? "OK" : "FAILED"}`);
-    for (const p of fixture.problems) console.log(`    - ${p}`);
+    emit(`  fixture self-check: ${fixture.ok ? "OK" : "FAILED"}`);
+    for (const p of fixture.problems) emit(`    - ${p}`);
 
     // A fixture that does not serve the shapes under test cannot produce a meaningful reading, so
     // the browsers are never launched. (This is the break-fixture fault's fast RED path.)
     if (fixture.ok) {
-      if (surfaces.includes("browser")) await runBrowserSurface({ base, observer, fault, rows });
-      if (surfaces.includes("retrieve")) await runRetrieveSurface({ base, gateway, secrets, audit, observer, fault, rows, timeouts });
-      if (surfaces.includes("drive")) await runDriveSurface({ base, gateway, secrets, audit, observer, fault, rows, timeouts });
+      if (surfaces.includes("browser")) await runBrowserSurface({ base, observer, rows });
+      if (surfaces.includes("retrieve")) await runRetrieveSurface({ base, gateway, secrets, audit, observer, rows, timeouts });
+      if (surfaces.includes("drive")) await runDriveSurface({ base, gateway, secrets, audit, observer, rows, timeouts });
     } else {
-      console.log("  (browsers not launched — a drifted fixture cannot produce a meaningful reading)");
+      emit("  (browsers not launched — a drifted fixture cannot produce a meaningful reading)");
     }
   } finally {
-    await observer.settleAll();
     await gateway.shutdown().catch(() => {});
+    // Only now is every session closed, so this is the barrier: teardown hooks finished, downloads
+    // settled. Attribution happens strictly after it.
+    await observer.settleAll();
     await new Promise((r) => server.close(r));
   }
 
-  // Fold the download blocks only now: every core has closed, so the before/after-close stats exist.
-  const finalRows = finalizeRows(rows, fault);
-  const validity = measurementValidity(finalRows, fixture);
+  const attribution = finalizeRows(rows, observer.records, fault);
+  const finalRows = attribution.rows;
+  const teardown = observer.teardownStates();
+  const validity = measurementValidity(finalRows, fixture, {
+    surfaces,
+    unattributedDownloads: attribution.unattributed,
+    headless: HEADLESS,
+    statErrors: observer.statErrors,
+    accessorErrors: observer.accessorErrors,
+    settleErrors: observer.settleErrors,
+    teardown,
+  });
   const report = {
     meta: {
       task: "eid-download-measurement-0",
@@ -887,55 +1301,82 @@ export async function main() {
     },
     fixture,
     rows: finalRows,
-    unattributedDownloads: observer.downloads.filter((d) => !CASES.some((c) => d.redactedUrl.endsWith(c.path))).length,
+    ledger: {
+      events: observer.records.length,
+      unattributed: attribution.unattributed,
+      statErrors: observer.statErrors,
+      accessorErrors: observer.accessorErrors,
+      settleErrors: observer.settleErrors,
+    },
+    teardown,
     validity,
   };
 
   const serialized = JSON.stringify(report, null, 2);
-  const hygiene = [
-    ...literalViolations(serialized, [
-      { label: "fixture-cookie", value: FIXTURE_COOKIE },
-      { label: "fixture-cookie-value", value: "COOKIE-MUST-NOT-BE-REPORTED" },
-      { label: "query-string-literal", value: FIXTURE_QUERY },
-      { label: "query-string-signature", value: "QUERYSTRING-MUST-NOT-BE-REPORTED" },
-      { label: "consumer-token", value: CONSUMER_TOKEN },
-      { label: "octet-payload", value: OCTET_BYTES.toString("utf8").trim() },
-    ]),
-    ...structuralViolations(serialized),
-  ];
+  const hygiene = [...literalViolations(serialized, FORBIDDEN_LITERALS), ...structuralViolations(serialized)];
 
   if (finalRows.length) {
-    console.log("");
+    emit("");
     printTable(finalRows);
   }
 
-  console.log("");
-  console.log("  observations:");
+  emit("");
+  emit("  observations:");
   for (const r of finalRows.filter((x) => x.role === "measured")) {
-    console.log(
+    emit(
       `    ${r.surface}/${r.case}: nav=${r.nav.outcome}(${r.nav.status ?? "null"}) download=${YES_NO(r.download.eventCount > 0)} ` +
         `filename=${r.download.suggestedFilename ?? "—"} tempBeforeClose=${r.download.tempFileBeforeClose ?? "—"} tempAfterClose=${r.download.tempFileAfterClose ?? "—"}`,
     );
   }
 
-  console.log("");
-  console.log(`  hygiene guard: ${hygiene.length === 0 ? "clean" : `VIOLATED [${hygiene.join(", ")}]`}`);
-  console.log(`  validity guard: ${validity.valid ? "valid" : "INVALID"}`);
-  for (const p of validity.problems) console.log(`    - ${p.code}${p.surface ? ` (${p.surface})` : ""}: ${p.detail}`);
+  emit("");
+  emit(`  ledger: ${observer.records.length} download event(s), ${attribution.unattributed} unattributed, ` +
+    `${observer.statErrors} stat / ${observer.accessorErrors} accessor / ${observer.settleErrors} settle failure(s)`);
+  emit(`  hygiene guard: ${hygiene.length === 0 ? "clean" : `VIOLATED [${hygiene.join(", ")}]`}`);
+  emit(`  validity guard: ${validity.valid ? "valid" : "INVALID"}`);
+  for (const p of validity.problems) emit(`    - ${p.code}${p.surface ? ` (${p.surface})` : ""}: ${p.detail}`);
 
   const ok = validity.valid && hygiene.length === 0;
   if (process.env.BGW_EID_MEASURE_JSON !== "0" && hygiene.length === 0) {
-    console.log("\n--- BEGIN EID-DOWNLOAD-MEASUREMENT JSON ---");
-    console.log(serialized);
-    console.log("--- END EID-DOWNLOAD-MEASUREMENT JSON ---");
+    emit("\n--- BEGIN EID-DOWNLOAD-MEASUREMENT JSON ---");
+    for (const line of serialized.split("\n")) emit(line);
+    emit("--- END EID-DOWNLOAD-MEASUREMENT JSON ---");
   } else if (hygiene.length > 0) {
-    console.log("\n  (JSON withheld — the hygiene guard refuses to print a report that carries forbidden content)");
+    emit("\n  (JSON withheld — the hygiene guard refuses to print a report that carries forbidden content)");
   }
 
-  console.log(`\n=== EID DOWNLOAD MEASUREMENT: ${ok ? "VALID ✅ (a reading, not a pass/fail gate)" : "INVALID ❌ — do not use these numbers"} ===`);
+  emit(`\n=== EID DOWNLOAD MEASUREMENT: ${ok ? "VALID ✅ (a reading, not a pass/fail gate)" : "INVALID ❌ — do not use these numbers"} ===`);
   return ok ? 0 : 1;
 }
 
+/**
+ * Fail closed, and say so in the only shape this harness is allowed to speak: a validated error name
+ * and a closed-vocabulary marker. An uncaught throw from browser creation, fixture startup, observer
+ * setup or teardown would otherwise let Node print a stack — and a driver's message interpolates the
+ * requested URL, the query string and its own temp paths.
+ */
+function reportAbort(stage, err) {
+  const s = sanitizeFailure(err);
+  emit("");
+  emit(`  !! measurement ABORTED during ${stage}: ${s.name} / ${s.marker} (no further detail is printable under the hygiene contract)`);
+  emit("=== EID DOWNLOAD MEASUREMENT: INVALID ❌ — do not use these numbers ===");
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  process.exit(await main());
+  process.on("uncaughtException", (err) => {
+    reportAbort("uncaught-exception", err);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    reportAbort("unhandled-rejection", reason);
+    process.exit(1);
+  });
+  let code = 1;
+  try {
+    code = await main();
+  } catch (err) {
+    reportAbort("main", err);
+    code = 1;
+  }
+  process.exit(code);
 }
