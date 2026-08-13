@@ -1,5 +1,6 @@
 export type ArtifactStatus = "available" | "capture-failed" | "multiple-artifacts" | "expired" | "consuming";
-export type ArtifactFailure = "artifact-transport-unsupported" | "capture-failed" | "multiple-artifacts" | "unavailable";
+export type ArtifactFailureCode = "artifact-transport-unsupported" | "capture-failed" | "multiple-artifacts" | "unavailable";
+export type ArtifactFailure = ArtifactFailureCode;
 export interface ArtifactRecord { id: string; consumerId: string; bytes: number; sha256: string; createdAt: number; expiresAt: number; status: "available" | "consuming"; }
 export interface ArtifactStoreOptions { enabled?: boolean; root: string; ttlMs?: number; maxBytes?: number; maxCount?: number; perConsumerBytes?: number; perConsumerCount?: number; now?: () => number; }
 export interface CaptureOptions { id: string; consumerId: string; ttlMs?: number; }
