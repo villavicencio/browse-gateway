@@ -108,10 +108,23 @@ case "$pid1" in
     ;;
 esac
 
-if docker exec "$CONTAINER" test -x /usr/bin/tini 2>/dev/null; then
-  echo "launch-http: image carries /usr/bin/tini — reaping survives a run without --init"
-else
-  echo "launch-http: WARNING this image has no /usr/bin/tini — it predates issue #131 piece 2." >&2
-  echo "launch-http:   Reaping currently depends ENTIRELY on the --init flag on the docker run above." >&2
-  echo "launch-http:   Any other creation path (a hand-written docker run) will wedge the pool." >&2
-fi
+# Check the image's configured ENTRYPOINT, not merely that the binary is on disk. An image can still
+# ship /usr/bin/tini while its entrypoint no longer invokes it — and because --init is hard-coded
+# above, PID 1 would read `docker-init` and a binary-presence test would pass, so BOTH checks would
+# print happy lines for an image that reverts to the non-reaping topology the moment anything creates
+# a container from it without --init. The entrypoint is the thing that actually decides.
+image_ep="$(docker inspect --format '{{json .Config.Entrypoint}}' "$BGW_DEPLOY_IMAGE" 2>/dev/null || true)"
+case "$image_ep" in
+  *tini*)
+    echo "launch-http: image entrypoint invokes tini — reaping survives a run without --init"
+    ;;
+  "")
+    echo "launch-http: WARNING could not read the image entrypoint — verify reaping manually" >&2
+    ;;
+  *)
+    echo "launch-http: WARNING this image's entrypoint does not invoke tini (${image_ep})." >&2
+    echo "launch-http:   Reaping currently depends ENTIRELY on the --init flag on the docker run above." >&2
+    echo "launch-http:   Any other creation path (a hand-written docker run) will wedge the pool — that" >&2
+    echo "launch-http:   is exactly how issue #131 happened. Expect an image built after piece 2." >&2
+    ;;
+esac

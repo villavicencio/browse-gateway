@@ -128,11 +128,17 @@ for (const name of readdirSync("/proc")) {
   // argument; everything after that belongs to the child. Scanning past that boundary false-trips on a
   // child's own flag — verified: `node scripts/validate-container-init.mjs -g` failed this leg while
   // tini carried nothing but `-s`. A gate that cries wolf is a gate that gets disabled.
+  // Two of tini's options take a VALUE (`tini -h`): `-p SIGNAL` and `-e EXIT_CODE`. Their values do not
+  // start with `-`, so a naive boundary scan mistakes the value for the child program and stops early —
+  // `tini -e 143 -g -- …` would end the scan at `143` and never see the `-g`. Consume those values.
+  const TAKES_VALUE = /^-[a-z]*[pe]$/; // exactly -p/-e, or a bundle ending in one (getopt takes the next arg)
   const argv = cmdline.split("\0").slice(1).filter((a) => a.length > 0);
   const ownArgs = [];
-  for (const a of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
     if (a === "--" || !a.startsWith("-")) break;
     ownArgs.push(a);
+    if (TAKES_VALUE.test(a)) i++; // skip its value — it is not the child boundary
   }
   const hasG = ownArgs.some((a) => /^-[a-z]+$/.test(a) && a.includes("g")); // -g, and bundles like -sg
 
