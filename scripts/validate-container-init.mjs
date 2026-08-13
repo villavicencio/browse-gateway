@@ -68,10 +68,11 @@ check(
 );
 
 // ── leg 3: the Xvfb this entrypoint backgrounds is ALIVE, not a zombie ────────────────────────────
-// The specific detector for the one tempting wrong flag: `tini -g` forwards SIGTERM to the whole
-// process group, which includes Xvfb, killing it mid-drain and manufacturing #129's symptom from a
-// new cause. Here we only assert the steady state — a live display process, no zombie — which `-g`
-// would break at shutdown and which a missing display would break immediately.
+// Steady state only: a display process exists and has not died. That is ALL this leg guards.
+//
+// It is explicitly NOT a detector for `tini -g`, despite the temptation to claim so. `-g` changes
+// signal FORWARDING, and this script never sends a signal — so under `-g` every leg here is green and
+// Xvfb only dies later, mid-drain, after this process has exited. Leg 4 covers `-g` directly.
 let xvfb;
 for (const name of readdirSync("/proc")) {
   if (!/^\d+$/.test(name)) continue;
@@ -96,9 +97,49 @@ check(
   xvfb === undefined ? "no Xvfb process found (entrypoint bypassed?)" : `pid=${xvfb.pid} state=${xvfb.state}`,
 );
 
+// ── leg 4: no init in this container is configured to signal the process GROUP ────────────────────
+// `tini -g` (equivalently TINI_KILL_PROCESS_GROUP) forwards SIGTERM to the whole group, which includes
+// the Xvfb the entrypoint backgrounds: measured, Xvfb goes S -> Z at T+0 while node is still draining,
+// manufacturing #129's in-flight-work-dies-instantly symptom from a brand new cause. It buys nothing —
+// it never reaches Chrome, which patchright spawns detached as its own group leader.
+//
+// Checked as CONFIGURATION rather than by delivering a signal: observing the effect needs a real
+// SIGTERM plus a mid-drain sample, i.e. docker-in-docker, which is disproportionate here. The two ways
+// `-g` can arrive are both visible in /proc without sending anything — an edited Dockerfile (cmdline)
+// and the env var (environ), the latter being a CREATE-time setting no image-level check could ever
+// see if we only inspected the image.
+//
+// EVERY tini is scanned, not just PID 1: the deploy path passes `--init`, which puts docker-init at
+// PID 1 and the baked tini one level below it. A PID-1-only check would look right and see nothing.
+const groupSignalling = [];
+for (const name of readdirSync("/proc")) {
+  if (!/^\d+$/.test(name)) continue;
+  let cmdline = "";
+  let environ = "";
+  try {
+    const { readFileSync } = await import("node:fs");
+    cmdline = readFileSync(`/proc/${name}/cmdline`, "utf8");
+    if (!/(^|\/)(tini|docker-init)\0/.test(cmdline)) continue;
+    environ = readFileSync(`/proc/${name}/environ`, "utf8");
+  } catch {
+    continue; // raced exit / unreadable — not evidence of anything
+  }
+  const args = cmdline.split("\0").slice(1);
+  const hasG = args.some((a) => a === "-g" || (/^-[a-z]*g[a-z]*$/.test(a) && a !== "--"));
+  const envG = /(^|\0)TINI_KILL_PROCESS_GROUP=(?!0*(\0|$))/.test(environ);
+  if (hasG || envG) {
+    groupSignalling.push(`pid=${name}${hasG ? " cmdline:-g" : ""}${envG ? " env:TINI_KILL_PROCESS_GROUP" : ""}`);
+  }
+}
+check(
+  "no init is configured to signal the process group (-g / TINI_KILL_PROCESS_GROUP)",
+  groupSignalling.length === 0,
+  groupSignalling.length === 0 ? "none found" : groupSignalling.join("; "),
+);
+
 console.log(
   failures === 0
-    ? `\nPASS — PID 1 is ${comm}, reaping confirmed by an orphan fixture, display process healthy.`
+    ? `\nPASS — PID 1 is ${comm}, reaping confirmed by an orphan fixture, display healthy, no group-signalling init.`
     : `\nFAIL — ${failures} check(s) failed.`,
 );
 process.exit(failures === 0 ? 0 : 1);

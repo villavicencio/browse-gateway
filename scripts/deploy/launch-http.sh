@@ -76,12 +76,21 @@ docker run -d --name "$CONTAINER" \
   "${env_args[@]}" \
   "$BGW_DEPLOY_IMAGE" node dist/mcp/http-main.js
 
-# Issue #131: assert the container actually came up with a reaping PID 1. Since piece 2 the image
-# bakes tini as its ENTRYPOINT, so this should always hold — but that is exactly the kind of
-# "should" that wedged production for 2.5 days, and this script can still deploy an OLDER image tag
-# that predates the change. Reads PID 1's identity from inside the container rather than trusting
-# HostConfig, because a --init flag and a baked entrypoint are two different mechanisms and only the
-# process table knows which (if either) took effect.
+# Issue #131: report what is actually reaping in this container.
+#
+# TWO SEPARATE CHECKS, because they answer different questions and one cannot substitute for the other:
+#
+#  1. PID 1's identity — what is reaping RIGHT NOW. Read from the process table, not from HostConfig,
+#     because `--init` and a baked ENTRYPOINT are different mechanisms and only /proc knows which took
+#     effect.
+#  2. Whether the IMAGE carries tini. `--init` is hard-coded on the docker run above, so /proc/1/comm
+#     is always `docker-init` on this path and check 1 CANNOT see a missing tini — it would print the
+#     happy line for an image with no init baked in at all. This script can still deploy an older
+#     image tag that predates piece 2, and the defense-in-depth layer silently disappearing is exactly
+#     what check 2 exists to notice.
+#
+# Both WARN rather than fail: while `--init` is on the run command above, reaping still works even with
+# no tini in the image, so a missing tini is a lost safety layer, not an outage.
 sleep 1
 pid1="$(docker exec "$CONTAINER" cat /proc/1/comm 2>/dev/null | tr -d '\n' || true)"
 case "$pid1" in
@@ -98,3 +107,11 @@ case "$pid1" in
     echo "launch-http:   See issue #131. Expect tini (baked into the image) or docker-init (--init)." >&2
     ;;
 esac
+
+if docker exec "$CONTAINER" test -x /usr/bin/tini 2>/dev/null; then
+  echo "launch-http: image carries /usr/bin/tini — reaping survives a run without --init"
+else
+  echo "launch-http: WARNING this image has no /usr/bin/tini — it predates issue #131 piece 2." >&2
+  echo "launch-http:   Reaping currently depends ENTIRELY on the --init flag on the docker run above." >&2
+  echo "launch-http:   Any other creation path (a hand-written docker run) will wedge the pool." >&2
+fi
