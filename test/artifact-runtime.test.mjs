@@ -10,9 +10,63 @@ function pdf(dir){const p=join(dir,"x.pdf");writeFileSync(p,Buffer.from("%PDF-1.
 
 test("lease is one-time and complete deletes the artifact", async()=>{const root=join(temp(),"a"), source=pdf(temp()), s=new ArtifactStore({enabled:true,root}); const id="B".repeat(22); await s.capture(source,{id,consumerId:"c"}); const l=s.acquire(id,"c"); assert.ok(l); assert.equal(s.acquire(id,"c"),null); assert.equal(l.base64,Buffer.from("%PDF-1.7\nhello").toString("base64")); l.complete(); l.complete(); assert.equal(s.acquire(id,"c"),null); s.close()});
 
-test("operation seals inline PDF as unsupported and records one valid download", async()=>{const root=join(temp(),"a"), source=pdf(temp()), r=new ArtifactRuntime({enabled:true,root}); const op=r.createOperation("owner","example.com","C".repeat(22)); op.noteMainResponseContentType(" application/pdf "); assert.deepEqual(op.seal(),{status:"unsupported-inline"}); const op2=r.createOperation("owner","example.com","D".repeat(22)); await op2.registerDownload({path:()=>source}); assert.equal(op2.seal().status,"available"); r.close()});
+test("inline PDF is rejected only for exact status 200 and no downloads",()=>{
+  const root = join(temp(), "a");
+  const r = new ArtifactRuntime({ enabled: true, root });
+  const op = r.createOperation("owner", "example.com", "C".repeat(22));
+  op.noteMainResponse(200, " Application/PDF ; charset=binary ");
+  assert.deepEqual(op.seal(), { outcome: "inline-pdf-unsupported", failure: "inline-pdf-unsupported" });
+  for (const status of [206, 404, null]) {
+    const candidate = r.createOperation("owner", "example.com", `${status === null ? "N" : status === 206 ? "P" : "Q"}`.repeat(22));
+    candidate.noteMainResponse(status, "application/pdf");
+    assert.equal(candidate.seal().outcome, "none");
+  }
+  r.close();
+});
 
-test("operation rejects multiple downloads", async()=>{const root=join(temp(),"a"), source=pdf(temp()), r=new ArtifactRuntime({enabled:true,root}); const op=r.createOperation("owner","example.com","E".repeat(22)); await op.registerDownload({path:()=>source}); await op.registerDownload({path:()=>source}); assert.equal(op.seal().status,"multiple-artifacts"); assert.deepEqual(readdirSync(join(root,"data")),[]); r.close()});
+test("operation exposes readonly contract identity and generated IDs are distinct",()=>{
+  const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a"), idGenerator: () => "G".repeat(22) });
+  const op = r.createOperation("owner", "example.com");
+  assert.equal(op.artifactId, "G".repeat(22));
+  assert.equal(op.sourceHost, "example.com");
+  assert.throws(() => new ArtifactRuntime({ enabled: true, root: join(temp(), "bad"), idGenerator: () => "bad" }).createOperation("c", "example.com"), /invalid-artifact-id/);
+  r.close();
+});
+
+test("second in-flight download terminalizes operation and late first capture cannot publish", async()=>{
+  const root = join(temp(), "a");
+  const source = pdf(temp());
+  const r = new ArtifactRuntime({ enabled: true, root });
+  let release;
+  const deferred = new Promise(resolve => { release = resolve; });
+  const op = r.createOperation("owner", "example.com", "E".repeat(22));
+  const first = op.registerDownload({ path: async () => { await deferred; return source; } });
+  const second = op.registerDownload({ path: () => source });
+  assert.deepEqual(await second, { outcome: "capture-failed", failure: "multiple-artifacts" });
+  release();
+  await first;
+  assert.deepEqual(op.seal(), { outcome: "capture-failed", failure: "multiple-artifacts" });
+  assert.deepEqual(readdirSync(join(root, "data")), []);
+  r.close();
+});
+
+test("invalidation and close win against an in-flight download", async()=>{
+  for (const action of ["invalidate", "close"]) {
+    const root = join(temp(), `a-${action}`);
+    const source = pdf(temp());
+    const r = new ArtifactRuntime({ enabled: true, root });
+    let release;
+    const deferred = new Promise(resolve => { release = resolve; });
+    const op = r.createOperation("owner", "example.com", `${action === "close" ? "H" : "I"}`.repeat(22));
+    const pending = op.registerDownload({ path: async () => { await deferred; return source; } });
+    const terminal = action === "close" ? (r.close(), op.invalidate()) : op.invalidate();
+    release();
+    await pending;
+    assert.deepEqual(terminal, { outcome: "capture-failed", failure: "capture-failed" });
+    assert.deepEqual(op.seal(), terminal);
+    assert.deepEqual(readdirSync(join(root, "data")), []);
+  }
+});
 
 test("closed store fails closed and does not write", async()=>{const root=join(temp(),"a"), source=pdf(temp()), s=new ArtifactStore({enabled:true,root}); s.close(); assert.equal((await s.capture(source,{id:"F".repeat(22),consumerId:"c"})).status,"capture-failed"); assert.equal(s.acquire("F".repeat(22),"c"),null);});
 

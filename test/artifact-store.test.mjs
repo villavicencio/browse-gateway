@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, statSync, writeFileSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, statSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactStore } from "../dist/artifacts/index.js";
@@ -36,5 +36,16 @@ test("source is copied once with strict PDF magic, size and sha256", async () =>
   assert.equal(result.bytes, 14);
   assert.match(result.sha256, /^[a-f0-9]{64}$/);
   assert.deepEqual(readdirSync(join(root, "data")), [`${"A".repeat(22)}.pdf`]);
+  store.close();
+});
+
+test("post-link directory fsync failure rolls back both artifact names", async () => {
+  const root = join(temp(), "artifacts");
+  const source = join(temp(), "source.pdf");
+  writeFileSync(source, Buffer.from("%PDF-1.7\nhello"));
+  const store = new ArtifactStore({ enabled: true, root, fsOps: { linkSync, unlinkSync, fsyncSync: () => { throw new Error("fsync sentinel"); } } });
+  const result = await store.capture(source, { id: "Z".repeat(22), consumerId: "owner" });
+  assert.deepEqual(result, { status: "capture-failed" });
+  assert.deepEqual(readdirSync(join(root, "data")), []);
   store.close();
 });
