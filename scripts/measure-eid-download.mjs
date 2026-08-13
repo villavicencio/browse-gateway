@@ -813,6 +813,17 @@ export async function observeWithin(promise, ms) {
   }
 }
 
+/**
+ * Establish the event-source barrier before snapshotting asynchronous download records.
+ * Exported so the exact teardown-window race has a regression test.
+ */
+export async function settleAfterTeardown(teardownPromises, snapshotDownloadPromises, timeoutMs) {
+  const teardownObserved = await observeWithin(Promise.all(teardownPromises), timeoutMs);
+  if (teardownObserved.status !== "fulfilled") return { status: "teardown-failed" };
+  const downloadObserved = await observeWithin(Promise.all(snapshotDownloadPromises()), timeoutMs);
+  return downloadObserved.status === "fulfilled" ? { status: "fulfilled" } : { status: "downloads-failed" };
+}
+
 const CLOSED_FAILURE_CLASSES = new Set([
   null,
   "anti-bot-block",
@@ -1047,18 +1058,18 @@ function createObserver(fault) {
       }));
     },
     /**
-     * The barrier attribution waits on: every queued teardown finished, then every download settled.
-     * Nothing is filed into a row before this resolves, which is what lets a late event still land
-     * in the correct row.
+     * Close every observed core first. Context closure is the event-source barrier: after all teardown
+     * promises resolve, no page can emit another download event. Only THEN snapshot and await the
+     * ledger. Constructing both Promise.all values before the first await reopens the race this method
+     * exists to close.
      */
     async settleAll() {
-      for (const promise of [
-        Promise.all(cores.map((c) => c.teardown.settled())),
-        Promise.all(records.filter((d) => d.settled).map((d) => d.settled)),
-      ]) {
-        const observed = await observeWithin(promise, DOWNLOAD_SETTLE_MS + 1_000);
-        if (observed.status !== "fulfilled") counters.settleErrors += 1;
-      }
+      const observed = await settleAfterTeardown(
+        cores.map((c) => c.teardown.settled()),
+        () => records.filter((d) => d.settled).map((d) => d.settled),
+        DOWNLOAD_SETTLE_MS + 1_000,
+      );
+      if (observed.status !== "fulfilled") counters.settleErrors += 1;
     },
   };
 }

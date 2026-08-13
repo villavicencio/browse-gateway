@@ -77,8 +77,11 @@ the behaviour: a "no download fired" row is a result, not a failure.
 
 ## Observed result
 
-> **Re-confirmed with the hardened harness after commit `b51f77a`.** The controller rebuilt the
-> container and repeated both the headful measurement and the deliberate mute-observer failure.
+> **Historical execution evidence for this barrier-corrected code tree.** On 2026-08-13 the
+> controller rebuilt the container and repeated both the headful measurement and the deliberate
+> mute-observer failure immediately before a documentation-only amend. The executable harness and
+> tests were unchanged by that amend. This tree defers the ledger snapshot until teardown has closed
+> every event source.
 
 The in-container headful-Chrome run reported **validity `valid`, hygiene `clean`**.
 

@@ -23,6 +23,7 @@ import {
   errorMarker,
   sanitizeFailure,
   observeWithin,
+  settleAfterTeardown,
   closedValue,
   downloadsForCase,
   attributeLedger,
@@ -426,6 +427,19 @@ test("observeWithin distinguishes success, rejection and timeout", async () => {
   assert.deepEqual(await observeWithin(Promise.resolve(7), 50), { status: "fulfilled", value: 7 });
   assert.deepEqual(await observeWithin(Promise.reject(new Error("secret /tmp/x")), 50), { status: "rejected", value: undefined });
   assert.deepEqual(await observeWithin(new Promise(() => {}), 10), { status: "timed-out", value: undefined });
+});
+
+test("settleAfterTeardown snapshots downloads only after teardown closes the event source", async () => {
+  const downloads = [];
+  let releaseTeardown;
+  const teardown = new Promise((resolve) => { releaseTeardown = resolve; });
+  const run = settleAfterTeardown([teardown], () => downloads.map((d) => d.settled), 100);
+  downloads.push({ settled: Promise.resolve("late-during-teardown") });
+  releaseTeardown();
+  assert.deepEqual(await run, { status: "fulfilled" });
+
+  const failed = await settleAfterTeardown([Promise.resolve()], () => [new Promise(() => {})], 10);
+  assert.deepEqual(failed, { status: "downloads-failed" });
 });
 
 test("runtime closed vocabularies reject malformed strings", () => {
