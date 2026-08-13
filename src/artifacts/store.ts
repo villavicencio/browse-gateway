@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { fstatSync, fsyncSync, mkdirSync, openSync, closeSync, readSync, writeSync, unlinkSync, linkSync, readdirSync, rmdirSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { ARTIFACT_ID, type ArtifactRecord, type ArtifactStoreOptions, type CaptureOptions, type ResponseLease } from "./types.js";
+import { ARTIFACT_ID, ArtifactStoreError, type ArtifactRecord, type ArtifactStoreOptions, type CaptureOptions, type ResponseLease } from "./types.js";
 
 const PDF_MAGIC = Buffer.from("%PDF-");
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
@@ -42,7 +42,8 @@ export class ArtifactStore {
   }
   async capture(source: string, options: CaptureOptions): Promise<ArtifactRecord | { status: "capture-failed" }> {
     this.reapExpired();
-    if (this.closed || !this.enabled || !ARTIFACT_ID.test(options.id)) return { status: "capture-failed" };
+    if (!ARTIFACT_ID.test(options.id)) throw new ArtifactStoreError("invalid-artifact-id");
+    if (this.closed || !this.enabled) return { status: "capture-failed" };
     if (this.records.has(options.id) || this.records.size >= this.maxCount || this.consumerCount(options.consumerId) >= this.perConsumerCount) return { status: "capture-failed" };
     let fd = -1; let part: string | undefined;
     try {
@@ -65,6 +66,7 @@ export class ArtifactStore {
     finally { if (fd >= 0) try { closeSync(fd); } catch {} if (part) try { unlinkSync(part); } catch {} }
   }
   acquire(id: string, consumerId: string): ResponseLease | null {
+    if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id");
     this.reapExpired(); if (this.closed) return null;
     const rec = this.records.get(id); if (!rec || rec.consumerId !== consumerId || rec.status !== "available") return null;
     const path = join(this.data, `${id}.pdf`); let fd = -1;
@@ -72,14 +74,14 @@ export class ArtifactStore {
       fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); const st = fstatSync(fd); if (st.size !== rec.bytes) throw new Error("integrity");
       const buf = Buffer.alloc(rec.bytes); let off = 0; while (off < buf.length) { const n = readSync(fd, buf, off, buf.length - off, off); if (n <= 0) throw new Error("short read"); off += n; }
       if (fstatSync(fd).size !== rec.bytes || createHash("sha256").update(buf).digest("hex") !== rec.sha256) throw new Error("integrity");
-      rec.status = "consuming"; const deadline = this.now() + 15_000; const timer = setTimeout(() => { if (rec.status === "consuming") this.discard(id); }, Math.max(0, deadline - Date.now())); this.timers.set(id, timer);
-      let done = false; return { record: rec, bytes: buf.length, base64: buf.toString("base64"), deadline, complete: () => { if (done) return; done = true; this.clearTimer(id); this.discard(id); } };
-    } catch { this.discard(id); return null; } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
+      rec.status = "consuming"; const deadline = this.now() + 15_000; const timer = setTimeout(() => { if (rec.status === "consuming") this.discardArtifact(id); }, Math.max(0, deadline - Date.now())); this.timers.set(id, timer);
+      let done = false; return { record: rec, bytes: buf.length, base64: buf.toString("base64"), deadline, complete: () => { if (done) return; done = true; this.clearTimer(id); this.discardArtifact(id); } };
+    } catch { this.discardArtifact(id); return null; } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
   }
-  discard(id: string) { this.clearTimer(id); this.records.delete(id); try { unlinkSync(join(this.data, `${id}.pdf`)); } catch {} try { unlinkSync(join(this.data, `${id}.part`)); } catch {} }
-  close() { if (this.closed || !this.enabled) return; this.closed = true; for (const id of Array.from(this.records.keys())) this.discard(id); for (const name of readdirSync(this.data)) if (/^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(name)) try { unlinkSync(join(this.data, name)); } catch {} try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} }
+  discardArtifact(id: string) { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.clearTimer(id); this.records.delete(id); try { unlinkSync(join(this.data, `${id}.pdf`)); } catch {} try { unlinkSync(join(this.data, `${id}.part`)); } catch {} }
+  close() { if (this.closed || !this.enabled) return; this.closed = true; for (const id of Array.from(this.records.keys())) this.discardArtifact(id); for (const name of readdirSync(this.data)) if (/^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(name)) try { unlinkSync(join(this.data, name)); } catch {} try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} }
   private clearTimer(id: string) { const t = this.timers.get(id); if (t) clearTimeout(t); this.timers.delete(id); }
-  private reapExpired() { for (const [id, rec] of Array.from(this.records.entries())) if (this.now() >= rec.expiresAt) this.discard(id); }
+  private reapExpired() { for (const [id, rec] of Array.from(this.records.entries())) if (this.now() >= rec.expiresAt) this.discardArtifact(id); }
   private consumerCount(c: string) { return Array.from(this.records.values()).filter(r => r.consumerId === c).length; }
   private consumerBytes(c: string) { return Array.from(this.records.values()).filter(r => r.consumerId === c).reduce((n, r) => n + r.bytes, 0); }
   private totalBytes() { return Array.from(this.records.values()).reduce((n, r) => n + r.bytes, 0); }
