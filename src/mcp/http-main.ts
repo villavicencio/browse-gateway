@@ -17,6 +17,7 @@ import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError, buildOperatorHealth } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
+import { describeInit } from "../gateway/init-identity.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
 
@@ -35,7 +36,70 @@ function splitCsv(value: string | undefined): string[] {
   return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+/** What `shutdown` needs once the runtime exists. Late-bound: the handlers are armed before it does. */
+interface ShutdownTarget {
+  httpServer: { close: () => unknown; closeAllConnections?: () => void };
+  handler: { drain: (ms: number) => Promise<void>; sessionCount: () => number };
+  closeAll: () => Promise<void>;
+  gateway: { shutdown: () => Promise<void>; sessions: { activeCount: number } };
+}
+
+/**
+ * Arm SIGINT/SIGTERM immediately and return the attach function for the runtime that does not exist
+ * yet (issue #131 piece 2, C7).
+ *
+ * These handlers used to be registered near the END of boot, after the runtime, the fail-closed boot
+ * guards and the reaper. That was survivable only by accident: with node as PID 1 the kernel discards
+ * default-disposition signals sent to init, so a SIGTERM arriving during the boot window did nothing
+ * and the container stayed up. Baking in a reaping PID 1 removes that accidental shield — the same
+ * signal now terminates the process immediately, exit 143, with `gateway.shutdown()` never called and
+ * any half-launched browser left behind. So the handlers move to the top, and the pre-runtime case
+ * exits deliberately and says why.
+ */
+function armShutdown(): (target: ShutdownTarget) => void {
+  let target: ShutdownTarget | undefined;
+  let shuttingDown = false;
+
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (!target) {
+      // Signalled inside the boot window. Nothing is listening and no browser has been handed out,
+      // so there is nothing to drain — but say so, or this reads as an unexplained exit 143.
+      log(`${signal} during boot, before the runtime existed — exiting; nothing to drain`);
+      process.exit(0);
+    }
+    // #129: the drain was entirely silent, so a swap could not be told apart from a crash after the
+    // fact. Name what is in flight, the budget, and the outcome.
+    const t0 = Date.now();
+    log(
+      `${signal} — draining: mcpSessions=${target.handler.sessionCount()} ` +
+        `browserSessions=${target.gateway.sessions.activeCount} budgetMs=${SHUTDOWN_DRAIN_MS}`,
+    );
+    target.httpServer.close(); // refuse new connections
+    await target.handler.drain(SHUTDOWN_DRAIN_MS); // let in-flight tool calls settle before force-closing
+    const waited = Date.now() - t0;
+    log(
+      `drain finished after ${waited}ms (${waited >= SHUTDOWN_DRAIN_MS ? "BUDGET EXHAUSTED — forcing" : "settled"}) ` +
+        `— mcpSessions=${target.handler.sessionCount()}`,
+    );
+    await target.closeAll().catch(() => {}); // close transports + dispose drive controllers
+    target.httpServer.closeAllConnections?.(); // drop lingering sockets (e.g. idle SSE) so close() completes
+    await target.gateway.shutdown().catch(() => {});
+    log(`shutdown complete after ${Date.now() - t0}ms`);
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  return (t) => {
+    target = t;
+  };
+}
+
 async function main(): Promise<void> {
+  // FIRST, before any boot guard that can throw or block: see armShutdown's note.
+  const attachShutdown = armShutdown();
   log(OBSCURA_BOOT_BANNER); // the brand on the experiential surface only — env/ports/tool names unchanged
   // Build the shared gateway runtime (config, secrets, vault, consumers, policy, gateway, escalation
   // posture) with every fail-closed boot guard. Identical construction is used by the on-host
@@ -122,19 +186,7 @@ async function main(): Promise<void> {
     });
   });
 
-  let shuttingDown = false;
-  const shutdown = async (): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    httpServer.close(); // refuse new connections
-    await handler.drain(SHUTDOWN_DRAIN_MS); // let in-flight tool calls settle before force-closing
-    await handler.closeAll().catch(() => {}); // close transports + dispose drive controllers
-    httpServer.closeAllConnections?.(); // drop any lingering sockets (e.g. idle SSE) so close() completes
-    await gateway.shutdown().catch(() => {});
-    process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  attachShutdown({ httpServer, handler, closeAll: () => handler.closeAll(), gateway });
 
   const port = Number(process.env.BGW_HTTP_PORT) || DEFAULT_PORT;
   const bind = process.env.BGW_HTTP_BIND || DEFAULT_BIND;
@@ -143,7 +195,8 @@ async function main(): Promise<void> {
       `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
         `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
         `sticky=${stickySuffix !== undefined} ` +
-        `dnsRebindProtection=${allowedHosts.length > 0 || allowedOrigins.length > 0}`,
+        `dnsRebindProtection=${allowedHosts.length > 0 || allowedOrigins.length > 0} ` +
+        `init=${describeInit()}`,
     );
   });
 }
