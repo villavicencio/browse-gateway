@@ -22,6 +22,8 @@ import {
   tempFileState,
   errorMarker,
   sanitizeFailure,
+  observeWithin,
+  closedValue,
   downloadsForCase,
   attributeLedger,
   finalizeRows,
@@ -324,6 +326,8 @@ const env = (over = {}) => ({
   statErrors: 0,
   accessorErrors: 0,
   settleErrors: 0,
+  cleanupErrors: [],
+  downloadCoreIds: [1],
   teardown: [{ coreId: 1, surface: "browser", beforeClose: "ok", afterClose: "ok", hookErrors: [], downloadCount: 1 }],
   ...over,
 });
@@ -380,7 +384,14 @@ test("measurementValidity goes RED on ANY unattributed download", () => {
   assert.ok(v.problems.some((p) => p.code === "unattributed-download"));
 });
 
-test("measurementValidity goes RED when teardown never completed for a core that saw downloads", () => {
+test("measurementValidity goes RED when teardown never completed or is missing for a core that saw downloads", () => {
+  const missingRecord = measurementValidity(healthyRows(), okFixture, env({
+    downloadCoreIds: [1, 2],
+    teardown: [{ coreId: 1, surface: "browser", beforeClose: "ok", afterClose: "ok", hookErrors: [], downloadCount: 1 }],
+  }));
+  assert.equal(missingRecord.valid, false);
+  assert.ok(missingRecord.problems.some((p) => p.code === "teardown-record-missing"));
+
   const incomplete = measurementValidity(healthyRows(), okFixture, env({
     teardown: [{ coreId: 1, surface: "browser", beforeClose: "ok", afterClose: "pending", hookErrors: [], downloadCount: 1 }],
   }));
@@ -409,6 +420,28 @@ test("measurementValidity goes RED when a stat, accessor or settle observation f
     assert.equal(v.valid, false, key);
     assert.ok(v.problems.some((p) => p.code === "observation-failed" && p.detail.includes(key)), key);
   }
+});
+
+test("observeWithin distinguishes success, rejection and timeout", async () => {
+  assert.deepEqual(await observeWithin(Promise.resolve(7), 50), { status: "fulfilled", value: 7 });
+  assert.deepEqual(await observeWithin(Promise.reject(new Error("secret /tmp/x")), 50), { status: "rejected", value: undefined });
+  assert.deepEqual(await observeWithin(new Promise(() => {}), 10), { status: "timed-out", value: undefined });
+});
+
+test("runtime closed vocabularies reject malformed strings", () => {
+  const allowed = new Set([null, "nav-failed"]);
+  assert.equal(closedValue("nav-failed", allowed), "nav-failed");
+  assert.equal(closedValue("http://host/a?secret=1", allowed), "unknown");
+});
+
+test("measurementValidity rejects incomplete lifecycle and cleanup failures", () => {
+  const incompleteRows = healthyRows();
+  incompleteRows[2].download = { eventCount: 1, tempFileBeforeClose: "unknown", tempFileAfterClose: "absent" };
+  const incomplete = measurementValidity(incompleteRows, okFixture, env());
+  assert.ok(incomplete.problems.some((p) => p.code === "lifecycle-incomplete"));
+
+  const cleanup = measurementValidity(healthyRows(), okFixture, env({ cleanupErrors: ["gateway-shutdown"] }));
+  assert.ok(cleanup.problems.some((p) => p.code === "cleanup-failed"));
 });
 
 test("measurementValidity REJECTS a headless run — the stack is only itself headful under Xvfb", () => {

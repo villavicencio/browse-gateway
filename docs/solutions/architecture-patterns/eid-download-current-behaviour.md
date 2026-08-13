@@ -77,11 +77,8 @@ the behaviour: a "no download fired" row is a result, not a failure.
 
 ## Observed result
 
-> **Taken with the pre-review harness (commit `a8b9394`).** The revised harness tightens validity
-> (measured rows, navigation evidence, unattributed downloads, teardown completion, headful) and
-> re-derives attribution from the ledger. The findings below are the readings that run produced;
-> treat them as **pending re-confirmation** until the in-container run is repeated on the current
-> harness.
+> **Re-confirmed with the hardened harness after commit `b51f77a`.** The controller rebuilt the
+> container and repeated both the headful measurement and the deliberate mute-observer failure.
 
 The in-container headful-Chrome run reported **validity `valid`, hygiene `clean`**.
 
@@ -106,8 +103,8 @@ A fault run — `BGW_EID_MEASURE_FAULT=mute-observer` on the `browser` surface, 
 the download listener — reported **validity `INVALID`** with **`positive-control-silent`** and
 **exited 1**. That is the arm that matters most here: the headline inline-PDF finding is a *quiet*
 row, and a deaf apparatus produces quiet rows for free. The finding is only readable because the
-instrument was watched failing to be quiet-by-accident. (That run was on the pre-review harness; the
-fault arms are re-run in-container against the current one.)
+instrument was watched failing to be quiet-by-accident. The fault was re-run against the hardened
+harness and again exited 1.
 
 The arms that cannot be reached by a fault mode are held RED by unit regressions in
 `test/eid-download-measure.test.mjs`, each verified to fail against the rejected implementation

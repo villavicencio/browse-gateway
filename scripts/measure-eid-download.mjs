@@ -408,6 +408,12 @@ export function measurementValidity(rows, fixture, env = {}) {
       if (row.navigationEvidence !== true) {
         problems.push({ code: "no-navigation-evidence", surface, detail: `${testCase.id} produced a row with no evidence the navigation was attempted` });
       }
+      if (
+        row.download?.eventCount > 0 &&
+        (row.download.tempFileBeforeClose === "unknown" || row.download.tempFileAfterClose === "unknown")
+      ) {
+        problems.push({ code: "lifecycle-incomplete", surface, detail: `${testCase.id} has a download without complete before/after-close observations` });
+      }
     }
     const pos = of(POSITIVE_CONTROL);
     const neg = of(NEGATIVE_CONTROL);
@@ -444,11 +450,21 @@ export function measurementValidity(rows, fixture, env = {}) {
       problems.push({ code: "observation-failed", detail: `${key}=${count ?? "unstated"} — an observation that threw cannot be reported as a reading` });
     }
   }
+  if (!Array.isArray(env.cleanupErrors) || env.cleanupErrors.length > 0) {
+    problems.push({ code: "cleanup-failed", detail: `cleanup failures=${Array.isArray(env.cleanupErrors) ? env.cleanupErrors.length : "unstated"}` });
+  }
 
   const teardown = Array.isArray(env.teardown) ? env.teardown : null;
-  if (!teardown) {
-    problems.push({ code: "teardown-incomplete", detail: "no teardown observations were reported" });
+  const downloadCoreIds = Array.isArray(env.downloadCoreIds) ? env.downloadCoreIds : null;
+  if (!teardown || !downloadCoreIds) {
+    problems.push({ code: "teardown-incomplete", detail: "teardown observations or download-core inventory were not reported" });
   } else {
+    const teardownIds = new Set(teardown.map((t) => t.coreId));
+    for (const coreId of downloadCoreIds) {
+      if (!teardownIds.has(coreId)) {
+        problems.push({ code: "teardown-record-missing", detail: "a core that observed downloads has no teardown record" });
+      }
+    }
     for (const t of teardown) {
       if (t.hookErrors?.length) {
         problems.push({ code: "teardown-hook-failed", surface: t.surface, detail: `a teardown hook threw (${t.hookErrors.map((h) => `${h.phase}:${h.name}`).join(", ")})` });
@@ -779,18 +795,45 @@ async function selfCheckFixture(base) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function withTimeout(promise, ms, fallback) {
+/** Observe an async operation without conflating success, rejection, and timeout. */
+export async function observeWithin(promise, ms) {
   let timer;
   try {
     return await Promise.race([
-      promise.catch(() => fallback),
-      new Promise((r) => {
-        timer = setTimeout(() => r(fallback), ms);
+      Promise.resolve(promise).then(
+        (value) => ({ status: "fulfilled", value }),
+        () => ({ status: "rejected", value: undefined }),
+      ),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ status: "timed-out", value: undefined }), ms);
       }),
     ]);
   } finally {
     clearTimeout(timer);
   }
+}
+
+const CLOSED_FAILURE_CLASSES = new Set([
+  null,
+  "anti-bot-block",
+  "captcha",
+  "hard-block",
+  "empty-shell",
+  "hydration-failed",
+  "real-zero-results",
+  "unsupported-browser",
+  "nav-failed",
+  "owner-host-mismatch",
+  "policy-blocked",
+  "burned-exit",
+  "timeout",
+  "ok",
+]);
+const CLOSED_BLOCK_REASONS = new Set([null, "anti-bot", "captcha", "hard-block", "nav-failed", "policy-blocked", "timeout"]);
+
+/** Runtime boundary for values TypeScript only proves statically. */
+export function closedValue(value, allowed) {
+  return allowed.has(value) ? value : "unknown";
 }
 
 /**
@@ -879,7 +922,11 @@ function createObserver(fault) {
     record.settled = (async () => {
       const call = async (fn, fallback) => {
         try {
-          return await withTimeout(Promise.resolve(fn()), DOWNLOAD_SETTLE_MS, fallback);
+          const observed = await observeWithin(Promise.resolve(fn()), DOWNLOAD_SETTLE_MS);
+          if (observed.status === "fulfilled") return observed.value;
+          record.settleError = true;
+          counters.settleErrors += 1;
+          return fallback;
         } catch {
           record.settleError = true;
           counters.settleErrors += 1;
@@ -974,11 +1021,11 @@ function createObserver(fault) {
       context.on("page", wirePage);
       const teardown = wrapCoreTeardown(core, {
         beforeClose: async () => {
-          await withTimeout(
+          const observed = await observeWithin(
             Promise.all(records.filter((d) => d.coreId === coreId && d.settled).map((d) => d.settled)),
             DOWNLOAD_SETTLE_MS + 1_000,
-            undefined,
           );
+          if (observed.status !== "fulfilled") throw new Error("download settle barrier failed");
           statSide("before", coreId);
         },
         afterClose: async () => {
@@ -1005,8 +1052,13 @@ function createObserver(fault) {
      * in the correct row.
      */
     async settleAll() {
-      await withTimeout(Promise.all(cores.map((c) => c.teardown.settled())), DOWNLOAD_SETTLE_MS + 1_000, undefined);
-      await withTimeout(Promise.all(records.filter((d) => d.settled).map((d) => d.settled)), DOWNLOAD_SETTLE_MS + 1_000, undefined);
+      for (const promise of [
+        Promise.all(cores.map((c) => c.teardown.settled())),
+        Promise.all(records.filter((d) => d.settled).map((d) => d.settled)),
+      ]) {
+        const observed = await observeWithin(promise, DOWNLOAD_SETTLE_MS + 1_000);
+        if (observed.status !== "fulfilled") counters.settleErrors += 1;
+      }
     },
   };
 }
@@ -1052,7 +1104,7 @@ function navFromError(err) {
     status: null,
     errorName: sanitized.name,
     errorMarker: sanitized.marker,
-    failureClass: failureOf(err)?.failureClass ?? null,
+    failureClass: closedValue(failureOf(err)?.failureClass ?? null, CLOSED_FAILURE_CLASSES),
   };
 }
 
@@ -1119,12 +1171,11 @@ async function runRetrieveSurface({ base, gateway, secrets, audit, observer, row
         outcome: "returned",
         status: r.status,
         blocked: r.blocked,
-        // `reason` and `failureClass` are CLOSED vocabularies (the type is the safety property —
-        // neither can be page-derived free text), so both are safe to carry verbatim.
-        blockReason: r.reason,
+        // Runtime-normalized closed vocabularies: malformed values collapse to `unknown`.
+        blockReason: closedValue(r.reason ?? null, CLOSED_BLOCK_REASONS),
         degraded: r.degraded,
         markdownLength: r.markdown.length,
-        failureClass: r.diagnostics?.failureClass ?? null,
+        failureClass: closedValue(r.diagnostics?.failureClass ?? null, CLOSED_FAILURE_CLASSES),
       };
     } catch (err) {
       nav = navFromError(err);
@@ -1252,6 +1303,7 @@ export async function main() {
   });
   const secrets = new SecretStore(() => ({})); // no proxy/solver material: direct sessions only
   const gateway = Gateway.create(config, async (opts) => observer.observe(await createBrowserCore(opts)), policy);
+  const cleanupErrors = [];
 
   try {
     fixture = await selfCheckFixture(base);
@@ -1268,11 +1320,16 @@ export async function main() {
       emit("  (browsers not launched — a drifted fixture cannot produce a meaningful reading)");
     }
   } finally {
-    await gateway.shutdown().catch(() => {});
+    const shutdown = await observeWithin(gateway.shutdown(), DOWNLOAD_SETTLE_MS + 1_000);
+    if (shutdown.status !== "fulfilled") cleanupErrors.push("gateway-shutdown");
     // Only now is every session closed, so this is the barrier: teardown hooks finished, downloads
     // settled. Attribution happens strictly after it.
     await observer.settleAll();
-    await new Promise((r) => server.close(r));
+    const fixtureClose = await observeWithin(
+      new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
+      FIXTURE_REQUEST_TIMEOUT_MS,
+    );
+    if (fixtureClose.status !== "fulfilled") cleanupErrors.push("fixture-close");
   }
 
   const attribution = finalizeRows(rows, observer.records, fault);
@@ -1286,6 +1343,8 @@ export async function main() {
     accessorErrors: observer.accessorErrors,
     settleErrors: observer.settleErrors,
     teardown,
+    downloadCoreIds: [...new Set(observer.records.map((record) => record.coreId))],
+    cleanupErrors,
   });
   const report = {
     meta: {
@@ -1309,6 +1368,7 @@ export async function main() {
       settleErrors: observer.settleErrors,
     },
     teardown,
+    cleanupErrors,
     validity,
   };
 
