@@ -124,9 +124,24 @@ for (const name of readdirSync("/proc")) {
   } catch {
     continue; // raced exit / unreadable — not evidence of anything
   }
-  const args = cmdline.split("\0").slice(1);
-  const hasG = args.some((a) => a === "-g" || (/^-[a-z]*g[a-z]*$/.test(a) && a !== "--"));
-  const envG = /(^|\0)TINI_KILL_PROCESS_GROUP=(?!0*(\0|$))/.test(environ);
+  // Only tini's OWN options count. Its option list ends at the first `--` or the first non-option
+  // argument; everything after that belongs to the child. Scanning past that boundary false-trips on a
+  // child's own flag — verified: `node scripts/validate-container-init.mjs -g` failed this leg while
+  // tini carried nothing but `-s`. A gate that cries wolf is a gate that gets disabled.
+  const argv = cmdline.split("\0").slice(1).filter((a) => a.length > 0);
+  const ownArgs = [];
+  for (const a of argv) {
+    if (a === "--" || !a.startsWith("-")) break;
+    ownArgs.push(a);
+  }
+  const hasG = ownArgs.some((a) => /^-[a-z]+$/.test(a) && a.includes("g")); // -g, and bundles like -sg
+
+  // PRESENCE, not truthiness. `tini -h` documents TINI_VERBOSITY as taking a value ("default: 1") and
+  // TINI_KILL_PROCESS_GROUP as taking none — it is a presence flag (tini tests getenv() != NULL), so
+  // `TINI_KILL_PROCESS_GROUP=0` ENABLES group signalling rather than disabling it. Treating `=0` as
+  // safe would be a false negative in a safety guard, which is the dangerous direction; an earlier
+  // draft of this check did exactly that.
+  const envG = /(^|\0)TINI_KILL_PROCESS_GROUP=/.test(environ);
   if (hasG || envG) {
     groupSignalling.push(`pid=${name}${hasG ? " cmdline:-g" : ""}${envG ? " env:TINI_KILL_PROCESS_GROUP" : ""}`);
   }
