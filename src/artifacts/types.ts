@@ -8,7 +8,7 @@ export type ArtifactFailure = ArtifactFailureCode;
 export type ArtifactStoreErrorCode = "invalid-artifact-id" | "artifact-store-unavailable" | ArtifactFailureCode;
 export class ArtifactStoreError extends Error { readonly code: ArtifactStoreErrorCode; constructor(code: ArtifactStoreErrorCode) { super(code); this.name = "ArtifactStoreError"; this.code = code; } }
 export interface ArtifactRecord { id: string; consumerId: string; bytes: number; sha256: string; createdAt: number; expiresAt: number; status: "available" | "consuming"; }
-export interface ArtifactStoreOptions { enabled?: boolean; root: string; ttlMs?: number; maxBytes?: number; maxCount?: number; perConsumerBytes?: number; perConsumerCount?: number; now?: () => number; idGenerator?: () => string; fsOps?: FsOps; }
+export interface ArtifactStoreOptions { enabled?: boolean; root: string; ttlMs?: number; maxBytes?: number; maxCount?: number; perConsumerBytes?: number; perConsumerCount?: number; now?: () => number; idGenerator?: () => string; fsOps?: FsOps; onDiscard?: (id: string) => void; }
 export interface FsOps { linkSync: typeof import("node:fs").linkSync; unlinkSync: typeof import("node:fs").unlinkSync; fsyncSync: typeof import("node:fs").fsyncSync; }
 export interface CaptureOptions { id: string; consumerId: string; ttlMs?: number; }
 export type CaptureResult = ArtifactRecord | { status: "capture-failed"; failure: ArtifactFailureCode };

@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, statSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, statSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactStore } from "../dist/artifacts/index.js";
@@ -23,6 +23,19 @@ test("enabled store creates private root/data and exclusive lock", () => {
   assert.equal(statSync(root).mode & 0o777, 0o700);
   assert.equal(statSync(join(root, "data")).mode & 0o777, 0o700);
   assert.equal(statSync(join(root, ".gateway-lock")).isDirectory(), true);
+  store.close();
+});
+
+test("recoverable boot validation failure rolls back this boot's lock", () => {
+  const root = join(temp(), "artifacts");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  mkdirSync(join(root, "data"), { mode: 0o700 });
+  writeFileSync(join(root, "data", "unexpected"), "x");
+  assert.throws(() => new ArtifactStore({ enabled: true, root }), e => e.code === "artifact-root-invalid");
+  assert.equal(existsSync(join(root, ".gateway-lock")), false);
+  unlinkSync(join(root, "data", "unexpected"));
+  const store = new ArtifactStore({ enabled: true, root });
+  assert.equal(existsSync(join(root, ".gateway-lock")), true);
   store.close();
 });
 
