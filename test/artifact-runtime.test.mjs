@@ -86,7 +86,9 @@ test("invalidation and close win against an in-flight download", async()=>{
     await pending;
     assert.deepEqual(terminal, { outcome: "capture-failed", failure: "artifact-runtime-invalidated" });
     assert.deepEqual(op.seal(), terminal);
-    assert.deepEqual(readdirSync(join(root, "data")), []);
+    // A closed runtime removes the emptied data directory; an invalidated one keeps it, empty.
+    if (action === "close") assert.equal(existsSync(join(root, "data")), false);
+    else assert.deepEqual(readdirSync(join(root, "data")), []);
   }
 });
 

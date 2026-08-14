@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, statSync, readFileSync, symlinkSync, chmodSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync, rmdirSync, renameSync } from "node:fs";
+import { mkdtempSync, mkdirSync, statSync, lstatSync, fstatSync, readFileSync, symlinkSync, chmodSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync, rmdirSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactStore } from "../dist/artifacts/index.js";
@@ -18,6 +18,10 @@ function stagingGate() { let arm = true, release; const held = new Promise((reso
 // A staging capture shrinks to its exact size as soon as the source is stat'd, so proving that
 // uncommitted bytes block admission needs a source big enough to matter against the cap.
 function bigSource(bytes) { const path = join(temp(), "big.pdf"); writeFileSync(path, Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(bytes - 9)])); return path; }
+const LOCK = ".gateway-lock", OWNER = "owner.json";
+const ownerPath = (root) => join(root, LOCK, OWNER);
+// The one scheduler owns process-start too, so a test supplies it exactly rather than racing a clock.
+const PROCESS_START = 1_732_000_000_123;
 
 // Deterministic scheduler: virtual time only, every registration retained so a test can fire a
 // cancelled or post-close callback by hand and prove it is inert.
@@ -26,6 +30,7 @@ function fakeScheduler(start = 1_000_000) {
   const registrations = [], cleared = [], live = new Map();
   return {
     now: () => time,
+    processStartedAt: () => PROCESS_START,
     setTimeout(callback, delayMs) { const registration = { handle: next++, callback, delayMs, dueAt: time + delayMs }; registrations.push(registration); live.set(registration.handle, registration); return registration.handle; },
     clearTimeout(handle) { cleared.push(handle); live.delete(handle); },
     registrations, cleared,
@@ -177,7 +182,7 @@ test("clean post-link close invalidates capture and removes lock", async () => {
   const root = join(temp(), "artifacts"), source = join(temp(), "source.pdf"), id = "M".repeat(22);
   writeFileSync(source, Buffer.from("%PDF-1.7\nhello")); let release; const paused = new Promise(r => { release = r; }); let reached; const seam = new Promise(r => { reached = r; });
   const store = new ArtifactStore({ root, afterLinkBeforeCommit: async () => { reached(); await paused; } }); const capture = store.capture(source, { id, consumerId: "owner" }); await seam; const closing = store.close(); release();
-  assert.deepEqual(await capture, { status: "capture-failed", failure: "artifact-runtime-invalidated" }); assert.equal(await closing, undefined); assert.deepEqual(readdirSync(join(root, "data")), []); assert.equal(existsSync(join(root, ".gateway-lock")), false);
+  assert.deepEqual(await capture, { status: "capture-failed", failure: "artifact-runtime-invalidated" }); assert.equal(await closing, undefined); assert.equal(existsSync(join(root, "data")), false, "a clean close removes the emptied data directory"); assert.equal(existsSync(join(root, ".gateway-lock")), false);
 });
 
 test("close resolves cleanup failure when data readdir fails", async () => {
@@ -723,6 +728,9 @@ test("a public discard after a clean close performs no mutation at all", async (
   const store = new ArtifactStore({ root, onDiscard: () => { discards++; }, fsOps: { linkSync, unlinkSync(path) { unlinks++; return unlinkSync(path); }, fsyncSync(fd) { fsyncs++; return fsyncSync(fd); } } });
   assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
   assert.equal(await store.close(), undefined);
+  // The clean close removed `data`, so this is a directory the store never owned at all — an even
+  // clearer thing for a disposed store to keep its hands off.
+  mkdirSync(join(root, "data"), { mode: 0o700 });
   const sentinel = join(root, "data", `${stray}.pdf`);
   writeFileSync(sentinel, "sentinel bytes"); chmodSync(sentinel, 0o600);
   const before = { unlinks, fsyncs, discards };
@@ -754,7 +762,7 @@ test("a public discard is refused from the moment close begins", async () => {
   // Close's own identity-bound cleanup still sweeps strict artifact files it owns — that path is
   // private and is exactly what the public refusal above does not do.
   assert.equal(existsSync(sentinel), false);
-  assert.deepEqual(readdirSync(join(root, "data")), []);
+  assert.equal(existsSync(join(root, "data")), false, "and the emptied data directory goes with it");
   assert.equal(existsSync(join(root, ".gateway-lock")), false);
 });
 
@@ -769,4 +777,294 @@ test("close closes both retained descriptors exactly once", async () => {
   assert.equal(await store.close(), undefined);
   assert.equal(closes, 2, "a repeated close performs no second descriptor close");
   assert.equal(existsSync(join(root, ".gateway-lock")), false);
+});
+
+test("lock diagnostic metadata is private and carries only closed operator fields", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "A".repeat(22), clock = fakeScheduler();
+  const store = new ArtifactStore({ root, scheduler: clock });
+  const meta = ownerPath(root), entry = lstatSync(meta);
+  assert.equal(entry.isSymbolicLink(), false, "the diagnostic entry is not a symlink");
+  assert.equal(entry.isFile(), true, "the diagnostic entry is one regular file");
+  assert.equal(entry.nlink, 1, "and is not a hard link to anything else");
+  assert.equal(entry.mode & 0o777, 0o600, "diagnostic metadata must be strictly private");
+  assert.equal(entry.uid, process.getuid(), "and owned by this process");
+  const raw = readFileSync(meta, "utf8"), parsed = JSON.parse(raw);
+  assert.deepEqual(Object.keys(parsed).sort(), ["nonce", "pid", "startedAt", "version"], "exactly the closed field set");
+  assert.equal(parsed.version, 1);
+  assert.equal(parsed.pid, process.pid);
+  assert.equal(typeof parsed.nonce, "string");
+  assert.ok(parsed.nonce.length >= 22, "the ownership nonce is opaque and long");
+  // startedAt comes from the one scheduler's process-start accessor, so it is exact: a constructor
+  // clock read would produce the scheduler's current time instead, which is a different value.
+  assert.equal(parsed.startedAt, PROCESS_START, "startedAt must be the scheduler's process-start value");
+  assert.notEqual(parsed.startedAt, clock.now(), "and must not be the moment this store took the lock");
+  assert.equal((await store.capture(pdf, { id, consumerId: "secret-consumer" })).status, "available");
+  assert.equal(readFileSync(meta, "utf8"), raw, "artifact work never writes into the diagnostic");
+  for (const secret of [root, "secret-consumer", id, pdf, "%PDF"]) assert.equal(raw.includes(secret), false, "no root path, consumer, artifact ID, token or browser data appears in the diagnostic");
+  assert.deepEqual(readdirSync(join(root, LOCK)), [OWNER], "the lock holds exactly one diagnostic file");
+  await store.close();
+});
+
+test("a second store refuses a pre-existing lock and leaves its metadata and data untouched", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "B".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: fakeScheduler() });
+  assert.equal((await store.capture(pdf, { id, consumerId: "first" })).status, "available");
+  const meta = ownerPath(root), artifact = join(root, "data", `${id}.pdf`);
+  const metaBefore = readFileSync(meta), metaStat = lstatSync(meta);
+  const artifactBefore = readFileSync(artifact), artifactStat = lstatSync(artifact);
+  // The lock is refused on the name alone: the loser never reads it to decide liveness, never
+  // rewrites it as its own, and never touches the winner's artifacts.
+  assert.throws(() => new ArtifactStore({ root, scheduler: fakeScheduler() }), e => e.code === "artifact-root-locked");
+  assert.deepEqual(readFileSync(meta), metaBefore, "the holder's diagnostic is byte-for-byte unchanged");
+  const metaAfter = lstatSync(meta);
+  assert.equal(metaAfter.ino, metaStat.ino, "and is the same file, not a replacement");
+  assert.equal(metaAfter.mtimeMs, metaStat.mtimeMs, "and was never rewritten");
+  assert.equal(metaAfter.mode & 0o777, 0o600);
+  assert.deepEqual(readFileSync(artifact), artifactBefore, "committed artifact bytes are untouched");
+  assert.equal(lstatSync(artifact).ino, artifactStat.ino);
+  assert.equal(lstatSync(artifact).mtimeMs, artifactStat.mtimeMs);
+  assert.deepEqual(readdirSync(root).sort(), [LOCK, "data"], "the refusal adds nothing to the root");
+  assert.deepEqual(readdirSync(join(root, LOCK)), [OWNER], "and nothing to the lock");
+  assert.deepEqual(readdirSync(join(root, "data")), [`${id}.pdf`]);
+  // The holder is undisturbed: it still owns the lock and still completes its own lifecycle.
+  assert.equal(await store.close(), undefined);
+  assert.equal(existsSync(join(root, LOCK)), false);
+});
+
+test("a replaced lock directory prevents removal and is never touched", async () => {
+  const root = join(temp(), "artifacts"), impostor = join(root, LOCK);
+  const store = new ArtifactStore({ root, scheduler: fakeScheduler() });
+  const mine = readFileSync(ownerPath(root));
+  // Same name, same mode, same diagnostic bytes — a different directory. Only the retained
+  // device/inode can tell them apart, and content equality must not be mistaken for ownership.
+  renameSync(impostor, join(root, "stashed"));
+  mkdirSync(impostor, { mode: 0o700 });
+  writeFileSync(ownerPath(root), mine, { mode: 0o600 });
+  const swapped = lstatSync(impostor), swappedOwner = lstatSync(ownerPath(root));
+  assert.equal(await store.close(), "artifact-cleanup-failed", "a lock this store cannot claim is never removed");
+  assert.equal(existsSync(impostor), true, "the impostor lock survives");
+  assert.equal(lstatSync(impostor).ino, swapped.ino, "and is the same directory, not a recreated one");
+  assert.deepEqual(readdirSync(impostor), [OWNER], "its contents are untouched");
+  assert.deepEqual(readFileSync(ownerPath(root)), mine);
+  assert.equal(lstatSync(ownerPath(root)).ino, swappedOwner.ino, "its diagnostic was never unlinked");
+  assert.deepEqual(readdirSync(join(root, "stashed")), [OWNER], "and the store's own stashed lock is not hunted down");
+  assert.equal((await store.capture(source(), { id: "C".repeat(22), consumerId: "after" })).failure, "artifact-runtime-invalidated");
+});
+
+// Each variant leaves a plausible diagnostic in place. The first three replace the entry, so the
+// retained identity must catch them; the rest keep the original inode, mode and owner, so only
+// reading the content against this boot's own expected values can. The last three are valid JSON of
+// the right shape — a diagnostic is owned by what it says, not merely by parsing.
+const TAMPERS = [
+  ["a symlink", (root, victim) => { unlinkSync(ownerPath(root)); symlinkSync(victim, ownerPath(root)); }],
+  ["a hard link", (root, victim) => { unlinkSync(ownerPath(root)); linkSync(victim, ownerPath(root)); }],
+  ["a directory", (root) => { unlinkSync(ownerPath(root)); mkdirSync(ownerPath(root), { mode: 0o600 }); }],
+  ["a world-readable mode", (root) => chmodSync(ownerPath(root), 0o644)],
+  ["malformed content", (root) => writeFileSync(ownerPath(root), "not json at all")],
+  ["a foreign nonce", (root) => { const meta = JSON.parse(readFileSync(ownerPath(root), "utf8")); writeFileSync(ownerPath(root), JSON.stringify({ ...meta, nonce: "Z".repeat(meta.nonce.length) })); }],
+  ["a rewritten process start", (root) => { const meta = JSON.parse(readFileSync(ownerPath(root), "utf8")); writeFileSync(ownerPath(root), JSON.stringify({ ...meta, startedAt: meta.startedAt + 1 })); }],
+  ["an unexpected extra field", (root) => { const meta = JSON.parse(readFileSync(ownerPath(root), "utf8")); writeFileSync(ownerPath(root), JSON.stringify({ ...meta, operator: "note" })); }],
+];
+
+test("a tampered diagnostic prevents lock removal and never touches its target", async () => {
+  // One accumulated report rather than per-variant assertions: a variant that stops failing is as
+  // interesting as one that starts, and both must be visible in the same run.
+  const observed = [];
+  for (const [what, tamper] of TAMPERS) {
+    const root = join(temp(), "artifacts"), victim = join(temp(), "victim");
+    writeFileSync(victim, "keep");
+    const store = new ArtifactStore({ root, scheduler: fakeScheduler() });
+    tamper(root, victim);
+    const entry = lstatSync(ownerPath(root));
+    const result = await store.close();
+    const survives = existsSync(join(root, LOCK)) && lstatSync(ownerPath(root)).ino === entry.ino;
+    observed.push(`${what}: ${result} lock-intact=${survives} victim=${readFileSync(victim, "utf8")}`);
+  }
+  assert.deepEqual(observed, TAMPERS.map(([what]) => `${what}: artifact-cleanup-failed lock-intact=true victim=keep`));
+});
+
+test("a non-empty data directory blocks removal, retains the lock and reports cleanup failure", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "D".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: fakeScheduler() });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  // An entry this store did not create. It is never deleted, and it is the reason data cannot go.
+  const stray = join(root, "data", "not-an-artifact");
+  writeFileSync(stray, "keep");
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(readFileSync(stray, "utf8"), "keep", "close deletes only the strict artifact files it owns");
+  assert.deepEqual(readdirSync(join(root, "data")), ["not-an-artifact"], "its own artifact is still swept, and nothing else is");
+  assert.equal(existsSync(join(root, LOCK)), true, "a data directory that cannot go retains the lock");
+  assert.deepEqual(readdirSync(join(root, LOCK)), [OWNER], "with its diagnostic intact");
+  // Retention is not cosmetic: the root stays locked against a fresh store.
+  assert.throws(() => new ArtifactStore({ root }), e => e.code === "artifact-root-locked");
+});
+
+test("a clean close tears down in order and leaves a private empty root", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "E".repeat(22), steps = [];
+  const store = new ArtifactStore({ root, scheduler: fakeScheduler(), onCloseStep: (step) => steps.push(step) });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  assert.equal(await store.close(), undefined);
+  // The order is the contract, not an implementation detail: data cannot go before its descriptor is
+  // closed, the lock cannot go before the data it guards, and the root fsync must cover every removal.
+  assert.deepEqual(steps, ["delete-files", "fsync-data", "close-data-fd", "remove-data", "remove-diagnostic", "remove-lock", "fsync-root", "close-root-fd"]);
+  assert.deepEqual(readdirSync(root), [], "a clean close leaves the root empty");
+  const left = lstatSync(root);
+  assert.equal(left.isDirectory(), true, "the root itself survives");
+  assert.equal(left.mode & 0o777, 0o700, "and is still private");
+  assert.equal(left.uid, process.getuid());
+});
+
+// Every removal and fsync step of a clean close. `close-root-fd` is deliberately absent: it is a
+// descriptor close after the last durability point, not a removal or an fsync, and failing it cannot
+// leave the tree in a different state.
+const CLOSE_FAULTS = ["delete-files", "fsync-data", "close-data-fd", "remove-data", "remove-diagnostic", "remove-lock", "fsync-root"];
+
+test("a failure at any removal or fsync step fails the close and never leaves the root unlocked", async () => {
+  const observed = [];
+  for (const failAt of CLOSE_FAULTS) {
+    const root = join(temp(), "artifacts"), pdf = source(), id = "F".repeat(22);
+    const store = new ArtifactStore({ root, scheduler: fakeScheduler(), closeStepFails: (step) => step === failAt });
+    assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+    const result = await store.close();
+    // Sampled before the probe below, which would create a lock of its own if the root were free.
+    const locked = existsSync(join(root, LOCK));
+    // A later success must not mask this failure, and the root must not be left claimable.
+    let refused = false;
+    try { new ArtifactStore({ root, scheduler: fakeScheduler() }); } catch (e) { refused = e.code === "artifact-root-locked"; }
+    observed.push(`${failAt}: ${result} locked=${locked} refused=${refused}`);
+  }
+  assert.deepEqual(observed, CLOSE_FAULTS.map((step) => `${step}: artifact-cleanup-failed locked=true refused=true`));
+});
+
+test("a failed final root fsync restores a lock it can prove, and never adopts one it cannot", async () => {
+  // The final fsync covers removals that already completed, so it cannot retain an already-removed
+  // lock. It recreates one instead, bound to this boot.
+  const root = join(temp(), "artifacts");
+  const store = new ArtifactStore({ root, scheduler: fakeScheduler(), closeStepFails: (step) => step === "fsync-root" });
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  const restored = lstatSync(ownerPath(root));
+  assert.equal(restored.isFile(), true); assert.equal(restored.nlink, 1); assert.equal(restored.mode & 0o777, 0o600);
+  const meta = JSON.parse(readFileSync(ownerPath(root), "utf8"));
+  assert.deepEqual(Object.keys(meta).sort(), ["nonce", "pid", "startedAt", "version"], "the restored diagnostic is the same closed field set");
+  assert.equal(meta.pid, process.pid); assert.equal(meta.startedAt, PROCESS_START);
+  assert.equal(existsSync(join(root, "data")), false, "restoring a lock does not resurrect removed data");
+
+  // If another process won the freed name first, the compensation must not read, alter or remove it.
+  const other = join(temp(), "artifacts"), foreign = ownerPath(other);
+  let taken;
+  const loser = new ArtifactStore({
+    root: other, scheduler: fakeScheduler(), closeStepFails: (step) => step === "fsync-root",
+    onCloseStep: (step) => { if (step === "remove-lock") { mkdirSync(join(other, LOCK), { mode: 0o700 }); writeFileSync(foreign, "foreign", { mode: 0o600 }); taken = { lock: lstatSync(join(other, LOCK)).ino, owner: lstatSync(foreign).ino }; } },
+  });
+  assert.equal(await loser.close(), "artifact-cleanup-failed");
+  assert.equal(readFileSync(foreign, "utf8"), "foreign", "a lock this store does not own is left exactly as found");
+  // Inodes, not just bytes: a compensation that recreated the directory or the diagnostic would
+  // leave identical-looking content behind a different file.
+  assert.equal(lstatSync(join(other, LOCK)).ino, taken.lock, "the winner's lock directory is the one still standing");
+  assert.equal(lstatSync(foreign).ino, taken.owner, "and its diagnostic was never replaced");
+  assert.deepEqual(readdirSync(join(other, LOCK)), [OWNER]);
+});
+
+test("constructor rollback removes only the lock it created, and never once cleanup mutation has begun", async () => {
+  // The lock is swapped underneath a failing constructor. Rollback must remove the lock this boot
+  // created, not whatever happens to be standing at that name.
+  const root = join(temp(), "artifacts"), lock = join(root, LOCK), stash = join(root, "stashed");
+  let swapped;
+  assert.throws(() => new ArtifactStore({ root, afterRootDescriptor: () => {
+    renameSync(lock, stash); mkdirSync(lock, { mode: 0o700 }); writeFileSync(ownerPath(root), "foreign", { mode: 0o600 });
+    swapped = { lock: lstatSync(lock).ino, owner: lstatSync(ownerPath(root)).ino };
+    rmdirSync(join(root, "data"));
+  } }), e => e.code === "artifact-root-invalid");
+  assert.equal(existsSync(lock), true, "a lock this constructor did not create survives its rollback");
+  assert.equal(lstatSync(lock).ino, swapped.lock, "and is the same directory, untouched");
+  assert.equal(readFileSync(ownerPath(root), "utf8"), "foreign", "its diagnostic is neither read nor removed");
+  assert.equal(lstatSync(ownerPath(root)).ino, swapped.owner);
+  assert.deepEqual(readdirSync(stash), [OWNER], "and this boot's own displaced lock is not hunted down either");
+
+  // Rollback belongs strictly to the pre-mutation window: once startup cleanup has begun deleting
+  // artifact files, a failure is a cleanup failure that retains the lock and its diagnostic.
+  const second = join(temp(), "artifacts"), id = "G".repeat(22);
+  mkdirSync(join(second, "data"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(second, "data", `${id}.pdf`), Buffer.from("%PDF-1.7\nx"), { mode: 0o600 });
+  chmodSync(join(second, "data", `${id}.pdf`), 0o600);
+  assert.throws(() => new ArtifactStore({ root: second, fsOps: { linkSync, fsyncSync, unlinkSync() { throw new Error("/private/sentinel"); } } }), e => e.code === "artifact-cleanup-failed" && !String(e).includes("sentinel"));
+  assert.equal(existsSync(join(second, LOCK)), true, "a mutating constructor keeps its lock rather than rolling back");
+  const kept = JSON.parse(readFileSync(ownerPath(second), "utf8"));
+  assert.deepEqual(Object.keys(kept).sort(), ["nonce", "pid", "startedAt", "version"], "with its diagnostic intact");
+  assert.equal(lstatSync(ownerPath(second)).mode & 0o777, 0o600);
+});
+
+test("no public error or result exposes the configured path, PID, process start, nonce or lock contents", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), notPdf = join(temp(), "x.pdf"), fileRoot = join(temp(), "file-root");
+  writeFileSync(notPdf, "not a pdf at all"); writeFileSync(fileRoot, "occupied");
+  const store = new ArtifactStore({ root, scheduler: fakeScheduler() });
+  const raw = readFileSync(ownerPath(root), "utf8"), secret = JSON.parse(raw);
+  // Two haystacks: everything a caller can read, and the same minus stack traces. Stacks carry code
+  // locations and are checked only against needles that cannot collide with a path or a line number.
+  const shallow = [], deep = [];
+  const record = (value) => {
+    shallow.push(String(value)); deep.push(String(value));
+    if (value && typeof value === "object") { shallow.push(JSON.stringify(value)); deep.push(JSON.stringify(value)); if (value.stack) deep.push(String(value.stack)); }
+  };
+  const attempt = (fn) => { try { record(fn()); } catch (e) { record(e); } };
+  attempt(() => new ArtifactStore({ root, scheduler: fakeScheduler() }));
+  attempt(() => new ArtifactStore({ root: fileRoot }));
+  attempt(() => new ArtifactStore({ root: "not/absolute" }));
+  attempt(() => store.discardArtifact("!!!"));
+  record(await store.capture(notPdf, { id: "H".repeat(22), consumerId: "owner" }));
+  try { await store.capture(pdf, { id: "short", consumerId: "owner" }); } catch (e) { record(e); }
+  record(await store.acquire("I".repeat(22), "owner"));
+  record(store.accounting());
+  // A close that fails its ownership proof must not describe in public what it found.
+  writeFileSync(ownerPath(root), "tampered");
+  record(await store.close());
+  for (const [what, needle] of [["the configured root path", root], ["the ownership nonce", secret.nonce], ["the diagnostic contents", raw]])
+    assert.equal(deep.join("\n").includes(needle), false, `no public error or result exposes ${what}`);
+  for (const [what, needle] of [["the process id", String(process.pid)], ["the process start", String(PROCESS_START)], ["the lock directory name", LOCK]])
+    assert.equal(shallow.join("\n").includes(needle), false, `no public error or result exposes ${what}`);
+});
+
+test("a compensating lock restoration makes its diagnostic's directory entry durable", async () => {
+  // The fsync seam already receives descriptors, so the test classifies targets itself by fstat
+  // identity. No new hook, and nothing about paths, fds, identities or the nonce leaves the store.
+  const fsynced = [];
+  const recorder = { linkSync, unlinkSync, fsyncSync(fd) { const st = fstatSync(fd); fsynced.push({ dev: st.dev, ino: st.ino, directory: st.isDirectory() }); return fsyncSync(fd); } };
+  const at = (target) => fsynced.findIndex((f) => f.directory && f.dev === target.dev && f.ino === target.ino);
+
+  const root = join(temp(), "artifacts");
+  const store = new ArtifactStore({ root, scheduler: fakeScheduler(), closeStepFails: (step) => step === "fsync-root", fsOps: recorder });
+  assert.equal(await store.close(), "artifact-cleanup-failed", "restoration never masks or replaces the original cleanup failure");
+  const lock = lstatSync(join(root, LOCK)), rootDir = lstatSync(root);
+  // The diagnostic's bytes are fsynced when it is written, but its *name* lives in this recreated
+  // directory: without a directory fsync the entry is not durable across a crash.
+  assert.ok(at(lock) >= 0, "the recreated lock directory is made durable");
+  assert.ok(at(rootDir) > at(lock), "and the root that names it is fsynced afterwards, not instead");
+
+  // A lock another process won is never opened, inspected or fsynced.
+  const other = join(temp(), "artifacts"), foreign = ownerPath(other);
+  let taken;
+  const loser = new ArtifactStore({
+    root: other, scheduler: fakeScheduler(), closeStepFails: (step) => step === "fsync-root", fsOps: recorder,
+    onCloseStep: (step) => { if (step === "remove-lock") { mkdirSync(join(other, LOCK), { mode: 0o700 }); writeFileSync(foreign, "foreign", { mode: 0o600 }); taken = lstatSync(join(other, LOCK)); } },
+  });
+  const mark = fsynced.length;
+  assert.equal(await loser.close(), "artifact-cleanup-failed");
+  assert.equal(fsynced.slice(mark).some((f) => f.dev === taken.dev && f.ino === taken.ino), false, "a lock this store does not own is never fsynced");
+  assert.equal(readFileSync(foreign, "utf8"), "foreign");
+  assert.equal(lstatSync(join(other, LOCK)).ino, taken.ino);
+
+  // The two restoration fsyncs are independent: a failing lock-directory fsync must not cost the
+  // root its own, and neither may upgrade or mask the original cleanup failure.
+  const third = join(temp(), "artifacts"), after = [];
+  const failing = { linkSync, unlinkSync, fsyncSync(fd) {
+    const st = fstatSync(fd);
+    if (st.isDirectory() && existsSync(join(third, LOCK)) && st.ino === lstatSync(join(third, LOCK)).ino) throw new Error("/private/lock-fsync-sentinel");
+    after.push({ dev: st.dev, ino: st.ino, directory: st.isDirectory() }); return fsyncSync(fd);
+  } };
+  const partial = new ArtifactStore({ root: third, scheduler: fakeScheduler(), closeStepFails: (step) => step === "fsync-root", fsOps: failing });
+  const outcome = await partial.close();
+  assert.equal(outcome, "artifact-cleanup-failed", "a failed restoration fsync leaves the original failure exactly as it was");
+  const thirdRoot = lstatSync(third);
+  assert.ok(after.some((f) => f.directory && f.dev === thirdRoot.dev && f.ino === thirdRoot.ino), "the retained root is still fsynced after the lock directory's fsync fails");
+  assert.equal(existsSync(ownerPath(third)), true, "and the restored lock and diagnostic still stand");
 });

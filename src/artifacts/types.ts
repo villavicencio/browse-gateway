@@ -11,14 +11,22 @@ export interface ArtifactRecord { id: string; consumerId: string; bytes: number;
 /** @internal test seam: aggregate accounting only — never IDs, consumers, paths, names, hashes or content. */
 export interface ArtifactAccounting { count: number; bytes: number; stagingBytes: number; stagePermits: number; stagePermitLimit: number; responsePermitHeld: boolean; responseWaiters: number; responseBytes: number; consumers: number; }
 /** The single time domain for artifact expiry, leases and cleanup. Never mixed with ambient `Date.now`/`setTimeout`. */
-export interface ArtifactScheduler { now(): number; setTimeout(callback: () => void, delayMs: number): unknown; clearTimeout(handle: unknown): void; }
+export interface ArtifactScheduler { now(): number; /** Process start, in the same domain as `now`. Diagnostic only: never read to decide liveness. */ processStartedAt(): number; setTimeout(callback: () => void, delayMs: number): unknown; clearTimeout(handle: unknown): void; }
 export interface ArtifactStoreOptions { enabled?: boolean; root: string; ttlMs?: number; cleanupIntervalMs?: number; maxBytes?: number; maxCount?: number; perConsumerBytes?: number; perConsumerCount?: number; idGenerator?: () => string; fsOps?: FsOps; /** @internal test seam */ scheduler?: ArtifactScheduler; /** @internal test seam */ onDiscard?: (id: string) => void; /** @internal test seam */ onCleanupPass?: () => void; /** @internal test seam */ afterPartFsync?: () => void | Promise<void>; /** @internal test seam */ afterLinkBeforeCommit?: () => void | Promise<void>;
   /** @internal test seam: a fault selector keyed only by which directory and which reading. It is
    * passed no path, descriptor, stat or observed identity, and returns only values its caller supplies. */
   identityOverride?: (target: "root" | "data", source: "descriptor" | "path") => { dev?: number; ino?: number; uid?: number; mode?: number; directory?: boolean } | "unreadable" | undefined;
+  /** @internal test seam: one closed close-step label per completed step. It carries no path,
+   * descriptor, stat, identity, ID or byte count, and its return value is ignored. */
+  onCloseStep?: (step: ArtifactCloseStep) => void;
+  /** @internal test seam: a fault selector keyed only by close-step label. It is passed no path,
+   * descriptor, stat or identity, and decides only whether that step fails. */
+  closeStepFails?: (step: ArtifactCloseStep) => boolean;
   /** @internal test seam */ afterRootDescriptor?: () => void;
   /** @internal test seam */ onDataPathOpen?: () => void;
   /** @internal test seam */ onDescriptorClose?: () => void; }
+/** @internal test seam: the closed set of ordered teardown steps a clean close performs. */
+export type ArtifactCloseStep = "delete-files" | "fsync-data" | "close-data-fd" | "remove-data" | "remove-diagnostic" | "remove-lock" | "fsync-root" | "close-root-fd";
 export interface FsOps { linkSync: typeof import("node:fs").linkSync; unlinkSync: typeof import("node:fs").unlinkSync; fsyncSync: typeof import("node:fs").fsyncSync; rmdirSync?: typeof import("node:fs").rmdirSync; /** @internal test seam */ readdirSync?: typeof import("node:fs").readdirSync; }
 export interface CaptureOptions { id: string; consumerId: string; ttlMs?: number; }
 export type CaptureResult = ArtifactRecord | { status: "capture-failed"; failure: ArtifactFailureCode };

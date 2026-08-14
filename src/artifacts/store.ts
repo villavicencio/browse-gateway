@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { fstatSync, fsyncSync, mkdirSync, openSync, closeSync, readSync, writeSync, readdirSync, rmdirSync, lstatSync, linkSync, unlinkSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { ARTIFACT_ID, ArtifactStoreError, type ArtifactAccounting, type ArtifactRecord, type ArtifactScheduler, type ArtifactStoreOptions, type CaptureOptions, type CaptureResult, type ResponseLease, type ArtifactFailureCode } from "./types.js";
+import { ARTIFACT_ID, ArtifactStoreError, type ArtifactAccounting, type ArtifactCloseStep, type ArtifactRecord, type ArtifactScheduler, type ArtifactStoreOptions, type CaptureOptions, type CaptureResult, type ResponseLease, type ArtifactFailureCode } from "./types.js";
 
 const PDF_MAGIC = Buffer.from("%PDF-");
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
@@ -13,8 +13,16 @@ const MAX_STAGE_COPIES = 2;
 interface Reservation { readonly id: string; readonly consumerId: string; bytes: number; staging: boolean; released: boolean; }
 /** Retained-directory identity. Private to this module: it never crosses a seam or a public type. */
 interface DirIdentity { dev: number; ino: number; uid: number; mode: number; directory: boolean; }
+/** Retained identity of the lock directory and its diagnostic. Module-private, like `DirIdentity`. */
+interface LockIdentity { dev: number; ino: number; uid: number; mode: number; }
+const LOCK_DIR = ".gateway-lock";
+const LOCK_OWNER_FILE = "owner.json";
+const LOCK_METADATA_VERSION = 1;
+// OS-derived and sampled once, so the whole process reports one stable start instant.
+const PROCESS_STARTED_AT = Math.round(Date.now() - process.uptime() * 1000);
 const SYSTEM_SCHEDULER: ArtifactScheduler = {
   now: () => Date.now(),
+  processStartedAt: () => PROCESS_STARTED_AT,
   // Artifact timers are background cleanup/deadline work: they must never be the sole reason a process stays alive.
   setTimeout: (callback, delayMs) => { const handle = setTimeout(callback, delayMs); (handle as { unref?: () => void }).unref?.(); return handle; },
   clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -36,25 +44,28 @@ export class ArtifactStore {
   private responseBusy = false; private responseHolder?: object; private responseId?: string; private responseBytes = 0; private responseSettle?: () => void;
   private readonly responseWaiters: Array<(granted: boolean) => void> = [];
   private rootFd = -1; private dataFd = -1; private rootIdentity?: DirIdentity; private dataIdentity?: DirIdentity; private identityLost = false; private disposed = false;
+  private lockNonce = ""; private lockStartedAt = 0; private lockIdentity?: LockIdentity; private ownerIdentity?: LockIdentity;
   private readonly identityOverride?: ArtifactStoreOptions["identityOverride"]; private readonly afterRootDescriptor?: () => void;
-  private readonly onDataPathOpen?: () => void; private readonly onDescriptorClose?: () => void;
+  private readonly onDataPathOpen?: () => void; private readonly onDescriptorClose?: () => void; private readonly onCloseStep?: ArtifactStoreOptions["onCloseStep"]; private readonly closeStepFails?: ArtifactStoreOptions["closeStepFails"];
 
   constructor(options: ArtifactStoreOptions) {
     this.enabled = options.enabled !== false; this.root = options.root; this.data = join(this.root, "data");
     this.scheduler = options.scheduler ?? SYSTEM_SCHEDULER; this.ttlMs = options.ttlMs ?? 600_000; this.cleanupIntervalMs = options.cleanupIntervalMs ?? DEFAULT_CLEANUP_INTERVAL_MS; this.maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
     this.maxCount = options.maxCount ?? 16; this.perConsumerBytes = options.perConsumerBytes ?? 16 * 1024 * 1024; this.perConsumerCount = options.perConsumerCount ?? 4;
     this.fsOps = options.fsOps ?? { linkSync, unlinkSync, fsyncSync }; this.onDiscard = options.onDiscard; this.onCleanupPass = options.onCleanupPass; this.afterPartFsync = options.afterPartFsync; this.afterLinkBeforeCommit = options.afterLinkBeforeCommit;
-    this.identityOverride = options.identityOverride; this.afterRootDescriptor = options.afterRootDescriptor; this.onDataPathOpen = options.onDataPathOpen; this.onDescriptorClose = options.onDescriptorClose;
+    this.identityOverride = options.identityOverride; this.afterRootDescriptor = options.afterRootDescriptor; this.onDataPathOpen = options.onDataPathOpen; this.onDescriptorClose = options.onDescriptorClose; this.onCloseStep = options.onCloseStep; this.closeStepFails = options.closeStepFails;
     if (!isAbsolute(this.root) || !Number.isFinite(this.ttlMs) || this.ttlMs <= 0 || !Number.isInteger(this.cleanupIntervalMs) || this.cleanupIntervalMs <= 0 || !Number.isFinite(this.maxBytes) || this.maxBytes <= 0 || !Number.isFinite(this.maxCount) || this.maxCount <= 0 || !Number.isFinite(this.perConsumerBytes) || this.perConsumerBytes <= 0 || !Number.isFinite(this.perConsumerCount) || this.perConsumerCount <= 0) throw new ArtifactStoreError("artifact-config-invalid");
     if (!this.enabled) return;
     if (process.platform !== "linux" || constants.O_NOFOLLOW === undefined || constants.O_DIRECTORY === undefined) throw new ArtifactStoreError("artifact-filesystem-unsupported");
     try { mkdirSync(this.root, { recursive: true, mode: 0o700 }); } catch { throw new ArtifactStoreError("artifact-root-invalid"); }
     try { const existing = lstatSync(this.root); if (!existing.isDirectory() || existing.uid !== process.getuid?.()) throw new Error(); } catch { throw new ArtifactStoreError("artifact-root-invalid"); }
-    try { mkdirSync(join(this.root, ".gateway-lock"), { mode: 0o700 }); } catch { throw new ArtifactStoreError("artifact-root-locked"); }
+    // A pre-existing lock always refuses here: it is never read, opened or removed.
+    try { mkdirSync(this.lockPath, { mode: 0o700 }); } catch { throw new ArtifactStoreError("artifact-root-locked"); }
+    try { this.claimLock(); } catch { this.rollbackLock(); throw new ArtifactStoreError("artifact-root-invalid"); }
     try {
       const rootStat = lstatSync(this.root); if (!rootStat.isDirectory() || rootStat.uid !== process.getuid?.() || (rootStat.mode & 0o777) !== 0o700) throw new Error();
       mkdirSync(this.data, { recursive: true, mode: 0o700 }); const dataStat = lstatSync(this.data); if (!dataStat.isDirectory() || dataStat.uid !== process.getuid?.() || (dataStat.mode & 0o777) !== 0o700) throw new Error();
-    } catch { try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} throw new ArtifactStoreError("artifact-root-invalid"); }
+    } catch { this.rollbackLock(); throw new ArtifactStoreError("artifact-root-invalid"); }
     // Still pre-mutation: retain both directory descriptors and bind them to the configured paths,
     // so every later mutation can prove it is acting on the tree this boot validated.
     try {
@@ -64,7 +75,7 @@ export class ArtifactStore {
       this.onDataPathOpen?.();
       this.rootIdentity = this.readIdentity("root", "descriptor"); this.dataIdentity = this.readIdentity("data", "descriptor");
       if (!this.identityHolds()) throw new Error();
-    } catch { this.closeDescriptors(); try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} throw new ArtifactStoreError("artifact-root-invalid"); }
+    } catch { this.closeDescriptors(); this.rollbackLock(); throw new ArtifactStoreError("artifact-root-invalid"); }
     try {
       let changed = false;
       const entries = readdirSync(this.data).sort();
@@ -72,7 +83,7 @@ export class ArtifactStore {
       for (const name of entries) { if (!/^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(name)) throw new ArtifactStoreError("artifact-root-invalid"); const path = join(this.data, name); const st = lstatSync(path); if (!st.isFile() || st.nlink !== 1 || st.uid !== process.getuid?.() || (st.mode & 0o777) !== 0o600) throw new ArtifactStoreError("artifact-root-invalid"); paths.push(path); }
       for (const path of paths) { this.fsOps.unlinkSync(path); changed = true; }
       if (changed) this.fsyncDataDir();
-    } catch (e) { this.closeDescriptors(); if (e instanceof ArtifactStoreError && e.code === "artifact-root-invalid") { try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} throw e; } throw new ArtifactStoreError("artifact-cleanup-failed"); }
+    } catch (e) { this.closeDescriptors(); if (e instanceof ArtifactStoreError && e.code === "artifact-root-invalid") { this.rollbackLock(); throw e; } throw new ArtifactStoreError("artifact-cleanup-failed"); }
     this.scheduleCleanup();
   }
 
@@ -192,7 +203,48 @@ export class ArtifactStore {
     const consumer = this.consumerLedger.get(reservation.consumerId);
     if (consumer) { consumer.count--; consumer.bytes -= reservation.bytes; if (consumer.count === 0 && consumer.bytes === 0) this.consumerLedger.delete(reservation.consumerId); }
   }
-  private finishClose(): void { let result: ArtifactFailureCode | undefined; if (!this.identityProven()) { result = "artifact-cleanup-failed"; this.closeDescriptors(); const stop = this.resolveClose; this.resolveClose = undefined; stop?.(result); return; } try { let recordsClean = true; for (const id of Array.from(this.records.keys())) if (!this.discardOwned(id)) recordsClean = false; const names = (this.fsOps.readdirSync ?? readdirSync)(this.data).filter(n => /^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(n)).map(n => join(this.data, n)); const clean = this.strictDelete(names); if (recordsClean && clean && this.strictFsyncDataDir()) { try { (this.fsOps.rmdirSync ?? rmdirSync)(join(this.root, ".gateway-lock")); } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } else { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } this.closeDescriptors(); const resolve = this.resolveClose; this.resolveClose = undefined; resolve?.(result); }
+  private finishClose(): void { let result: ArtifactFailureCode | undefined; if (!this.identityProven()) { result = "artifact-cleanup-failed"; this.closeDescriptors(); const stop = this.resolveClose; this.resolveClose = undefined; stop?.(result); return; } try { let recordsClean = true; for (const id of Array.from(this.records.keys())) if (!this.discardOwned(id)) recordsClean = false; const names = (this.fsOps.readdirSync ?? readdirSync)(this.data).filter(n => /^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(n)).map(n => join(this.data, n)); const clean = !this.closeStepFails?.("delete-files") && this.strictDelete(names); if (recordsClean && clean) { this.step("delete-files"); if (!this.closeStepFails?.("fsync-data") && this.strictFsyncDataDir()) { this.step("fsync-data"); try { this.teardown(); } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } else { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } else { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } this.closeDescriptors(); const resolve = this.resolveClose; this.resolveClose = undefined; resolve?.(result); }
+  /** The ordered teardown of a clean close, once the data directory is swept and durable. Each step
+   * is a precondition of the next: the data descriptor is closed before the directory it refers to is
+   * removed, the lock outlives the data it guards, and the root fsync covers every removal above it.
+   * Any throw here leaves the lock in place and turns the close into `artifact-cleanup-failed`. */
+  private teardown(): void {
+    this.run("close-data-fd", () => this.closeDataDescriptor());
+    this.run("remove-data", () => this.removeData());
+    this.removeLock();
+    // The lock is already gone by here, so a failed durability fsync cannot retain it — it restores one.
+    try { this.run("fsync-root", () => this.fsyncRoot()); } catch (e) { this.restoreLock(); throw e; }
+    this.run("close-root-fd", () => this.closeRootDescriptor());
+  }
+  /** One teardown step: it either completes and is reported, or fails and aborts the teardown. */
+  private run(step: ArtifactCloseStep, action: () => void): void { if (this.closeStepFails?.(step)) throw new ArtifactStoreError("artifact-cleanup-failed"); action(); this.step(step); }
+  /** A durability fsync necessarily follows the removal it covers, so this compensation recreates a
+   * lock rather than retaining one. Fail-closed and exclusive: if another process already won the
+   * freed name, that lock is never read, altered or removed. Failing to restore leaves the close's
+   * original `artifact-cleanup-failed` untouched — it never masks it and never upgrades it. */
+  private restoreLock(): void {
+    try { mkdirSync(this.lockPath, { mode: 0o700 }); } catch { return; }
+    try { this.claimLock(); } catch { return; }
+    // `claimLock` makes the diagnostic's bytes durable, but its *name* lives in this recreated
+    // directory. Both are best effort and independent: a failed directory fsync must not skip the
+    // root fsync, and neither can mask or replace the close's original cleanup failure.
+    try { this.fsyncLockDir(); } catch {}
+    try { this.fsyncRoot(); } catch {}
+  }
+  /** Fsync the recreated lock through a descriptor proved to be that directory: opened
+   * `O_DIRECTORY|O_NOFOLLOW` and matched against the identity `claimLock` has just recorded, so a
+   * directory swapped in underneath is fsynced by nobody. The descriptor is closed exactly once. */
+  private fsyncLockDir(): void {
+    const identity = this.lockIdentity; if (!identity) return;
+    let fd = -1;
+    try {
+      fd = openSync(this.lockPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      const st = fstatSync(fd);
+      if (!st.isDirectory() || st.dev !== identity.dev || st.ino !== identity.ino || st.uid !== process.getuid?.() || st.uid !== identity.uid || (st.mode & 0o777) !== 0o700 || (st.mode & 0o777) !== identity.mode) return;
+      this.fsOps.fsyncSync(fd);
+    } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
+  }
+  private step(step: ArtifactCloseStep) { try { this.onCloseStep?.(step); } catch {} }
   // A poisoned store owns no future work: its timers are cancelled and any lease holding or waiting
   // on the response permit is settled here, or a queued acquire would wait for a lease that can no
   // longer settle it.
@@ -236,7 +288,78 @@ export class ArtifactStore {
     if (holds) return true;
     this.identityLost = true; this.markUnhealthy(); return false;
   }
-  private closeDescriptors() { for (const fd of [this.rootFd, this.dataFd]) if (fd >= 0) { try { closeSync(fd); } catch {} try { this.onDescriptorClose?.(); } catch {} } this.rootFd = -1; this.dataFd = -1; this.disposed = true; }
+  private closeDataDescriptor() { if (this.dataFd < 0) return; try { closeSync(this.dataFd); } catch {} this.dataFd = -1; try { this.onDescriptorClose?.(); } catch {} }
+  private closeRootDescriptor() { if (this.rootFd < 0) return; try { closeSync(this.rootFd); } catch {} this.rootFd = -1; try { this.onDescriptorClose?.(); } catch {} }
+  private closeDescriptors() { this.closeDataDescriptor(); this.closeRootDescriptor(); this.disposed = true; }
+  private fsyncRoot(): void { if (this.rootFd < 0) throw new ArtifactStoreError("artifact-runtime-invalidated"); this.fsOps.fsyncSync(this.rootFd); }
+
+  private get lockPath() { return join(this.root, LOCK_DIR); }
+  private get ownerPath() { return join(this.lockPath, LOCK_OWNER_FILE); }
+  /** Bind the lock this constructor just created to this instance. The diagnostic is operator
+   * metadata only — version, PID, process start and an opaque nonce. It carries no configured path,
+   * consumer, artifact ID or content, and the nonce is never a bearer credential or licence to steal
+   * a lock. Process start comes from the one scheduler, so it is never a second time domain. */
+  private claimLock(): void {
+    const lock = lstatSync(this.lockPath);
+    if (!lock.isDirectory() || lock.uid !== process.getuid?.() || (lock.mode & 0o777) !== 0o700) throw new Error();
+    this.lockIdentity = { dev: lock.dev, ino: lock.ino, uid: lock.uid, mode: lock.mode & 0o777 };
+    const nonce = randomBytes(24).toString("base64url");
+    // Sampled once and kept: ownership is proved against the exact value written, never against a
+    // fresh reading of the scheduler.
+    const startedAt = this.scheduler.processStartedAt();
+    const body = Buffer.from(JSON.stringify({ version: LOCK_METADATA_VERSION, pid: process.pid, startedAt, nonce }), "utf8");
+    // O_EXCL|O_NOFOLLOW at mode 0600: the diagnostic is created here or not at all, and an existing
+    // name — symlink or otherwise — is never written through.
+    const fd = openSync(this.ownerPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try { let off = 0; while (off < body.length) off += writeSync(fd, body, off, body.length - off, off); fsyncSync(fd); } finally { closeSync(fd); }
+    const owner = lstatSync(this.ownerPath);
+    if (!owner.isFile() || owner.nlink !== 1 || owner.uid !== process.getuid?.() || (owner.mode & 0o777) !== 0o600) throw new Error();
+    this.ownerIdentity = { dev: owner.dev, ino: owner.ino, uid: owner.uid, mode: owner.mode & 0o777 };
+    this.lockStartedAt = startedAt; this.lockNonce = nonce;
+  }
+  /** Constructor rollback only, and best effort: the diagnostic cannot outlive the directory holding
+   * it, so it goes first. A failure here never masks the startup error being thrown. */
+  private rollbackLock(): void {
+    // Once identity is recorded, only the directory this boot created is removable. Before that —
+    // the narrow window where `claimLock` failed early — no diagnostic is unlinked at all and the
+    // bare `rmdir` can only succeed on the empty directory `mkdir` just made.
+    if (this.lockIdentity) { if (!this.lockHeld()) return; try { unlinkSync(this.ownerPath); } catch {} }
+    try { rmdirSync(this.lockPath); } catch {}
+  }
+  /** The lock removed must be the directory this store created — same device, inode, owner and mode.
+   * Identical contents prove nothing: only the retained identity distinguishes it from a replacement. */
+  private lockHeld(): boolean {
+    if (!this.lockIdentity) return false;
+    let st; try { st = lstatSync(this.lockPath); } catch { return false; }
+    return st.isDirectory() && st.dev === this.lockIdentity.dev && st.ino === this.lockIdentity.ino && st.uid === this.lockIdentity.uid && (st.mode & 0o777) === this.lockIdentity.mode;
+  }
+  /** The diagnostic must still be the private regular file this instance wrote, and must still carry
+   * the nonce only this instance holds. Opened `O_NOFOLLOW`, so a symlink left at the name fails here
+   * rather than being read or removed through to its target. */
+  private diagnosticOwned(): boolean {
+    if (!this.ownerIdentity || !this.lockNonce) return false;
+    let fd = -1;
+    try {
+      fd = openSync(this.ownerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.nlink !== 1 || st.uid !== process.getuid?.() || st.dev !== this.ownerIdentity.dev || st.ino !== this.ownerIdentity.ino || st.uid !== this.ownerIdentity.uid || (st.mode & 0o777) !== this.ownerIdentity.mode) return false;
+      const buf = Buffer.alloc(st.size); let off = 0;
+      while (off < buf.length) { const n = readSync(fd, buf, off, buf.length - off, off); if (n <= 0) return false; off += n; }
+      // Owned by what it says, not merely by parsing: a plain object carrying exactly the closed key
+      // set, every value equal to what this boot wrote. An extra field, a missing one, a rewritten
+      // process start or an array all fail here.
+      const meta = JSON.parse(buf.toString("utf8"));
+      if (typeof meta !== "object" || meta === null || Array.isArray(meta)) return false;
+      const keys = Object.keys(meta).sort();
+      if (keys.length !== 4 || keys[0] !== "nonce" || keys[1] !== "pid" || keys[2] !== "startedAt" || keys[3] !== "version") return false;
+      return meta.version === LOCK_METADATA_VERSION && meta.pid === process.pid && meta.startedAt === this.lockStartedAt && meta.nonce === this.lockNonce;
+    } catch { return false; } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
+  }
+  /** `data` goes only when it is empty: `rmdir` refuses a directory holding anything this store did
+   * not create and sweep, and that refusal is what retains the lock. Nothing is ever removed recursively. */
+  private removeData(): void { rmdirSync(this.data); }
+  /** Graceful removal, in the only order that can succeed. Any failure propagates: the lock stays. */
+  private removeLock(): void { if (!this.lockHeld() || !this.diagnosticOwned()) throw new ArtifactStoreError("artifact-cleanup-failed"); this.run("remove-diagnostic", () => unlinkSync(this.ownerPath)); this.run("remove-lock", () => (this.fsOps.rmdirSync ?? rmdirSync)(this.lockPath)); }
   private strictFsyncDataDir() { try { this.fsyncDataDir(); return true; } catch { return false; } }
   private clearTimer(id: string) { const t = this.timers.get(id); if (t !== undefined) this.scheduler.clearTimeout(t); this.timers.delete(id); }
   private reapExpired() { for (const [id, rec] of Array.from(this.records.entries())) if (this.scheduler.now() >= rec.expiresAt) this.discardArtifact(id); }
