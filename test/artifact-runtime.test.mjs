@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, linkSync, unlinkSync, fsyncSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactRuntime, ArtifactStore } from "../dist/artifacts/index.js";
@@ -142,4 +142,38 @@ test("runtime observer failure still releases explicit ID reservation", async ()
 test("in-flight and available artifacts retain IDs until terminal cleanup", async () => {
   const root = join(temp(), "a"), source = pdf(temp()), id = "Q".repeat(22), r = new ArtifactRuntime({ enabled: true, root }); let release; const gate = new Promise(resolve => { release = resolve; });
   const op = r.createOperation("owner", "example.com", id); const pending = op.registerDownload({ path: async () => { await gate; return source; } }); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); release(); assert.equal((await pending).outcome, "available"); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete(); assert.equal(r.createOperation("owner", "example.com", id).artifactId, id); await r.close();
+});
+
+test("invalidation cleanup failure retains operation reservation and reports cleanup failure", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "A".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root, fsOps: { linkSync, fsyncSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`)) throw new Error("unlink"); return unlinkSync(path); } } });
+  const op = r.createOperation("owner", "example.com", id);
+  assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
+  assert.deepEqual(op.invalidate(), { outcome: "capture-failed", failure: "artifact-cleanup-failed" });
+  assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+  assert.equal(existsSync(join(root, ".gateway-lock")), true);
+});
+
+test("multiple cleanup failure supersedes multiple-artifacts and retains reservation", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "B".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root, fsOps: { linkSync, fsyncSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`)) throw new Error("unlink"); return unlinkSync(path); } } });
+  const op = r.createOperation("owner", "example.com", id);
+  assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
+  assert.deepEqual(await op.registerDownload({ path: () => source }), { outcome: "capture-failed", failure: "artifact-cleanup-failed" });
+  assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+});
+
+test("in-flight invalidation and multiple retain ID until continuation cleanup completes", async () => {
+  for (const mode of ["invalidate", "multiple"]) {
+    const root = join(temp(), mode), source = pdf(temp()), id = `${mode === "invalidate" ? "C" : "D"}`.repeat(22), r = new ArtifactRuntime({ enabled: true, root });
+    let release; const gate = new Promise(resolve => { release = resolve; });
+    const op = r.createOperation("owner", "example.com", id);
+    const first = op.registerDownload({ path: async () => { await gate; return source; } });
+    const terminal = mode === "invalidate" ? op.invalidate() : await op.registerDownload({ path: () => source });
+    assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+    release(); await first;
+    assert.equal(readdirSync(join(root, "data")).length, 0);
+    assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
+    assert.equal(terminal.failure, mode === "invalidate" ? "artifact-runtime-invalidated" : "multiple-artifacts");
+  }
 });

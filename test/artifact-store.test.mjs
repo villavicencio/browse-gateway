@@ -173,7 +173,7 @@ test("startup validates every entry before deleting any valid entry", () => {
 
 test("discard observer failure does not poison store or prevent release", async () => {
   const root = join(temp(), "artifacts"), source = join(temp(), "source.pdf"), id = "O".repeat(22);
-  writeFileSync(source, Buffer.from("%PDF-1.7\\nhello"));
+  writeFileSync(source, Buffer.from("%PDF-1.7\nhello"));
   const store = new ArtifactStore({ root, onDiscard: () => { throw new Error("observer sentinel"); } });
   assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available"); assert.equal(store.discardArtifact(id), true);
   assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false);
@@ -183,7 +183,7 @@ test("discard observer failure does not poison store or prevent release", async 
 
 test("close retains failure from a record discard even when residual cleanup later succeeds", async () => {
   const root = join(temp(), "artifacts"), source = join(temp(), "source.pdf"), id = "V".repeat(22);
-  writeFileSync(source, Buffer.from("%PDF-1.7\\nhello")); let attempts = 0;
+  writeFileSync(source, Buffer.from("%PDF-1.7\nhello")); let attempts = 0;
   const store = new ArtifactStore({ root, fsOps: { linkSync, fsyncSync, readdirSync, rmdirSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`) && attempts++ === 0) throw new Error("first discard"); return unlinkSync(path); } } });
   assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available"); assert.equal(await store.close(), "artifact-cleanup-failed");
   assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false); assert.equal(await store.close(), "artifact-cleanup-failed");
