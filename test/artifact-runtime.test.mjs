@@ -24,12 +24,24 @@ test("inline PDF is rejected only for exact status 200 and no downloads",()=>{
   r.close();
 });
 
-test("operation exposes readonly contract identity and generated IDs are distinct",()=>{
-  const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a"), idGenerator: () => "G".repeat(22) });
-  const op = r.createOperation("owner", "example.com");
-  assert.equal(op.artifactId, "G".repeat(22));
-  assert.equal(op.sourceHost, "example.com");
-  assert.throws(() => new ArtifactRuntime({ enabled: true, root: join(temp(), "bad"), idGenerator: () => "bad" }).createOperation("c", "example.com"), /invalid-artifact-id/);
+test("generated IDs reserve collisions and canonicalize the source host",()=>{
+  const ids = ["G".repeat(22), "G".repeat(22), "H".repeat(22)];
+  const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a"), idGenerator: () => ids.shift() });
+  const a = r.createOperation("owner", "EXAMPLE.COM.");
+  const b = r.createOperation("owner", "example.com");
+  assert.notEqual(a.artifactId, b.artifactId);
+  assert.equal(a.sourceHost, "example.com");
+  assert.throws(() => r.createOperation("owner", "example.com", a.artifactId), /artifact-capacity/);
+  r.close();
+});
+
+test("download accessor exceptions become private capture failures", async()=>{
+  const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a") });
+  const op = r.createOperation("owner", "example.com", "X".repeat(22));
+  const secret = "/private/secret-path sentinel";
+  const result = await op.registerDownload({ failure: () => Promise.reject(new Error(secret)), path: () => { throw new Error(secret); } });
+  assert.deepEqual(result, { outcome: "capture-failed", failure: "download-capture-failed" });
+  assert.equal(JSON.stringify(result).includes(secret), false);
   r.close();
 });
 
@@ -62,7 +74,7 @@ test("invalidation and close win against an in-flight download", async()=>{
     const terminal = action === "close" ? (r.close(), op.invalidate()) : op.invalidate();
     release();
     await pending;
-    assert.deepEqual(terminal, { outcome: "capture-failed", failure: "capture-failed" });
+    assert.deepEqual(terminal, { outcome: "capture-failed", failure: "artifact-runtime-invalidated" });
     assert.deepEqual(op.seal(), terminal);
     assert.deepEqual(readdirSync(join(root, "data")), []);
   }

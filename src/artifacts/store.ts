@@ -20,6 +20,7 @@ export class ArtifactStore {
   private readonly perConsumerCount: number;
   private readonly fsOps: NonNullable<ArtifactStoreOptions["fsOps"]>;
   private closed = false;
+  private unhealthy = false;
   private records = new Map<string, ArtifactRecord>();
   private timers = new Map<string, Timer>();
   constructor(options: ArtifactStoreOptions) {
@@ -45,7 +46,7 @@ export class ArtifactStore {
   async capture(source: string, options: CaptureOptions): Promise<ArtifactRecord | { status: "capture-failed" }> {
     this.reapExpired();
     if (!ARTIFACT_ID.test(options.id)) throw new ArtifactStoreError("invalid-artifact-id");
-    if (this.closed || !this.enabled) return { status: "capture-failed" };
+    if (this.closed || this.unhealthy || !this.enabled) return { status: "capture-failed" };
     if (this.records.has(options.id) || this.records.size >= this.maxCount || this.consumerCount(options.consumerId) >= this.perConsumerCount) return { status: "capture-failed" };
     let fd = -1; let part: string | undefined;
     try {
@@ -57,14 +58,14 @@ export class ArtifactStore {
       const finalStat = fstatSync(fd); if (finalStat.size !== initial.size || off !== initial.size || !buf.subarray(0, 5).equals(PDF_MAGIC)) return { status: "capture-failed" };
       part = join(this.data, `${options.id}.part`); const final = join(this.data, `${options.id}.pdf`);
       const out = openSync(part, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      try { let written = 0; while (written < buf.length) { const n = writeSync(out, buf, written, buf.length - written, written); if (n <= 0) throw new Error("short artifact write"); written += n; } fsyncSync(out); } finally { closeSync(out); }
+      try { let written = 0; while (written < buf.length) { const n = writeSync(out, buf, written, buf.length - written, written); if (n <= 0) throw new Error("short artifact write"); written += n; } this.fsOps.fsyncSync(out); } finally { closeSync(out); }
       if (this.closed) return { status: "capture-failed" };
       this.fsOps.linkSync(part, final); this.fsOps.unlinkSync(part); part = undefined;
       const dirFd = openSync(this.data, constants.O_RDONLY); try { this.fsOps.fsyncSync(dirFd); } finally { closeSync(dirFd); }
       if (this.closed) { try { this.fsOps.unlinkSync(final); } catch { this.closed = true; } return { status: "capture-failed" }; }
       const createdAt = this.now(); const record: ArtifactRecord = { id: options.id, consumerId: options.consumerId, bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex"), createdAt, expiresAt: createdAt + (options.ttlMs ?? this.ttlMs), status: "available" };
       this.records.set(options.id, record); return record;
-    } catch { if (part) try { this.fsOps.unlinkSync(part); } catch { this.closed = true; } try { this.fsOps.unlinkSync(join(this.data, `${options.id}.pdf`)); } catch {} return { status: "capture-failed" }; }
+    } catch { let clean = true; for (const path of [part, join(this.data, `${options.id}.pdf`)]) if (path) try { this.fsOps.unlinkSync(path); } catch { clean = false; } if (!clean) { this.unhealthy = true; this.closed = true; } return { status: "capture-failed" }; }
     finally { if (fd >= 0) try { closeSync(fd); } catch {} }
   }
   acquire(id: string, consumerId: string): ResponseLease | null {
