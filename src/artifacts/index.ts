@@ -33,7 +33,7 @@ export class ArtifactOperation {
 
 export class ArtifactRuntime {
   readonly store: ArtifactStore; private readonly idGenerator: () => string; private readonly reserved = new Set<string>();
-  constructor(options: ArtifactStoreOptions) { this.store = new ArtifactStore({ ...options, onDiscard: (id) => { this.reserved.delete(id); options.onDiscard?.(id); } }); this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url")); }
+  constructor(options: ArtifactStoreOptions) { this.store = new ArtifactStore({ ...options, onDiscard: (id) => { this.reserved.delete(id); try { options.onDiscard?.(id); } catch {} } }); this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url")); }
   createOperation(consumerId: string, sourceHost: string, explicitId?: string) {
     let host: string;
     try { host = canonicalizeHost(sourceHost); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }

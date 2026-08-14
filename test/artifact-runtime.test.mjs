@@ -129,6 +129,16 @@ test("terminal operation outcomes release explicit IDs at the correct boundary",
   const invalid = r.createOperation("owner", "example.com", id); assert.equal(invalid.invalidate().failure, "artifact-runtime-invalidated"); r.createOperation("owner", "example.com", id).seal(); await r.close();
 });
 
+test("runtime observer failure still releases explicit ID reservation", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "U".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root, onDiscard: () => { throw new Error("observer sentinel"); } });
+  const op = r.createOperation("owner", "example.com", id);
+  assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
+  assert.equal(r.store.discardArtifact(id), true);
+  assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
+  await r.close();
+});
+
 test("in-flight and available artifacts retain IDs until terminal cleanup", async () => {
   const root = join(temp(), "a"), source = pdf(temp()), id = "Q".repeat(22), r = new ArtifactRuntime({ enabled: true, root }); let release; const gate = new Promise(resolve => { release = resolve; });
   const op = r.createOperation("owner", "example.com", id); const pending = op.registerDownload({ path: async () => { await gate; return source; } }); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); release(); assert.equal((await pending).outcome, "available"); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete(); assert.equal(r.createOperation("owner", "example.com", id).artifactId, id); await r.close();

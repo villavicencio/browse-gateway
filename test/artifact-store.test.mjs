@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, statSync, readFileSync, symlinkSync, chmodSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, statSync, readFileSync, symlinkSync, chmodSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactStore } from "../dist/artifacts/index.js";
@@ -159,4 +159,33 @@ test("startup cleanup unlink failure retains lock and hides raw errors", () => {
 test("startup cleanup fsync failure retains lock because deletion is not durable", () => {
   const root = join(temp(), "artifacts"), id = "F".repeat(22); mkdirSync(root, { mode: 0o700 }); mkdirSync(join(root, "data"), { mode: 0o700 }); writeFileSync(join(root, "data", `${id}.part`), "part"); chmodSync(join(root, "data", `${id}.part`), 0o600);
   assert.throws(() => new ArtifactStore({ root, fsOps: { linkSync, unlinkSync, fsyncSync() { throw new Error("/private/fsync-sentinel"); } } }), e => e.code === "artifact-cleanup-failed" && !String(e).includes("fsync-sentinel")); assert.equal(existsSync(join(root, ".gateway-lock")), true); assert.throws(() => new ArtifactStore({ root }), e => e.code === "artifact-root-locked");
+});
+
+test("startup validates every entry before deleting any valid entry", () => {
+  const root = join(temp(), "artifacts"), valid = "A".repeat(22), invalid = "B".repeat(22);
+  mkdirSync(root, { mode: 0o700 }); mkdirSync(join(root, "data"), { mode: 0o700 });
+  const validPath = join(root, "data", `${valid}.pdf`); writeFileSync(validPath, "valid"); chmodSync(validPath, 0o600);
+  mkdirSync(join(root, "data", `${invalid}.pdf`), { mode: 0o700 });
+  assert.throws(() => new ArtifactStore({ root }), e => e.code === "artifact-root-invalid");
+  assert.equal(readFileSync(validPath, "utf8"), "valid"); assert.equal(statSync(validPath).isFile(), true);
+  assert.equal(existsSync(join(root, ".gateway-lock")), false);
+});
+
+test("discard observer failure does not poison store or prevent release", async () => {
+  const root = join(temp(), "artifacts"), source = join(temp(), "source.pdf"), id = "O".repeat(22);
+  writeFileSync(source, Buffer.from("%PDF-1.7\\nhello"));
+  const store = new ArtifactStore({ root, onDiscard: () => { throw new Error("observer sentinel"); } });
+  assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available"); assert.equal(store.discardArtifact(id), true);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false);
+  assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available");
+  assert.equal(await store.close(), undefined); assert.equal(existsSync(join(root, ".gateway-lock")), false);
+});
+
+test("close retains failure from a record discard even when residual cleanup later succeeds", async () => {
+  const root = join(temp(), "artifacts"), source = join(temp(), "source.pdf"), id = "V".repeat(22);
+  writeFileSync(source, Buffer.from("%PDF-1.7\\nhello")); let attempts = 0;
+  const store = new ArtifactStore({ root, fsOps: { linkSync, fsyncSync, readdirSync, rmdirSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`) && attempts++ === 0) throw new Error("first discard"); return unlinkSync(path); } } });
+  assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available"); assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false); assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(existsSync(join(root, ".gateway-lock")), true);
 });
