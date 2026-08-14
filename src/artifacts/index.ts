@@ -6,16 +6,20 @@ import { isIP } from "node:net";
 
 const HOST = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const MAX_ID_ATTEMPTS = 8;
+const runtimeDisposers = new WeakMap<ArtifactOperation, () => OperationResult>();
+const disposeForRuntime = (operation: ArtifactOperation) => runtimeDisposers.get(operation)?.();
 
 export class ArtifactOperation {
   private events = 0; private sealed = false; private generation = 0; private result?: OperationResult; private status: number | null = null; private contentType: string | null = null;
   private active = 0; private cleanupConfirmed = true; private released = false; private waitingForArtifact = false;
   private disposed = false;
-  constructor(private readonly store: ArtifactStore, private readonly consumerId: string, readonly sourceHost: string, readonly artifactId: string, private readonly release: () => void) {}
+  constructor(private readonly store: ArtifactStore, private readonly consumerId: string, readonly sourceHost: string, readonly artifactId: string, private readonly release: () => void) {
+    runtimeDisposers.set(this, () => this.disposeForRuntime());
+  }
   noteMainResponse(status: number | null, contentType: string | null) { if (!this.sealed) { this.status = status; this.contentType = contentType; } }
   private tryRelease() { if (this.sealed && this.active === 0 && this.cleanupConfirmed && !this.waitingForArtifact && !this.released) { this.released = true; this.release(); } }
   private discard() { const clean = this.store.discardArtifact(this.artifactId); this.cleanupConfirmed = clean; this.waitingForArtifact = false; if (!clean) this.result = { outcome: "capture-failed", failure: "artifact-cleanup-failed" }; return clean; }
-  dispose() {
+  private disposeForRuntime() {
     if (this.disposed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" };
     this.disposed = true;
     if (this.result?.outcome === "available") {
@@ -84,7 +88,11 @@ export class ArtifactRuntime {
   constructor(options: ArtifactStoreOptions) {
     this.store = new ArtifactStore({ ...options, onDiscard: (id) => {
       // ArtifactStore invokes onDiscard synchronously after durable deletion, before a replacement can be created.
-      this.reserved.delete(id);
+      const token = this.reserved.get(id);
+      if (token !== undefined) {
+        this.reserved.delete(id);
+        this.operations.delete(token);
+      }
       try { options.onDiscard?.(id); } catch {}
     } });
     this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url"));
@@ -112,7 +120,7 @@ export class ArtifactRuntime {
   close() {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    for (const operation of Array.from(this.operations.values())) operation.dispose();
+    for (const operation of Array.from(this.operations.values())) disposeForRuntime(operation);
     this.closePromise = this.store.close();
     return this.closePromise;
   }
