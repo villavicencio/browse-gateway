@@ -144,6 +144,44 @@ test("in-flight and available artifacts retain IDs until terminal cleanup", asyn
   const op = r.createOperation("owner", "example.com", id); const pending = op.registerDownload({ path: async () => { await gate; return source; } }); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); release(); assert.equal((await pending).outcome, "available"); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete(); assert.equal(r.createOperation("owner", "example.com", id).artifactId, id); await r.close();
 });
 
+test("sealing an available operation retains its ID until durable discard", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "S".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root });
+  const op = r.createOperation("owner", "example.com", id);
+  assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
+  assert.equal(op.seal().outcome, "available");
+  assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
+  await r.close();
+});
+
+test("capture-originated cleanup failure retains the explicit ID reservation", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "K".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root, fsOps: {
+    linkSync, unlinkSync,
+    fsyncSync() { throw new Error("fsync"); }
+  } });
+  const op = r.createOperation("owner", "example.com", id);
+  assert.deepEqual(await op.registerDownload({ path: () => source }), { outcome: "capture-failed", failure: "artifact-cleanup-failed" });
+  assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+  await r.close();
+});
+
+test("stale operation methods cannot release a replacement reservation", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "L".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root });
+  const old = r.createOperation("owner", "example.com", id);
+  assert.equal((await old.registerDownload({ path: () => source })).outcome, "available");
+  old.seal();
+  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  const replacement = r.createOperation("owner", "example.com", id);
+  old.seal(); old.invalidate(); old.seal();
+  assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+  replacement.seal();
+  await r.close();
+});
+
 test("invalidation cleanup failure retains operation reservation and reports cleanup failure", async () => {
   const root = join(temp(), "a"), source = pdf(temp()), id = "A".repeat(22);
   const r = new ArtifactRuntime({ enabled: true, root, fsOps: { linkSync, fsyncSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`)) throw new Error("unlink"); return unlinkSync(path); } } });

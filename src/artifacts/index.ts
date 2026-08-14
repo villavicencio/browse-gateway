@@ -14,7 +14,16 @@ export class ArtifactOperation {
   noteMainResponse(status: number | null, contentType: string | null) { if (!this.sealed) { this.status = status; this.contentType = contentType; } }
   private tryRelease() { if (this.sealed && this.active === 0 && this.cleanupConfirmed && !this.waitingForArtifact && !this.released) { this.released = true; this.release(); } }
   private discard() { const clean = this.store.discardArtifact(this.artifactId); this.cleanupConfirmed = clean; this.waitingForArtifact = false; if (!clean) this.result = { outcome: "capture-failed", failure: "artifact-cleanup-failed" }; return clean; }
-  private terminal(result: OperationResult, cleanup = false) { this.sealed = true; this.generation++; this.result = result; this.cleanupConfirmed = !cleanup; this.waitingForArtifact = false; this.tryRelease(); return this.result; }
+  private terminal(result: OperationResult, cleanup = false) {
+    this.sealed = true;
+    this.generation++;
+    this.result = result;
+    this.cleanupConfirmed = !cleanup && !(result.outcome === "capture-failed" && result.failure === "artifact-cleanup-failed");
+    // An available artifact remains reserved until the store's synchronous onDiscard callback.
+    if (result.outcome !== "available") this.waitingForArtifact = false;
+    this.tryRelease();
+    return this.result;
+  }
   async registerDownload(download: DownloadLike) {
     if (this.sealed) return this.result;
     this.active++;
@@ -33,7 +42,7 @@ export class ArtifactOperation {
       const captured = await this.store.capture(path, { id: this.artifactId, consumerId: this.consumerId });
       if (this.sealed || generation !== this.generation) { this.discard(); this.tryRelease(); return this.result; }
       if (captured.status === "available") { this.result = { outcome: "available", artifact: captured }; this.waitingForArtifact = true; }
-      else if ("failure" in captured) this.terminal({ outcome: "capture-failed", failure: captured.failure });
+      else if ("failure" in captured) this.terminal({ outcome: "capture-failed", failure: captured.failure }, captured.failure === "artifact-cleanup-failed");
       return this.result;
     } finally { this.active--; this.tryRelease(); }
   }
@@ -50,8 +59,15 @@ export class ArtifactOperation {
 }
 
 export class ArtifactRuntime {
-  readonly store: ArtifactStore; private readonly idGenerator: () => string; private readonly reserved = new Set<string>();
-  constructor(options: ArtifactStoreOptions) { this.store = new ArtifactStore({ ...options, onDiscard: (id) => { this.reserved.delete(id); try { options.onDiscard?.(id); } catch {} } }); this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url")); }
+  readonly store: ArtifactStore; private readonly idGenerator: () => string; private readonly reserved = new Map<string, symbol>();
+  constructor(options: ArtifactStoreOptions) {
+    this.store = new ArtifactStore({ ...options, onDiscard: (id) => {
+      // ArtifactStore invokes onDiscard synchronously after durable deletion, before a replacement can be created.
+      this.reserved.delete(id);
+      try { options.onDiscard?.(id); } catch {}
+    } });
+    this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url"));
+  }
   createOperation(consumerId: string, sourceHost: string, explicitId?: string) {
     let host: string;
     try { host = canonicalizeHost(sourceHost); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }
@@ -59,7 +75,10 @@ export class ArtifactRuntime {
     let id = explicitId;
     if (id !== undefined) { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); if (this.reserved.has(id)) throw new ArtifactStoreError("artifact-capacity"); }
     else for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) { const candidate = this.idGenerator(); if (ARTIFACT_ID.test(candidate) && !this.reserved.has(candidate)) { id = candidate; break; } }
-    if (!id) throw new ArtifactStoreError("artifact-capacity"); this.reserved.add(id); return new ArtifactOperation(this.store, consumerId, host, id, () => this.reserved.delete(id));
+    if (!id) throw new ArtifactStoreError("artifact-capacity");
+    const token = Symbol(id);
+    this.reserved.set(id, token);
+    return new ArtifactOperation(this.store, consumerId, host, id, () => { if (this.reserved.get(id) === token) this.reserved.delete(id); });
   }
   close() { return this.store.close(); }
 }
