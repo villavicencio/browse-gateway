@@ -2,29 +2,37 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { fstatSync, fsyncSync, mkdirSync, openSync, closeSync, readSync, writeSync, readdirSync, rmdirSync, lstatSync, linkSync, unlinkSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { ARTIFACT_ID, ArtifactStoreError, type ArtifactRecord, type ArtifactStoreOptions, type CaptureOptions, type CaptureResult, type ResponseLease, type ArtifactFailureCode } from "./types.js";
+import { ARTIFACT_ID, ArtifactStoreError, type ArtifactRecord, type ArtifactScheduler, type ArtifactStoreOptions, type CaptureOptions, type CaptureResult, type ResponseLease, type ArtifactFailureCode } from "./types.js";
 
 const PDF_MAGIC = Buffer.from("%PDF-");
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
-type Timer = ReturnType<typeof setTimeout>;
+const DEFAULT_CLEANUP_INTERVAL_MS = 60_000;
+const RESPONSE_LEASE_MS = 15_000;
+const SYSTEM_SCHEDULER: ArtifactScheduler = {
+  now: () => Date.now(),
+  // Artifact timers are background cleanup/deadline work: they must never be the sole reason a process stays alive.
+  setTimeout: (callback, delayMs) => { const handle = setTimeout(callback, delayMs); (handle as { unref?: () => void }).unref?.(); return handle; },
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
 
 export class ArtifactStore {
   readonly enabled: boolean;
-  private readonly root: string; private readonly data: string; private readonly now: () => number;
-  private readonly ttlMs: number; private readonly maxBytes: number; private readonly maxCount: number;
+  private readonly root: string; private readonly data: string; private readonly scheduler: ArtifactScheduler;
+  private readonly ttlMs: number; private readonly cleanupIntervalMs: number; private readonly maxBytes: number; private readonly maxCount: number;
   private readonly perConsumerBytes: number; private readonly perConsumerCount: number;
   private readonly fsOps: NonNullable<ArtifactStoreOptions["fsOps"]>; private readonly afterPartFsync?: ArtifactStoreOptions["afterPartFsync"]; private readonly afterLinkBeforeCommit?: ArtifactStoreOptions["afterLinkBeforeCommit"];
   private closed = false; private unhealthy = false; private activeCaptures = 0;
   private closePromise?: Promise<ArtifactFailureCode | undefined>; private resolveClose?: (result: ArtifactFailureCode | undefined) => void;
-  private readonly inflight = new Set<string>(); private readonly onDiscard?: (id: string) => void;
-  private records = new Map<string, ArtifactRecord>(); private timers = new Map<string, Timer>();
+  private readonly inflight = new Set<string>(); private readonly onDiscard?: (id: string) => void; private readonly onCleanupPass?: () => void;
+  private records = new Map<string, ArtifactRecord>(); private timers = new Map<string, unknown>();
+  private cleanupTimer?: unknown; private cleanupRunning = false;
 
   constructor(options: ArtifactStoreOptions) {
     this.enabled = options.enabled !== false; this.root = options.root; this.data = join(this.root, "data");
-    this.now = options.now ?? Date.now; this.ttlMs = options.ttlMs ?? 600_000; this.maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
+    this.scheduler = options.scheduler ?? SYSTEM_SCHEDULER; this.ttlMs = options.ttlMs ?? 600_000; this.cleanupIntervalMs = options.cleanupIntervalMs ?? DEFAULT_CLEANUP_INTERVAL_MS; this.maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
     this.maxCount = options.maxCount ?? 16; this.perConsumerBytes = options.perConsumerBytes ?? 16 * 1024 * 1024; this.perConsumerCount = options.perConsumerCount ?? 4;
-    this.fsOps = options.fsOps ?? { linkSync, unlinkSync, fsyncSync }; this.onDiscard = options.onDiscard; this.afterPartFsync = options.afterPartFsync; this.afterLinkBeforeCommit = options.afterLinkBeforeCommit;
-    if (!isAbsolute(this.root) || !Number.isFinite(this.ttlMs) || this.ttlMs <= 0 || !Number.isFinite(this.maxBytes) || this.maxBytes <= 0 || !Number.isFinite(this.maxCount) || this.maxCount <= 0 || !Number.isFinite(this.perConsumerBytes) || this.perConsumerBytes <= 0 || !Number.isFinite(this.perConsumerCount) || this.perConsumerCount <= 0) throw new ArtifactStoreError("artifact-config-invalid");
+    this.fsOps = options.fsOps ?? { linkSync, unlinkSync, fsyncSync }; this.onDiscard = options.onDiscard; this.onCleanupPass = options.onCleanupPass; this.afterPartFsync = options.afterPartFsync; this.afterLinkBeforeCommit = options.afterLinkBeforeCommit;
+    if (!isAbsolute(this.root) || !Number.isFinite(this.ttlMs) || this.ttlMs <= 0 || !Number.isInteger(this.cleanupIntervalMs) || this.cleanupIntervalMs <= 0 || !Number.isFinite(this.maxBytes) || this.maxBytes <= 0 || !Number.isFinite(this.maxCount) || this.maxCount <= 0 || !Number.isFinite(this.perConsumerBytes) || this.perConsumerBytes <= 0 || !Number.isFinite(this.perConsumerCount) || this.perConsumerCount <= 0) throw new ArtifactStoreError("artifact-config-invalid");
     if (!this.enabled) return;
     if (process.platform !== "linux" || constants.O_NOFOLLOW === undefined) throw new ArtifactStoreError("artifact-filesystem-unsupported");
     try { mkdirSync(this.root, { recursive: true, mode: 0o700 }); } catch { throw new ArtifactStoreError("artifact-root-invalid"); }
@@ -42,6 +50,7 @@ export class ArtifactStore {
       for (const path of paths) { this.fsOps.unlinkSync(path); changed = true; }
       if (changed) this.fsyncDataDir();
     } catch (e) { if (e instanceof ArtifactStoreError && e.code === "artifact-root-invalid") { try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} throw e; } throw new ArtifactStoreError("artifact-cleanup-failed"); }
+    this.scheduleCleanup();
   }
 
   async capture(source: string, options: CaptureOptions): Promise<CaptureResult> {
@@ -65,7 +74,7 @@ export class ArtifactStore {
       if (this.closed || this.unhealthy) return { status: "capture-failed", failure: "artifact-runtime-invalidated" };
       this.fsOps.linkSync(part, final); linked = true; this.fsOps.unlinkSync(part); part = undefined; this.fsyncDataDir();
       if (this.afterLinkBeforeCommit) await this.afterLinkBeforeCommit(); if (this.closed || this.unhealthy) { const clean = this.strictDelete([final]); if (!clean) { this.markUnhealthy(); return { status: "capture-failed", failure: "artifact-cleanup-failed" }; } return { status: "capture-failed", failure: "artifact-runtime-invalidated" }; }
-      const createdAt = this.now(); const record: ArtifactRecord = { id: options.id, consumerId: options.consumerId, bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex"), createdAt, expiresAt: createdAt + (options.ttlMs ?? this.ttlMs), status: "available" };
+      const createdAt = this.scheduler.now(); const record: ArtifactRecord = { id: options.id, consumerId: options.consumerId, bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex"), createdAt, expiresAt: createdAt + (options.ttlMs ?? this.ttlMs), status: "available" };
       this.records.set(options.id, record); return record;
     } catch {
       if (out >= 0) try { closeSync(out); } catch {}
@@ -80,19 +89,24 @@ export class ArtifactStore {
     if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.reapExpired(); if (this.closed || this.unhealthy) return null;
     const rec = this.records.get(id); if (!rec || rec.consumerId !== consumerId || rec.status !== "available") return null;
     const path = join(this.data, `${id}.pdf`); let fd = -1;
-    try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); const st = fstatSync(fd); if (st.size !== rec.bytes) throw new Error(); const buf = Buffer.alloc(rec.bytes); let off = 0; while (off < buf.length) { const n = readSync(fd, buf, off, buf.length - off, off); if (n <= 0) throw new Error(); off += n; } if (fstatSync(fd).size !== rec.bytes || createHash("sha256").update(buf).digest("hex") !== rec.sha256) throw new Error(); rec.status = "consuming"; const deadline = this.now() + 15_000; const timer = setTimeout(() => { if (rec.status === "consuming") this.discardArtifact(id); }, Math.max(0, deadline - Date.now())); this.timers.set(id, timer); let done = false; return { record: rec, bytes: buf.length, base64: buf.toString("base64"), deadline, complete: () => { if (done) return; done = true; this.clearTimer(id); this.discardArtifact(id); } }; }
+    try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); const st = fstatSync(fd); if (st.size !== rec.bytes) throw new Error(); const buf = Buffer.alloc(rec.bytes); let off = 0; while (off < buf.length) { const n = readSync(fd, buf, off, buf.length - off, off); if (n <= 0) throw new Error(); off += n; } if (fstatSync(fd).size !== rec.bytes || createHash("sha256").update(buf).digest("hex") !== rec.sha256) throw new Error(); rec.status = "consuming"; let done = false; const deadline = this.scheduler.now() + RESPONSE_LEASE_MS; const timer = this.scheduler.setTimeout(() => { this.timers.delete(id); if (done || this.closed || this.unhealthy) return; done = true; this.discardArtifact(id); }, Math.max(0, deadline - this.scheduler.now())); this.timers.set(id, timer); return { record: rec, bytes: buf.length, base64: buf.toString("base64"), deadline, complete: () => { if (done) return; done = true; this.clearTimer(id); if (this.closed || this.unhealthy) return; this.discardArtifact(id); } }; }
     catch { if (!this.discardArtifact(id)) this.markUnhealthy(); return null; } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
   }
 
   discardArtifact(id: string): boolean { if (typeof id !== "string") throw new ArtifactStoreError("invalid-artifact-id"); if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.clearTimer(id); const existed = this.records.has(id); const clean = this.strictDelete([join(this.data, `${id}.pdf`), join(this.data, `${id}.part`)]); if (!clean) { this.markUnhealthy(); return false; } if (existed) { this.records.delete(id); try { this.onDiscard?.(id); } catch {} } return true; }
-  close(): Promise<ArtifactFailureCode | undefined> { if (this.closePromise) return this.closePromise; if (!this.enabled || this.closed && !this.unhealthy) return Promise.resolve(this.unhealthy ? "artifact-cleanup-failed" : undefined); this.closed = true; this.closePromise = new Promise(resolve => { this.resolveClose = resolve; if (this.activeCaptures === 0) this.finishClose(); }); return this.closePromise; }
+  close(): Promise<ArtifactFailureCode | undefined> { if (this.closePromise) return this.closePromise; this.cancelTimers(); if (!this.enabled || this.closed && !this.unhealthy) return Promise.resolve(this.unhealthy ? "artifact-cleanup-failed" : undefined); this.closed = true; this.closePromise = new Promise(resolve => { this.resolveClose = resolve; if (this.activeCaptures === 0) this.finishClose(); }); return this.closePromise; }
   private finishClose(): void { let result: ArtifactFailureCode | undefined; try { let recordsClean = true; for (const id of Array.from(this.records.keys())) if (!this.discardArtifact(id)) recordsClean = false; const names = (this.fsOps.readdirSync ?? readdirSync)(this.data).filter(n => /^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(n)).map(n => join(this.data, n)); const clean = this.strictDelete(names); if (recordsClean && clean && this.strictFsyncDataDir()) { try { (this.fsOps.rmdirSync ?? rmdirSync)(join(this.root, ".gateway-lock")); } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } else { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } const resolve = this.resolveClose; this.resolveClose = undefined; resolve?.(result); }
-  private markUnhealthy() { this.unhealthy = true; this.closed = true; }
+  private markUnhealthy() { this.unhealthy = true; this.closed = true; this.cancelCleanup(); }
+  /** One cleanup pass at a time: a timer callback that arrives mid-pass returns without entering. */
+  private runCleanupPass() { if (this.cleanupRunning || this.closed || this.unhealthy || !this.enabled) return; this.cleanupRunning = true; try { this.onCleanupPass?.(); this.reapExpired(); } finally { this.cleanupRunning = false; this.scheduleCleanup(); } }
+  private scheduleCleanup() { if (this.closed || this.unhealthy || !this.enabled || this.cleanupTimer !== undefined) return; this.cleanupTimer = this.scheduler.setTimeout(() => { this.cleanupTimer = undefined; this.runCleanupPass(); }, this.cleanupIntervalMs); }
+  private cancelCleanup() { if (this.cleanupTimer !== undefined) { this.scheduler.clearTimeout(this.cleanupTimer); this.cleanupTimer = undefined; } }
+  private cancelTimers() { this.cancelCleanup(); for (const id of Array.from(this.timers.keys())) this.clearTimer(id); }
   private strictDelete(paths: string[]) { let ok = true, changed = false; for (const path of paths) { try { this.fsOps.unlinkSync(path); changed = true; } catch (e: any) { if (e?.code !== "ENOENT") ok = false; } } if (ok && changed && !this.strictFsyncDataDir()) ok = false; return ok; }
   private fsyncDataDir() { const fd = openSync(this.data, constants.O_RDONLY); try { this.fsOps.fsyncSync(fd); } finally { closeSync(fd); } }
   private strictFsyncDataDir() { try { this.fsyncDataDir(); return true; } catch { return false; } }
-  private clearTimer(id: string) { const t = this.timers.get(id); if (t) clearTimeout(t); this.timers.delete(id); }
-  private reapExpired() { for (const [id, rec] of Array.from(this.records.entries())) if (this.now() >= rec.expiresAt) this.discardArtifact(id); }
+  private clearTimer(id: string) { const t = this.timers.get(id); if (t !== undefined) this.scheduler.clearTimeout(t); this.timers.delete(id); }
+  private reapExpired() { for (const [id, rec] of Array.from(this.records.entries())) if (this.scheduler.now() >= rec.expiresAt) this.discardArtifact(id); }
   private consumerCount(c: string) { return Array.from(this.records.values()).filter(r => r.consumerId === c).length; }
   private consumerBytes(c: string) { return Array.from(this.records.values()).filter(r => r.consumerId === c).reduce((n, r) => n + r.bytes, 0); }
   private totalBytes() { return Array.from(this.records.values()).reduce((n, r) => n + r.bytes, 0); }

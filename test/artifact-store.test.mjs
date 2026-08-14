@@ -8,6 +8,31 @@ import { ArtifactStore } from "../dist/artifacts/index.js";
 const dirs = [];
 function temp() { const dir = mkdtempSync(join(tmpdir(), "bgw-artifact-")); dirs.push(dir); return dir; }
 afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
+function source() { const path = join(temp(), "source.pdf"); writeFileSync(path, Buffer.from("%PDF-1.7\nhello")); return path; }
+
+// Deterministic scheduler: virtual time only, every registration retained so a test can fire a
+// cancelled or post-close callback by hand and prove it is inert.
+function fakeScheduler(start = 1_000_000) {
+  let time = start, next = 1;
+  const registrations = [], cleared = [], live = new Map();
+  return {
+    now: () => time,
+    setTimeout(callback, delayMs) { const registration = { handle: next++, callback, delayMs, dueAt: time + delayMs }; registrations.push(registration); live.set(registration.handle, registration); return registration.handle; },
+    clearTimeout(handle) { cleared.push(handle); live.delete(handle); },
+    registrations, cleared,
+    pending: () => Array.from(live.values()),
+    registration: (delayMs) => registrations.find((r) => r.delayMs === delayMs),
+    advance(ms) {
+      const target = time + ms;
+      for (;;) {
+        const due = Array.from(live.values()).filter((r) => r.dueAt <= target).sort((a, b) => a.dueAt - b.dueAt)[0];
+        if (!due) break;
+        live.delete(due.handle); time = due.dueAt; due.callback();
+      }
+      time = target;
+    },
+  };
+}
 
 test("disabled store has no filesystem side effects", async () => {
   const root = join(temp(), "not-created");
@@ -188,4 +213,120 @@ test("close retains failure from a record discard even when residual cleanup lat
   assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available"); assert.equal(await store.close(), "artifact-cleanup-failed");
   assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false); assert.equal(await store.close(), "artifact-cleanup-failed");
   assert.equal(existsSync(join(root, ".gateway-lock")), true);
+});
+
+test("periodic cleanup interval must be a finite positive integer", () => {
+  for (const cleanupIntervalMs of [0, -1, 1.5, NaN, Infinity, "60000"]) {
+    const root = join(temp(), "artifacts");
+    assert.throws(() => new ArtifactStore({ root, cleanupIntervalMs }), (e) => e.code === "artifact-config-invalid");
+    assert.equal(existsSync(root), false);
+  }
+});
+
+test("expiry is decided by the injected scheduler at the exact TTL boundary", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), discarded = [];
+  const early = "E".repeat(22), exact = "X".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: clock, ttlMs: 1000, onDiscard: (id) => discarded.push(id) });
+  const record = await store.capture(pdf, { id: early, consumerId: "owner" });
+  assert.equal(record.createdAt, clock.now());
+  assert.equal(record.expiresAt, clock.now() + 1000);
+  assert.equal((await store.capture(pdf, { id: exact, consumerId: "owner" })).status, "available");
+  clock.advance(999);
+  const lease = store.acquire(early, "owner");
+  assert.ok(lease, "now === expiresAt - 1 must remain available");
+  lease.complete();
+  clock.advance(1);
+  assert.equal(store.acquire(exact, "owner"), null);
+  assert.deepEqual(readdirSync(join(root, "data")), []);
+  assert.deepEqual(discarded, [early, exact]);
+  await store.close();
+});
+
+test("response lease deadline and timeout advance only on the injected scheduler", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), discarded = [], id = "T".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: clock, onDiscard: (i) => discarded.push(i) });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const wallBefore = Date.now();
+  const lease = store.acquire(id, "owner");
+  assert.ok(lease);
+  assert.equal(lease.deadline, clock.now() + 15_000);
+  assert.ok(clock.pending().some((r) => r.delayMs === 15_000), "lease timeout must be registered on the injected scheduler");
+  clock.advance(14_999);
+  assert.deepEqual(discarded, []);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true);
+  clock.advance(1);
+  assert.deepEqual(discarded, [id]);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false);
+  assert.equal(store.acquire(id, "owner"), null);
+  lease.complete(); lease.complete();
+  assert.deepEqual(discarded, [id]);
+  assert.ok(Date.now() - wallBefore < 15_000, "ambient wall time must be irrelevant");
+  await store.close();
+});
+
+test("lease completion cancels the timeout and later time advance is inert", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), discarded = [], id = "C".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: clock, onDiscard: (i) => discarded.push(i) });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const lease = store.acquire(id, "owner");
+  assert.ok(lease);
+  const timeout = clock.registration(15_000);
+  lease.complete();
+  assert.equal(clock.cleared.includes(timeout.handle), true);
+  assert.deepEqual(discarded, [id]);
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  clock.advance(60_000);
+  assert.deepEqual(discarded, [id]);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true);
+  lease.complete();
+  assert.deepEqual(discarded, [id]);
+  await store.close();
+});
+
+test("periodic cleanup defaults to 60s, is single-flight, and reschedules only after settlement", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), discarded = [];
+  const first = "A".repeat(22), second = "B".repeat(22);
+  let reentering = false, nested = false, registrationsDuringPass = -1, passes = 0;
+  const store = new ArtifactStore({ root, scheduler: clock, ttlMs: 1000, onDiscard: (id) => discarded.push(id), onCleanupPass: () => {
+    if (reentering) { nested = true; return; }
+    passes++;
+    reentering = true; periodic.callback(); reentering = false;
+    registrationsDuringPass = clock.registrations.length;
+  } });
+  const periodic = clock.registration(60_000);
+  assert.ok(periodic, "constructor must schedule the default 60s cleanup on the injected scheduler");
+  assert.equal(clock.registrations.length, 1);
+  assert.equal((await store.capture(pdf, { id: first, consumerId: "owner" })).status, "available");
+  assert.equal((await store.capture(pdf, { id: second, consumerId: "owner" })).status, "available");
+  clock.advance(60_000);
+  assert.equal(nested, false, "a second pass must not enter while one is running");
+  assert.equal(passes, 1);
+  assert.equal(registrationsDuringPass, 1, "the next schedule must not be established mid-pass");
+  assert.equal(clock.registrations.length, 2);
+  assert.equal(clock.registration(60_000).delayMs, 60_000);
+  assert.deepEqual(discarded.slice().sort(), [first, second].sort());
+  assert.deepEqual(readdirSync(join(root, "data")), []);
+  await store.close();
+});
+
+test("close cancels artifact timers and post-close callbacks cannot mutate state", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), discarded = [], id = "L".repeat(22);
+  let unlinks = 0;
+  const ops = { linkSync, fsyncSync, unlinkSync(path) { unlinks++; return unlinkSync(path); } };
+  const store = new ArtifactStore({ root, scheduler: clock, fsOps: ops, onDiscard: (i) => discarded.push(i) });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const lease = store.acquire(id, "owner");
+  assert.ok(lease);
+  const periodic = clock.registration(60_000), timeout = clock.registration(15_000);
+  assert.equal(await store.close(), undefined);
+  assert.equal(clock.pending().length, 0);
+  assert.equal(clock.cleared.includes(periodic.handle), true);
+  assert.equal(clock.cleared.includes(timeout.handle), true);
+  assert.deepEqual(discarded, [id]);
+  const settled = unlinks;
+  periodic.callback(); timeout.callback(); lease.complete();
+  assert.equal(unlinks, settled, "no post-close callback may attempt filesystem mutation");
+  assert.deepEqual(discarded, [id]);
+  assert.equal(clock.registrations.length, 2, "close must not leave the periodic pass rescheduling");
+  assert.equal(existsSync(join(root, ".gateway-lock")), false);
 });
