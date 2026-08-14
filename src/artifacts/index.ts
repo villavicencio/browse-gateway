@@ -14,12 +14,12 @@ export class ArtifactOperation {
   private active = 0; private cleanupConfirmed = true; private released = false; private waitingForArtifact = false;
   private disposed = false;
   constructor(private readonly store: ArtifactStore, private readonly consumerId: string, readonly sourceHost: string, readonly artifactId: string, private readonly release: () => void) {
-    runtimeDisposers.set(this, () => this.disposeForRuntime());
+    runtimeDisposers.set(this, () => this.#disposeForRuntime());
   }
   noteMainResponse(status: number | null, contentType: string | null) { if (!this.sealed) { this.status = status; this.contentType = contentType; } }
   private tryRelease() { if (this.sealed && this.active === 0 && this.cleanupConfirmed && !this.waitingForArtifact && !this.released) { this.released = true; this.release(); } }
   private discard() { const clean = this.store.discardArtifact(this.artifactId); this.cleanupConfirmed = clean; this.waitingForArtifact = false; if (!clean) this.result = { outcome: "capture-failed", failure: "artifact-cleanup-failed" }; return clean; }
-  private disposeForRuntime() {
+  #disposeForRuntime() {
     if (this.disposed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" };
     this.disposed = true;
     if (this.result?.outcome === "available") {

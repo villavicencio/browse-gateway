@@ -269,8 +269,8 @@ test("runtime close revokes committed available artifacts without a public dispo
   const root = join(temp(), "a"), source = pdf(temp()), id = "W".repeat(22);
   const r = new ArtifactRuntime({ enabled: true, root });
   const op = r.createOperation("owner", "example.com", id);
-  assert.equal(typeof op.dispose, "undefined");
-  assert.equal(typeof op._disposeForRuntime, "undefined");
+  assert.equal(typeof op.disposeForRuntime, "undefined");
+  assert.equal(Object.getOwnPropertyNames(Object.getPrototypeOf(op)).some(name => /dispose/i.test(name)), false);
   assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
   const closing = r.close();
   assert.deepEqual(op.seal(), { outcome: "capture-failed", failure: "artifact-runtime-invalidated" });
