@@ -103,6 +103,7 @@ export class ArtifactRuntime {
     try { host = canonicalizeHost(sourceHost); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }
     if (!HOST.test(host) || isIP(canonicalizeHostForIp(host)) !== 0 || /[\u0000-\u001f\u007f]/.test(sourceHost)) throw new ArtifactStoreError("artifact-config-invalid");
     let id = explicitId;
+    if (id !== undefined && typeof id !== "string") throw new ArtifactStoreError("invalid-artifact-id");
     if (id !== undefined) { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); if (this.reserved.has(id)) throw new ArtifactStoreError("artifact-capacity"); }
     else for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
       let candidate: unknown;

@@ -295,3 +295,17 @@ test("id generator failures are private typed configuration errors", () => {
     r.close();
   }
 });
+
+test("all public artifact ID boundaries reject nonstrings with private typed errors", async () => {
+  const values = [Symbol("private sentinel"), { secret: true }, 42, null];
+  for (const value of values) {
+    const runtime = new ArtifactRuntime({ enabled: false, root: join(temp(), "runtime-boundary") });
+    assert.throws(() => runtime.createOperation("owner", "example.com", value), e => e.code === "invalid-artifact-id" && !String(e).includes("TypeError") && !String(e).includes("private sentinel"));
+    await runtime.close();
+
+    const store = new ArtifactStore({ enabled: false, root: join(temp(), "store-boundary") });
+    await assert.rejects(store.capture("/private/sentinel", { id: value, consumerId: "owner" }), e => e.code === "invalid-artifact-id" && !String(e).includes("TypeError") && !String(e).includes("private sentinel"));
+    assert.throws(() => store.acquire(value, "owner"), e => e.code === "invalid-artifact-id" && !String(e).includes("TypeError") && !String(e).includes("private sentinel"));
+    assert.throws(() => store.discardArtifact(value), e => e.code === "invalid-artifact-id" && !String(e).includes("TypeError") && !String(e).includes("private sentinel"));
+  }
+});

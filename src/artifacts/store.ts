@@ -45,6 +45,7 @@ export class ArtifactStore {
   }
 
   async capture(source: string, options: CaptureOptions): Promise<CaptureResult> {
+    if (typeof options.id !== "string") throw new ArtifactStoreError("invalid-artifact-id");
     if (options.ttlMs !== undefined && (!Number.isFinite(options.ttlMs) || !Number.isInteger(options.ttlMs) || options.ttlMs <= 0)) return { status: "capture-failed", failure: "artifact-config-invalid" };
     this.reapExpired();
     if (!ARTIFACT_ID.test(options.id)) throw new ArtifactStoreError("invalid-artifact-id");
@@ -75,6 +76,7 @@ export class ArtifactStore {
   }
 
   acquire(id: string, consumerId: string): ResponseLease | null {
+    if (typeof id !== "string") throw new ArtifactStoreError("invalid-artifact-id");
     if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.reapExpired(); if (this.closed || this.unhealthy) return null;
     const rec = this.records.get(id); if (!rec || rec.consumerId !== consumerId || rec.status !== "available") return null;
     const path = join(this.data, `${id}.pdf`); let fd = -1;
@@ -82,7 +84,7 @@ export class ArtifactStore {
     catch { if (!this.discardArtifact(id)) this.markUnhealthy(); return null; } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
   }
 
-  discardArtifact(id: string): boolean { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.clearTimer(id); const existed = this.records.has(id); const clean = this.strictDelete([join(this.data, `${id}.pdf`), join(this.data, `${id}.part`)]); if (!clean) { this.markUnhealthy(); return false; } if (existed) { this.records.delete(id); try { this.onDiscard?.(id); } catch {} } return true; }
+  discardArtifact(id: string): boolean { if (typeof id !== "string") throw new ArtifactStoreError("invalid-artifact-id"); if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.clearTimer(id); const existed = this.records.has(id); const clean = this.strictDelete([join(this.data, `${id}.pdf`), join(this.data, `${id}.part`)]); if (!clean) { this.markUnhealthy(); return false; } if (existed) { this.records.delete(id); try { this.onDiscard?.(id); } catch {} } return true; }
   close(): Promise<ArtifactFailureCode | undefined> { if (this.closePromise) return this.closePromise; if (!this.enabled || this.closed && !this.unhealthy) return Promise.resolve(this.unhealthy ? "artifact-cleanup-failed" : undefined); this.closed = true; this.closePromise = new Promise(resolve => { this.resolveClose = resolve; if (this.activeCaptures === 0) this.finishClose(); }); return this.closePromise; }
   private finishClose(): void { let result: ArtifactFailureCode | undefined; try { let recordsClean = true; for (const id of Array.from(this.records.keys())) if (!this.discardArtifact(id)) recordsClean = false; const names = (this.fsOps.readdirSync ?? readdirSync)(this.data).filter(n => /^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(n)).map(n => join(this.data, n)); const clean = this.strictDelete(names); if (recordsClean && clean && this.strictFsyncDataDir()) { try { (this.fsOps.rmdirSync ?? rmdirSync)(join(this.root, ".gateway-lock")); } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } else { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } const resolve = this.resolveClose; this.resolveClose = undefined; resolve?.(result); }
   private markUnhealthy() { this.unhealthy = true; this.closed = true; }
