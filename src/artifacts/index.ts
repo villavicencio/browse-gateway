@@ -33,7 +33,7 @@ export class ArtifactOperation {
 
 export class ArtifactRuntime {
   readonly store: ArtifactStore; private readonly idGenerator: () => string; private readonly reserved = new Set<string>();
-  constructor(options: ArtifactStoreOptions) { this.store = new ArtifactStore({ ...options, onDiscard: (id) => { this.reserved.delete(id); } }); this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url")); }
+  constructor(options: ArtifactStoreOptions) { this.store = new ArtifactStore({ ...options, onDiscard: (id) => { this.reserved.delete(id); options.onDiscard?.(id); } }); this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url")); }
   createOperation(consumerId: string, sourceHost: string, explicitId?: string) {
     let host: string;
     try { host = canonicalizeHost(sourceHost); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }
@@ -43,7 +43,7 @@ export class ArtifactRuntime {
     else for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) { const candidate = this.idGenerator(); if (ARTIFACT_ID.test(candidate) && !this.reserved.has(candidate)) { id = candidate; break; } }
     if (!id) throw new ArtifactStoreError("artifact-capacity"); this.reserved.add(id); return new ArtifactOperation(this.store, consumerId, host, id, () => this.reserved.delete(id));
   }
-  close() { this.store.close(); }
+  close() { return this.store.close(); }
 }
 export * from "./types.js";
 export { ArtifactStore } from "./store.js";

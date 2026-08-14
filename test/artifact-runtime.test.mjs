@@ -110,3 +110,26 @@ test("canonicalizeHost synchronous failure is typed and private", () => {
   const secret = "/private/host-secret";
   assert.throws(() => new ArtifactRuntime({ enabled: true, root: join(temp(), "a") }).createOperation("c", secret), (e) => e.code === "artifact-config-invalid" && !String(e).includes(secret));
 });
+
+
+test("tampered available artifact is discarded and frees explicit ID quota", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "T".repeat(22); let discarded = 0;
+  const r = new ArtifactRuntime({ enabled: true, root, maxCount: 1, onDiscard: () => discarded++ });
+  const op = r.createOperation("owner", "example.com", id); const result = await op.registerDownload({ path: () => source }); assert.equal(result.outcome, "available");
+  writeFileSync(join(root, "data", `${id}.pdf`), Buffer.from("tampered")); assert.equal(r.store.acquire(id, "owner"), null); assert.equal(discarded, 1);
+  const replacement = r.createOperation("owner", "example.com", id); assert.equal(replacement.artifactId, id); await r.close();
+});
+
+test("terminal operation outcomes release explicit IDs at the correct boundary", async () => {
+  const root = join(temp(), "a"), r = new ArtifactRuntime({ enabled: true, root }), id = "R".repeat(22);
+  const none = r.createOperation("owner", "example.com", id); assert.deepEqual(none.seal(), { outcome: "none" }); r.createOperation("owner", "example.com", id).seal();
+  const inline = r.createOperation("owner", "example.com", id); inline.noteMainResponse(200, "application/pdf"); assert.equal(inline.seal().outcome, "inline-pdf-unsupported"); r.createOperation("owner", "example.com", id).seal();
+  const failed = r.createOperation("owner", "example.com", id); assert.equal((await failed.registerDownload({ failure: () => { throw new Error("private"); } })).failure, "download-capture-failed"); r.createOperation("owner", "example.com", id).seal();
+  const pathFailed = r.createOperation("owner", "example.com", id); assert.equal((await pathFailed.registerDownload({ path: () => { throw new Error("private"); } })).failure, "download-capture-failed"); r.createOperation("owner", "example.com", id).seal();
+  const invalid = r.createOperation("owner", "example.com", id); assert.equal(invalid.invalidate().failure, "artifact-runtime-invalidated"); r.createOperation("owner", "example.com", id).seal(); await r.close();
+});
+
+test("in-flight and available artifacts retain IDs until terminal cleanup", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "Q".repeat(22), r = new ArtifactRuntime({ enabled: true, root }); let release; const gate = new Promise(resolve => { release = resolve; });
+  const op = r.createOperation("owner", "example.com", id); const pending = op.registerDownload({ path: async () => { await gate; return source; } }); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); release(); assert.equal((await pending).outcome, "available"); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete(); assert.equal(r.createOperation("owner", "example.com", id).artifactId, id); await r.close();
+});
