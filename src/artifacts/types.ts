@@ -9,7 +9,7 @@ export type ArtifactStoreErrorCode = "invalid-artifact-id" | "artifact-store-una
 export class ArtifactStoreError extends Error { readonly code: ArtifactStoreErrorCode; constructor(code: ArtifactStoreErrorCode) { super(code); this.name = "ArtifactStoreError"; this.code = code; } }
 export interface ArtifactRecord { id: string; consumerId: string; bytes: number; sha256: string; createdAt: number; expiresAt: number; status: "available" | "consuming"; }
 export interface ArtifactStoreOptions { enabled?: boolean; root: string; ttlMs?: number; maxBytes?: number; maxCount?: number; perConsumerBytes?: number; perConsumerCount?: number; now?: () => number; idGenerator?: () => string; fsOps?: FsOps; onDiscard?: (id: string) => void; afterPartFsync?: () => void | Promise<void>; afterLinkBeforeCommit?: () => void | Promise<void>; }
-export interface FsOps { linkSync: typeof import("node:fs").linkSync; unlinkSync: typeof import("node:fs").unlinkSync; fsyncSync: typeof import("node:fs").fsyncSync; rmdirSync?: typeof import("node:fs").rmdirSync; }
+export interface FsOps { linkSync: typeof import("node:fs").linkSync; unlinkSync: typeof import("node:fs").unlinkSync; fsyncSync: typeof import("node:fs").fsyncSync; rmdirSync?: typeof import("node:fs").rmdirSync; /** @internal test seam */ readdirSync?: typeof import("node:fs").readdirSync; }
 export interface CaptureOptions { id: string; consumerId: string; ttlMs?: number; }
 export type CaptureResult = ArtifactRecord | { status: "capture-failed"; failure: ArtifactFailureCode };
 export interface ResponseLease { record: ArtifactRecord; bytes: number; base64: string; deadline: number; complete(): void; }

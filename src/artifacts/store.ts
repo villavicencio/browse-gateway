@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { fstatSync, fsyncSync, mkdirSync, openSync, closeSync, readSync, writeSync, readdirSync, rmdirSync, statSync, linkSync, unlinkSync } from "node:fs";
+import { fstatSync, fsyncSync, mkdirSync, openSync, closeSync, readSync, writeSync, readdirSync, rmdirSync, lstatSync, linkSync, unlinkSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { ARTIFACT_ID, ArtifactStoreError, type ArtifactRecord, type ArtifactStoreOptions, type CaptureOptions, type CaptureResult, type ResponseLease, type ArtifactFailureCode } from "./types.js";
 
@@ -28,11 +28,15 @@ export class ArtifactStore {
     if (!this.enabled) return;
     if (process.platform !== "linux" || constants.O_NOFOLLOW === undefined) throw new ArtifactStoreError("artifact-filesystem-unsupported");
     try { mkdirSync(this.root, { recursive: true, mode: 0o700 }); } catch { throw new ArtifactStoreError("artifact-root-invalid"); }
+    try { const existing = lstatSync(this.root); if (!existing.isDirectory() || existing.uid !== process.getuid?.()) throw new Error(); } catch { throw new ArtifactStoreError("artifact-root-invalid"); }
     try { mkdirSync(join(this.root, ".gateway-lock"), { mode: 0o700 }); } catch { throw new ArtifactStoreError("artifact-root-locked"); }
-    try { mkdirSync(this.data, { recursive: true, mode: 0o700 }); if ((statSync(this.root).mode & 0o777) !== 0o700 || (statSync(this.data).mode & 0o777) !== 0o700) throw new Error(); } catch { try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} throw new ArtifactStoreError("artifact-root-invalid"); }
+    try {
+      const rootStat = lstatSync(this.root); if (!rootStat.isDirectory() || rootStat.uid !== process.getuid?.() || (rootStat.mode & 0o777) !== 0o700) throw new Error();
+      mkdirSync(this.data, { recursive: true, mode: 0o700 }); const dataStat = lstatSync(this.data); if (!dataStat.isDirectory() || dataStat.uid !== process.getuid?.() || (dataStat.mode & 0o777) !== 0o700) throw new Error();
+    } catch { try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} throw new ArtifactStoreError("artifact-root-invalid"); }
     try {
       let changed = false;
-      for (const name of readdirSync(this.data)) { if (!/^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(name)) throw new ArtifactStoreError("artifact-root-invalid"); this.fsOps.unlinkSync(join(this.data, name)); changed = true; }
+      for (const name of readdirSync(this.data)) { if (!/^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(name)) throw new ArtifactStoreError("artifact-root-invalid"); const st = lstatSync(join(this.data, name)); if (!st.isFile() || st.nlink !== 1 || st.uid !== process.getuid?.() || (st.mode & 0o777) !== 0o600) throw new ArtifactStoreError("artifact-root-invalid"); this.fsOps.unlinkSync(join(this.data, name)); changed = true; }
       if (changed) this.fsyncDataDir();
     } catch (e) { if (e instanceof ArtifactStoreError && e.code === "artifact-root-invalid") { try { rmdirSync(join(this.root, ".gateway-lock")); } catch {} throw e; } throw new ArtifactStoreError("artifact-cleanup-failed"); }
   }
@@ -74,9 +78,9 @@ export class ArtifactStore {
     catch { if (!this.discardArtifact(id)) this.markUnhealthy(); return null; } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
   }
 
-  discardArtifact(id: string): boolean { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.clearTimer(id); const existed = this.records.delete(id); if (existed) { try { this.onDiscard?.(id); } catch {} } const clean = this.strictDelete([join(this.data, `${id}.pdf`), join(this.data, `${id}.part`)]); if (!clean) this.markUnhealthy(); return clean; }
+  discardArtifact(id: string): boolean { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); this.clearTimer(id); const existed = this.records.has(id); const clean = this.strictDelete([join(this.data, `${id}.pdf`), join(this.data, `${id}.part`)]); if (!clean) { this.markUnhealthy(); return false; } if (existed) { this.records.delete(id); try { this.onDiscard?.(id); } catch { this.markUnhealthy(); return false; } } return true; }
   close(): Promise<ArtifactFailureCode | undefined> { if (this.closePromise) return this.closePromise; if (!this.enabled || this.closed && !this.unhealthy) return Promise.resolve(this.unhealthy ? "artifact-cleanup-failed" : undefined); this.closed = true; this.closePromise = new Promise(resolve => { this.resolveClose = resolve; if (this.activeCaptures === 0) this.finishClose(); }); return this.closePromise; }
-  private finishClose(): void { for (const id of Array.from(this.records.keys())) this.discardArtifact(id); const names = readdirSync(this.data).filter(n => /^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(n)).map(n => join(this.data, n)); const clean = this.strictDelete(names); let result: ArtifactFailureCode | undefined; if (clean && this.strictFsyncDataDir()) { try { (this.fsOps.rmdirSync ?? rmdirSync)(join(this.root, ".gateway-lock")); } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } else { this.markUnhealthy(); result = "artifact-cleanup-failed"; } this.resolveClose?.(result); this.resolveClose = undefined; }
+  private finishClose(): void { let result: ArtifactFailureCode | undefined; try { for (const id of Array.from(this.records.keys())) this.discardArtifact(id); const names = (this.fsOps.readdirSync ?? readdirSync)(this.data).filter(n => /^[A-Za-z0-9_-]{22,64}\.(?:part|pdf)$/.test(n)).map(n => join(this.data, n)); const clean = this.strictDelete(names); if (clean && this.strictFsyncDataDir()) { try { (this.fsOps.rmdirSync ?? rmdirSync)(join(this.root, ".gateway-lock")); } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } else { this.markUnhealthy(); result = "artifact-cleanup-failed"; } } catch { this.markUnhealthy(); result = "artifact-cleanup-failed"; } const resolve = this.resolveClose; this.resolveClose = undefined; resolve?.(result); }
   private markUnhealthy() { this.unhealthy = true; this.closed = true; }
   private strictDelete(paths: string[]) { let ok = true, changed = false; for (const path of paths) { try { this.fsOps.unlinkSync(path); changed = true; } catch (e: any) { if (e?.code !== "ENOENT") ok = false; } } if (ok && changed && !this.strictFsyncDataDir()) ok = false; return ok; }
   private fsyncDataDir() { const fd = openSync(this.data, constants.O_RDONLY); try { this.fsOps.fsyncSync(fd); } finally { closeSync(fd); } }
