@@ -148,8 +148,39 @@ test("sealing an available operation retains its ID until durable discard", asyn
   const root = join(temp(), "a"), source = pdf(temp()), id = "S".repeat(22);
   const r = new ArtifactRuntime({ enabled: true, root });
   const op = r.createOperation("owner", "example.com", id);
-  assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
+  const available = await op.registerDownload({ path: () => source });
+  assert.equal(available.outcome, "available");
   assert.equal(op.seal().outcome, "available");
+  assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
+  await r.close();
+});
+
+test("ordinary invalidation after capture commits an available artifact", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "O".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root });
+  const op = r.createOperation("owner", "example.com", id);
+  const available = await op.registerDownload({ path: () => source });
+  assert.equal(available.outcome, "available");
+  assert.strictEqual(op.invalidate(), available);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true);
+  assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
+  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
+  await r.close();
+});
+
+test("repeated ordinary invalidation cannot revoke a sealed available artifact", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "P".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root });
+  const op = r.createOperation("owner", "example.com", id);
+  const available = await op.registerDownload({ path: () => source });
+  assert.equal(available.outcome, "available");
+  assert.strictEqual(op.seal(), available);
+  assert.strictEqual(op.invalidate(), available);
+  assert.strictEqual(op.invalidate(), available);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true);
   assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
   const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
   assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
@@ -182,11 +213,19 @@ test("stale operation methods cannot release a replacement reservation", async (
   await r.close();
 });
 
-test("invalidation cleanup failure retains operation reservation and reports cleanup failure", async () => {
+test("invalidation cleanup failure remains terminal and retains operation reservation", async () => {
   const root = join(temp(), "a"), source = pdf(temp()), id = "A".repeat(22);
-  const r = new ArtifactRuntime({ enabled: true, root, fsOps: { linkSync, fsyncSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`)) throw new Error("unlink"); return unlinkSync(path); } } });
+  let reachedLink;
+  const linked = new Promise(resolve => { reachedLink = resolve; });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const r = new ArtifactRuntime({ enabled: true, root, afterLinkBeforeCommit: async () => { reachedLink(); await gate; }, fsOps: { linkSync, fsyncSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`)) throw new Error("unlink"); return unlinkSync(path); } } });
   const op = r.createOperation("owner", "example.com", id);
-  assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
+  const pending = op.registerDownload({ path: () => source });
+  await linked;
+  assert.deepEqual(op.invalidate(), { outcome: "capture-failed", failure: "artifact-cleanup-failed" });
+  release();
+  assert.deepEqual(await pending, { outcome: "capture-failed", failure: "artifact-cleanup-failed" });
   assert.deepEqual(op.invalidate(), { outcome: "capture-failed", failure: "artifact-cleanup-failed" });
   assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
   assert.equal(existsSync(join(root, ".gateway-lock")), true);

@@ -53,6 +53,7 @@ export class ArtifactOperation {
     return this.terminal(this.result ?? { outcome: "none" });
   }
   invalidate() {
+    if (this.result?.outcome === "available") { this.sealed = true; return this.result; }
     if (!this.sealed) { this.sealed = true; this.generation++; this.result = { outcome: "capture-failed", failure: "artifact-runtime-invalidated" }; }
     this.cleanupConfirmed = this.discard(); this.tryRelease(); return this.result!;
   }
