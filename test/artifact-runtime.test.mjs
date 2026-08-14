@@ -254,3 +254,42 @@ test("in-flight invalidation and multiple retain ID until continuation cleanup c
     assert.equal(terminal.failure, mode === "invalidate" ? "artifact-runtime-invalidated" : "multiple-artifacts");
   }
 });
+
+test("runtime close invalidates preexisting operations and rejects new ones", async () => {
+  const root = join(temp(), "a"), r = new ArtifactRuntime({ enabled: true, root });
+  const open = r.createOperation("owner", "example.com", "Z".repeat(22));
+  const closing = r.close();
+  assert.throws(() => r.createOperation("owner", "example.com", "Y".repeat(22)), e => e.code === "artifact-runtime-invalidated");
+  assert.deepEqual(open.seal(), { outcome: "capture-failed", failure: "artifact-runtime-invalidated" });
+  assert.strictEqual(r.close(), closing);
+  await closing;
+});
+
+test("runtime close revokes committed available artifacts", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "W".repeat(22);
+  const r = new ArtifactRuntime({ enabled: true, root });
+  const op = r.createOperation("owner", "example.com", id);
+  assert.equal((await op.registerDownload({ path: () => source })).outcome, "available");
+  const closing = r.close();
+  assert.deepEqual(op.seal(), { outcome: "capture-failed", failure: "artifact-runtime-invalidated" });
+  await closing;
+  assert.equal(r.store.acquire(id, "owner"), null);
+});
+
+test("capture rejects every invalid per-capture TTL before accounting", async () => {
+  for (const ttlMs of [-1, 0, NaN, Infinity, 1.5]) {
+    const root = join(temp(), `ttl-${String(ttlMs)}`), source = pdf(temp()), id = "V".repeat(22);
+    const s = new ArtifactStore({ enabled: true, root, maxCount: 1 });
+    assert.deepEqual(await s.capture(source, { id, consumerId: "c", ttlMs }), { status: "capture-failed", failure: "artifact-config-invalid" });
+    assert.equal(s.acquire(id, "c"), null);
+    await s.close();
+  }
+});
+
+test("id generator failures are private typed configuration errors", () => {
+  for (const idGenerator of [() => { throw new Error("secret sentinel"); }, () => Symbol("secret"), () => ({ secret: true }), () => null]) {
+    const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "generator") , idGenerator });
+    assert.throws(() => r.createOperation("owner", "example.com"), e => e.code === "artifact-config-invalid" && !String(e).includes("secret"));
+    r.close();
+  }
+});

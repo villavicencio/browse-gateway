@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { ArtifactStore } from "./store.js";
-import { ARTIFACT_ID, ArtifactStoreError, type ArtifactStoreOptions, type DownloadLike, type OperationResult } from "./types.js";
+import { ARTIFACT_ID, ArtifactStoreError, type ArtifactFailureCode, type ArtifactStoreOptions, type DownloadLike, type OperationResult } from "./types.js";
 import { canonicalizeHost, canonicalizeHostForIp } from "../security/url.js";
 import { isIP } from "node:net";
 
@@ -10,10 +10,28 @@ const MAX_ID_ATTEMPTS = 8;
 export class ArtifactOperation {
   private events = 0; private sealed = false; private generation = 0; private result?: OperationResult; private status: number | null = null; private contentType: string | null = null;
   private active = 0; private cleanupConfirmed = true; private released = false; private waitingForArtifact = false;
+  private disposed = false;
   constructor(private readonly store: ArtifactStore, private readonly consumerId: string, readonly sourceHost: string, readonly artifactId: string, private readonly release: () => void) {}
   noteMainResponse(status: number | null, contentType: string | null) { if (!this.sealed) { this.status = status; this.contentType = contentType; } }
   private tryRelease() { if (this.sealed && this.active === 0 && this.cleanupConfirmed && !this.waitingForArtifact && !this.released) { this.released = true; this.release(); } }
   private discard() { const clean = this.store.discardArtifact(this.artifactId); this.cleanupConfirmed = clean; this.waitingForArtifact = false; if (!clean) this.result = { outcome: "capture-failed", failure: "artifact-cleanup-failed" }; return clean; }
+  dispose() {
+    if (this.disposed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" };
+    this.disposed = true;
+    if (this.result?.outcome === "available") {
+      this.sealed = true;
+      this.generation++;
+      const clean = this.discard();
+      this.result = { outcome: "capture-failed", failure: clean ? "artifact-runtime-invalidated" : "artifact-cleanup-failed" };
+      this.tryRelease();
+      return this.result;
+    }
+    if (!this.sealed) { this.sealed = true; this.generation++; this.result = { outcome: "capture-failed", failure: "artifact-runtime-invalidated" }; }
+    const clean = this.discard();
+    if (!clean) this.result = { outcome: "capture-failed", failure: "artifact-cleanup-failed" };
+    this.tryRelease();
+    return this.result!;
+  }
   private terminal(result: OperationResult, cleanup = false) {
     this.sealed = true;
     this.generation++;
@@ -25,6 +43,7 @@ export class ArtifactOperation {
     return this.result;
   }
   async registerDownload(download: DownloadLike) {
+    if (this.disposed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" };
     if (this.sealed) return this.result;
     this.active++;
     this.events++;
@@ -47,6 +66,7 @@ export class ArtifactOperation {
     } finally { this.active--; this.tryRelease(); }
   }
   seal(): OperationResult {
+    if (this.disposed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" };
     if (this.sealed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" };
     const essence = ((this.contentType ?? "").trim().toLowerCase().split(";", 1)[0] ?? "").trim();
     if (this.events === 0 && this.status === 200 && essence === "application/pdf") return this.terminal({ outcome: "inline-pdf-unsupported", failure: "inline-pdf-unsupported" });
@@ -60,7 +80,7 @@ export class ArtifactOperation {
 }
 
 export class ArtifactRuntime {
-  readonly store: ArtifactStore; private readonly idGenerator: () => string; private readonly reserved = new Map<string, symbol>();
+  readonly store: ArtifactStore; private readonly idGenerator: () => string; private readonly reserved = new Map<string, symbol>(); private readonly operations = new Map<symbol, ArtifactOperation>(); private closed = false; private closePromise?: Promise<ArtifactFailureCode | undefined>;
   constructor(options: ArtifactStoreOptions) {
     this.store = new ArtifactStore({ ...options, onDiscard: (id) => {
       // ArtifactStore invokes onDiscard synchronously after durable deletion, before a replacement can be created.
@@ -70,18 +90,32 @@ export class ArtifactRuntime {
     this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url"));
   }
   createOperation(consumerId: string, sourceHost: string, explicitId?: string) {
+    if (this.closed) throw new ArtifactStoreError("artifact-runtime-invalidated");
     let host: string;
     try { host = canonicalizeHost(sourceHost); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }
     if (!HOST.test(host) || isIP(canonicalizeHostForIp(host)) !== 0 || /[\u0000-\u001f\u007f]/.test(sourceHost)) throw new ArtifactStoreError("artifact-config-invalid");
     let id = explicitId;
     if (id !== undefined) { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); if (this.reserved.has(id)) throw new ArtifactStoreError("artifact-capacity"); }
-    else for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) { const candidate = this.idGenerator(); if (ARTIFACT_ID.test(candidate) && !this.reserved.has(candidate)) { id = candidate; break; } }
+    else for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
+      let candidate: unknown;
+      try { candidate = this.idGenerator(); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }
+      if (typeof candidate !== "string") throw new ArtifactStoreError("artifact-config-invalid");
+      if (ARTIFACT_ID.test(candidate) && !this.reserved.has(candidate)) { id = candidate; break; }
+    }
     if (!id) throw new ArtifactStoreError("artifact-capacity");
     const token = Symbol(id);
     this.reserved.set(id, token);
-    return new ArtifactOperation(this.store, consumerId, host, id, () => { if (this.reserved.get(id) === token) this.reserved.delete(id); });
+    const operation = new ArtifactOperation(this.store, consumerId, host, id, () => { if (this.reserved.get(id) === token) this.reserved.delete(id); this.operations.delete(token); });
+    this.operations.set(token, operation);
+    return operation;
   }
-  close() { return this.store.close(); }
+  close() {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    for (const operation of Array.from(this.operations.values())) operation.dispose();
+    this.closePromise = this.store.close();
+    return this.closePromise;
+  }
 }
 export * from "./types.js";
 export { ArtifactStore } from "./store.js";

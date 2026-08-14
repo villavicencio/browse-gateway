@@ -45,6 +45,7 @@ export class ArtifactStore {
   }
 
   async capture(source: string, options: CaptureOptions): Promise<CaptureResult> {
+    if (options.ttlMs !== undefined && (!Number.isFinite(options.ttlMs) || !Number.isInteger(options.ttlMs) || options.ttlMs <= 0)) return { status: "capture-failed", failure: "artifact-config-invalid" };
     this.reapExpired();
     if (!ARTIFACT_ID.test(options.id)) throw new ArtifactStoreError("invalid-artifact-id");
     if (this.closed || this.unhealthy || !this.enabled) return { status: "capture-failed", failure: "artifact-runtime-invalidated" };
