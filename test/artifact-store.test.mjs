@@ -10,6 +10,15 @@ function temp() { const dir = mkdtempSync(join(tmpdir(), "bgw-artifact-")); dirs
 afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
 function source() { const path = join(temp(), "source.pdf"); writeFileSync(path, Buffer.from("%PDF-1.7\nhello")); return path; }
 
+const STAGE_BYTES = 8 * 1024 * 1024, SOURCE_BYTES = 14;
+const IDLE = { count: 0, bytes: 0, stagingBytes: 0, stagePermits: 0, stagePermitLimit: 2, responsePermitHeld: false, responseWaiters: 0, responseBytes: 0, consumers: 0 };
+// `capture` runs synchronously into `afterPartFsync`, so flipping `arm` after the call pauses
+// exactly the captures a test wants staging and lets the rest run to completion.
+function stagingGate() { let arm = true, release; const held = new Promise((resolve) => { release = resolve; }); return { hook: () => (arm ? held : undefined), arm: () => { arm = true; }, disarm: () => { arm = false; }, release: () => release() }; }
+// A staging capture shrinks to its exact size as soon as the source is stat'd, so proving that
+// uncommitted bytes block admission needs a source big enough to matter against the cap.
+function bigSource(bytes) { const path = join(temp(), "big.pdf"); writeFileSync(path, Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(bytes - 9)])); return path; }
+
 // Deterministic scheduler: virtual time only, every registration retained so a test can fire a
 // cancelled or post-close callback by hand and prove it is inert.
 function fakeScheduler(start = 1_000_000) {
@@ -113,7 +122,7 @@ test("post-link part unlink failure poisons store and retains lock", async () =>
   const store = new ArtifactStore({ enabled: true, root, fsOps: ops });
   assert.deepEqual(await store.capture(source, { id: "Y".repeat(22), consumerId: "owner" }), { status: "capture-failed", failure: "artifact-cleanup-failed" });
   assert.deepEqual(await store.capture(source, { id: "X".repeat(22), consumerId: "owner" }), { status: "capture-failed", failure: "artifact-runtime-invalidated" });
-  assert.equal(store.acquire("Y".repeat(22), "owner"), null);
+  assert.equal(await store.acquire("Y".repeat(22), "owner"), null);
   assert.equal(existsSync(join(root, ".gateway-lock")), true);
   assert.throws(() => new ArtifactStore({ enabled: true, root }), (e) => e.code === "artifact-root-locked" && !String(e).includes("sentinel"));
   await store.close();
@@ -123,7 +132,7 @@ test("post-link part unlink failure poisons store and retains lock", async () =>
 test("discard failure retains available record and callback", async () => {
   const root = join(temp(), "artifacts"), source = join(temp(), "source.pdf"), id = "D".repeat(22); writeFileSync(source, Buffer.from("%PDF-1.7\nhello")); let callbacks = 0;
   const store = new ArtifactStore({ root, onDiscard: () => { callbacks++; }, fsOps: { linkSync, fsyncSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`)) throw new Error("unlink"); return unlinkSync(path); } } });
-  assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available"); assert.equal(store.discardArtifact(id), false); assert.equal(callbacks, 0); assert.equal(store.acquire(id, "owner"), null); assert.equal(existsSync(join(root, ".gateway-lock")), true); await store.close();
+  assert.equal((await store.capture(source, { id, consumerId: "owner" })).status, "available"); assert.equal(store.discardArtifact(id), false); assert.equal(callbacks, 0); assert.equal(await store.acquire(id, "owner"), null); assert.equal(existsSync(join(root, ".gateway-lock")), true); await store.close();
 });
 
 test("rollback final unlink failure after dir fsync failure poisons store and retains lock", async () => {
@@ -232,11 +241,11 @@ test("expiry is decided by the injected scheduler at the exact TTL boundary", as
   assert.equal(record.expiresAt, clock.now() + 1000);
   assert.equal((await store.capture(pdf, { id: exact, consumerId: "owner" })).status, "available");
   clock.advance(999);
-  const lease = store.acquire(early, "owner");
+  const lease = await store.acquire(early, "owner");
   assert.ok(lease, "now === expiresAt - 1 must remain available");
   lease.complete();
   clock.advance(1);
-  assert.equal(store.acquire(exact, "owner"), null);
+  assert.equal(await store.acquire(exact, "owner"), null);
   assert.deepEqual(readdirSync(join(root, "data")), []);
   assert.deepEqual(discarded, [early, exact]);
   await store.close();
@@ -247,7 +256,7 @@ test("response lease deadline and timeout advance only on the injected scheduler
   const store = new ArtifactStore({ root, scheduler: clock, onDiscard: (i) => discarded.push(i) });
   assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
   const wallBefore = Date.now();
-  const lease = store.acquire(id, "owner");
+  const lease = await store.acquire(id, "owner");
   assert.ok(lease);
   assert.equal(lease.deadline, clock.now() + 15_000);
   assert.ok(clock.pending().some((r) => r.delayMs === 15_000), "lease timeout must be registered on the injected scheduler");
@@ -257,7 +266,7 @@ test("response lease deadline and timeout advance only on the injected scheduler
   clock.advance(1);
   assert.deepEqual(discarded, [id]);
   assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false);
-  assert.equal(store.acquire(id, "owner"), null);
+  assert.equal(await store.acquire(id, "owner"), null);
   lease.complete(); lease.complete();
   assert.deepEqual(discarded, [id]);
   assert.ok(Date.now() - wallBefore < 15_000, "ambient wall time must be irrelevant");
@@ -268,7 +277,7 @@ test("lease completion cancels the timeout and later time advance is inert", asy
   const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), discarded = [], id = "C".repeat(22);
   const store = new ArtifactStore({ root, scheduler: clock, onDiscard: (i) => discarded.push(i) });
   assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
-  const lease = store.acquire(id, "owner");
+  const lease = await store.acquire(id, "owner");
   assert.ok(lease);
   const timeout = clock.registration(15_000);
   lease.complete();
@@ -315,7 +324,7 @@ test("close cancels artifact timers and post-close callbacks cannot mutate state
   const ops = { linkSync, fsyncSync, unlinkSync(path) { unlinks++; return unlinkSync(path); } };
   const store = new ArtifactStore({ root, scheduler: clock, fsOps: ops, onDiscard: (i) => discarded.push(i) });
   assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
-  const lease = store.acquire(id, "owner");
+  const lease = await store.acquire(id, "owner");
   assert.ok(lease);
   const periodic = clock.registration(60_000), timeout = clock.registration(15_000);
   assert.equal(await store.close(), undefined);
@@ -329,4 +338,263 @@ test("close cancels artifact timers and post-close callbacks cannot mutate state
   assert.deepEqual(discarded, [id]);
   assert.equal(clock.registrations.length, 2, "close must not leave the periodic pass rescheduling");
   assert.equal(existsSync(join(root, ".gateway-lock")), false);
+});
+
+test("a staging capture holds its global count slot before it is committed", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), gate = stagingGate();
+  const committed = "A".repeat(22), staging = "B".repeat(22), rejected = "C".repeat(22);
+  const store = new ArtifactStore({ root, maxCount: 2, afterPartFsync: gate.hook });
+  gate.disarm();
+  assert.equal((await store.capture(pdf, { id: committed, consumerId: "one" })).status, "available");
+  gate.arm();
+  const pending = store.capture(pdf, { id: staging, consumerId: "two" });
+  gate.disarm();
+  assert.deepEqual(await store.capture(pdf, { id: rejected, consumerId: "three" }), { status: "capture-failed", failure: "artifact-capacity" });
+  assert.equal(existsSync(join(root, "data", `${rejected}.part`)), false, "a rejected reservation must not create a destination file");
+  assert.equal(store.accounting().count, 2);
+  gate.release();
+  assert.equal((await pending).status, "available");
+  await store.close();
+});
+
+test("per-consumer count reservation includes that consumer's staging capture", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), gate = stagingGate();
+  const first = "D".repeat(22), second = "E".repeat(22);
+  const store = new ArtifactStore({ root, perConsumerCount: 1, afterPartFsync: gate.hook });
+  const pending = store.capture(pdf, { id: first, consumerId: "owner" });
+  gate.disarm();
+  assert.deepEqual(await store.capture(pdf, { id: second, consumerId: "owner" }), { status: "capture-failed", failure: "artifact-capacity" });
+  assert.equal(existsSync(join(root, "data", `${second}.part`)), false);
+  assert.equal((await store.capture(pdf, { id: second, consumerId: "other" })).status, "available");
+  gate.release();
+  assert.equal((await pending).status, "available");
+  await store.close();
+});
+
+test("staging bytes block aggregate over-admission while nothing is committed", async () => {
+  const root = join(temp(), "artifacts"), big = bigSource(5 * 1024 * 1024), pdf = source(), gate = stagingGate();
+  const first = "F".repeat(22), second = "G".repeat(22);
+  const store = new ArtifactStore({ root, maxBytes: 12 * 1024 * 1024, afterPartFsync: gate.hook });
+  const pending = store.capture(big, { id: first, consumerId: "one" });
+  gate.disarm();
+  // 5 MiB staging + an 8 MiB admission exceeds the 12 MiB cap, with no record committed anywhere.
+  assert.deepEqual(await store.capture(pdf, { id: second, consumerId: "two" }), { status: "capture-failed", failure: "artifact-capacity" });
+  assert.equal(existsSync(join(root, "data", `${second}.part`)), false);
+  assert.equal(store.accounting().stagingBytes, 5 * 1024 * 1024, "an uncommitted copy still holds its exact bytes");
+  gate.release();
+  assert.equal((await pending).status, "available");
+  // A committed 5 MiB artifact still leaves no room for an 8 MiB admission under a 12 MiB cap.
+  assert.deepEqual(await store.capture(pdf, { id: second, consumerId: "two" }), { status: "capture-failed", failure: "artifact-capacity" });
+  assert.equal(store.discardArtifact(first), true);
+  assert.equal((await store.capture(pdf, { id: second, consumerId: "two" })).status, "available");
+  await store.close();
+});
+
+test("per-consumer staging bytes are reserved independently of other consumers", async () => {
+  const root = join(temp(), "artifacts"), big = bigSource(5 * 1024 * 1024), pdf = source(), gate = stagingGate();
+  const first = "H".repeat(22), blocked = "I".repeat(22), other = "J".repeat(22);
+  const store = new ArtifactStore({ root, perConsumerBytes: 12 * 1024 * 1024, afterPartFsync: gate.hook });
+  const pending = store.capture(big, { id: first, consumerId: "owner" });
+  gate.disarm();
+  assert.deepEqual(await store.capture(pdf, { id: blocked, consumerId: "owner" }), { status: "capture-failed", failure: "artifact-capacity" });
+  assert.equal(existsSync(join(root, "data", `${blocked}.part`)), false);
+  assert.equal((await store.capture(pdf, { id: other, consumerId: "stranger" })).status, "available");
+  gate.release();
+  assert.equal((await pending).status, "available");
+  await store.close();
+});
+
+test("exact source size releases the unused byte reservation promptly", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), gate = stagingGate(), id = "K".repeat(22);
+  const store = new ArtifactStore({ root, afterPartFsync: gate.hook });
+  const pending = store.capture(pdf, { id, consumerId: "owner" });
+  gate.disarm();
+  assert.deepEqual(store.accounting(), { ...IDLE, count: 1, bytes: SOURCE_BYTES, stagingBytes: SOURCE_BYTES, stagePermits: 1, consumers: 1 }, "the pessimistic reservation must shrink to the exact size before the copy completes");
+  gate.release();
+  assert.equal((await pending).status, "available");
+  assert.deepEqual(store.accounting(), { ...IDLE, count: 1, bytes: SOURCE_BYTES, consumers: 1 });
+  await store.close();
+});
+
+test("every terminal capture and lease path releases its reservation exactly once", async () => {
+  const pdf = source(), id = "L".repeat(22);
+  const tiny = join(temp(), "tiny.pdf"); writeFileSync(tiny, Buffer.from("%PD"));
+  const notPdf = join(temp(), "plain.pdf"); writeFileSync(notPdf, Buffer.from("plain text, not a pdf"));
+  const oversize = join(temp(), "big.pdf"); writeFileSync(oversize, Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(STAGE_BYTES)]));
+  const failures = [[tiny, "artifact-not-pdf"], [notPdf, "artifact-integrity-failed"], [oversize, "artifact-size-limit"]];
+  for (const [path, failure] of failures) {
+    const store = new ArtifactStore({ root: join(temp(), "artifacts") });
+    assert.deepEqual(await store.capture(path, { id, consumerId: "owner" }), { status: "capture-failed", failure });
+    assert.deepEqual(store.accounting(), IDLE);
+    await store.close();
+  }
+  { // write failure with confirmed rollback
+    const store = new ArtifactStore({ root: join(temp(), "artifacts"), fsOps: { unlinkSync, fsyncSync, linkSync() { throw new Error("/private/link-sentinel"); } } });
+    assert.deepEqual(await store.capture(pdf, { id, consumerId: "owner" }), { status: "capture-failed", failure: "artifact-write-failed" });
+    assert.deepEqual(store.accounting(), IDLE);
+    await store.close();
+  }
+  { // completion, repeated completion and repeated discard
+    const store = new ArtifactStore({ root: join(temp(), "artifacts") });
+    assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+    const lease = await store.acquire(id, "owner"); assert.ok(lease);
+    assert.deepEqual(store.accounting(), { ...IDLE, count: 1, bytes: SOURCE_BYTES, consumers: 1, responsePermitHeld: true, responseBytes: SOURCE_BYTES });
+    lease.complete(); lease.complete();
+    assert.equal(store.discardArtifact(id), true); assert.equal(store.discardArtifact(id), true);
+    assert.deepEqual(store.accounting(), IDLE);
+    await store.close();
+  }
+  { // explicit discard of an available artifact
+    const store = new ArtifactStore({ root: join(temp(), "artifacts") });
+    assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+    assert.equal(store.discardArtifact(id), true);
+    assert.deepEqual(store.accounting(), IDLE);
+    await store.close();
+  }
+  { // expiry and lease timeout on the injected clock
+    const clock = fakeScheduler(), store = new ArtifactStore({ root: join(temp(), "artifacts"), scheduler: clock, ttlMs: 1000 });
+    assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+    clock.advance(60_000); // the periodic pass reaps the expired record and releases its reservation
+    assert.deepEqual(store.accounting(), IDLE);
+    assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+    const lease = await store.acquire(id, "owner"); assert.ok(lease);
+    clock.advance(15_000);
+    assert.deepEqual(store.accounting(), IDLE);
+    lease.complete();
+    assert.deepEqual(store.accounting(), IDLE);
+    await store.close();
+  }
+  { // clean close
+    const store = new ArtifactStore({ root: join(temp(), "artifacts") });
+    assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+    assert.equal(await store.close(), undefined);
+    assert.deepEqual(store.accounting(), IDLE);
+  }
+});
+
+test("unconfirmed cleanup retains reserved count and bytes instead of freeing capacity", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "M".repeat(22);
+  const store = new ArtifactStore({ root, fsOps: { linkSync, fsyncSync, unlinkSync(path) { if (path.endsWith(`${id}.pdf`)) throw new Error("/private/unlink-sentinel"); return unlinkSync(path); } } });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  assert.equal(store.discardArtifact(id), false);
+  const retained = { ...IDLE, count: 1, bytes: SOURCE_BYTES, consumers: 1 };
+  assert.deepEqual(store.accounting(), retained, "an undeleted artifact's capacity must not become reusable");
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.deepEqual(store.accounting(), retained, "close must not fabricate zero accounting for unconfirmed cleanup");
+  assert.equal(existsSync(join(root, ".gateway-lock")), true);
+});
+
+test("a stale lease cannot release a replacement reservation or the live response permit", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), discarded = [], id = "N".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: clock, onDiscard: (i) => discarded.push(i) });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const stale = await store.acquire(id, "owner"); assert.ok(stale);
+  const staleTimeout = clock.registration(15_000);
+  clock.advance(15_000);
+  assert.deepEqual(discarded, [id]);
+  assert.deepEqual(store.accounting(), IDLE);
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const fresh = await store.acquire(id, "owner"); assert.ok(fresh, "the replacement artifact must be leasable");
+  const live = store.accounting();
+  stale.complete(); staleTimeout.callback();
+  assert.deepEqual(store.accounting(), live, "a stale token must not touch the replacement's accounting");
+  assert.equal(store.accounting().responsePermitHeld, true);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true);
+  fresh.complete();
+  assert.deepEqual(store.accounting(), IDLE);
+  assert.deepEqual(discarded, [id, id]);
+  await store.close();
+});
+
+test("at most two stage copies run and a third fails before creating a destination file", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), gate = stagingGate();
+  const a = "O".repeat(22), b = "P".repeat(22), c = "Q".repeat(22);
+  const store = new ArtifactStore({ root, afterPartFsync: gate.hook });
+  const first = store.capture(pdf, { id: a, consumerId: "one" });
+  const second = store.capture(pdf, { id: b, consumerId: "two" });
+  gate.disarm();
+  assert.deepEqual(await store.capture(pdf, { id: c, consumerId: "three" }), { status: "capture-failed", failure: "artifact-capacity" });
+  assert.equal(existsSync(join(root, "data", `${c}.part`)), false);
+  assert.deepEqual(readdirSync(join(root, "data")).sort(), [`${a}.part`, `${b}.part`].sort());
+  assert.equal(store.accounting().stagePermits, 2);
+  assert.equal(store.accounting().stagePermitLimit, 2);
+  gate.release();
+  assert.equal((await first).status, "available");
+  assert.equal((await second).status, "available");
+  assert.equal(store.accounting().stagePermits, 0, "a rejected stage must leak no permit");
+  assert.equal((await store.capture(pdf, { id: c, consumerId: "three" })).status, "available");
+  await store.close();
+});
+
+test("one global response permit serializes leases and starts the deadline after admission", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler();
+  const a = "R".repeat(22), b = "S".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: clock });
+  assert.equal((await store.capture(pdf, { id: a, consumerId: "owner" })).status, "available");
+  assert.equal((await store.capture(pdf, { id: b, consumerId: "owner" })).status, "available");
+  const first = await store.acquire(a, "owner"); assert.ok(first);
+  assert.equal(first.deadline, clock.now() + 15_000);
+  const waiting = store.acquire(b, "owner");
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(await Promise.race([waiting, Promise.resolve("waiting")]), "waiting", "a second lease must not be granted while the permit is held");
+  assert.equal(store.accounting().responseWaiters, 1);
+  assert.equal(clock.pending().filter((r) => r.delayMs === 15_000).length, 1, "a waiting acquire must not start a lease deadline");
+  assert.equal(existsSync(join(root, "data", `${b}.pdf`)), true, "a waiting acquire must not touch its artifact");
+  clock.advance(5_000);
+  first.complete();
+  const second = await waiting;
+  assert.ok(second);
+  assert.equal(second.deadline, clock.now() + 15_000, "the 15s lease must start at admission, not at request");
+  assert.deepEqual(store.accounting(), { ...IDLE, count: 1, bytes: SOURCE_BYTES, consumers: 1, responsePermitHeld: true, responseBytes: SOURCE_BYTES });
+  second.complete();
+  assert.deepEqual(store.accounting(), IDLE);
+  await store.close();
+});
+
+test("a lease timeout admits exactly one waiter and close cancels the rest", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler();
+  const a = "T".repeat(22), b = "U".repeat(22), c = "V".repeat(22);
+  const store = new ArtifactStore({ root, scheduler: clock });
+  for (const id of [a, b, c]) assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const first = await store.acquire(a, "owner"); assert.ok(first);
+  const secondPending = store.acquire(b, "owner"), thirdPending = store.acquire(c, "owner");
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(await Promise.race([secondPending, Promise.resolve("waiting")]), "waiting", "a held permit must block every waiter");
+  assert.equal(store.accounting().responseWaiters, 2);
+  clock.advance(15_000);
+  const second = await secondPending;
+  assert.ok(second, "a lease timeout must admit the first waiter");
+  assert.equal(await Promise.race([thirdPending, Promise.resolve("waiting")]), "waiting", "a timeout must admit exactly one waiter");
+  assert.equal(store.accounting().responseWaiters, 1);
+  const closing = store.close();
+  assert.equal(await thirdPending, null, "close must cancel a waiting acquire");
+  assert.equal(await closing, undefined);
+  assert.deepEqual(store.accounting(), IDLE, "close must release clean reservations and permits");
+  assert.equal(existsSync(join(root, ".gateway-lock")), false);
+});
+
+test("poisoning the store settles held and queued response ownership", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler();
+  const held = "W".repeat(22), queued = "X".repeat(22), poison = "Y".repeat(22);
+  let unlinks = 0;
+  const store = new ArtifactStore({ root, scheduler: clock, fsOps: { linkSync, fsyncSync, unlinkSync(path) { unlinks++; if (path.endsWith(`${poison}.pdf`)) throw new Error("/private/unlink-sentinel"); return unlinkSync(path); } } });
+  for (const id of [held, queued, poison]) assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const lease = await store.acquire(held, "owner"); assert.ok(lease);
+  const waiting = store.acquire(queued, "owner");
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(store.accounting().responseWaiters, 1);
+  // An unrelated artifact's unconfirmed cleanup poisons the store while one lease holds the
+  // response permit and another waits behind it.
+  assert.equal(store.discardArtifact(poison), false);
+  const stranded = new Promise((resolve) => { setImmediate(() => resolve("still waiting")); });
+  assert.equal(await Promise.race([waiting, stranded]), null, "a poisoned store must refuse a queued acquire, not strand it");
+  const settled = { ...IDLE, count: 3, bytes: 3 * SOURCE_BYTES, consumers: 1 };
+  assert.deepEqual(store.accounting(), settled, "response ownership settles while unconfirmed-cleanup capacity stays retained");
+  assert.equal(clock.pending().length, 0, "poisoning must cancel artifact timers");
+  const mutations = unlinks;
+  clock.advance(60_000); lease.complete(); lease.complete();
+  assert.equal(unlinks, mutations, "no post-poison callback may attempt filesystem mutation");
+  assert.deepEqual(store.accounting(), settled);
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(existsSync(join(root, ".gateway-lock")), true);
 });

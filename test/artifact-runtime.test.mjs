@@ -8,7 +8,7 @@ const dirs=[]; const temp=()=>{const d=mkdtempSync(join(tmpdir(),"bgw-artifact-"
 afterEach(()=>{while(dirs.length)rmSync(dirs.pop(),{recursive:true,force:true})});
 function pdf(dir){const p=join(dir,"x.pdf");writeFileSync(p,Buffer.from("%PDF-1.7\nhello"));return p}
 
-test("lease is one-time and complete deletes the artifact", async()=>{const root=join(temp(),"a"), source=pdf(temp()), s=new ArtifactStore({enabled:true,root}); const id="B".repeat(22); await s.capture(source,{id,consumerId:"c"}); const l=s.acquire(id,"c"); assert.ok(l); assert.equal(s.acquire(id,"c"),null); assert.equal(l.base64,Buffer.from("%PDF-1.7\nhello").toString("base64")); l.complete(); l.complete(); assert.equal(s.acquire(id,"c"),null); s.close()});
+test("lease is one-time and complete deletes the artifact", async()=>{const root=join(temp(),"a"), source=pdf(temp()), s=new ArtifactStore({enabled:true,root}); const id="B".repeat(22); await s.capture(source,{id,consumerId:"c"}); const l=await s.acquire(id,"c"); assert.ok(l); assert.equal(await s.acquire(id,"c"),null); assert.equal(l.base64,Buffer.from("%PDF-1.7\nhello").toString("base64")); l.complete(); l.complete(); assert.equal(await s.acquire(id,"c"),null); s.close()});
 
 test("inline PDF is rejected only for exact status 200 and no downloads",()=>{
   const root = join(temp(), "a");
@@ -90,7 +90,7 @@ test("invalidation and close win against an in-flight download", async()=>{
   }
 });
 
-test("closed store fails closed and does not write", async()=>{const root=join(temp(),"a"), source=pdf(temp()), s=new ArtifactStore({enabled:true,root}); s.close(); assert.equal((await s.capture(source,{id:"F".repeat(22),consumerId:"c"})).status,"capture-failed"); assert.equal(s.acquire("F".repeat(22),"c"),null);});
+test("closed store fails closed and does not write", async()=>{const root=join(temp(),"a"), source=pdf(temp()), s=new ArtifactStore({enabled:true,root}); s.close(); assert.equal((await s.capture(source,{id:"F".repeat(22),consumerId:"c"})).status,"capture-failed"); assert.equal(await s.acquire("F".repeat(22),"c"),null);});
 
 test("malicious operation id cannot delete a file outside the data directory",()=>{const base=temp(), root=join(base,"artifacts"), victim=join(base,"victim.pdf"); writeFileSync(victim,"sentinel"); const r=new ArtifactRuntime({enabled:true,root}); assert.throws(()=>r.createOperation("c","example.com","../../victim")); assert.equal(readFileSync(victim,"utf8"),"sentinel"); r.close()});
 
@@ -116,7 +116,7 @@ test("tampered available artifact is discarded and frees explicit ID quota", asy
   const root = join(temp(), "a"), source = pdf(temp()), id = "T".repeat(22); let discarded = 0;
   const r = new ArtifactRuntime({ enabled: true, root, maxCount: 1, onDiscard: () => discarded++ });
   const op = r.createOperation("owner", "example.com", id); const result = await op.registerDownload({ path: () => source }); assert.equal(result.outcome, "available");
-  writeFileSync(join(root, "data", `${id}.pdf`), Buffer.from("tampered")); assert.equal(r.store.acquire(id, "owner"), null); assert.equal(discarded, 1);
+  writeFileSync(join(root, "data", `${id}.pdf`), Buffer.from("tampered")); assert.equal(await r.store.acquire(id, "owner"), null); assert.equal(discarded, 1);
   const replacement = r.createOperation("owner", "example.com", id); assert.equal(replacement.artifactId, id); await r.close();
 });
 
@@ -141,7 +141,7 @@ test("runtime observer failure still releases explicit ID reservation", async ()
 
 test("in-flight and available artifacts retain IDs until terminal cleanup", async () => {
   const root = join(temp(), "a"), source = pdf(temp()), id = "Q".repeat(22), r = new ArtifactRuntime({ enabled: true, root }); let release; const gate = new Promise(resolve => { release = resolve; });
-  const op = r.createOperation("owner", "example.com", id); const pending = op.registerDownload({ path: async () => { await gate; return source; } }); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); release(); assert.equal((await pending).outcome, "available"); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete(); assert.equal(r.createOperation("owner", "example.com", id).artifactId, id); await r.close();
+  const op = r.createOperation("owner", "example.com", id); const pending = op.registerDownload({ path: async () => { await gate; return source; } }); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); release(); assert.equal((await pending).outcome, "available"); assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity"); const lease = await r.store.acquire(id, "owner"); assert.ok(lease); lease.complete(); assert.equal(r.createOperation("owner", "example.com", id).artifactId, id); await r.close();
 });
 
 test("sealing an available operation retains its ID until durable discard", async () => {
@@ -152,7 +152,7 @@ test("sealing an available operation retains its ID until durable discard", asyn
   assert.equal(available.outcome, "available");
   assert.equal(op.seal().outcome, "available");
   assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
-  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  const lease = await r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
   assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
   await r.close();
 });
@@ -166,7 +166,7 @@ test("ordinary invalidation after capture commits an available artifact", async 
   assert.strictEqual(op.invalidate(), available);
   assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true);
   assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
-  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  const lease = await r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
   assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
   await r.close();
 });
@@ -182,7 +182,7 @@ test("repeated ordinary invalidation cannot revoke a sealed available artifact",
   assert.strictEqual(op.invalidate(), available);
   assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true);
   assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
-  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  const lease = await r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
   assert.equal(r.createOperation("owner", "example.com", id).artifactId, id);
   await r.close();
 });
@@ -205,7 +205,7 @@ test("stale operation methods cannot release a replacement reservation", async (
   const old = r.createOperation("owner", "example.com", id);
   assert.equal((await old.registerDownload({ path: () => source })).outcome, "available");
   old.seal();
-  const lease = r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
+  const lease = await r.store.acquire(id, "owner"); assert.ok(lease); lease.complete();
   const replacement = r.createOperation("owner", "example.com", id);
   old.seal(); old.invalidate(); old.seal();
   assert.throws(() => r.createOperation("owner", "example.com", id), e => e.code === "artifact-capacity");
@@ -275,7 +275,7 @@ test("runtime close revokes committed available artifacts without a public dispo
   const closing = r.close();
   assert.deepEqual(op.seal(), { outcome: "capture-failed", failure: "artifact-runtime-invalidated" });
   await closing;
-  assert.equal(r.store.acquire(id, "owner"), null);
+  assert.equal(await r.store.acquire(id, "owner"), null);
 });
 
 test("capture rejects every invalid per-capture TTL before accounting", async () => {
@@ -283,7 +283,7 @@ test("capture rejects every invalid per-capture TTL before accounting", async ()
     const root = join(temp(), `ttl-${String(ttlMs)}`), source = pdf(temp()), id = "V".repeat(22);
     const s = new ArtifactStore({ enabled: true, root, maxCount: 1 });
     assert.deepEqual(await s.capture(source, { id, consumerId: "c", ttlMs }), { status: "capture-failed", failure: "artifact-config-invalid" });
-    assert.equal(s.acquire(id, "c"), null);
+    assert.equal(await s.acquire(id, "c"), null);
     await s.close();
   }
 });
