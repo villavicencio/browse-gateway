@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, statSync, readFileSync, symlinkSync, chmodSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync, rmdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, statSync, readFileSync, symlinkSync, chmodSync, writeFileSync, rmSync, readdirSync, linkSync, unlinkSync, fsyncSync, existsSync, rmdirSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactStore } from "../dist/artifacts/index.js";
@@ -597,4 +597,176 @@ test("poisoning the store settles held and queued response ownership", async () 
   assert.deepEqual(store.accounting(), settled);
   assert.equal(await store.close(), "artifact-cleanup-failed");
   assert.equal(existsSync(join(root, ".gateway-lock")), true);
+});
+
+test("a replaced root refuses publication and acquire without touching the replacement", async () => {
+  const base = temp(), root = join(base, "artifacts"), pdf = source(), original = join(base, "original"), kept = "A".repeat(22);
+  const store = new ArtifactStore({ root });
+  assert.equal((await store.capture(pdf, { id: kept, consumerId: "owner" })).status, "available");
+  renameSync(root, original);
+  mkdirSync(join(root, "data"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(root, "data", "sentinel"), "keep");
+  assert.deepEqual(await store.capture(pdf, { id: "B".repeat(22), consumerId: "owner" }), { status: "capture-failed", failure: "artifact-runtime-invalidated" });
+  assert.equal(await store.acquire(kept, "owner"), null);
+  assert.deepEqual(readdirSync(join(root, "data")), ["sentinel"], "no work may create anything in the replacement tree");
+  assert.equal(readFileSync(join(root, "data", "sentinel"), "utf8"), "keep");
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(existsSync(join(root, ".gateway-lock")), false, "close must not create or remove a lock in the replacement");
+  assert.equal(existsSync(join(original, ".gateway-lock")), true, "unproven ownership retains the original lock");
+  assert.equal(existsSync(join(original, "data", `${kept}.pdf`)), true, "cleanup is skipped where ownership is unproven");
+});
+
+test("a replaced data directory is never published into, discarded through or deleted", async () => {
+  const base = temp(), root = join(base, "artifacts"), pdf = source(), data = join(root, "data"), moved = join(base, "moved"), kept = "C".repeat(22);
+  const store = new ArtifactStore({ root });
+  assert.equal((await store.capture(pdf, { id: kept, consumerId: "owner" })).status, "available");
+  renameSync(data, moved);
+  mkdirSync(data, { mode: 0o700 });
+  const decoy = join(data, `${kept}.pdf`); writeFileSync(decoy, "decoy"); chmodSync(decoy, 0o600);
+  assert.deepEqual(await store.capture(pdf, { id: "D".repeat(22), consumerId: "owner" }), { status: "capture-failed", failure: "artifact-runtime-invalidated" });
+  assert.deepEqual(readdirSync(data), [`${kept}.pdf`], "publication must create nothing in the replacement");
+  assert.equal(store.discardArtifact(kept), false, "discard must refuse while data identity is unproven");
+  assert.equal(readFileSync(decoy, "utf8"), "decoy", "discard must not delete through the replacement");
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(readFileSync(decoy, "utf8"), "decoy", "close must not delete through the replacement");
+  assert.equal(existsSync(join(root, ".gateway-lock")), true, "uncertainty retains the lock");
+});
+
+test("an injected owner, mode or type change fails closed with no raw detail", async () => {
+  for (const change of [{ uid: 4_294_967_290 }, { mode: 0o777 }, { directory: false }]) {
+    const root = join(temp(), "artifacts"), pdf = source(), kept = "E".repeat(22);
+    let armed = false; const observed = [];
+    const store = new ArtifactStore({ root, identityOverride: function (...args) { observed.push(args); return armed ? change : undefined; } });
+    assert.equal((await store.capture(pdf, { id: kept, consumerId: "owner" })).status, "available");
+    armed = true;
+    const refused = await store.capture(pdf, { id: "F".repeat(22), consumerId: "owner" });
+    assert.deepEqual(refused, { status: "capture-failed", failure: "artifact-runtime-invalidated" });
+    assert.equal(JSON.stringify(refused).includes(root), false, "a closed failure carries no path");
+    assert.equal(await store.acquire(kept, "owner"), null);
+    assert.equal(await store.close(), "artifact-cleanup-failed");
+    assert.equal(existsSync(join(root, ".gateway-lock")), true);
+    assert.equal(existsSync(join(root, "data", `${kept}.pdf`)), true);
+    // The selector is told which directory and which reading, and nothing else: no path, no
+    // descriptor number, no observed stat, no private value it could report back.
+    assert.ok(observed.length > 0);
+    for (const args of observed) {
+      assert.equal(args.length, 2, "the identity seam takes exactly two closed-enum arguments");
+      assert.ok(["root", "data"].includes(args[0]));
+      assert.ok(["descriptor", "path"].includes(args[1]));
+    }
+  }
+});
+
+test("an unreadable retained descriptor refuses later work and still closes", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), kept = "G".repeat(22);
+  let armed = false;
+  const store = new ArtifactStore({ root, identityOverride: (_target, source) => (armed && source === "descriptor" ? "unreadable" : undefined) });
+  assert.equal((await store.capture(pdf, { id: kept, consumerId: "owner" })).status, "available");
+  armed = true;
+  assert.equal(await store.acquire(kept, "owner"), null);
+  assert.deepEqual(await store.capture(pdf, { id: "H".repeat(22), consumerId: "owner" }), { status: "capture-failed", failure: "artifact-runtime-invalidated" });
+  assert.equal(store.discardArtifact(kept), false);
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(await store.close(), "artifact-cleanup-failed", "close stays total and idempotent");
+  assert.equal(existsSync(join(root, "data", `${kept}.pdf`)), true, "cleanup is skipped where ownership is unproven");
+  assert.equal(existsSync(join(root, ".gateway-lock")), true);
+});
+
+test("directory fsync uses the retained data descriptor after startup", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "I".repeat(22);
+  let pathOpens = 0;
+  const store = new ArtifactStore({ root, onDataPathOpen: () => { pathOpens++; } });
+  assert.equal(pathOpens, 1, "startup opens the data directory by path exactly once, to retain its descriptor");
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  assert.equal(store.discardArtifact(id), true);
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false, "the durable deletion really happened");
+  assert.equal(pathOpens, 1, "no data directory reopen by path after startup");
+  assert.equal(await store.close(), undefined);
+  assert.equal(pathOpens, 1);
+});
+
+test("a constructor failure after the first descriptor closes it and rolls back the boot lock", async () => {
+  const root = join(temp(), "artifacts");
+  let closes = 0;
+  assert.throws(() => new ArtifactStore({ root, onDescriptorClose: () => { closes++; }, afterRootDescriptor: () => { rmdirSync(join(root, "data")); } }), (e) => e.code === "artifact-root-invalid" && !String(e).includes(root));
+  assert.equal(closes, 1, "the one descriptor this boot owned is closed exactly once");
+  assert.equal(existsSync(join(root, ".gateway-lock")), false, "a pre-mutation failure rolls back this boot's lock");
+  const store = new ArtifactStore({ root });
+  assert.equal(existsSync(join(root, ".gateway-lock")), true, "the released lock lets a later boot start");
+  assert.equal(await store.close(), undefined);
+});
+
+test("a root replaced during the commit window refuses to publish and retains everything", async () => {
+  const base = temp(), root = join(base, "artifacts"), pdf = source(), original = join(base, "original"), id = "K".repeat(22);
+  let release; const held = new Promise((r) => { release = r; }); let reached; const seam = new Promise((r) => { reached = r; });
+  const store = new ArtifactStore({ root, afterLinkBeforeCommit: async () => { reached(); await held; } });
+  const pending = store.capture(pdf, { id, consumerId: "owner" });
+  await seam;
+  // The link has landed but the record has not. Swap the root inside that commit window.
+  renameSync(root, original);
+  mkdirSync(join(root, "data"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(root, "data", "sentinel"), "keep");
+  release();
+  assert.deepEqual(await pending, { status: "capture-failed", failure: "artifact-runtime-invalidated" }, "identity must be reproven immediately before the record is committed");
+  assert.equal(await store.acquire(id, "owner"), null, "nothing may be published out of an unprovable tree");
+  assert.deepEqual(readdirSync(join(root, "data")), ["sentinel"], "the replacement tree stays untouched");
+  assert.equal(readFileSync(join(root, "data", "sentinel"), "utf8"), "keep");
+  assert.equal(existsSync(join(original, "data", `${id}.pdf`)), true, "the uncertain artifact is retained, not deleted");
+  assert.deepEqual(store.accounting(), { ...IDLE, count: 1, bytes: SOURCE_BYTES, consumers: 1 }, "its capacity stays reserved");
+  assert.equal(await store.close(), "artifact-cleanup-failed");
+  assert.equal(existsSync(join(original, ".gateway-lock")), true, "uncertainty retains the lock");
+});
+
+test("a public discard after a clean close performs no mutation at all", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "L".repeat(22), stray = "M".repeat(22);
+  let unlinks = 0, fsyncs = 0, discards = 0;
+  const store = new ArtifactStore({ root, onDiscard: () => { discards++; }, fsOps: { linkSync, unlinkSync(path) { unlinks++; return unlinkSync(path); }, fsyncSync(fd) { fsyncs++; return fsyncSync(fd); } } });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  assert.equal(await store.close(), undefined);
+  const sentinel = join(root, "data", `${stray}.pdf`);
+  writeFileSync(sentinel, "sentinel bytes"); chmodSync(sentinel, 0o600);
+  const before = { unlinks, fsyncs, discards };
+  assert.equal(store.discardArtifact(stray), false, "a disposed store refuses a public discard rather than acting on a tree it no longer owns");
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel bytes", "a closed store must not delete through its former data directory");
+  assert.deepEqual({ unlinks, fsyncs, discards }, before, "a closed store's discard performs no unlink, fsync or callback");
+});
+
+test("a public discard is refused from the moment close begins", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), clock = fakeScheduler(), gate = stagingGate();
+  const id = "N".repeat(22), stray = "O".repeat(22);
+  let unlinks = 0, fsyncs = 0, discards = 0;
+  const store = new ArtifactStore({ root, scheduler: clock, afterPartFsync: gate.hook, onDiscard: () => { discards++; },
+    fsOps: { linkSync, unlinkSync(path) { unlinks++; return unlinkSync(path); }, fsyncSync(fd) { fsyncs++; return fsyncSync(fd); } } });
+  const pending = store.capture(pdf, { id, consumerId: "owner" });
+  gate.disarm();
+  // Close has begun but cannot finish: it is still waiting on the active capture, so the descriptors
+  // are open and the store is not yet disposed.
+  const closing = store.close();
+  const sentinel = join(root, "data", `${stray}.pdf`);
+  writeFileSync(sentinel, "sentinel bytes"); chmodSync(sentinel, 0o600);
+  const before = { unlinks, fsyncs, discards, cleared: clock.cleared.length, waiters: store.accounting().responseWaiters };
+  assert.equal(store.discardArtifact(stray), false, "a closing store refuses a public discard");
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel bytes", "a closing store must not delete through its data directory");
+  assert.deepEqual({ unlinks, fsyncs, discards, cleared: clock.cleared.length, waiters: store.accounting().responseWaiters }, before, "a refused discard performs no unlink, fsync, callback, timer or settlement mutation");
+  gate.release();
+  assert.deepEqual(await pending, { status: "capture-failed", failure: "artifact-runtime-invalidated" });
+  assert.equal(await closing, undefined);
+  // Close's own identity-bound cleanup still sweeps strict artifact files it owns — that path is
+  // private and is exactly what the public refusal above does not do.
+  assert.equal(existsSync(sentinel), false);
+  assert.deepEqual(readdirSync(join(root, "data")), []);
+  assert.equal(existsSync(join(root, ".gateway-lock")), false);
+});
+
+test("close closes both retained descriptors exactly once", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "J".repeat(22);
+  let closes = 0;
+  const store = new ArtifactStore({ root, onDescriptorClose: () => { closes++; } });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  assert.equal(closes, 0, "descriptors stay open while the store is live");
+  assert.equal(await store.close(), undefined);
+  assert.equal(closes, 2, "root and data descriptors each close exactly once");
+  assert.equal(await store.close(), undefined);
+  assert.equal(closes, 2, "a repeated close performs no second descriptor close");
+  assert.equal(existsSync(join(root, ".gateway-lock")), false);
 });

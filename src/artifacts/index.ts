@@ -77,6 +77,9 @@ export class ArtifactOperation {
     return this.terminal(this.result ?? { outcome: "none" });
   }
   invalidate() {
+    // Runtime disposal is terminal: invalidating afterwards must not issue a second discard, which a
+    // disposed store refuses and which would overwrite this operation's settled outcome.
+    if (this.disposed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" };
     if (this.result?.outcome === "available") { this.sealed = true; return this.result; }
     if (!this.sealed) { this.sealed = true; this.generation++; this.result = { outcome: "capture-failed", failure: "artifact-runtime-invalidated" }; }
     this.cleanupConfirmed = this.discard(); this.tryRelease(); return this.result!;
