@@ -24,7 +24,7 @@ export class ArtifactOperation {
     if (!path) { this.result = { outcome: "capture-failed", failure: "download-capture-failed" }; return this.result; }
     const captured = await this.store.capture(path, { id: this.artifactId, consumerId: this.consumerId });
     if (this.sealed || generation !== this.generation) { this.store.discardArtifact(this.artifactId); return this.result; }
-    if (captured.status === "available") this.result = { outcome: "available", artifact: captured }; else this.result = { outcome: "capture-failed", failure: "artifact-write-failed" };
+    if (captured.status === "available") this.result = { outcome: "available", artifact: captured }; else this.result = { outcome: "capture-failed", failure: (captured as { status: "capture-failed"; failure: import("./types.js").ArtifactFailureCode }).failure };
     return this.result;
   }
   seal(): OperationResult { if (this.sealed) return this.result ?? { outcome: "capture-failed", failure: "artifact-runtime-invalidated" }; this.sealed = true; this.generation++; const essence = ((this.contentType ?? "").trim().toLowerCase().split(";", 1)[0] ?? "").trim(); if (this.events === 0 && this.status === 200 && essence === "application/pdf") this.result = { outcome: "inline-pdf-unsupported", failure: "inline-pdf-unsupported" }; return this.result ?? { outcome: "none" }; }
@@ -35,8 +35,9 @@ export class ArtifactRuntime {
   readonly store: ArtifactStore; private readonly idGenerator: () => string; private readonly reserved = new Set<string>();
   constructor(options: ArtifactStoreOptions) { this.store = new ArtifactStore(options); this.idGenerator = options.idGenerator ?? (() => randomBytes(16).toString("base64url")); }
   createOperation(consumerId: string, sourceHost: string, explicitId?: string) {
-    const host = canonicalizeHost(sourceHost);
-    if (!HOST.test(host) || isIP(canonicalizeHostForIp(host)) !== 0 || /[\u0000-\u001f\u007f]/.test(sourceHost)) throw new Error("invalid source host");
+    let host: string;
+    try { host = canonicalizeHost(sourceHost); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }
+    if (!HOST.test(host) || isIP(canonicalizeHostForIp(host)) !== 0 || /[\u0000-\u001f\u007f]/.test(sourceHost)) throw new ArtifactStoreError("artifact-config-invalid");
     let id = explicitId;
     if (id !== undefined) { if (!ARTIFACT_ID.test(id)) throw new ArtifactStoreError("invalid-artifact-id"); if (this.reserved.has(id)) throw new ArtifactStoreError("artifact-capacity"); }
     else for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) { const candidate = this.idGenerator(); if (ARTIFACT_ID.test(candidate) && !this.reserved.has(candidate)) { id = candidate; break; } }

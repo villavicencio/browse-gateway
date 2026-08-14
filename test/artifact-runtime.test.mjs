@@ -35,11 +35,21 @@ test("generated IDs reserve collisions and canonicalize the source host",()=>{
   r.close();
 });
 
-test("download accessor exceptions become private capture failures", async()=>{
+test("download failure accessor exceptions are private capture failures", async()=>{
   const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a") });
   const op = r.createOperation("owner", "example.com", "X".repeat(22));
   const secret = "/private/secret-path sentinel";
-  const result = await op.registerDownload({ failure: () => Promise.reject(new Error(secret)), path: () => { throw new Error(secret); } });
+  const result = await op.registerDownload({ failure: () => Promise.reject(new Error(secret)), path: () => "/not-read" });
+  assert.deepEqual(result, { outcome: "capture-failed", failure: "download-capture-failed" });
+  assert.equal(JSON.stringify(result).includes(secret), false);
+  r.close();
+});
+
+test("download path accessor exceptions are private capture failures", async()=>{
+  const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a") });
+  const op = r.createOperation("owner", "example.com", "V".repeat(22));
+  const secret = "/private/secret-path sentinel";
+  const result = await op.registerDownload({ failure: () => undefined, path: () => { throw new Error(secret); } });
   assert.deepEqual(result, { outcome: "capture-failed", failure: "download-capture-failed" });
   assert.equal(JSON.stringify(result).includes(secret), false);
   r.close();
@@ -84,4 +94,19 @@ test("closed store fails closed and does not write", async()=>{const root=join(t
 
 test("malicious operation id cannot delete a file outside the data directory",()=>{const base=temp(), root=join(base,"artifacts"), victim=join(base,"victim.pdf"); writeFileSync(victim,"sentinel"); const r=new ArtifactRuntime({enabled:true,root}); assert.throws(()=>r.createOperation("c","example.com","../../victim")); assert.equal(readFileSync(victim,"utf8"),"sentinel"); r.close()});
 
-test("runtime default operation ids are unique",()=>{const r=new ArtifactRuntime({enabled:true,root:join(temp(),"a")}); const a=r.createOperation("c","example.com"), b=r.createOperation("c","example.com"); assert.notEqual(a,b); r.close()});
+test("runtime default operation ids are deterministic-shaped and unique",()=>{const r=new ArtifactRuntime({enabled:true,root:join(temp(),"a")}); const a=r.createOperation("c","example.com"), b=r.createOperation("c","example.com"); assert.notEqual(a.artifactId,b.artifactId); assert.match(a.artifactId,/^[A-Za-z0-9_-]{22,64}$/); r.close()});
+
+test("one valid download after a 200 PDF response is available, never inline", async()=>{
+  const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a") });
+  const source = pdf(temp()); const op = r.createOperation("owner", "example.com", "J".repeat(22));
+  op.noteMainResponse(200, "application/pdf");
+  const result = await op.registerDownload({ failure: () => undefined, path: () => source });
+  assert.notEqual(result.outcome, "inline-pdf-unsupported");
+  assert.equal(result.outcome, "available");
+  r.close();
+});
+
+test("canonicalizeHost synchronous failure is typed and private", () => {
+  const secret = "/private/host-secret";
+  assert.throws(() => new ArtifactRuntime({ enabled: true, root: join(temp(), "a") }).createOperation("c", secret), (e) => e.code === "artifact-config-invalid" && !String(e).includes(secret));
+});
