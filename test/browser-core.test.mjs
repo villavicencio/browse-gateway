@@ -209,3 +209,17 @@ test("buildLaunchOptions: software-WebGL args are pinned in every config", () =>
     }
   }
 });
+
+test("resolveCoreOptions: captureSettleTimeoutMs must be a finite positive integer", () => {
+  // The single bound the whole cutoff runs under. A non-positive or non-finite value would either
+  // expire instantly (every capture a settle-timeout) or never (teardown wedged).
+  for (const captureSettleTimeoutMs of [0, -1, -0.5, NaN, Infinity, -Infinity, 1.5, "5000", null]) {
+    assert.throws(
+      () => resolveCoreOptions({ captureSettleTimeoutMs }),
+      `accepted an invalid settle timeout: ${String(captureSettleTimeoutMs)}`,
+    );
+  }
+  assert.equal(resolveCoreOptions({ captureSettleTimeoutMs: 1 }).captureSettleTimeoutMs, 1);
+  assert.equal(resolveCoreOptions({ captureSettleTimeoutMs: 5_000 }).captureSettleTimeoutMs, 5_000);
+  assert.equal(resolveCoreOptions().captureSettleTimeoutMs, 5_000, "the default still applies");
+});

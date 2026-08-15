@@ -20,7 +20,9 @@ const LOCK_OWNER_FILE = "owner.json";
 const LOCK_METADATA_VERSION = 1;
 // OS-derived and sampled once, so the whole process reports one stable start instant.
 const PROCESS_STARTED_AT = Math.round(Date.now() - process.uptime() * 1000);
-const SYSTEM_SCHEDULER: ArtifactScheduler = {
+/** The default time domain. Exported so the runtime's OPERATION deadlines resolve to the same
+ *  scheduler instance the store uses — one clock for expiry, leases, cleanup and settlement. */
+export const SYSTEM_SCHEDULER: ArtifactScheduler = {
   now: () => Date.now(),
   processStartedAt: () => PROCESS_STARTED_AT,
   // Artifact timers are background cleanup/deadline work: they must never be the sole reason a process stays alive.
@@ -87,9 +89,26 @@ export class ArtifactStore {
     this.scheduleCleanup();
   }
 
-  async capture(source: string, options: CaptureOptions): Promise<CaptureResult> {
-    if (typeof options.id !== "string") throw new ArtifactStoreError("invalid-artifact-id");
-    if (options.ttlMs !== undefined && (!Number.isFinite(options.ttlMs) || !Number.isInteger(options.ttlMs) || options.ttlMs <= 0)) return { status: "capture-failed", failure: "artifact-config-invalid" };
+  async capture(source: string, untrustedOptions: CaptureOptions): Promise<CaptureResult> {
+    if (!untrustedOptions || typeof untrustedOptions !== "object") throw new ArtifactStoreError("artifact-config-invalid");
+    let id: unknown, consumerId: unknown, ttlMs: unknown;
+    try {
+      // Snapshot once before any accounting or filesystem work. Public callers may supply throwing or
+      // stateful getters/proxies; their exceptions and inconsistent second reads stay outside the store.
+      id = untrustedOptions.id;
+      consumerId = untrustedOptions.consumerId;
+      ttlMs = untrustedOptions.ttlMs;
+    } catch {
+      throw new ArtifactStoreError("artifact-config-invalid");
+    }
+    if (typeof id !== "string") throw new ArtifactStoreError("invalid-artifact-id");
+    if (typeof consumerId !== "string" || consumerId.length === 0) throw new ArtifactStoreError("artifact-config-invalid");
+    let normalizedTtlMs: number | undefined;
+    if (ttlMs !== undefined) {
+      if (typeof ttlMs !== "number" || !Number.isFinite(ttlMs) || !Number.isInteger(ttlMs) || ttlMs <= 0) return { status: "capture-failed", failure: "artifact-config-invalid" };
+      normalizedTtlMs = ttlMs;
+    }
+    const options: CaptureOptions = { id, consumerId, ...(normalizedTtlMs === undefined ? {} : { ttlMs: normalizedTtlMs }) };
     this.reapExpired();
     if (!ARTIFACT_ID.test(options.id)) throw new ArtifactStoreError("invalid-artifact-id");
     if (this.closed || this.unhealthy || !this.enabled) return { status: "capture-failed", failure: "artifact-runtime-invalidated" };

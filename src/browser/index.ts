@@ -6,6 +6,8 @@
  * launch-option helpers are re-exported for the kill-gate and tests.
  */
 export type {
+  ArtifactCaptureOperation,
+  CaptureContext,
   BrowserCore,
   BrowserCoreOptions,
   Category,

@@ -12,6 +12,15 @@ export interface ResolvedCoreOptions {
   noSandbox: boolean;
   userDataDir: string;
   navigationTimeoutMs: number;
+  /**
+   * Hard ceiling on the capture-settlement barrier a VERB runs at its own cutoff, and on the bounded
+   * drain of unattributed-download disposal at teardown. It is NOT a drain of operation-internal
+   * staging: staging belongs to the artifact operation, and core close/kill invalidate it
+   * synchronously and non-queued instead of waiting on it (Amendment 1 §6 rules 6-7).
+   *
+   * A runtime option, never a launch arg. Site-neutral by construction: one bound for every host.
+   */
+  captureSettleTimeoutMs: number;
   proxy?: ProxyConfig;
 }
 
@@ -21,7 +30,22 @@ export const DEFAULT_CORE_OPTIONS: ResolvedCoreOptions = {
   noSandbox: false,
   userDataDir: "", // ephemeral persistent context, matching the spike.
   navigationTimeoutMs: 45_000,
+  captureSettleTimeoutMs: 5_000, // normative: BGW_ARTIFACT_SETTLE_TIMEOUT_MS default (Amendment 1 §6)
 };
+
+/**
+ * The capture-settlement bound must be a finite positive integer. A zero/negative value would expire
+ * before any capture could settle (turning every attachment into a settle-timeout), and a non-finite
+ * one would never expire (wedging teardown behind a hung copy) — so both fail closed at resolution
+ * rather than misbehaving at runtime.
+ */
+function validSettleTimeout(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_CORE_OPTIONS.captureSettleTimeoutMs;
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error("captureSettleTimeoutMs must be a finite positive integer");
+  }
+  return value;
+}
 
 export function resolveCoreOptions(
   opts: BrowserCoreOptions = {},
@@ -33,6 +57,7 @@ export function resolveCoreOptions(
     userDataDir: opts.userDataDir ?? DEFAULT_CORE_OPTIONS.userDataDir,
     navigationTimeoutMs:
       opts.navigationTimeoutMs ?? DEFAULT_CORE_OPTIONS.navigationTimeoutMs,
+    captureSettleTimeoutMs: validSettleTimeout(opts.captureSettleTimeoutMs),
     ...(opts.proxy ? { proxy: opts.proxy } : {}),
   };
 }
