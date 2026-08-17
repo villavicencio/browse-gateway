@@ -355,3 +355,44 @@ test("controller: concurrent navigate calls are serialized — no double-open (m
   assert.equal(a.status, 200);
   assert.equal(b.status, 200);
 });
+
+test("controller: concurrent navigates never cross-attribute a capture's sourceHost (provenance, H3)", async () => {
+  // The mutex above proves EXECUTION is serialized. It says nothing about per-call state written
+  // BEFORE queue admission: two navigates fired with no await between them both run navigate()'s
+  // synchronous prologue before either serialized turn starts. If the capture host lives in instance
+  // state assigned outside the turn, turn A reads call B's host — committing the WRONG sourceHost as
+  // the artifact's provenance — and A's cleanup clears the field before B's turn, so B's capture is
+  // silently skipped. sourceHost is the never-re-derived provenance a consumer trusts, so this is a
+  // data-integrity defect, not a logging one.
+  const seen = []; // { url, sourceHost } per core.navigate
+  const runtime = { createOperation: ({ owner, sourceHost }) => ({ owner, sourceHost }) };
+  const open = new Map();
+  let nextId = 1;
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession() {
+      const id = "h" + nextId++;
+      open.set(id, {
+        core: {
+          async navigate(url, opts = {}) {
+            seen.push({ url, sourceHost: opts.artifactOperation?.sourceHost });
+            return { url, title: "t", tree: REAL, status: 200, diagnostics: { finalUrl: url, title: "t", status: 200 } };
+          },
+          async snapshot() { return { url: "u", title: "t", tree: REAL, status: 200 }; },
+        },
+      });
+      return id;
+    },
+    async useConsumerSession(token, handle, fn) { return fn(open.get(handle)); },
+    async closeConsumerSession(token, handle) { open.delete(handle); },
+  };
+  const c = new GatewayDriveController(gateway, noSecrets(), "tok", {
+    artifacts: { runtime, consumerId: "atlas" },
+  });
+  await Promise.all([c.navigate("https://alpha.example/a"), c.navigate("https://bravo.example/b")]);
+  assert.equal(seen.length, 2, "both navigates reached the core");
+  for (const { url, sourceHost } of seen) {
+    const expected = new URL(url).hostname;
+    assert.equal(sourceHost, expected, `capture for ${url} must be attributed to ${expected}, got ${String(sourceHost)}`);
+  }
+});

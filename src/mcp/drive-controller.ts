@@ -63,10 +63,14 @@ export class GatewayDriveController implements DriveController {
    *  no capture attempted, byte-identical output). */
   readonly #artifacts?: { runtime: ArtifactRuntime; consumerId: string };
   /**
-   * The target host for the navigate verb currently in flight — set at the top of the public
-   * `navigate()`, cleared once it settles. Safe as mutable instance state only because verbs are
-   * serialized (`#serialize`/`#lock`): no two navigate() calls on one controller ever have this field
-   * live at once. Deliberately just the host, NOT a shared operation: `ArtifactOperation.seal()` is
+   * The target host for the navigate verb currently in flight — assigned and cleared INSIDE the
+   * serialized turn (`#serialize`/`#lock`), never in `navigate()`'s prologue. That placement is the
+   * whole invariant: `#serialize` serializes EXECUTION, not ENTRY, so every concurrent caller runs the
+   * prologue before any turn starts; a field written there would be overwritten by the next queued
+   * navigate before the current turn reads it (publishing an artifact under the WRONG sourceHost) and
+   * cleared before that next turn runs (silently skipping its capture). Written, read by every
+   * `#targetNavOpts` below, and cleared within one turn, no two navigates ever have it live at once.
+   * Deliberately just the host, NOT a shared operation: `ArtifactOperation.seal()` is
    * idempotent and commits PERMANENTLY on its first render call, so reusing one operation across this
    * verb's internal retries would let an uneventful FIRST attempt (e.g. a CF-blocked direct render,
    * which never fires a download event) silently foreclose capture on a LATER attempt that actually
@@ -436,25 +440,30 @@ export class GatewayDriveController implements DriveController {
     // full-budget verb would receive a FRESH callBudgetMs and the caller-visible time could reach multiples
     // of the bound. Threaded into #navigate (not recomputed there) so the whole verb shares ONE deadline.
     const budgetDeadlineMs = t0 + this.#timeouts.callBudgetMs;
-    // Task 2 §6: the target host for THIS navigate call only, cleared in the finally below. `new
-    // URL(url)` can throw on a malformed target; caught here so a bad URL still reaches #navigate's own
-    // `isHttpUrl` rejection inside the serialized turn (unchanged ordering/behavior) instead of
-    // throwing early, out of turn.
-    try { this.#navigateHost = canonicalizeHost(new URL(url).hostname); } catch { this.#navigateHost = undefined; }
-    try {
-      const snap = await this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts, budgetDeadlineMs)));
-      // #48: annotate a SILENT HOME-FALLBACK on the returned snapshot — the requested DEEP link (non-root path
-      // / query) landed on the site's bare root (snap.url is the raw post-redirect page.url()). NON-FATAL: a
-      // homepage is a legitimately returnable snapshot (never a drive failure), so this ANNOTATES and returns,
-      // letting the in-loop agent decide — unlike retrieve, which surfaces it as an outcome flag. The SHARED
-      // isHomeFallback predicate keeps drive/retrieve detection from drifting (the parity invariant). Only
-      // navigate() has a requested target; post-action snapshot()/click()/… never carry this. A drive nav that
-      // FAILS throws before here (the block/nav class is the story there); the fallback-on-failure envelope
-      // slot is a documented deferral.
-      return isHomeFallback(url, snap.url) ? { ...snap, homeFallback: true } : snap;
-    } finally {
-      this.#navigateHost = undefined;
-    }
+    // Task 2 §6: the target host for THIS navigate call only, assigned and cleared INSIDE the
+    // serialized turn (see #navigateHost's doc). #serialize serializes EXECUTION, not entry — every
+    // concurrent caller runs this method's synchronous prologue before any turn starts — so assigning
+    // out here would let a queued second navigate overwrite the host the first turn is about to read
+    // (wrong provenance committed into the artifact record) and would clear it before the second turn
+    // runs (capture silently skipped). `new URL(url)` can throw on a malformed target; caught so a bad
+    // URL still reaches #navigate's own `isHttpUrl` rejection with unchanged ordering/behavior.
+    const snap = await this.#serialize(async () => {
+      try { this.#navigateHost = canonicalizeHost(new URL(url).hostname); } catch { this.#navigateHost = undefined; }
+      try {
+        return await this.#timedSnap(t0, () => this.#navigate(url, opts, budgetDeadlineMs));
+      } finally {
+        this.#navigateHost = undefined;
+      }
+    });
+    // #48: annotate a SILENT HOME-FALLBACK on the returned snapshot — the requested DEEP link (non-root path
+    // / query) landed on the site's bare root (snap.url is the raw post-redirect page.url()). NON-FATAL: a
+    // homepage is a legitimately returnable snapshot (never a drive failure), so this ANNOTATES and returns,
+    // letting the in-loop agent decide — unlike retrieve, which surfaces it as an outcome flag. The SHARED
+    // isHomeFallback predicate keeps drive/retrieve detection from drifting (the parity invariant). Only
+    // navigate() has a requested target; post-action snapshot()/click()/… never carry this. A drive nav that
+    // FAILS throws before here (the block/nav class is the story there); the fallback-on-failure envelope
+    // slot is a documented deferral.
+    return isHomeFallback(url, snap.url) ? { ...snap, homeFallback: true } : snap;
   }
 
   async #navigate(url: string, opts: { forceProxy?: boolean }, budgetDeadlineMs: number): Promise<PageSnapshot> {

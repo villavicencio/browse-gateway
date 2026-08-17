@@ -13,7 +13,8 @@ import type { Consumer } from "../policy/index.js";
 import { redactSecrets } from "../security/index.js";
 import { retrieve, hostForcesProxy } from "../verbs/index.js";
 import { buildGatewayRuntime } from "./runtime.js";
-import type { GatewayRuntime } from "./runtime.js";
+import { loadArtifactConfig, buildArtifactRuntime } from "../artifacts/runtime-builder.js";
+import type { ArtifactRuntime } from "../artifacts/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError, buildOperatorHealth } from "./http-server.js";
@@ -48,7 +49,7 @@ interface ShutdownTarget {
   gateway: { shutdown: () => Promise<void>; sessions: { activeCount: number } };
   /** Task 2 §6 — the process-owned runtime, present iff artifact capture is enabled. Absent = the
    *  shutdown sequence's artifact-close step is a no-op (disabled mode, unchanged behavior). */
-  artifactRuntime?: GatewayRuntime["artifactRuntime"];
+  artifactRuntime?: ArtifactRuntime;
 }
 
 /**
@@ -110,17 +111,28 @@ async function main(): Promise<void> {
   // Build the shared gateway runtime (config, secrets, vault, consumers, policy, gateway, escalation
   // posture) with every fail-closed boot guard. Identical construction is used by the on-host
   // `obscura vault login` capture (cli/vault-host.ts) so the two never drift.
-  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress, artifactRuntime } =
+  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress } =
     buildGatewayRuntime(process.env, { log });
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
-  // Task 2 §4.3/§6 — from here, an artifact-enabled runtime already holds its root lock. Every boot
-  // guard below that can still throw is wrapped so a LATER failure (DNS-rebind, health-token collision,
-  // or anything else between construction and a successful listen) bounded-closes the runtime first —
-  // otherwise a fail-closed boot would abandon the lock/root authority for the rest of the container's
-  // life instead of releasing it (`closeArtifactRuntimeBounded` is the same bound `runShutdownSequence`
-  // uses on the normal shutdown path, so both cases are diagnosable the same way).
+  // Task 2 §4.3/§6 — the HTTP process is the SOLE owner of the artifact runtime and its exclusive root
+  // lock (see GatewayRuntime.artifactRuntime: the shared builder never takes it, so `obscura vault
+  // login` and the on-host scripts can run against the same artifact env without contending for, or
+  // leaking, the lock). It is constructed as the FIRST statement INSIDE this guard, deliberately:
+  //   - every fail-closed guard inside buildGatewayRuntime (manifest, pool sizing, vault key, sticky
+  //     suffix) has already run above, so an ordinary config typo can no longer abandon a lock that
+  //     nothing reclaims and then mask itself as artifact-root-locked on every later boot; and
+  //   - every guard that can still throw below (DNS-rebind, health-token collision, an invalid artifact
+  //     root itself) is inside this try, so the catch bounded-closes the lock before the process exits.
+  // `closeArtifactRuntimeBounded` is the same bound `runShutdownSequence` uses on the normal shutdown
+  // path, so both cases are diagnosable the same way.
+  // Declared OUTSIDE the try so the catch (and the listen-error handler) can still release the lock;
+  // `artifacts` is the `const` alias the per-connection closures below capture, since narrowing on a
+  // `let` does not survive into a deferred callback.
+  let artifactRuntime: ArtifactRuntime | undefined;
   try {
+    artifactRuntime = buildArtifactRuntime(loadArtifactConfig(process.env));
+    const artifacts = artifactRuntime;
     // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without Host-based
     // DNS-rebinding protection. The listener is reachable over the Tailnet and MCP clients send no
     // Origin, so Host validation is the load-bearing guard; BGW_ALLOWED_ORIGINS is additive only.
@@ -150,7 +162,7 @@ async function main(): Promise<void> {
       // `drive.controllerId` (below) is the SAME primitive GatewayDriveController mints for its own
       // capture operations and what GatewayMcpDeps.artifacts.controllerId is snapshotted from, so
       // drive-side capture and MCP-side retrieval can never disagree on which lineage they mean.
-      const artifactCapture = artifactRuntime ? { runtime: artifactRuntime, consumerId: consumer.id } : undefined;
+      const artifactCapture = artifacts ? { runtime: artifacts, consumerId: consumer.id } : undefined;
       const drive = new GatewayDriveController(gateway, secrets, consumer.token, {
         onDatacenterIp,
         stickySuffix,
@@ -190,13 +202,13 @@ async function main(): Promise<void> {
         // this graph's runtime is enabled. `consumerId`/`controllerId` are snapshotted ONCE here, by
         // value, from server-minted identities never reachable from MCP input; `consumeForServer` is
         // the runtime's own `acquireResponseLease`, closed over nothing else.
-        ...(artifactRuntime
+        ...(artifacts
           ? {
               artifacts: {
                 consumerId: consumer.id,
                 controllerId: drive.controllerId,
                 consumeForServer: (input: { artifactId: string; consumerId: string; controllerId?: string }) =>
-                  artifactRuntime.acquireResponseLease(input),
+                  artifacts.acquireResponseLease(input),
               },
             }
           : {}),
@@ -209,7 +221,7 @@ async function main(): Promise<void> {
       // touched here (`discardController` only ever looks at drive-scoped entries).
       const dispose = createConsumerGraphDisposer({
         drive,
-        artifactRuntime,
+        artifactRuntime: artifacts,
         consumerId: consumer.id,
         controllerId: drive.controllerId,
       });
@@ -247,6 +259,19 @@ async function main(): Promise<void> {
 
     const port = Number(process.env.BGW_HTTP_PORT) || DEFAULT_PORT;
     const bind = process.env.BGW_HTTP_BIND || DEFAULT_BIND;
+    // Task 2 §4.3/§6 — a bind failure is emitted as an 'error' event on a LATER tick, so it is never
+    // thrown INTO the try above and the catch's bounded close cannot see it. With no listener Node
+    // rethrows it as an uncaught exception and the process dies still holding the artifact root lock,
+    // which nothing reclaims — the exact leak this guard exists to prevent, on the likeliest late-boot
+    // failure there is: EADDRNOTAVAIL when BGW_HTTP_BIND names a Tailnet address the sidecar has not
+    // assigned yet, or EADDRINUSE on a restart race. Release the lock here too, then exit non-zero.
+    httpServer.on("error", (err: NodeJS.ErrnoException) => {
+      void (async () => {
+        log(`listen failed on ${bind}:${port} — ${err.code ?? "error"}: ${err.message}`);
+        await closeArtifactRuntimeBounded(artifactRuntime, ARTIFACT_CLOSE_TIMEOUT_MS, log);
+        process.exit(1);
+      })();
+    });
     httpServer.listen(port, bind, () => {
       log(
         `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +

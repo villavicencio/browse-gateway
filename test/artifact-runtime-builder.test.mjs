@@ -150,22 +150,62 @@ test("buildGatewayRuntime: disabled (default) exposes no artifactRuntime and cre
   }
 });
 
-test("buildGatewayRuntime: enabled constructs exactly one process-owned ArtifactRuntime and exposes it", async () => {
+test("buildGatewayRuntime: an AUXILIARY caller never constructs the process-owned runtime nor takes the root lock", async () => {
+  // The process-owned ArtifactRuntime holds an EXCLUSIVE, mkdir-based root lock that no later boot
+  // reclaims (store.ts: "A pre-existing lock always refuses here: it is never read, opened or
+  // removed"). buildGatewayRuntime is shared by the HTTP entrypoint AND auxiliary callers —
+  // cli/vault-host.ts (`obscura vault login`, run via `docker exec` INSIDE the running gateway
+  // container, inheriting the same artifact env) plus scripts/validate-vault-host-login.mjs and
+  // scripts/measure-input-realism.mjs. If the shared builder took the lock, every one of those would
+  // either be refused by the live gateway's lock or, winning it first, exit without releasing it and
+  // permanently brick the gateway's own boot. Ownership therefore belongs to the HTTP entrypoint
+  // alone: the shared builder constructs nothing, so no auxiliary caller can inherit the lock by
+  // forgetting to opt out.
   const artifactsRoot = join(temp(), "artifacts");
   const env = gatewayFixtureEnv({ BGW_ARTIFACT_CAPTURE_ENABLED: "1", BGW_ARTIFACT_ROOT: artifactsRoot });
   const rt = buildGatewayRuntime(env, { log: noLog });
   try {
-    assert.ok(rt.artifactRuntime instanceof ArtifactRuntime);
-    assert.equal(existsSync(artifactsRoot), true);
+    assert.equal(rt.artifactRuntime, undefined, "the shared builder must not construct the process-owned runtime");
+    assert.equal(existsSync(join(artifactsRoot, ".gateway-lock")), false, "no auxiliary caller may take the artifact root lock");
   } finally {
-    await rt.artifactRuntime.close();
     await rt.gateway.shutdown().catch(() => {});
   }
 });
 
-test("buildGatewayRuntime: an invalid artifact root fails the whole boot closed, before the gateway is built", () => {
+test("buildGatewayRuntime: a fail-closed boot guard leaves no artifact lock behind, so the fixed config boots", async () => {
+  // The guards that fire most often in practice (missing manifest, pool sizing, a no-{id} sticky
+  // suffix) live INSIDE buildGatewayRuntime. When the shared builder took the root lock before them,
+  // an ordinary config typo abandoned a lock nothing reclaims — so the operator fixed the typo and the
+  // container still refused to boot, now with artifact-root-locked masking the original error.
+  const artifactsRoot = join(temp(), "artifacts");
+  const artifactEnv = { BGW_ARTIFACT_CAPTURE_ENABLED: "1", BGW_ARTIFACT_ROOT: artifactsRoot };
+  const bad = gatewayFixtureEnv({ ...artifactEnv, BGW_PROXY_STICKY_SUFFIX: "_s-no-placeholder" });
+  assert.throws(() => buildGatewayRuntime(bad, { log: noLog }), /\{id\}|sticky/i);
+  assert.equal(existsSync(join(artifactsRoot, ".gateway-lock")), false, "a failed boot must not abandon the artifact root lock");
+  // The operator fixes the typo: boot must now succeed rather than die on a stale lock.
+  const good = gatewayFixtureEnv({ ...artifactEnv, BGW_PROXY_STICKY_SUFFIX: "_s-{id}" });
+  const rt = buildGatewayRuntime(good, { log: noLog });
+  await rt.gateway.shutdown().catch(() => {});
+});
+
+test("buildArtifactRuntime: the HTTP entrypoint's own construction still yields one runtime on a valid root", async () => {
+  // Ownership moved to http-main, but the shared config/construction boundary is unchanged — this is
+  // the exact call http-main makes, so the entrypoint can never independently interpret the env.
+  const artifactsRoot = join(temp(), "artifacts");
+  const runtime = buildArtifactRuntime(loadArtifactConfig({ BGW_ARTIFACT_CAPTURE_ENABLED: "1", BGW_ARTIFACT_ROOT: artifactsRoot }));
+  try {
+    assert.ok(runtime instanceof ArtifactRuntime);
+    assert.equal(existsSync(join(artifactsRoot, ".gateway-lock")), true, "the owning entrypoint does take the lock");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("buildArtifactRuntime: an invalid artifact root fails closed at the shared boundary", () => {
   const notADir = join(temp(), "not-a-directory");
   writeFileSync(notADir, "a plain file, not a directory");
-  const env = gatewayFixtureEnv({ BGW_ARTIFACT_CAPTURE_ENABLED: "1", BGW_ARTIFACT_ROOT: notADir });
-  assert.throws(() => buildGatewayRuntime(env, { log: noLog }), (e) => e.code === "artifact-root-invalid");
+  assert.throws(
+    () => buildArtifactRuntime(loadArtifactConfig({ BGW_ARTIFACT_CAPTURE_ENABLED: "1", BGW_ARTIFACT_ROOT: notADir })),
+    (e) => e.code === "artifact-root-invalid",
+  );
 });

@@ -13,7 +13,6 @@
 import { readFileSync } from "node:fs";
 import { Gateway, loadConfig, poolSizingError } from "../gateway/index.js";
 import type { GatewayConfig } from "../gateway/index.js";
-import { loadArtifactConfig, buildArtifactRuntime } from "../artifacts/runtime-builder.js";
 import type { ArtifactRuntime } from "../artifacts/index.js";
 import {
   PolicyEngine,
@@ -61,11 +60,16 @@ export interface GatewayRuntime {
   warmupPaths: ReturnType<typeof parseWarmupPaths>;
   verifyEgress: boolean;
   /**
-   * Task 2 §4.3/§6 — the ONE process-owned artifact runtime, present iff `BGW_ARTIFACT_CAPTURE_ENABLED`
-   * is exactly `"1"`. Absent means disabled: no root, lock, timer, listener, or filesystem side effect
-   * was ever attempted (`loadArtifactConfig`'s exact short-circuit). Capture-operation wiring,
-   * HTTP-server dependency injection, and shutdown ordering are separate scope — this field only
-   * constructs and exposes the singleton; callers that don't yet consume it are unaffected.
+   * Task 2 §4.3/§6 — ALWAYS `undefined` from this shared builder, and kept only so the field's absence
+   * is part of the published contract rather than an omission a caller has to infer.
+   *
+   * The process-owned `ArtifactRuntime` holds an EXCLUSIVE, mkdir-based root lock that no later boot
+   * reclaims, so exactly one process may own it: the HTTP entrypoint, which constructs it itself
+   * (`http-main.ts`, inside the guard that releases it on a failed boot). This builder is shared with
+   * auxiliary callers that run against the SAME artifact env — `cli/vault-host.ts` executes inside the
+   * running gateway container — and constructing it here made every one of them either fail against the
+   * live gateway's lock or leak the lock and brick the gateway's next boot. Ownership is therefore not
+   * something a caller opts out of; the shared builder simply never takes it.
    */
   artifactRuntime?: ArtifactRuntime;
 }
@@ -107,13 +111,13 @@ function loadConsumers(env: NodeJS.ProcessEnv, secrets: SecretStore): ConsumerSp
 export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOptions): GatewayRuntime {
   const { log } = opts;
   const config = loadConfig(env);
-  // Task 2 §4.3/§6: the ONE process-owned artifact runtime, built once here so every caller of
-  // buildGatewayRuntime (http-main's serve, vault-host's on-host capture) shares the same construction
-  // path and can never independently interpret BGW_ARTIFACT_ROOT/limits. Disabled is an exact
-  // short-circuit (no root/lock/fs read at all); enabled fails closed (throws) on an invalid root or a
-  // live/stale lock, before any of the guards below run — a misconfigured artifact root must not boot
-  // silently into a runtime that answers every capture with a filesystem error later.
-  const artifactRuntime = buildArtifactRuntime(loadArtifactConfig(env));
+  // Task 2 §4.3/§6: the process-owned artifact runtime is deliberately NOT built here — see
+  // GatewayRuntime.artifactRuntime. It takes an exclusive root lock nothing reclaims, and this builder
+  // is shared with auxiliary callers (cli/vault-host.ts runs inside the live gateway container), so
+  // ownership belongs to the HTTP entrypoint alone. Building it here also placed the lock BEFORE every
+  // fail-closed guard below, so an ordinary config typo abandoned it and masked itself behind
+  // artifact-root-locked on every later boot. `loadArtifactConfig`/`buildArtifactRuntime` remain the one
+  // shared construction boundary; http-main calls them itself, inside the guard that releases the lock.
   // Bind the SecretStore to the SAME env the rest of the runtime reads (prod callers pass process.env
   // → identical to before; the in-process gate's controlled env then fully governs the runtime).
   const secrets = opts.secrets ?? new SecretStore(() => env);
@@ -175,6 +179,5 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   return {
     config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts,
     freshExitHosts, warmupHosts, warmupPaths, verifyEgress,
-    ...(artifactRuntime ? { artifactRuntime } : {}),
   };
 }
