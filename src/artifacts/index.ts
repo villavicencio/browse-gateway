@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { ArtifactStore, SYSTEM_SCHEDULER, canonicalizeStoreOptions } from "./store.js";
-import { ARTIFACT_ID, ArtifactStoreError, type ArtifactFailureCode, type ArtifactOwner, type ArtifactRecord, type ArtifactScheduler, type ArtifactStoreOptions, type DownloadLike, type OperationResult } from "./types.js";
+import { ARTIFACT_ID, ArtifactStoreError, type ArtifactFailureCode, type ArtifactDiscardResult, type ArtifactMetadata, type ArtifactOwner, type ArtifactRecord, type ArtifactResponseLease, type ArtifactResponseOutcome, type ArtifactScheduler, type ArtifactStoreOptions, type DownloadLike, type OperationResult, type ResponseLease } from "./types.js";
 import { canonicalizeHost, canonicalizeHostForIp } from "../security/url.js";
 import { isIP } from "node:net";
 
@@ -77,8 +77,98 @@ const CLEANUP_CONFIRM_BUDGET_MS = 5_000;
  * this stack can have made; it is a malformed report, and the operation is retired rather than
  * allowed to decide the inline-PDF predicate from it.
  */
+/** Amendment 2 §3: at most 30 retrieval attempts per consumer per rolling minute. */
+const MAX_RETRIEVALS_PER_WINDOW = 30;
+const RETRIEVAL_WINDOW_MS = 60_000;
 const MIN_HTTP_STATUS = 100;
 const MAX_HTTP_STATUS = 599;
+
+/** The widest instant a `Date` can represent. A scheduler value outside it has no ISO rendering. */
+const MAX_TIME_VALUE = 8.64e15;
+/**
+ * Render ONE instant from the injected scheduler's domain as ISO-8601, or answer `undefined` when it
+ * has no rendering at all.
+ *
+ * The clock is an INJECTED authority, and nothing validates the numbers it returns: `now()` may
+ * answer a NaN, an infinity or 1e20, and `new Date(...).toISOString()` throws a raw `RangeError` on
+ * every one of them. Thrown from the projection this is called from, that exception would escape
+ * `seal()` — a public method whose whole error vocabulary is closed — so an unrenderable instant is
+ * reported as the malformed configuration it is, not as an escaping Node exception.
+ */
+function isoInstant(value: number): string | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > MAX_TIME_VALUE) return undefined;
+  try { return new Date(value).toISOString(); } catch { return undefined; }
+}
+
+/**
+ * Project the private committed record into the ONE public artifact shape (Task 2 §3.1).
+ *
+ * Built at successful seal, from the record the store just committed plus the operation's OWN frozen
+ * canonical `sourceHost` — never a caller string re-read at projection time, and never a later
+ * lookup. The result is frozen and carries no `consumerId`, `status`, raw scheduler number, owner,
+ * path, operation ID or reservation state: authorization is decided from the runtime's private
+ * ledger, so a field a caller could rewrite decides nothing.
+ */
+function projectMetadata(record: ArtifactRecord, sourceHost: string): ArtifactMetadata | undefined {
+  const createdAt = isoInstant(record.createdAt);
+  const expiresAt = isoInstant(record.expiresAt);
+  if (createdAt === undefined || expiresAt === undefined) return undefined;
+  return Object.freeze({
+    artifactId: record.id,
+    kind: "pdf" as const,
+    disposition: "attachment" as const,
+    sizeBytes: record.bytes,
+    sha256: record.sha256,
+    createdAt,
+    expiresAt,
+    sourceHost,
+  });
+}
+
+/**
+ * Adapt Task 1's accepted private lease to Amendment 4's authoritative one.
+ *
+ * A pure adapter, deliberately: the bytes were opened, verified, hashed and encoded ONCE, inside the
+ * store, under the single global permit — this wraps that one encoding into its final embedded
+ * resource and adds nothing. Nothing here re-reads the file, re-encodes the buffer or copies it, so
+ * the permit continues to bound exactly one raw buffer and one base64 string, as Amendment 2 §3
+ * requires.
+ *
+ * `complete()` is asynchronous and idempotent with FIRST-OUTCOME-WINS semantics, and it never
+ * rejects: it is invoked from guarded transport fallbacks and from a `finally`, where a rejection
+ * would replace the failure being handled. The private completion beneath it makes the artifact
+ * permanently unavailable, performs the owned durable discard, and releases the permit and the
+ * response reservation — in that order, synchronously, so no waiter admitted by the release can
+ * observe the artifact still present.
+ */
+function makeResponseLease(raw: ResponseLease, metadata: ArtifactMetadata): ArtifactResponseLease {
+  let completion: Promise<void> | undefined;
+  return Object.freeze({
+    metadata,
+    resource: Object.freeze({
+      type: "resource" as const,
+      // The URI carries the authorized opaque ID and nothing else: no path, no root, no private URL.
+      resource: Object.freeze({ uri: `artifact:${metadata.artifactId}`, mimeType: "application/pdf" as const, blob: raw.base64 }),
+    }),
+    deadlineMs: raw.deadline,
+    /**
+     * All three outcomes perform the SAME irreversible terminal work — Amendment 2 §5 gives
+     * `sent`, transport failure and the exact 15-second timeout the same destination, and no path
+     * returns an artifact to `available`. The reason exists for the audit surface above, which is
+     * why nothing here reads it: an out-of-vocabulary value handed in by a JavaScript caller cannot
+     * reach a decision, a callback or a log line, because it reaches nothing at all.
+     */
+    complete(_outcome: ArtifactResponseOutcome): Promise<void> {
+      if (completion) return completion;
+      // Latched BEFORE the work, so a re-entrant completion observes the latch rather than
+      // discarding twice. The private completion is synchronous, so awaiting this resolved promise
+      // still means the deletion and the permit release have already happened.
+      completion = Promise.resolve();
+      try { raw.complete(); } catch { /* the private completion is total; a throw must not reject */ }
+      return completion;
+    },
+  });
+}
 
 /** What an untrusted accessor produced, or that the operation stopped waiting for it. */
 type AccessorOutcome<T> = { state: "value"; value: T } | { state: "threw" } | { state: "stopped" };
@@ -231,6 +321,9 @@ export class ArtifactOperation {
   readonly #onReleased?: () => void;
   readonly #onCommitted?: () => void;
   readonly #onCleanupUnconfirmed?: () => void;
+  /** The runtime's token-bound owner-ledger publication, invoked ONCE, on the legal
+   *  `sealing -> committed(available)` transition and never from anywhere else. */
+  readonly #publishOwner?: (metadata: ArtifactMetadata) => void;
   #state: { name: "open" | "sealing" } | { name: "committed"; result: OperationResult } | { name: "invalidated"; reason: ArtifactFailureCode } = { name: "open" };
   #events = 0;
   #jobs = new Set<Promise<void>>();
@@ -290,6 +383,7 @@ export class ArtifactOperation {
     onCommitted?: () => void,
     /** Fires once, when this operation could not confirm disposal of its attributed download. */
     onCleanupUnconfirmed?: () => void,
+    publishOwner?: (metadata: ArtifactMetadata) => void,
   ) {
     this.#store = store;
     this.#release = release;
@@ -299,6 +393,7 @@ export class ArtifactOperation {
     this.#onReleased = onReleased;
     this.#onCommitted = onCommitted;
     this.#onCleanupUnconfirmed = onCleanupUnconfirmed;
+    this.#publishOwner = publishOwner;
     // TypeScript `readonly` disappears at runtime. These values govern store ownership/reservation
     // after asynchronous driver work, so expose them as immutable own properties: neither assignment
     // nor `defineProperty` may replace the frozen owner snapshot or disconnect the reserved identity.
@@ -634,7 +729,16 @@ export class ArtifactOperation {
     // the state can legitimately have changed during the awaits above, which narrowing cannot know.
     const current = this.#state as { name: string; reason?: ArtifactFailureCode };
     if (current.name === "invalidated") return this.#invalidatedResult(current.reason!);
-    if (this.#provisional) return this.#commit({ outcome: "available", artifact: this.#provisional });
+    if (this.#provisional) {
+      // Task 2 §3.2: the safe projection is constructed HERE, at the successful seal, while this
+      // operation still owns both the trusted canonical host and the private committed record. An
+      // instant the injected clock made unrenderable is a malformed configuration, and an artifact
+      // this stack cannot describe must not stay retrievable — `invalidate()` discards the staged
+      // record on its way out, exactly as every other pre-commitment failure does.
+      const metadata = projectMetadata(this.#provisional, this.sourceHost);
+      if (!metadata) { this.invalidate("artifact-config-invalid"); return this.#invalidatedResult("artifact-config-invalid"); }
+      return this.#commit({ outcome: "available", artifact: metadata });
+    }
     const essence = ((this.#contentType ?? "").trim().toLowerCase().split(";", 1)[0] ?? "").trim();
     if (this.#events === 0 && this.#status === 200 && essence === "application/pdf") {
       return this.#commit({ outcome: "inline-pdf-unsupported", failure: "inline-pdf-unsupported" });
@@ -654,6 +758,10 @@ export class ArtifactOperation {
   #commit(result: OperationResult): OperationResult {
     if (this.#state.name === "committed") return this.#state.result;
     this.#state = { name: "committed", result };
+    // Task 2 §6: the owner ledger is populated ONLY by the successful commit, and only from inside
+    // the legal `sealing -> committed` transition — so nothing provisional, invalidated or merely
+    // staged is ever retrievable, and the entry is bound to this operation's reservation token.
+    if (result.outcome === "available") { try { this.#publishOwner?.(result.artifact); } catch {} }
     // Committed is terminal, so the ONE settlement deadline is over — dropped HERE, before any
     // untrusted callback or the result itself becomes observable. The staging job's `finally` already
     // asked, but it runs while the state is still `sealing`, which is deliberately not terminal, so
@@ -821,6 +929,28 @@ export class ArtifactRuntime {
   readonly #idGenerator: () => string;
   readonly #reserved = new Map<string, symbol>();
   readonly #operations = new Map<symbol, ArtifactOperation>();
+  /**
+   * The private owner ledger (Task 2 §6). It is the ONLY authority retrieval is authorized from: the
+   * store knows the owning `consumerId` and nothing about drive lineage, and the public metadata
+   * deliberately carries neither.
+   *
+   * Populated only by the successful operation commit callback, and removed only by that same
+   * operation's token-bound release — which Task 1 already gates on durable discard — so a stale or
+   * duplicated notification cannot delete a replacement's entry, and an ID cannot be authorized
+   * after the artifact behind it is gone.
+   */
+  readonly #artifactOwners = new Map<string, { token: symbol; owner: ArtifactOwner; metadata: ArtifactMetadata }>();
+  /**
+   * Drive lineage (Task 2 §6). Consumer and controller stay SEPARATE primitive keys in a nested map:
+   * concatenating them into one string key would make `a|b` and `ab|` collide, and a serialized
+   * composite is exactly the sort of value that ends up in a log line.
+   */
+  readonly #controllerState = new Map<string, Map<string, "active" | "invalidated">>();
+  /** Retrieval attempt instants per consumer, in the injected domain (Amendment 2 §3). Bounded to
+   *  {@link MAX_RETRIEVALS_PER_WINDOW} entries by construction: once the window is full the attempt
+   *  is refused WITHOUT being recorded, so a flood cannot grow this and the window still slides from
+   *  the thirty attempts actually admitted. */
+  readonly #retrievals = new Map<string, number[]>();
   #closed = false;
   /** STICKY capture poison, owned by the runtime (never the browser core): set when an operation
    *  could not confirm disposal of its attributed download. It rejects every LATER createOperation
@@ -888,6 +1018,10 @@ export class ArtifactRuntime {
     // keeps its own object and may mutate it afterwards; the operation must never read that state
     // again, or a mutation landing mid-staging could divert an artifact to a different owner.
     const canonicalOwner = canonicalizeOwner(owner as ArtifactOwner | undefined);
+    // Task 2 §6, "operation create": a drive generation requires an ACTIVE lineage. Checked here on
+    // the canonical snapshot, and again below with the other two fences, because everything between
+    // is caller-controlled code that can dispose this very lineage while the frame is still deciding.
+    if (this.#invalidLineage(canonicalOwner)) throw new ArtifactStoreError("artifact-runtime-invalidated");
     if (typeof sourceHost !== "string") throw new ArtifactStoreError("artifact-config-invalid");
     let host: string;
     try { host = canonicalizeHost(sourceHost); } catch { throw new ArtifactStoreError("artifact-config-invalid"); }
@@ -915,11 +1049,27 @@ export class ArtifactRuntime {
     // Rechecked HERE, nothing has been reserved yet, so a refusal also leaks nothing.
     if (this.#closed) throw new ArtifactStoreError("artifact-runtime-invalidated");
     if (this.#cleanupPoisoned) throw new ArtifactStoreError("artifact-cleanup-failed");
+    if (this.#invalidLineage(canonicalOwner)) throw new ArtifactStoreError("artifact-runtime-invalidated");
     const token = Symbol(id);
     this.#reserved.set(id, token);
+    // Task 2 §6, "operation create": a drive generation establishes its lineage. First use activates
+    // it; an entry that already exists is never overwritten, so a lineage that has been invalidated
+    // stays invalidated and no later operation can quietly revive it.
+    if (canonicalOwner.scope === "drive") {
+      let lineage = this.#controllerState.get(canonicalOwner.consumerId);
+      if (!lineage) { lineage = new Map(); this.#controllerState.set(canonicalOwner.consumerId, lineage); }
+      if (!lineage.has(canonicalOwner.controllerId)) lineage.set(canonicalOwner.controllerId, "active");
+    }
     const operation = new ArtifactOperation(
       this.#store, canonicalOwner, host, id,
-      () => { if (this.#reserved.get(id!) === token) this.#reserved.delete(id!); this.#operations.delete(token); },
+      () => {
+        if (this.#reserved.get(id!) === token) this.#reserved.delete(id!);
+        // TOKEN-BOUND, exactly like the reservation above: release happens only once Task 1 has
+        // proved the artifact durably discarded, and only the operation that published the entry may
+        // remove it. A stale operation releasing late cannot revoke a replacement's authorization.
+        if (this.#artifactOwners.get(id!)?.token === token) this.#artifactOwners.delete(id!);
+        this.#operations.delete(token);
+      },
       this.#scheduler, this.#beforeCommit, this.#onTerminal, this.#onReleased, this.#onCommitted,
       () => {
         // Poison is the RUNTIME's transition, not the operation's: drop the operation (and with it any
@@ -928,9 +1078,209 @@ export class ArtifactRuntime {
         this.#cleanupPoisoned = true;
         this.#operations.delete(token);
       },
+      (metadata) => { this.#artifactOwners.set(id!, { token, owner: canonicalOwner, metadata }); },
     );
     this.#operations.set(token, operation);
     return operation;
+  }
+
+  /**
+   * Spend one retrieval attempt from this consumer's rolling-minute budget (Amendment 2 §3).
+   *
+   * ATTEMPTS are what the budget counts, not successes: a sweep of unknown IDs is exactly what the
+   * limit exists to bound, and each of those is denied before it reaches a lookup. Answering `true`
+   * means the attempt is refused, and a refused attempt is deliberately NOT recorded — so the array
+   * cannot grow past the limit and the window keeps sliding off the thirty instants actually
+   * admitted rather than being extended by the flood it is refusing.
+   */
+  #spendRetrieval(consumerId: string): boolean {
+    const now = this.#scheduler.now();
+    const cutoff = now - RETRIEVAL_WINDOW_MS;
+    let attempts = this.#retrievals.get(consumerId);
+    if (attempts) {
+      // Rolling, not a fixed bucket: an instant leaves the window exactly one minute after it was
+      // spent. Bounded work — the array can never hold more than the limit.
+      while (attempts.length > 0 && attempts[0]! <= cutoff) attempts.shift();
+      if (attempts.length === 0) { this.#retrievals.delete(consumerId); attempts = undefined; }
+    }
+    if (attempts && attempts.length >= MAX_RETRIEVALS_PER_WINDOW) return true;
+    if (attempts) attempts.push(now);
+    else this.#retrievals.set(consumerId, [now]);
+    return false;
+  }
+
+  /** Whether this owner names a lineage that has already been fenced. Consumer-scoped owners have
+   *  no lineage at all: a transient artifact binds to its consumer and outlives every controller. */
+  #invalidLineage(owner: ArtifactOwner): boolean {
+    return owner.scope === "drive" && this.#controllerState.get(owner.consumerId)?.get(owner.controllerId) === "invalidated";
+  }
+
+  /**
+   * Fence one drive lineage (Amendment 4 §4).
+   *
+   * SYNCHRONOUS and total, because every graph-disposal path must call it BEFORE its first await:
+   * a DELETE, an idle reap or a close-all that awaited a browser close first left a window in which
+   * an already-open generation could still publish and a retrieval for the disposed lineage was
+   * still authorized. It therefore invalidates every open/sealing generation of that lineage,
+   * refuses every later drive operation on it, and revokes retrieval for its committed artifacts —
+   * without deleting anything, which is `discardController`'s separate job.
+   *
+   * It never throws. A disposal path cannot handle an exception from its own fence, and a malformed
+   * identity names no lineage that could ever have been created: `canonicalizeOwner` rejects a
+   * non-string or empty controller at creation, so there is nothing to fence and nothing to bypass.
+   *
+   * Amendment 4 calls this allocation-free. The one deliberate exception is the bounded snapshot
+   * below: `invalidate()` reaches the injected scheduler, the store's discard and an
+   * `onOperationTerminal` observer, any of which may create or retire operations re-entrantly, and
+   * iterating the live map while that happens is not a bound this method can state.
+   */
+  invalidateController(input: { consumerId: string; controllerId: string }): void {
+    if (!input || typeof input !== "object") return;
+    let consumerId: unknown, controllerId: unknown;
+    try { consumerId = input.consumerId; controllerId = input.controllerId; } catch { return; }
+    if (typeof consumerId !== "string" || consumerId.length === 0) return;
+    if (typeof controllerId !== "string" || controllerId.length === 0) return;
+    let lineage = this.#controllerState.get(consumerId);
+    if (!lineage) { lineage = new Map(); this.#controllerState.set(consumerId, lineage); }
+    // Recorded FIRST, so a generation retired below — and anything its observers do re-entrantly —
+    // already sees a lineage that can never be revived.
+    lineage.set(controllerId, "invalidated");
+    const doomed: ArtifactOperation[] = [];
+    for (const operation of this.#operations.values()) {
+      const owner = operation.owner;
+      if (owner.scope === "drive" && owner.consumerId === consumerId && owner.controllerId === controllerId) doomed.push(operation);
+    }
+    // Each generation is retired on its OWN account: `invalidate()` is designed to be total, but it
+    // reaches caller code, and a throw from one must not skip the generations behind it.
+    for (const operation of doomed) { try { disposeForRuntime(operation); } catch {} }
+  }
+
+  /**
+   * Discard one drive lineage and report the CLOSED internal result (Task 2 §6, Amendment 7 §5.1).
+   *
+   * The lineage is fenced synchronously first — this call IS a disposal path — and then every
+   * committed artifact it owns is discarded. All attempts run even when one of them fails, because a
+   * teardown that stops at the first failure leaves the rest of the lineage on disk.
+   *
+   * The three results are not interchangeable:
+   *
+   *  - `clean`   — every artifact of the lineage was durably deleted, or there were none.
+   *  - `refused` — at least one record is `consuming`, and its active response lease exclusively owns
+   *    resolution (Amendment 2 §5). Deliberately NOT reported as clean: nothing was deleted, and only
+   *    that lease's completion or its exact 15-second timeout may resolve it.
+   *  - `failed`  — durable deletion could not be proven. The runtime is poisoned, so later capture is
+   *    rejected with `artifact-cleanup-failed` and every unsafe identity stays reserved.
+   *
+   * Consumer-scoped artifacts are untouched: they bind to the consumer alone and outlive every
+   * controller lineage (Task 1 invariant 10).
+   */
+  async discardController(input: { consumerId: string; controllerId: string }): Promise<ArtifactDiscardResult> {
+    // The fence belongs to this call and lands BEFORE its first await, so no generation can publish
+    // into a lineage that is being torn down. It is total and validates the identities itself.
+    this.invalidateController(input);
+    if (!input || typeof input !== "object") return "clean";
+    let consumerId: unknown, controllerId: unknown;
+    try { consumerId = input.consumerId; controllerId = input.controllerId; } catch { return "clean"; }
+    if (typeof consumerId !== "string" || consumerId.length === 0) return "clean";
+    if (typeof controllerId !== "string" || controllerId.length === 0) return "clean";
+    // Snapshotted before the first discard: a durable deletion notifies its operation, which releases
+    // its reservation and its ledger entry, so the map is mutated from underneath this loop.
+    const doomed: string[] = [];
+    for (const [artifactId, entry] of this.#artifactOwners) {
+      const owner = entry.owner;
+      if (owner.scope === "drive" && owner.consumerId === consumerId && owner.controllerId === controllerId) doomed.push(artifactId);
+    }
+    let refused = false, failed = false;
+    for (const artifactId of doomed) {
+      // Each artifact on its OWN account: the discard reaches the store's identity proof, its
+      // filesystem authority and an `onDiscard` observer, and a throw from one must not skip the
+      // rest of the lineage. An exception is exactly what `failed` means — deletion unproven.
+      let result: ArtifactDiscardResult;
+      try { result = this.#store.discardArtifactDetailed(artifactId); } catch { result = "failed"; }
+      if (result === "failed") failed = true;
+      else if (result === "refused") refused = true;
+    }
+    // Poison is the RUNTIME's transition, exactly as it is for unconfirmed driver disposal: later
+    // capture is refused and every unsafe identity stays reserved, while what is already committed
+    // and provably intact stays retrievable.
+    if (failed) this.#cleanupPoisoned = true;
+    // No separate "this lineage failed once" ledger: a failed deletion has already poisoned the
+    // STORE, and the artifact it could not delete keeps its ledger entry (no `onDiscard` ran, so no
+    // operation released it). A repeated disposal therefore re-finds that artifact and re-derives
+    // `failed` from the store itself, instead of from a second, drifting record of the same fact —
+    // and the two identities are never concatenated into one composite key to hold it.
+    return failed ? "failed" : refused ? "refused" : "clean";
+  }
+
+  /**
+   * The ONE clock this subsystem decides from, published so a transport tracker can compute its own
+   * remaining budget as `lease.deadlineMs - runtime.now()` without the lease growing a `now()` of its
+   * own — and without any caller mixing in ambient `Date.now()`, which is a different domain whenever
+   * a scheduler is injected. Read-only: it exposes no timer, no authority and no state.
+   */
+  now(): number { return this.#scheduler.now(); }
+
+  /**
+   * Acquire one artifact into an authoritative response lease (Amendment 4 §1, Task 2 §4.1).
+   *
+   * Authorization is decided HERE, from the private owner ledger, before the store is touched at all:
+   * consumer artifacts require the exact consumer identity, drive artifacts require the exact
+   * consumer AND controller identity on a lineage that has not been invalidated. The store knows only
+   * the owning consumer, so drive lineage could never have been enforced down there.
+   *
+   * Every denial — malformed input, invalid grammar, unknown, foreign, wrong lineage, invalidated
+   * lineage, expired, consumed, concurrent — rejects with a CLOSED `ArtifactStoreError`. The codes
+   * differ so the audit surface can say which (Task 2 §7, Amendment 2 §3); the MCP seam above collapses
+   * all of them to one fixed external result, so none of them is an oracle.
+   *
+   * An invalid-grammar ID never reaches the store, so it performs no lookup, no path derivation and
+   * no filesystem call at all.
+   */
+  async acquireResponseLease(input: { artifactId: string; consumerId: string; controllerId?: string }): Promise<ArtifactResponseLease> {
+    const unavailable = (code: ArtifactFailureCode) => new ArtifactStoreError(code);
+    if (!input || typeof input !== "object") throw unavailable("artifact-not-found");
+    let artifactId: unknown, consumerId: unknown, controllerId: unknown;
+    try {
+      // One synchronous snapshot of caller-controlled properties, exactly as every other public
+      // entry point in this module does: a getter may throw or answer differently on a second read,
+      // and neither may govern an authorization decision.
+      artifactId = input.artifactId;
+      consumerId = input.consumerId;
+      controllerId = input.controllerId;
+    } catch {
+      throw unavailable("artifact-not-found");
+    }
+    if (typeof consumerId !== "string" || consumerId.length === 0) throw unavailable("artifact-not-found");
+    // Spent BEFORE the grammar check and the ledger lookup: the budget bounds attempts, and a sweep
+    // of malformed or unknown IDs is precisely the attempt it exists to bound.
+    if (this.#spendRetrieval(consumerId)) throw unavailable("artifact-rate-limited");
+    // The closed grammar, BEFORE any lookup or path derivation (Task 2 §7). A well-typed traversal,
+    // Unicode or overlong string is denied here, having touched neither the ledger nor the store.
+    if (typeof artifactId !== "string" || !ARTIFACT_ID.test(artifactId)) throw unavailable("artifact-not-found");
+    const entry = this.#artifactOwners.get(artifactId);
+    if (!entry) throw unavailable("artifact-not-found");
+    if (entry.owner.consumerId !== consumerId) throw unavailable("artifact-owner-mismatch");
+    if (entry.owner.scope === "drive") {
+      if (typeof controllerId !== "string" || controllerId !== entry.owner.controllerId) throw unavailable("artifact-owner-mismatch");
+      if (this.#controllerState.get(consumerId)?.get(controllerId) !== "active") throw unavailable("artifact-owner-mismatch");
+    }
+    // Expiry, the transition out of `available`, the identity re-proof, the read, the hash and the
+    // ONE encoding are all Task 1's, under Task 1's single global permit: this layer adds no second
+    // expiry rule and no second encoding. A `null` is every remaining reason at once — expired,
+    // already consuming, consumed, unhealthy or closing — and is deliberately indistinguishable.
+    let raw;
+    try {
+      raw = await this.#store.acquire(artifactId, consumerId);
+    } catch {
+      throw unavailable("artifact-not-found");
+    }
+    if (!raw) throw unavailable("artifact-not-found");
+    // IMMEDIATELY, before this lease is wrapped or returned to anything: hand the deadline off. From
+    // this instant the store's own internal timer can never again independently release the permit
+    // or discard the artifact — that authority now belongs exclusively to this runtime and, later,
+    // to whoever the public lease is registered with (Amendment 4 §1/§2, plan §4.1).
+    raw.claimTimeout();
+    return makeResponseLease(raw, entry.metadata);
   }
   /**
    * Close, in exactly the order Amendment 7 §5.2 fixes:

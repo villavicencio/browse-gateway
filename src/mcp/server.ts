@@ -11,6 +11,9 @@ import type { BlockReason, EscalationDiagnostics } from "../verbs/index.js";
 import { EscalationError, isRetrieveFailure } from "../verbs/index.js";
 import { summarizeFailureDiagnostics, failureOf, sanitizeUrlForError, sanitizeUrlsInErrorText } from "../observability/index.js";
 import type { FailureDiagnostics, Timing } from "../observability/index.js";
+import type { ArtifactOutcome, ArtifactResponseLease } from "../artifacts/index.js";
+import { getArtifactLeaseTracker } from "./http-request-context.js";
+import { ARTIFACT_TOOL_NAME } from "./http-response-lease.js";
 
 /**
  * `_meta` key on a tool ERROR result carrying a machine-readable failure kind (issue #47), so a
@@ -42,6 +45,19 @@ export type ErrorKind = "in-band" | "internal";
 
 const errorKindMeta = (kind: ErrorKind) => ({ [ERROR_KIND_META_KEY]: kind });
 
+/**
+ * Task 2 §3.5 — the ONE external shape every `browser_get_artifact` denial collapses to before a
+ * lease is acquired: invalid grammar, unknown, foreign, wrong-controller, expired, consumed,
+ * concurrent, rate-limited, and "no active HTTP request context" are all indistinguishable from
+ * outside. No `structuredContent`, no status/timing/owner-scope hint — any of those would turn the
+ * response into an oracle. Frozen so no caller can mutate the shared literal.
+ */
+const ARTIFACT_UNAVAILABLE_RESULT = Object.freeze({
+  isError: true as const,
+  _meta: Object.freeze(errorKindMeta("in-band")),
+  content: [Object.freeze({ type: "text" as const, text: "Artifact is unavailable." })],
+});
+
 /** The slice of a RetrieveResult the MCP tool reports. */
 export interface RetrieveOutcome {
   markdown: string;
@@ -69,6 +85,10 @@ export interface RetrieveOutcome {
    *  On a SUCCESS the tool returns clean markdown (no timing line — content purity), so this carries the
    *  breakdown at the result-object level for a programmatic caller. */
   timing?: Timing;
+  /** Task 2 §3.2 — the sealed capture outcome for this retrieve, when artifact capture is configured
+   *  (the capture-operation wiring itself is separate scope). Absent means artifact-disabled: the tool
+   *  output stays byte-identical to pre-Task-2 retrieve. Mirrors {@link PageSnapshot.artifactOutcome}. */
+  artifactOutcome?: ArtifactOutcome;
 }
 
 export type RetrieveFn = (input: { url: string; forceProxy?: boolean }) => Promise<RetrieveOutcome>;
@@ -99,6 +119,75 @@ export interface GatewayMcpDeps {
   drive?: DriveController;
   name?: string;
   version?: string;
+  /**
+   * Task 2 §4.2 — the server-scoped, IMMUTABLE artifact-retrieval dependency. Present only when HTTP
+   * artifact support is enabled for this server graph; absent means `browser_get_artifact` is not
+   * registered at all (Task 2 §3.3). `consumerId`/`controllerId` are the trusted, server-minted
+   * identities this graph is bound to — MCP input never carries them. `consumeForServer` is the
+   * runtime's `acquireResponseLease` closed over nothing but those identities plus the caller's
+   * artifact ID; lifecycle methods and transport-tracker controls deliberately do not enter this
+   * shape (Task 2 §4.2: "Lifecycle methods and transport-tracker controls do not enter GatewayMcpDeps").
+   */
+  artifacts?: {
+    readonly consumerId: string;
+    readonly controllerId?: string;
+    consumeForServer(input: { artifactId: string; consumerId: string; controllerId?: string }): Promise<ArtifactResponseLease>;
+  };
+}
+
+/**
+ * Task 2 §4.2 — read `artifacts`'s identity primitives and `consumeForServer` EXACTLY ONCE, validate
+ * them, and freeze the result into local constants the server never re-reads `deps.artifacts` for
+ * again. `deps.artifacts` is trusted server-side wiring (an entrypoint closes over the runtime), not
+ * caller input — a hostile getter or a later mutation on that dependency object must not be able to
+ * retarget an already-registered tool's owner/lineage (acceptance C6), so this is the ONE read.
+ *
+ * Throws when malformed: an invalid `GatewayMcpDeps.artifacts` is a construction-time wiring defect,
+ * not a runtime denial a caller can trigger — nothing here is reachable from MCP input.
+ */
+function snapshotArtifactIdentity(
+  artifacts: NonNullable<GatewayMcpDeps["artifacts"]>,
+  driveEnabled: boolean,
+): { consumerId: string; controllerId?: string; consumeForServer: NonNullable<GatewayMcpDeps["artifacts"]>["consumeForServer"] } {
+  let consumerId: unknown, controllerId: unknown, consumeForServer: unknown;
+  try {
+    // One synchronous snapshot: a getter/proxy may throw or answer differently on a second read, and
+    // neither may govern which identity this server graph is bound to.
+    consumerId = artifacts.consumerId;
+    controllerId = artifacts.controllerId;
+    consumeForServer = artifacts.consumeForServer;
+  } catch {
+    throw new Error("GatewayMcpDeps.artifacts: reading consumerId/controllerId/consumeForServer threw");
+  }
+  if (typeof consumerId !== "string" || consumerId.length === 0) {
+    throw new Error("GatewayMcpDeps.artifacts.consumerId must be a non-empty string");
+  }
+  if (controllerId !== undefined && (typeof controllerId !== "string" || controllerId.length === 0)) {
+    throw new Error("GatewayMcpDeps.artifacts.controllerId must be a non-empty string when present");
+  }
+  // Task 2 §4.2: "controllerId is mandatory when drive and artifacts coexist" — a drive artifact can
+  // never be authorized without controller lineage, so a graph that has both must snapshot one.
+  if (driveEnabled && controllerId === undefined) {
+    throw new Error("GatewayMcpDeps.artifacts.controllerId is required when drive and artifacts coexist");
+  }
+  if (typeof consumeForServer !== "function") {
+    throw new Error("GatewayMcpDeps.artifacts.consumeForServer must be a function");
+  }
+  return Object.freeze({
+    consumerId,
+    controllerId: controllerId as string | undefined,
+    consumeForServer: consumeForServer as NonNullable<GatewayMcpDeps["artifacts"]>["consumeForServer"],
+  });
+}
+
+/** Task 2 §3.2 — project a committed {@link ArtifactOutcome} into MCP `structuredContent`, or
+ *  `undefined` when nothing should be added. The artifact-disabled (`undefined`) and no-artifact
+ *  (`"none"`) cases both answer `undefined` here, which is what keeps that output byte-identical to
+ *  pre-Task-2 behavior — neither manufactures a field. */
+function artifactStructuredContent(outcome: ArtifactOutcome | undefined): Record<string, unknown> | undefined {
+  if (!outcome || outcome.outcome === "none") return undefined;
+  if (outcome.outcome === "available") return { artifactOutcome: "available", artifact: outcome.artifact };
+  return { artifactOutcome: outcome.outcome, artifactFailure: outcome.failure };
 }
 
 /** Render a snapshot for the agent: a url/title header plus the ref-annotated accessibility tree. The
@@ -136,6 +225,10 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
     version: deps.version ?? "0.1.0",
   });
 
+  // Task 2 §4.2: snapshot ONCE at construction, before any tool is registered — `browser_get_artifact`
+  // below closes over this frozen local, never `deps.artifacts` again.
+  const artifactIdentity = deps.artifacts ? snapshotArtifactIdentity(deps.artifacts, deps.drive !== undefined) : undefined;
+
   server.registerTool(
     "retrieve",
     {
@@ -157,6 +250,28 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
     async ({ url, forceProxy }) => {
       try {
         const result = await deps.retrieve({ url, forceProxy });
+        // Task 2 §3.2 — the capture outcome is checked BEFORE the ordinary failure predicate: an
+        // absent field or `{outcome:"none"}` falls straight through to existing behavior (byte-
+        // identical), so neither manufactures a field. `"available"` is a deliberate SUCCESS with no
+        // markdown (the bytes live in the artifact, fetched separately via browser_get_artifact) —
+        // not an MCP error. `inline-pdf-unsupported`/`capture-failed` surface a sanitized, closed
+        // in-band error carrying only the authorized URL and the closed failure code — never raw
+        // driver/fs/path text.
+        const artifact = result.artifactOutcome;
+        if (artifact && artifact.outcome === "available") {
+          return {
+            content: [{ type: "text", text: "" }],
+            structuredContent: { artifactOutcome: "available", artifact: artifact.artifact },
+          };
+        }
+        if (artifact && (artifact.outcome === "inline-pdf-unsupported" || artifact.outcome === "capture-failed")) {
+          return {
+            isError: true,
+            _meta: errorKindMeta("in-band"),
+            content: [{ type: "text", text: `Could not capture an artifact for ${sanitizeUrlForError(url)} (artifactFailure=${artifact.failure}).` }],
+            structuredContent: { artifactOutcome: artifact.outcome, artifactFailure: artifact.failure },
+          };
+        }
         // The SHARED retrieve-failure predicate (retrieve() attaches the evidence envelope on exactly
         // this condition, #39): blocked, empty/whitespace markdown (empty extraction), or a failed nav
         // (null status + thin body — an off-allowlist/unreachable target whose thin error page must not
@@ -245,7 +360,14 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
     const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
     const snap = async (run: () => Promise<PageSnapshot>) => {
       try {
-        return ok(formatSnapshot(await run()));
+        const result = await run();
+        // Task 2 §3.2: `formatSnapshot` text is NEVER touched — structuredContent is the sole
+        // carrier, added only when an internal artifact object exists and isn't the no-artifact case.
+        const structuredContent = artifactStructuredContent(result.artifactOutcome);
+        return {
+          content: [{ type: "text" as const, text: formatSnapshot(result) }],
+          ...(structuredContent ? { structuredContent } : {}),
+        };
       } catch (err) {
         return fail(err);
       }
@@ -407,6 +529,57 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
         } catch (err) {
           return fail(err);
         }
+      },
+    );
+  }
+
+  // Task 2 §3.3/§4.2/§5.1 — registered only when a server-scoped artifact dependency was supplied and
+  // validated at construction. Input is deliberately the strict, string-only shape: identities are
+  // closed over the server graph, never MCP input (Task 2 §7 threat 1).
+  if (artifactIdentity) {
+    server.registerTool(
+      ARTIFACT_TOOL_NAME,
+      {
+        title: "Get a captured artifact",
+        description:
+          "Retrieve a PDF artifact captured during a prior retrieve/browser_navigate call, by its opaque artifactId " +
+          "(surfaced in that call's structuredContent). Returns the PDF bytes as an embedded resource.",
+        inputSchema: z.object({ artifactId: z.string() }).strict(),
+      },
+      async (args, extra) => {
+        // Task 2 §5.1 guarded order, step 1: an active tracker is required before acquisition — a
+        // call reaching this tool outside an active HTTP POST dispatch (e.g. no real HTTP layer, or a
+        // requestId that doesn't match the currently active dispatch) is a closed invariant failure,
+        // collapsed to the same external denial as every other runtime refusal.
+        const tracker = getArtifactLeaseTracker(extra.requestId);
+        if (!tracker) return ARTIFACT_UNAVAILABLE_RESULT;
+        let lease: ArtifactResponseLease;
+        try {
+          // Step 2: acquire. Every runtime denial — invalid grammar, unknown, foreign, wrong-lineage,
+          // expired, consumed, concurrent, rate-limited — collapses to the one fixed external result;
+          // none of the closed internal codes reaches the caller (Task 2 §3.5/§7).
+          lease = await artifactIdentity.consumeForServer({
+            artifactId: args.artifactId,
+            consumerId: artifactIdentity.consumerId,
+            controllerId: artifactIdentity.controllerId,
+          });
+        } catch {
+          return ARTIFACT_UNAVAILABLE_RESULT;
+        }
+        try {
+          // Step 3: register synchronously, before reading/returning `lease.resource`.
+          tracker.register(lease);
+        } catch {
+          // Step 4: acquisition succeeded but registration failed (duplicate/terminal tracker —
+          // register() has already fail-completed the lease it rejected; this fallback call is
+          // idempotent belt-and-braces, matching the fixed §3.5 external result either way).
+          await lease.complete("transport-failed").catch(() => {});
+          return ARTIFACT_UNAVAILABLE_RESULT;
+        }
+        // Step 5: once registered, only the tracker may ever complete this lease — no catch here, so
+        // a later throw (e.g. a hostile resource getter) propagates untouched to the SDK, and the
+        // tracker's own finish/close/error/deadline handling terminalizes it exactly once.
+        return { content: [lease.resource], structuredContent: { artifact: lease.metadata } };
       },
     );
   }

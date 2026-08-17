@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, linkSync, unlinkSync, fsyncSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { ArtifactRuntime } from "../dist/artifacts/index.js";
 // Amendment 3 §1: `ArtifactRuntime` is the ONLY cross-module runtime API, so the concrete store is
 // not on the public barrel. These tests reach it as what it is — an INTERNAL module of
@@ -155,7 +156,7 @@ test("stateful download failure getter is read once and invoked with its own rec
   assert.equal(calls, 1, "the snapshotted accessor was not invoked exactly once");
   assert.equal(receiver, download, "the accessor did not run against the download it came from");
   assert.equal(result.outcome, "available", "a download reporting no failure did not publish");
-  assert.equal(result.artifact.id, id);
+  assert.equal(result.artifact.artifactId, id);
   assert.equal(JSON.stringify(result).includes(privateMarker), false, "the second-read sentinel escaped");
   assert.deepEqual(readdirSync(join(root, "data")), [`${id}.pdf`]);
   await r.close();
@@ -848,14 +849,17 @@ test("the operation keeps a frozen snapshot: mutating the caller's owner cannot 
   const result = await op.seal();
 
   assert.equal(result.outcome, "available");
-  assert.equal(result.artifact.consumerId, "rightful", "the stored artifact followed the mutated owner");
+  // Task 2 §3.1: the owner is no longer READABLE from the result — the public projection carries no
+  // consumer at all — so the binding is proved where it is actually decided, on the private record
+  // the store authorizes from and on the operation's own frozen owner snapshot.
+  assert.equal("consumerId" in result.artifact, false, "the public projection carried the owning consumer");
   assert.equal(op.owner.consumerId, "rightful", "the operation retained caller-mutable owner state");
   assert.equal(op.owner.scope, "consumer");
   assert.equal("controllerId" in op.owner, false, "a controller id was injected after creation");
   assert.throws(() => { op.owner.consumerId = "attacker"; }, "the owner snapshot is not frozen");
   // And the artifact really belongs to the rightful owner.
-  assert.equal(await observedStore().acquire(result.artifact.id, "attacker"), null);
-  assert.ok(await observedStore().acquire(result.artifact.id, "rightful"));
+  assert.equal(await observedStore().acquire(result.artifact.artifactId, "attacker"), null);
+  assert.ok(await observedStore().acquire(result.artifact.artifactId, "rightful"));
   await r.close();
 });
 
@@ -2754,47 +2758,61 @@ const CONFIG_SENTINEL = "/private/statements/2026-08/CONFIG_GETTER_SENTINEL";
 const configBoom = () => { throw new Error(CONFIG_SENTINEL); };
 const serializeSafely = (value) => { try { return JSON.stringify(value); } catch { return "<serialization threw>"; } };
 
-test("a mutated sealed artifact record cannot re-authorize a different consumer", async () => {
-  // The reported reproduction, exactly.
-  const root = join(temp(), "a"), source = pdf(temp());
+// MIGRATED to Task 2 §3.1's public projection, not weakened. The reported defect was that `seal()`
+// handed back the store's OWN mutable record and the store authorized from it, so
+// `result.artifact.consumerId = "attacker"` re-authorized the artifact to somebody else. The public
+// projection now carries no consumer at all, so the reproduction becomes stronger: INJECT one,
+// rewrite every field the projection does carry, and prove the store still authorizes exactly the
+// private record's owner.
+test("a mutated sealed artifact projection cannot re-authorize a different consumer", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "K".repeat(22);
   const r = new ArtifactRuntime({ enabled: true, root });
-  const op = r.createOperation({ owner: ownerOf("rightful"), sourceHost: "example.com", artifactId: "K".repeat(22) });
+  const op = r.createOperation({ owner: ownerOf("rightful"), sourceHost: "example.com", artifactId: id });
   op.registerDownload({ path: () => source });
   const result = await op.seal();
   assert.equal(result.outcome, "available");
-  try { result.artifact.consumerId = "attacker"; } catch {}
-  try { Object.defineProperty(result.artifact, "consumerId", { value: "attacker" }); } catch {}
-  assert.equal(result.artifact.consumerId, "rightful", "the caller's mutation reached the published record");
-  assert.equal(await observedStore().acquire(result.artifact.id, "attacker"), null, "a mutated record authorized the wrong consumer");
-  const lease = await observedStore().acquire(result.artifact.id, "rightful");
+  assert.equal("consumerId" in result.artifact, false, "the public projection exposed the owning consumer");
+  for (const [field, value] of [["consumerId", "attacker"], ["artifactId", "M".repeat(22)], ["sizeBytes", 1], ["sourceHost", "attacker.test"]]) {
+    try { result.artifact[field] = value; } catch {}
+    try { Object.defineProperty(result.artifact, field, { value, writable: true, configurable: true }); } catch {}
+  }
+  assert.equal(result.artifact.consumerId, undefined, "an injected consumer stuck to the frozen projection");
+  assert.equal(result.artifact.artifactId, id, "the caller's mutation reached the published projection");
+  assert.equal(await observedStore().acquire(id, "attacker"), null, "a mutated projection authorized the wrong consumer");
+  const lease = await observedStore().acquire(id, "rightful");
   assert.ok(lease, "the rightful consumer lost access to its own artifact");
   lease.complete();
   await r.close();
 });
 
-test("the sealed artifact and its lease record are distinct frozen snapshots", async () => {
-  const root = join(temp(), "a"), source = pdf(temp());
+test("the sealed artifact projection and the private lease record are distinct frozen snapshots", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "L".repeat(22);
   const r = new ArtifactRuntime({ enabled: true, root });
-  const op = r.createOperation({ owner: ownerOf("rightful"), sourceHost: "example.com", artifactId: "L".repeat(22) });
+  const op = r.createOperation({ owner: ownerOf("rightful"), sourceHost: "example.com", artifactId: id });
   op.registerDownload({ path: () => source });
   const result = await op.seal();
   assert.equal(result.outcome, "available");
-  assert.equal(Object.isFrozen(result.artifact), true, "the published record crossed the seam mutable");
+  assert.equal(Object.isFrozen(result.artifact), true, "the public projection crossed the seam mutable");
   const original = { ...result.artifact };
-  for (const [field, value] of [["consumerId", "attacker"], ["status", "consuming"], ["bytes", 1], ["sha256", "0".repeat(64)], ["expiresAt", 0], ["id", "M".repeat(22)]]) {
+  // Every field the projection carries, plus the private ones it deliberately does not: neither an
+  // overwrite nor an injection may land, and none of them may change what the store decides.
+  for (const [field, value] of [["consumerId", "attacker"], ["status", "consuming"], ["sizeBytes", 1], ["sha256", "0".repeat(64)], ["expiresAt", "1999-01-01T00:00:00.000Z"], ["artifactId", "M".repeat(22)], ["kind", "exe"], ["disposition", "inline"]]) {
     try { result.artifact[field] = value; } catch {}
     try { Object.defineProperty(result.artifact, field, { value, writable: true, configurable: true }); } catch {}
   }
-  assert.deepEqual({ ...result.artifact }, original, "a caller's mutation reached the published record");
+  assert.deepEqual({ ...result.artifact }, original, "a caller's mutation reached the public projection");
   // Sealing again returns the SAME committed result, still frozen and still describing the artifact.
   assert.deepEqual(await op.seal(), result);
-  const lease = await observedStore().acquire(original.id, "rightful");
+  // The private record is a SEPARATE frozen snapshot that never crossed the operation boundary: it
+  // still carries the owner, the mutable status and the raw scheduler instants the projection drops.
+  const lease = await observedStore().acquire(original.artifactId, "rightful");
   assert.ok(lease, "integrity or expiry followed the caller's mutation");
   assert.equal(Object.isFrozen(lease.record), true, "the lease record crossed the seam mutable");
   assert.notEqual(lease.record, result.artifact, "the lease handed back the very object the seal returned");
   assert.equal(lease.record.consumerId, "rightful");
   assert.equal(lease.record.status, "consuming");
   assert.equal(lease.record.sha256, original.sha256);
+  assert.equal(typeof lease.record.createdAt, "number", "the private record stopped carrying its own time domain");
   lease.complete();
   await r.close();
 });
@@ -3044,4 +3062,485 @@ test("a hostile observation accessor is read once, cannot throw out, and never r
   assert.deepEqual(result, { outcome: "capture-failed", failure: "download-lifecycle-race" }, "the first terminal reason was rewritten");
   assert.equal(serializeSafely(result).includes("SENTINEL"), false, "raw text crossed the result seam");
   await reentrant.close();
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 2 Slice A — the safe public projection, the private owner ledger and the authoritative
+// response lease (Task 2 §3.1/§3.2/§4.1, Amendment 4 §1).
+//
+// Task 1 committed only the private `ArtifactRecord`, and `seal()` handed it straight back: an
+// operation result carried `consumerId`, the raw store `id`, `status` and two scheduler-domain
+// NUMBERS, all of which are store/runtime state that no MCP surface may see. Task 2 introduces
+// `ArtifactMetadata` as the ONLY public projection, built at successful seal while the operation
+// still owns the trusted `sourceHost` and the private committed record.
+// ---------------------------------------------------------------------------------------------
+
+/** The exact projection from Task 2 §3.1, duplicated deliberately: a production field added,
+ *  renamed or dropped stops matching here rather than silently widening the public surface. */
+const METADATA_KEYS = ["artifactId", "kind", "disposition", "sizeBytes", "sha256", "createdAt", "expiresAt", "sourceHost"];
+const PDF_BYTES = Buffer.from("%PDF-1.7\nhello");
+
+test("a sealed capture reports the exact safe metadata projection, not the private record", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "A2".padEnd(22, "z");
+  const clock = fakeScheduler();
+  const r = new ArtifactRuntime({ enabled: true, root, scheduler: clock });
+  const op = r.createOperation({ owner: ownerOf("rightful"), sourceHost: "Docs.Example.COM.", artifactId: id });
+  op.registerDownload({ path: () => source });
+  const result = await op.seal();
+
+  assert.equal(result.outcome, "available");
+  const metadata = result.artifact;
+  assert.deepEqual(Object.keys(metadata).sort(), [...METADATA_KEYS].sort(), "the public projection is not the exact Task 2 §3.1 shape");
+  assert.deepEqual({ ...metadata }, {
+    artifactId: id,
+    kind: "pdf",
+    disposition: "attachment",
+    sizeBytes: PDF_BYTES.length,
+    sha256: createHash("sha256").update(PDF_BYTES).digest("hex"),
+    // The ISO rendering of the ONE injected scheduler domain the record was created in.
+    createdAt: new Date(1_000_000).toISOString(),
+    expiresAt: new Date(1_000_000 + 600_000).toISOString(),
+    // The operation's own canonical host, never a caller string re-read at projection time.
+    sourceHost: "docs.example.com",
+  }, "the safe projection did not describe the committed artifact exactly");
+  assert.equal(Object.isFrozen(metadata), true, "the public projection crossed the seam mutable");
+  // Task 2 §3.1: `filename` is deliberately absent in the first implementation — Task 1's accepted
+  // DownloadLike/operation contract retains none, and inventing one would mean reaching back into an
+  // untrusted driver object during retrieval.
+  assert.equal("filename" in metadata, false, "a filename was manufactured from nothing");
+  await r.close();
+});
+
+// The clock is an INJECTED authority and nothing validates the numbers it returns, so the ISO
+// projection is the first thing in this subsystem that can be handed a value with no rendering at
+// all. `new Date(1e20).toISOString()` throws a raw `RangeError`, and it would throw from inside
+// `seal()` — a public method whose whole error vocabulary is closed. An artifact this stack cannot
+// describe must also not stay retrievable.
+test("an instant the injected clock cannot render is a closed capture failure, not an escaping RangeError", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "W2".padEnd(22, "z");
+  const unrenderable = { now: () => 1e20, processStartedAt: () => 0, setTimeout: () => ({}), clearTimeout: () => {} };
+  const r = new ArtifactRuntime({ enabled: true, root, scheduler: unrenderable });
+  const op = r.createOperation({ owner: ownerOf("rightful"), sourceHost: "example.com", artifactId: id });
+  op.registerDownload({ path: () => source });
+
+  let result, thrown;
+  try { result = await op.seal(); } catch (e) { thrown = e; }
+  assert.equal(thrown, undefined, `seal() threw a raw exception out of the closed boundary: ${thrown && thrown.message}`);
+  assert.deepEqual(result, { outcome: "capture-failed", failure: "artifact-config-invalid" }, "an undescribable artifact was not a closed capture failure");
+  assert.equal(serializeSafely(result).includes("Invalid time value"), false, "raw Date exception text crossed the result seam");
+  // Fail-closed: the staged artifact is discarded rather than left retrievable with no description.
+  assert.deepEqual(readdirSync(join(root, "data")), [], "an artifact that could not be described was left on disk");
+  assert.equal(await observedStore().acquire(id, "rightful"), null, "an undescribable artifact stayed retrievable");
+  await r.close();
+});
+
+/** Seal one real artifact into a runtime and hand back the pieces the retrieval tests need. */
+async function committed(r, { id, consumer = "rightful", controller, host = "example.com", source }) {
+  const owner = controller === undefined
+    ? { scope: "consumer", consumerId: consumer }
+    : { scope: "drive", consumerId: consumer, controllerId: controller };
+  const op = r.createOperation({ owner, sourceHost: host, artifactId: id });
+  op.registerDownload({ path: () => source });
+  const sealed = await op.seal();
+  assert.equal(sealed.outcome, "available", `the fixture artifact ${id} did not publish`);
+  return sealed.artifact;
+}
+
+/** Every denial is the closed internal error; nothing about it may distinguish the reason externally. */
+async function denied(promise, expectedCode, message) {
+  let thrown;
+  try { await promise; } catch (e) { thrown = e; }
+  assert.ok(thrown, `${message}: the retrieval was not denied at all`);
+  assert.equal(thrown.name, "ArtifactStoreError", `${message}: a raw exception crossed the runtime boundary`);
+  assert.equal(thrown.code, expectedCode, message);
+  return thrown;
+}
+
+test("acquireResponseLease hands back the exact Amendment 4 lease over an already-encoded resource", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "C2".padEnd(22, "z");
+  const clock = fakeScheduler();
+  const r = new ArtifactRuntime({ enabled: true, root, scheduler: clock });
+  const metadata = await committed(r, { id, source });
+
+  const lease = await r.acquireResponseLease({ artifactId: id, consumerId: "rightful" });
+
+  assert.deepEqual(Object.keys(lease).sort(), ["complete", "deadlineMs", "metadata", "resource"], "the lease is not the exact Amendment 4 shape");
+  assert.deepEqual({ ...lease.metadata }, { ...metadata }, "the lease described a different artifact than the seal did");
+  assert.deepEqual(lease.resource, {
+    type: "resource",
+    resource: { uri: `artifact:${id}`, mimeType: "application/pdf", blob: PDF_BYTES.toString("base64") },
+  }, "the embedded resource is not the exact §3.4 block");
+  // The bytes are encoded ONCE, in the artifact layer: the blob decodes to exactly the artifact the
+  // metadata describes, and no caller ever receives a raw Buffer to re-encode.
+  const decoded = Buffer.from(lease.resource.resource.blob, "base64");
+  assert.deepEqual(decoded, PDF_BYTES, "the blob is not one complete encoding of the artifact");
+  assert.equal(decoded.length, lease.metadata.sizeBytes);
+  assert.equal(createHash("sha256").update(decoded).digest("hex"), lease.metadata.sha256);
+  assert.equal(lease.resource.resource.blob.includes("\n"), false, "the base64 carried line breaks");
+
+  // ONE absolute deadline in the injected scheduler's domain, opened immediately before file open —
+  // and reachable by a later HTTP tracker from the SAME clock, without widening the lease shape.
+  assert.equal(lease.deadlineMs, clock.now() + 15_000, "the deadline is not one absolute instant in the injected domain");
+  assert.equal(r.now(), clock.now(), "the runtime does not publish the one clock its deadlines are in");
+  assert.equal("record" in lease || "bytes" in lease || "base64" in lease || "deadline" in lease, false, "the private Task 1 lease vocabulary crossed the boundary");
+  assert.equal(Object.isFrozen(lease) && Object.isFrozen(lease.resource) && Object.isFrozen(lease.resource.resource), true, "the lease or its resource crossed the seam mutable");
+
+  await lease.complete("sent");
+  await r.close();
+});
+
+test("a consumer artifact is authorized by exact consumer identity, and a denial consumes nothing", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "D2".padEnd(22, "z");
+  const r = new ArtifactRuntime({ enabled: true, root });
+  await committed(r, { id, consumer: "rightful", source });
+
+  await denied(r.acquireResponseLease({ artifactId: id, consumerId: "attacker" }), "artifact-owner-mismatch", "a foreign consumer retrieved another consumer's artifact");
+  await denied(r.acquireResponseLease({ artifactId: id, consumerId: "" }), "artifact-not-found", "an empty consumer identity was accepted");
+  await denied(r.acquireResponseLease({ artifactId: id, consumerId: {} }), "artifact-not-found", "a non-string consumer identity was accepted");
+  // A transient artifact belongs to the consumer alone, so a graph that also holds drive lineage —
+  // which passes its controller on every call — must still be able to retrieve it.
+  const lease = await r.acquireResponseLease({ artifactId: id, consumerId: "rightful", controllerId: "some-controller" });
+  assert.equal(lease.metadata.artifactId, id, "the rightful owner lost access to its own artifact after denials");
+  await lease.complete("sent");
+  await r.close();
+});
+
+test("a drive artifact is authorized by exact consumer AND controller lineage", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "E2".padEnd(22, "z");
+  const r = new ArtifactRuntime({ enabled: true, root });
+  await committed(r, { id, consumer: "rightful", controller: "lineage-1", source });
+
+  for (const [label, input] of [
+    ["absent controller", { artifactId: id, consumerId: "rightful" }],
+    ["wrong controller", { artifactId: id, consumerId: "rightful", controllerId: "lineage-2" }],
+    ["non-string controller", { artifactId: id, consumerId: "rightful", controllerId: 7 }],
+    ["foreign consumer", { artifactId: id, consumerId: "attacker", controllerId: "lineage-1" }],
+  ]) {
+    await denied(r.acquireResponseLease(input), "artifact-owner-mismatch", `${label} retrieved a drive artifact`);
+  }
+  // None of those denials may have consumed the rightful owner's artifact.
+  const lease = await r.acquireResponseLease({ artifactId: id, consumerId: "rightful", controllerId: "lineage-1" });
+  assert.equal(lease.metadata.artifactId, id, "the rightful lineage lost its own artifact to a denial");
+  await lease.complete("sent");
+  await r.close();
+});
+
+test("an invalid-grammar artifact id is denied without any store lookup or path derivation", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "F2".padEnd(22, "z");
+  const r = new ArtifactRuntime({ enabled: true, root });
+  await committed(r, { id, source });
+
+  // The store is the ONLY thing below this layer that derives a path from an ID, so counting its
+  // acquisitions is what proves the closed grammar ran first.
+  let lookups = 0;
+  const realAcquire = ArtifactStore.prototype.acquire;
+  ArtifactStore.prototype.acquire = function (...args) { lookups += 1; return Reflect.apply(realAcquire, this, args); };
+  try {
+    for (const hostile of [
+      "../../../etc/passwd", `${id}/../${id}`, `${id}.pdf`, "..", "", "short", "A".repeat(65),
+      `${id} `, "Ａ".repeat(22), `${id}${String.fromCharCode(10)}`, "A".repeat(21), 7, null, undefined, Symbol("x"), { toString: () => id },
+    ]) {
+      await denied(r.acquireResponseLease({ artifactId: hostile, consumerId: "rightful" }), "artifact-not-found", `${String(hostile)} was not denied by the closed grammar`);
+    }
+    assert.equal(lookups, 0, "an invalid-grammar id reached the store, which derives a path from it");
+    // And the rightful artifact is untouched by the whole sweep.
+    assert.deepEqual(readdirSync(join(root, "data")), [`${id}.pdf`], "the grammar sweep changed the artifact tree");
+    const lease = await r.acquireResponseLease({ artifactId: id, consumerId: "rightful" });
+    assert.equal(lookups, 1, "the well-formed retrieval did not reach the store exactly once");
+    await lease.complete("sent");
+  } finally {
+    ArtifactStore.prototype.acquire = realAcquire;
+  }
+  await r.close();
+});
+
+test("acquisition is one-shot: no denial, completion or transport failure returns an artifact to available", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), first = "G2".padEnd(22, "z"), second = "H2".padEnd(22, "z");
+  const discarded = [];
+  const r = new ArtifactRuntime({ enabled: true, root, onDiscard: (i) => discarded.push(i) });
+  await committed(r, { id: first, source });
+
+  const lease = await r.acquireResponseLease({ artifactId: first, consumerId: "rightful" });
+  // While the lease is live the record has left `available` permanently: the rightful owner itself
+  // cannot acquire it a second time, and nothing may wait on or observe the winner.
+  await denied(r.acquireResponseLease({ artifactId: first, consumerId: "rightful" }), "artifact-not-found", "a live lease was acquired twice");
+  await lease.complete("sent");
+  await denied(r.acquireResponseLease({ artifactId: first, consumerId: "rightful" }), "artifact-not-found", "a completed artifact became available again");
+  assert.deepEqual(discarded, [first], "the completion did not durably discard exactly once");
+  assert.deepEqual(readdirSync(join(root, "data")), [], "the completed artifact was left on disk");
+  assert.equal(observedStore().accounting().responsePermitHeld, false, "the completion stranded the one global response permit");
+
+  // A transport failure is not a retry: the artifact is gone exactly as it is on success.
+  await committed(r, { id: second, source });
+  const failing = await r.acquireResponseLease({ artifactId: second, consumerId: "rightful" });
+  await failing.complete("transport-failed");
+  await denied(r.acquireResponseLease({ artifactId: second, consumerId: "rightful" }), "artifact-not-found", "a transport failure returned the artifact to available");
+  assert.deepEqual(discarded, [first, second]);
+  await r.close();
+});
+
+test("concurrent acquisition of one artifact has exactly one winner", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "I2".padEnd(22, "z");
+  const r = new ArtifactRuntime({ enabled: true, root });
+  await committed(r, { id, source });
+
+  const settled = await Promise.allSettled([
+    r.acquireResponseLease({ artifactId: id, consumerId: "rightful" }),
+    r.acquireResponseLease({ artifactId: id, consumerId: "rightful" }),
+    r.acquireResponseLease({ artifactId: id, consumerId: "rightful" }),
+  ]);
+  const winners = settled.filter((s) => s.status === "fulfilled");
+  assert.equal(winners.length, 1, "concurrent retrieval produced more than one lease over one artifact");
+  for (const loser of settled.filter((s) => s.status === "rejected")) {
+    assert.equal(loser.reason.code, "artifact-not-found", "a concurrent loser learned something a stranger could not");
+  }
+  await winners[0].value.complete("sent");
+  await r.close();
+});
+
+test("lease completion is idempotent, asynchronous and first-outcome-wins", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "J2".padEnd(22, "z");
+  const discarded = [];
+  const r = new ArtifactRuntime({ enabled: true, root, onDiscard: (i) => discarded.push(i) });
+  await committed(r, { id, source });
+  const lease = await r.acquireResponseLease({ artifactId: id, consumerId: "rightful" });
+
+  const settled = lease.complete("sent");
+  assert.ok(settled instanceof Promise, "complete() is not asynchronous");
+  await settled;
+  // Awaiting the completion means the deletion has ALREADY happened — the permit a waiter is about
+  // to be admitted on is never released over an artifact still on disk.
+  assert.deepEqual(readdirSync(join(root, "data")), [], "await complete() resolved before the artifact was discarded");
+
+  // Every later completion — including one carrying a different outcome, or a value from outside the
+  // closed vocabulary a JavaScript caller can still hand in — is inert and cannot reject. The FIRST
+  // settlement is also the only one: each call hands back that exact promise, so a transport adapter
+  // and a fallback completing the same lease are awaiting one settlement rather than two. Asserted
+  // by identity because Task 1's own one-shot flag already makes the store side inert — without this
+  // the lease's latch could be deleted and nothing would notice.
+  for (const outcome of ["sent", "timed-out", "transport-failed", undefined, { toString() { throw new Error("SENTINEL"); } }]) {
+    assert.equal(lease.complete(outcome), settled, "a repeated completion produced a second settlement");
+  }
+  assert.deepEqual(discarded, [id], "a repeated completion discarded or notified more than once");
+  assert.equal(observedStore().accounting().responsePermitHeld, false, "a repeated completion re-released the permit");
+  await r.close();
+});
+
+// ---------------------------------------------------------------------------------------------
+// Amendment 4 §4 / Task 2 §6 — synchronous controller invalidation.
+//
+// Every graph-disposal path must fence the lineage BEFORE its first await: a DELETE, an idle reap or
+// a close-all that awaited a browser close first left a window in which an already-open generation
+// could still publish, and in which a retrieval for the disposed lineage was still authorized.
+// ---------------------------------------------------------------------------------------------
+
+test("invalidateController fences a lineage synchronously, before any await", async () => {
+  const root = join(temp(), "a"), source = pdf(temp());
+  const terminal = [];
+  const r = new ArtifactRuntime({ enabled: true, root, onOperationTerminal: (reason) => terminal.push(reason) });
+  const drive = await committed(r, { id: "K2".padEnd(22, "z"), consumer: "c", controller: "lineage-1", source });
+  const other = await committed(r, { id: "L2".padEnd(22, "z"), consumer: "c", controller: "lineage-2", source });
+  const transient = await committed(r, { id: "M2".padEnd(22, "z"), consumer: "c", source });
+
+  // An OPEN generation on the doomed lineage, with a staging job in flight.
+  const open = r.createOperation({ owner: { scope: "drive", consumerId: "c", controllerId: "lineage-1" }, sourceHost: "example.com", artifactId: "N2".padEnd(22, "z") });
+  assert.equal(open.registerDownload({ path: () => source }), true);
+  terminal.length = 0;
+
+  assert.equal(r.invalidateController({ consumerId: "c", controllerId: "lineage-1" }), undefined, "invalidateController is not a synchronous void");
+  // SYNCHRONOUSLY, in the same turn: the open generation is already terminal. Nothing was awaited.
+  assert.deepEqual(terminal, ["artifact-runtime-invalidated"], "the open generation was not fenced before the first await");
+
+  assert.deepEqual(await open.seal(), { outcome: "capture-failed", failure: "artifact-runtime-invalidated" }, "a fenced generation still published");
+  // No NEW drive work may start on the lineage, and its committed artifacts are no longer authorized.
+  assert.throws(() => r.createOperation({ owner: { scope: "drive", consumerId: "c", controllerId: "lineage-1" }, sourceHost: "example.com" }), /artifact-runtime-invalidated/, "a fenced lineage accepted a new capture");
+  await denied(r.acquireResponseLease({ artifactId: drive.artifactId, consumerId: "c", controllerId: "lineage-1" }), "artifact-owner-mismatch", "a fenced lineage still authorized retrieval");
+
+  // Invalidation REVOKES authorization; it does not delete. The artifact is still on disk for the
+  // discard that follows, and every other lineage and the consumer's transient artifact are untouched.
+  assert.equal(existsSync(join(root, "data", `${drive.artifactId}.pdf`)), true, "invalidation deleted an artifact it only had to fence");
+  const sibling = await r.acquireResponseLease({ artifactId: other.artifactId, consumerId: "c", controllerId: "lineage-2" });
+  await sibling.complete("sent");
+  const consumerScoped = await r.acquireResponseLease({ artifactId: transient.artifactId, consumerId: "c", controllerId: "lineage-1" });
+  await consumerScoped.complete("sent");
+
+  // Idempotent, and total: repeating it, naming a lineage that never existed, or handing it a
+  // malformed identity must not throw from a disposal path.
+  for (const input of [{ consumerId: "c", controllerId: "lineage-1" }, { consumerId: "c", controllerId: "never" }, { consumerId: "", controllerId: "x" }, { consumerId: "c" }, {}, null, undefined]) {
+    assert.equal(r.invalidateController(input), undefined, `invalidateController threw for ${serializeSafely(input)}`);
+  }
+  await r.close();
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 2 §6 — controller discard reports a CLOSED internal result rather than swallowing failure.
+//
+// All attempts run; a `refused` because an active lease exclusively owns a consuming record is not
+// reported as clean; and a `failed` cleanup poisons the runtime against later capture instead of
+// presenting a failed teardown as a successful one.
+// ---------------------------------------------------------------------------------------------
+
+test("discardController deletes exactly its own lineage and reports a clean result", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), discarded = [];
+  const terminal = [];
+  const r = new ArtifactRuntime({ enabled: true, root, onDiscard: (i) => discarded.push(i), onOperationTerminal: (reason) => terminal.push(reason) });
+  const doomedA = await committed(r, { id: "P2".padEnd(22, "z"), consumer: "c", controller: "lineage-1", source });
+  const doomedB = await committed(r, { id: "Q2".padEnd(22, "z"), consumer: "c", controller: "lineage-1", source });
+  const sibling = await committed(r, { id: "R2".padEnd(22, "z"), consumer: "c", controller: "lineage-2", source });
+  const transient = await committed(r, { id: "S2".padEnd(22, "z"), consumer: "c", source });
+  const foreign = await committed(r, { id: "T2".padEnd(22, "z"), consumer: "other", controller: "lineage-1", source });
+
+  const open = r.createOperation({ owner: { scope: "drive", consumerId: "c", controllerId: "lineage-1" }, sourceHost: "example.com", artifactId: "U2".padEnd(22, "z") });
+  assert.equal(open.registerDownload({ path: () => source }), true);
+  terminal.length = 0;
+
+  // The fence is part of THIS call and lands before its first await.
+  const pending = r.discardController({ consumerId: "c", controllerId: "lineage-1" });
+  assert.deepEqual(terminal, ["artifact-runtime-invalidated"], "discardController awaited something before fencing its lineage");
+  assert.equal(await pending, "clean", "a lineage whose artifacts were all durably deleted was not reported clean");
+
+  assert.deepEqual(discarded.sort(), [doomedA.artifactId, doomedB.artifactId].sort(), "the discard did not delete exactly its own lineage");
+  assert.deepEqual(readdirSync(join(root, "data")).sort(), [sibling, transient, foreign].map((m) => `${m.artifactId}.pdf`).sort(), "the discard removed artifacts outside its lineage");
+  for (const gone of [doomedA, doomedB]) {
+    // Deletion removed the ledger entry with the artifact, so this is not even an owner mismatch any
+    // more: a discarded artifact is internally indistinguishable from an ID that never existed.
+    await denied(r.acquireResponseLease({ artifactId: gone.artifactId, consumerId: "c", controllerId: "lineage-1" }), "artifact-not-found", "a discarded lineage artifact was still authorized");
+  }
+  // Everything outside the lineage is still genuinely retrievable.
+  for (const [metadata, consumer, controller] of [[sibling, "c", "lineage-2"], [transient, "c", undefined], [foreign, "other", "lineage-1"]]) {
+    const lease = await r.acquireResponseLease({ artifactId: metadata.artifactId, consumerId: consumer, controllerId: controller });
+    await lease.complete("sent");
+  }
+
+  // Idempotent: repeating it, and naming lineages that never existed, discards nothing further.
+  const before = discarded.length;
+  for (const input of [{ consumerId: "c", controllerId: "lineage-1" }, { consumerId: "c", controllerId: "never" }, { consumerId: "", controllerId: "x" }, {}, null]) {
+    assert.equal(await r.discardController(input), "clean", `repeated disposal of ${serializeSafely(input)} was not idempotent`);
+  }
+  assert.equal(discarded.length, before, "a repeated disposal discarded a second time");
+  await r.close();
+});
+
+test("a consuming record is REFUSED to controller discard and stays the lease's to resolve", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), discarded = [], id = "V2".padEnd(22, "z");
+  const r = new ArtifactRuntime({ enabled: true, root, onDiscard: (i) => discarded.push(i) });
+  await committed(r, { id, consumer: "c", controller: "lineage-1", source });
+  const lease = await r.acquireResponseLease({ artifactId: id, consumerId: "c", controllerId: "lineage-1" });
+
+  assert.equal(await r.discardController({ consumerId: "c", controllerId: "lineage-1" }), "refused", "a discard an active lease owns was reported as clean");
+  assert.deepEqual(discarded, [], "a refused discard notified anyway");
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), true, "a refused discard deleted the artifact its lease was still reading");
+  assert.equal(Buffer.from(lease.resource.resource.blob, "base64").length, PDF_BYTES.length, "the refused discard damaged the live response");
+
+  // The lease — not the disposal — resolves it, exactly once.
+  await lease.complete("sent");
+  assert.deepEqual(discarded, [id], "the lease did not resolve the refused discard exactly once");
+  assert.equal(existsSync(join(root, "data", `${id}.pdf`)), false, "the completion left the artifact behind");
+  assert.equal(await r.discardController({ consumerId: "c", controllerId: "lineage-1" }), "clean", "the resolved lineage did not become clean");
+  await r.close();
+});
+
+test("a discard that cannot prove deletion is FAILED and poisons the runtime against later capture", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "W3".padEnd(22, "z");
+  const r = new ArtifactRuntime({
+    enabled: true, root,
+    fsOps: {
+      linkSync, fsyncSync,
+      unlinkSync(path) {
+        if (path.endsWith(`${id}.pdf`)) { const e = new Error("EPERM"); e.code = "EPERM"; throw e; }
+        return unlinkSync(path);
+      },
+    },
+  });
+  await committed(r, { id, consumer: "c", controller: "lineage-1", source });
+
+  assert.equal(await r.discardController({ consumerId: "c", controllerId: "lineage-1" }), "failed", "an unprovable deletion was not reported as failed");
+  // Poison rejects LATER capture with the exact closed code, and retains the unsafe identity.
+  assert.throws(() => r.createOperation({ owner: ownerOf("c"), sourceHost: "example.com" }), /artifact-cleanup-failed/, "a failed teardown did not poison the runtime");
+  assert.throws(() => r.createOperation({ owner: ownerOf("c"), sourceHost: "example.com", artifactId: id }), /artifact-cleanup-failed/, "the unsafe identity was offered to a replacement capture");
+  // Repeated disposal cannot report clean over a failure it could not prove away.
+  assert.equal(await r.discardController({ consumerId: "c", controllerId: "lineage-1" }), "failed", "a repeated disposal presented a failed teardown as clean");
+  await r.close();
+});
+
+// ---------------------------------------------------------------------------------------------
+// Amendment 2 §3 — artifact retrieval attempts: at most 30 per consumer per ROLLING minute.
+//
+// The budget is spent by ATTEMPTS, not by successes: an unauthenticated-shaped sweep of unknown IDs
+// is exactly what the limit exists to bound, and each of those is denied before it reaches a lookup.
+// Excess returns the same external denial and the closed internal `artifact-rate-limited` code.
+// ---------------------------------------------------------------------------------------------
+
+test("retrieval is bounded at 30 attempts per consumer per rolling minute", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), mine = "X3".padEnd(22, "z"), theirs = "Y3".padEnd(22, "z");
+  const clock = fakeScheduler();
+  const r = new ArtifactRuntime({ enabled: true, root, scheduler: clock });
+  await committed(r, { id: mine, consumer: "c", source });
+  await committed(r, { id: theirs, consumer: "other", source });
+
+  // Thirty attempts inside the window, all denied on their own merits and all spending budget.
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await denied(r.acquireResponseLease({ artifactId: "Z".repeat(22), consumerId: "c" }), "artifact-not-found", `attempt ${attempt} was refused before the budget ran out`);
+  }
+  await denied(r.acquireResponseLease({ artifactId: "Z".repeat(22), consumerId: "c" }), "artifact-rate-limited", "the 31st attempt in one minute was not rate limited");
+  // The limit does not consume: a rate-limited owner's own artifact is untouched and still there.
+  await denied(r.acquireResponseLease({ artifactId: mine, consumerId: "c" }), "artifact-rate-limited", "a legitimate retrieval escaped the consumer's spent budget");
+  assert.equal(existsSync(join(root, "data", `${mine}.pdf`)), true, "a rate-limited retrieval consumed the artifact anyway");
+
+  // The budget is PER CONSUMER: another consumer's own retrieval is unaffected.
+  const unaffected = await r.acquireResponseLease({ artifactId: theirs, consumerId: "other" });
+  await unaffected.complete("sent");
+
+  // ROLLING, in the injected domain: one minute after the first attempt the whole window is free
+  // again — and one tick before it, it is not.
+  await clock.advanceBy(59_999);
+  await denied(r.acquireResponseLease({ artifactId: mine, consumerId: "c" }), "artifact-rate-limited", "the window expired before a full rolling minute");
+  await clock.advanceBy(1);
+  const lease = await r.acquireResponseLease({ artifactId: mine, consumerId: "c" });
+  assert.equal(lease.metadata.artifactId, mine, "the rolling window never reopened");
+  await lease.complete("sent");
+  await r.close();
+});
+
+// The owner ledger is published only by a successful commit and removed only by that operation's
+// token-bound release, which Task 1 already gates on durable discard. So a logical ID that comes back
+// into circulation is re-authorized on the NEW artifact's terms — the previous owner's authorization
+// leaves with the artifact rather than lingering against a name.
+test("a reused artifact id is authorized on the new owner's terms, never the retired one's", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "A4".padEnd(22, "z");
+  const r = new ArtifactRuntime({ enabled: true, root });
+
+  const first = await committed(r, { id, consumer: "first", host: "first.example.com", source });
+  const retired = await r.acquireResponseLease({ artifactId: id, consumerId: "first" });
+  await retired.complete("sent");
+  await denied(r.acquireResponseLease({ artifactId: id, consumerId: "first" }), "artifact-not-found", "the retired artifact survived its own completion");
+
+  // The identity is only now free, and the replacement belongs to somebody else entirely.
+  const second = await committed(r, { id, consumer: "second", host: "second.example.com", source });
+  assert.equal(second.artifactId, first.artifactId, "the fixture did not actually reuse the identity");
+  assert.notEqual(second.createdAt === first.createdAt && second.sourceHost === first.sourceHost, true, "the replacement was not a distinct artifact");
+
+  await denied(r.acquireResponseLease({ artifactId: id, consumerId: "first" }), "artifact-owner-mismatch", "the retired owner was still authorized against the reused identity");
+  const lease = await r.acquireResponseLease({ artifactId: id, consumerId: "second" });
+  assert.equal(lease.metadata.sourceHost, "second.example.com", "the lease described the retired artifact, not the live one");
+  assert.equal(lease.resource.resource.uri, `artifact:${id}`);
+  await lease.complete("sent");
+  await r.close();
+});
+
+// Task 2 §6, "runtime close": no future operation OR acquisition. Measured rather than assumed —
+// the fence that stops `createOperation` is the runtime's, but nothing in the retrieval path reads
+// it, so this asserts the property the table states rather than the mechanism it happens to use.
+test("a closed runtime authorizes no further acquisition", async () => {
+  const root = join(temp(), "a"), source = pdf(temp()), id = "B4".padEnd(22, "z");
+  const r = new ArtifactRuntime({ enabled: true, root });
+  await committed(r, { id, consumer: "c", source });
+
+  assert.equal(await r.close(), undefined, "the fixture close was not clean");
+  await denied(r.acquireResponseLease({ artifactId: id, consumerId: "c" }), "artifact-not-found", "a closed runtime still handed out a response lease");
+  assert.throws(() => r.createOperation({ owner: ownerOf("c"), sourceHost: "example.com" }), /artifact-runtime-invalidated/, "a closed runtime still accepted a capture");
+  // Disposal surfaces stay total after close: they are called from shutdown paths that cannot handle
+  // an exception, and the store — not this lineage — owns whatever deletion is left.
+  assert.equal(r.invalidateController({ consumerId: "c", controllerId: "lineage-1" }), undefined);
+  assert.equal(["clean", "refused", "failed"].includes(await r.discardController({ consumerId: "c", controllerId: "lineage-1" })), true, "disposal after close left the closed result vocabulary");
 });

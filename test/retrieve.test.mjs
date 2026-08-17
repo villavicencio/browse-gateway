@@ -20,6 +20,10 @@ import {
 } from "../dist/verbs/index.js";
 import { SecretStore } from "../dist/security/index.js";
 import { DEFAULT_CALL_TIMEOUTS } from "../dist/gateway/index.js";
+import { ArtifactRuntime } from "../dist/artifacts/index.js";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const articleHtml = `<!doctype html><html><head><title>Doc</title></head><body><nav>menu</nav>
 <article><h1>Headline</h1><p>${"Real article sentence with plenty of words. ".repeat(20)}</p>
@@ -770,4 +774,109 @@ test("#43: a direct-only render that consumes the budget is classified timeout (
   assert.equal(calls.length, 1, "only the direct render ran");
   assert.equal(r.diagnostics?.failureClass, "timeout", "direct-only budget exhaustion is a decisive timeout");
   assert.equal(r.reason, null, "reason nulled so the MCP surfaces timeout");
+});
+
+// ---- Task 2 §6: artifact capture wiring (opts.artifactCapture) ------------------------------------
+
+/** Fake gateway whose Nth withConsumerSession call simulates the Nth programmed attempt against a
+ *  REAL ArtifactRuntime: when the caller wired capture, each render() invocation gets whatever
+ *  operation retrieve() minted for THAT specific call, optionally registers a download, and awaits
+ *  seal() — exactly mirroring what the real browser core does per render call. */
+function makeCaptureFakeGateway(attempts) {
+  let idx = 0;
+  const calls = [];
+  const gateway = {
+    async withConsumerSession(token, fn, coreOverrides) {
+      const attempt = attempts[Math.min(idx, attempts.length - 1)];
+      idx++;
+      const call = { token, coreOverrides };
+      calls.push(call);
+      const session = {
+        core: {
+          async render(url, renderOpts) {
+            call.renderOpts = renderOpts;
+            const op = renderOpts.artifactOperation;
+            call.operation = op;
+            if (op && attempt.download) op.registerDownload({ path: () => attempt.pdfPath });
+            const artifactOutcome = op ? await op.seal() : undefined;
+            return attempt.blocked
+              ? { ...renderOf(cfBlockSignal), url, ...(artifactOutcome ? { artifactOutcome } : {}) }
+              : { url, status: 200, title: "t", text: "x".repeat(1000), html: articleHtml, clearanceWaitedMs: 0, ...(artifactOutcome ? { artifactOutcome } : {}) };
+          },
+        },
+      };
+      return fn(session);
+    },
+  };
+  return { gateway, calls };
+}
+
+function artifactTemp() {
+  const dir = mkdtempSync(join(tmpdir(), "bgw-retrieve-artifact-"));
+  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+function pdfFixture(dir) {
+  const path = join(dir, "doc.pdf");
+  writeFileSync(path, Buffer.from("%PDF-1.7\nhello"));
+  return path;
+}
+
+test("retrieve: artifact capture surfaces safe metadata, server-derived sourceHost, no raw record/path/owner leakage", async () => {
+  const fx = artifactTemp();
+  const runtime = new ArtifactRuntime({ enabled: true, root: join(fx.dir, "artifacts") });
+  try {
+    const pdfPath = pdfFixture(fx.dir);
+    const { gateway } = makeCaptureFakeGateway([{ blocked: false, download: true, pdfPath }]);
+    const result = await retrieve(gateway, new SecretStore(() => ({})), {
+      token: "t",
+      url: "https://example.com/doc",
+      artifactCapture: { runtime, consumerId: "consumer-1" },
+    });
+    assert.equal(result.artifactOutcome?.outcome, "available");
+    assert.equal(result.artifactOutcome.artifact.sourceHost, "example.com", "sourceHost derived server-side from the requested url");
+    assert.match(result.artifactOutcome.artifact.artifactId, /^[A-Za-z0-9_-]{22,64}$/);
+    const serialized = JSON.stringify(result);
+    assert.ok(!serialized.includes(pdfPath), "no raw path escapes");
+    assert.ok(!serialized.includes("consumer-1"), "no raw owner/consumerId escapes");
+    assert.ok(!serialized.includes(fx.dir), "no root/data directory path escapes");
+  } finally {
+    await runtime.close();
+    fx.cleanup();
+  }
+});
+
+test("retrieve: disabled (no artifactCapture) leaves the result byte-shape unchanged — no artifactOutcome field", async () => {
+  const { gateway } = makeCaptureFakeGateway([{ blocked: false, download: false }]);
+  const result = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://example.com/doc" });
+  assert.equal("artifactOutcome" in result, false, "field is entirely absent, not merely undefined-valued");
+});
+
+test("retrieve: no operation is reused cross-call — an uneventful direct attempt does not foreclose capture on a later proxied retry", async () => {
+  const fx = artifactTemp();
+  const runtime = new ArtifactRuntime({ enabled: true, root: join(fx.dir, "artifacts") });
+  try {
+    const pdfPath = pdfFixture(fx.dir);
+    // Direct attempt: blocked, no download at all (the operation it minted would seal to "none" if
+    // reused). Proxied retry: clears AND downloads. A shared-operation design would silently lose this
+    // capture, because ArtifactOperation.seal() commits permanently on its FIRST render call.
+    const { gateway, calls } = makeCaptureFakeGateway([
+      { blocked: true, download: false },
+      { blocked: false, download: true, pdfPath },
+    ]);
+    const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
+    const result = await retrieve(gateway, secrets, {
+      token: "t",
+      url: "https://hard.example/doc",
+      escalation: { onDatacenterIp: true },
+      artifactCapture: { runtime, consumerId: "consumer-1" },
+    });
+    assert.equal(calls.length, 2, "direct + one proxied retry");
+    assert.ok(calls[0].operation && calls[1].operation, "both attempts were handed an operation");
+    assert.notEqual(calls[0].operation, calls[1].operation, "each render call minted its OWN fresh operation");
+    assert.equal(result.artifactOutcome?.outcome, "available", "the winning retry's capture surfaced");
+  } finally {
+    await runtime.close();
+    fx.cleanup();
+  }
 });

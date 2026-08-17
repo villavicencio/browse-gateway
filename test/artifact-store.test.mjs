@@ -611,6 +611,101 @@ test("the response deadline is armed before final open and synchronous work cann
   assert.equal(await store.close(), undefined);
 });
 
+// ---------------------------------------------------------------------------------------------
+// Task 2 Slice A correction — Amendment 4 §1/§2, plan §4.1.
+//
+// `complete()` is supposed to make the artifact permanently unavailable, perform the owned private
+// discard, and only THEN release the permit/reservation. The store's own deadline timer independently
+// releasing that permit after a runtime-level lease has been returned also races the plan's explicit
+// ownership split: "the acquisition path owns pre-return timeout; after return, the active request
+// tracker owns the remaining deadline... The current store timer must not independently release the
+// permit while an HTTP adapter still references the response/resource." `claimTimeout()` is the
+// PRIVATE handoff point a claimant uses to take that ownership away from the store's own timer,
+// immediately upon receiving the lease — direct `ArtifactStore` callers that never claim it keep the
+// existing store-owned auto-timeout behavior unchanged.
+// ---------------------------------------------------------------------------------------------
+
+test("complete() performs the durable discard before it releases the response permit", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "AC1".padEnd(22, "z");
+  const observed = [];
+  let store;
+  store = new ArtifactStore({
+    root,
+    fsOps: {
+      linkSync, fsyncSync,
+      unlinkSync(path) {
+        if (path.endsWith(`${id}.pdf`)) observed.push(store.accounting().responsePermitHeld);
+        return unlinkSync(path);
+      },
+    },
+  });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const lease = await store.acquire(id, "owner");
+  assert.ok(lease);
+  lease.complete();
+  assert.deepEqual(observed, [true], "complete() released the response permit before the durable unlink that proves discard");
+  assert.equal(store.accounting().responsePermitHeld, false, "complete() left the permit held after it had already settled");
+  await store.close();
+});
+
+test("an unclaimed lease's own store timeout also discards before it releases the permit", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), id = "AC2".padEnd(22, "z");
+  const clock = fakeScheduler(), observed = [];
+  let store;
+  store = new ArtifactStore({
+    root, scheduler: clock,
+    fsOps: {
+      linkSync, fsyncSync,
+      unlinkSync(path) {
+        if (path.endsWith(`${id}.pdf`)) observed.push(store.accounting().responsePermitHeld);
+        return unlinkSync(path);
+      },
+    },
+  });
+  assert.equal((await store.capture(pdf, { id, consumerId: "owner" })).status, "available");
+  const lease = await store.acquire(id, "owner");
+  assert.ok(lease);
+  clock.advance(15_000);
+  assert.deepEqual(observed, [true], "the store's own timeout released the permit before its durable unlink proved discard");
+  assert.equal(store.accounting().responsePermitHeld, false);
+  await store.close();
+});
+
+test("claimTimeout hands the deadline off: a claimed lease's own store timer no longer independently completes it", async () => {
+  const root = join(temp(), "artifacts"), pdf = source(), unclaimedId = "AC3".padEnd(22, "z"), claimedId = "AC4".padEnd(22, "z");
+  const clock = fakeScheduler(), discarded = [];
+  const store = new ArtifactStore({ root, scheduler: clock, onDiscard: (i) => discarded.push(i) });
+  assert.equal((await store.capture(pdf, { id: unclaimedId, consumerId: "owner" })).status, "available");
+  assert.equal((await store.capture(pdf, { id: claimedId, consumerId: "owner" })).status, "available");
+
+  // BASELINE, unclaimed: the existing Task 1 contract is unchanged for a direct store caller that
+  // never claims — the store's own timer still resolves it.
+  const unclaimed = await store.acquire(unclaimedId, "owner");
+  assert.ok(unclaimed);
+  clock.advance(15_000);
+  assert.deepEqual(discarded, [unclaimedId], "an unclaimed lease's own store timer did not still resolve it");
+  assert.equal(store.accounting().responsePermitHeld, false, "an unclaimed lease's timeout did not release the permit");
+
+  // CLAIMED: once ownership is handed off, the store's OWN timer must never again independently
+  // discard the artifact or release the permit that responsibility no longer belongs to it.
+  const claimed = await store.acquire(claimedId, "owner");
+  assert.ok(claimed);
+  assert.equal(claimed.claimTimeout(), undefined, "claimTimeout is not a synchronous void handoff");
+  clock.advance(15_000);
+  assert.deepEqual(discarded, [unclaimedId], "a CLAIMED lease's own store timer still fired and discarded the artifact");
+  assert.equal(store.accounting().responsePermitHeld, true, "a claimed lease's store timer released a permit it no longer owns");
+  assert.equal(existsSync(join(root, "data", `${claimedId}.pdf`)), true, "a claimed lease's store timer deleted an artifact it no longer owns");
+
+  // The claimant remains the sole path to completion, and completion still behaves correctly.
+  claimed.complete();
+  assert.deepEqual(discarded.sort(), [claimedId, unclaimedId].sort(), "the claimed lease's own completion did not still discard exactly once");
+  assert.equal(store.accounting().responsePermitHeld, false);
+  // Idempotent: claiming again, or after completion, must not throw or double-anything.
+  assert.equal(claimed.claimTimeout(), undefined);
+  assert.equal(unclaimed.claimTimeout ? unclaimed.claimTimeout() : undefined, undefined);
+  await store.close();
+});
+
 test("expiry cannot reap a consuming record: its completion or its exact 15s timeout resolves it", async () => {
   // A store whose artifact TTL expires while a response lease is live. Nothing here reads wall time.
   function expiring(id) {

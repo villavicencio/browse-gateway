@@ -63,6 +63,34 @@ export class ArtifactStoreError extends Error { readonly code: ArtifactStoreErro
  * a caller let `result.artifact.consumerId = "attacker"` re-authorize the artifact to somebody else.
  */
 export interface ArtifactRecord { readonly id: string; readonly consumerId: string; readonly bytes: number; readonly sha256: string; readonly createdAt: number; readonly expiresAt: number; readonly status: "available" | "consuming"; }
+/**
+ * The ONE public projection of an artifact (Task 2 §3.1). Every field here is safe to hand to an MCP
+ * consumer; everything the private {@link ArtifactRecord} carries and this does not — the owning
+ * `consumerId`, the mutable `status`, and two raw numbers in the injected scheduler's time domain —
+ * is store/runtime state, and each of them was crossing the operation boundary before Task 2.
+ *
+ * It is built ONCE, at successful seal, while the operation still owns the trusted canonical
+ * `sourceHost` and the private committed record; no later lookup re-derives it and no MCP surface
+ * ever serializes the record itself. Instances are frozen: authorization is decided from the private
+ * ledger, never from a field a caller can rewrite.
+ *
+ * `filename` is deliberately absent in the first implementation: Task 1's accepted `DownloadLike`/
+ * operation contract retains none, and manufacturing one would mean reaching back into an untrusted
+ * driver object during retrieval. Capturing a filename is separate scope, not a reason to widen this.
+ */
+export interface ArtifactMetadata {
+  readonly artifactId: string;
+  readonly kind: "pdf";
+  readonly disposition: "attachment";
+  readonly sizeBytes: number;
+  readonly sha256: string;
+  /** ISO-8601, rendered from the record's instant in the ONE injected scheduler domain. */
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  /** Canonical hostname only (Amendment 2 §9): never a URL, a path or a query. */
+  readonly sourceHost: string;
+  readonly filename?: string;
+}
 /** @internal test seam: aggregate accounting only — never IDs, consumers, paths, names, hashes or content. */
 export interface ArtifactAccounting { count: number; bytes: number; stagingBytes: number; stagePermits: number; stagePermitLimit: number; responsePermitHeld: boolean; responseWaiters: number; responseBytes: number; consumers: number; }
 /** The single time domain for artifact expiry, leases, cleanup AND capture-operation settlement
@@ -124,10 +152,65 @@ export type ArtifactDiscardResult = "clean" | "refused" | "failed";
 export interface FsOps { linkSync: typeof import("node:fs").linkSync; unlinkSync: typeof import("node:fs").unlinkSync; fsyncSync: typeof import("node:fs").fsyncSync; rmdirSync?: typeof import("node:fs").rmdirSync; /** @internal test seam */ readdirSync?: typeof import("node:fs").readdirSync; }
 export interface CaptureOptions { id: string; consumerId: string; ttlMs?: number; }
 export type CaptureResult = ArtifactRecord | { status: "capture-failed"; failure: ArtifactFailureCode };
-export interface ResponseLease { record: ArtifactRecord; bytes: number; base64: string; deadline: number; complete(): void; }
+/**
+ * The PRIVATE Task 1 lease, as the store still spells it: the authoritative record, the raw byte
+ * count, the one encoding and a synchronous completion. It never leaves `src/artifacts/`.
+ * {@link ArtifactResponseLease} is the public adapter over it.
+ */
+export interface ResponseLease {
+  record: ArtifactRecord; bytes: number; base64: string; deadline: number; complete(): void;
+  /**
+   * Hand the deadline off to the claimant, exclusively (Amendment 4 §1/§2, plan §4.1). Synchronous,
+   * idempotent, and total: it disarms the store's own internal deadline timer so it can never again
+   * independently release the response permit or discard the artifact.
+   *
+   * A caller that never calls this keeps the store's ordinary auto-timeout behavior; production
+   * calls it immediately upon receiving this lease, before constructing the public
+   * `ArtifactResponseLease` — pre-return expiry stays store-owned, and post-return timeout becomes
+   * exclusively whatever later owns the lease (a future HTTP tracker), never a second, racing timer.
+   */
+  claimTimeout(): void;
+}
+/** The three exact terminal outcomes a response lease may be completed with (Amendment 4 §1/§2). */
+export type ArtifactResponseOutcome = "sent" | "transport-failed" | "timed-out";
+/**
+ * The AUTHORITATIVE cross-module response lease (Amendment 4 §1). A caller receives the artifact only
+ * ever like this: already encoded, already assembled into its final embedded-resource block, under a
+ * permit and a reservation the lease still holds, and against one absolute deadline.
+ *
+ * Deliberately NOT the private Task 1 lease. That one hands out `record` (the owning consumer, the
+ * mutable status and two raw scheduler numbers), a bare `bytes` count and a raw `base64` string, and
+ * completes SYNCHRONOUSLY with no reason at all — so a transport adapter could neither say WHY a
+ * response ended nor await the deletion its completion performs. Here:
+ *
+ *  - `resource` is the finished block. The MCP layer never receives a `Buffer` and never re-encodes:
+ *    one encoding exists, it is made in the artifact layer under the permit, and it is handed on.
+ *  - `deadlineMs` is ONE absolute instant in the injected scheduler's domain, opened immediately
+ *    before file open and never extended. A transport tracker computes its own remaining time from
+ *    `deadlineMs - runtime.now()`; the clock is published by the runtime, so tracking the remaining
+ *    budget never requires widening this shape.
+ *  - `complete()` is asynchronous and idempotent, and the FIRST outcome wins. It makes the artifact
+ *    permanently unavailable, performs the owned private discard, and only then releases the permit
+ *    and the response reservation. No outcome — and no failure inside one — returns it to available.
+ */
+export interface ArtifactResponseLease {
+  readonly metadata: ArtifactMetadata;
+  readonly resource: {
+    readonly type: "resource";
+    readonly resource: {
+      readonly uri: string;
+      readonly mimeType: "application/pdf";
+      readonly blob: string;
+    };
+  };
+  readonly deadlineMs: number;
+  complete(outcome: ArtifactResponseOutcome): Promise<void>;
+}
 export type ArtifactOutcome =
   | { outcome: "none" }
-  | { outcome: "available"; artifact: ArtifactRecord }
+  // Task 2 §3.2: the ONE deliberate public-surface migration. A successful capture carries the safe
+  // projection; the private record stays store/runtime-only and is never serialized at an MCP seam.
+  | { outcome: "available"; artifact: ArtifactMetadata }
   | { outcome: "inline-pdf-unsupported"; failure: "inline-pdf-unsupported" }
   | { outcome: "capture-failed"; failure: ArtifactFailureCode };
 export type OperationResult = ArtifactOutcome;

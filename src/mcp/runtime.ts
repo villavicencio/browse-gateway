@@ -13,6 +13,8 @@
 import { readFileSync } from "node:fs";
 import { Gateway, loadConfig, poolSizingError } from "../gateway/index.js";
 import type { GatewayConfig } from "../gateway/index.js";
+import { loadArtifactConfig, buildArtifactRuntime } from "../artifacts/runtime-builder.js";
+import type { ArtifactRuntime } from "../artifacts/index.js";
 import {
   PolicyEngine,
   ConsumerRegistry,
@@ -58,6 +60,14 @@ export interface GatewayRuntime {
   warmupHosts: ReturnType<typeof parseForceProxyHosts>;
   warmupPaths: ReturnType<typeof parseWarmupPaths>;
   verifyEgress: boolean;
+  /**
+   * Task 2 §4.3/§6 — the ONE process-owned artifact runtime, present iff `BGW_ARTIFACT_CAPTURE_ENABLED`
+   * is exactly `"1"`. Absent means disabled: no root, lock, timer, listener, or filesystem side effect
+   * was ever attempted (`loadArtifactConfig`'s exact short-circuit). Capture-operation wiring,
+   * HTTP-server dependency injection, and shutdown ordering are separate scope — this field only
+   * constructs and exposes the singleton; callers that don't yet consume it are unaffected.
+   */
+  artifactRuntime?: ArtifactRuntime;
 }
 
 export interface BuildRuntimeOptions {
@@ -97,6 +107,13 @@ function loadConsumers(env: NodeJS.ProcessEnv, secrets: SecretStore): ConsumerSp
 export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOptions): GatewayRuntime {
   const { log } = opts;
   const config = loadConfig(env);
+  // Task 2 §4.3/§6: the ONE process-owned artifact runtime, built once here so every caller of
+  // buildGatewayRuntime (http-main's serve, vault-host's on-host capture) shares the same construction
+  // path and can never independently interpret BGW_ARTIFACT_ROOT/limits. Disabled is an exact
+  // short-circuit (no root/lock/fs read at all); enabled fails closed (throws) on an invalid root or a
+  // live/stale lock, before any of the guards below run — a misconfigured artifact root must not boot
+  // silently into a runtime that answers every capture with a filesystem error later.
+  const artifactRuntime = buildArtifactRuntime(loadArtifactConfig(env));
   // Bind the SecretStore to the SAME env the rest of the runtime reads (prod callers pass process.env
   // → identical to before; the in-process gate's controlled env then fully governs the runtime).
   const secrets = opts.secrets ?? new SecretStore(() => env);
@@ -155,5 +172,9 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // minted sticky password can't leak the exit's geo/session/lifetime structure past redactSecrets (R9).
   secrets.addRedactable(stickySuffixRedactables(stickySuffix));
 
-  return { config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress };
+  return {
+    config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts,
+    freshExitHosts, warmupHosts, warmupPaths, verifyEgress,
+    ...(artifactRuntime ? { artifactRuntime } : {}),
+  };
 }

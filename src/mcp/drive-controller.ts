@@ -11,13 +11,15 @@
  * without losing page state (KTD-5). The proxy override is resolved fresh per open, so a secret
  * rotation takes effect on the next session.
  */
+import { randomBytes } from "node:crypto";
 import { isHttpUrl, redactSecrets, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
 import { DEFAULT_CALL_TIMEOUTS } from "../gateway/index.js";
 import type { CallTimeouts } from "../gateway/index.js";
 import { DIAGNOSTICS_EGRESS_HOSTS } from "../policy/index.js";
-import type { BrowserCoreOptions, DriveTarget, PageSnapshot, WaitCondition } from "../browser/index.js";
+import type { BrowserCoreOptions, DriveTarget, PageSnapshot, RenderOptions, WaitCondition } from "../browser/index.js";
+import type { ArtifactCaptureOperation, ArtifactRuntime } from "../artifacts/index.js";
 import {
   proxyOverrideFor,
   navFailed,
@@ -48,6 +50,33 @@ import type { DriveController } from "./server.js";
 const EXIT_INFO_URL = `https://${DIAGNOSTICS_EGRESS_HOSTS[0]}/json`;
 
 export class GatewayDriveController implements DriveController {
+  /**
+   * Task 2 §6 drive lineage identity — minted ONCE, here, at construction, so it is the SAME primitive
+   * whether it is used to scope this controller's own capture operations or read by the entrypoint to
+   * build `GatewayMcpDeps.artifacts.controllerId` (two independently minted values could never be
+   * guaranteed equal). Present unconditionally, whether or not artifact capture is wired for this
+   * graph — an unused identity primitive has no side effect and costs one `randomBytes` call.
+   */
+  readonly controllerId: string = randomBytes(16).toString("base64url");
+  /** Task 2 §6 — this controller's artifact runtime/consumer identity, when artifact capture is wired
+   *  for this graph. Absent = every navigate proceeds exactly as before Task 2 (no operation created,
+   *  no capture attempted, byte-identical output). */
+  readonly #artifacts?: { runtime: ArtifactRuntime; consumerId: string };
+  /**
+   * The target host for the navigate verb currently in flight — set at the top of the public
+   * `navigate()`, cleared once it settles. Safe as mutable instance state only because verbs are
+   * serialized (`#serialize`/`#lock`): no two navigate() calls on one controller ever have this field
+   * live at once. Deliberately just the host, NOT a shared operation: `ArtifactOperation.seal()` is
+   * idempotent and commits PERMANENTLY on its first render call, so reusing one operation across this
+   * verb's internal retries would let an uneventful FIRST attempt (e.g. a CF-blocked direct render,
+   * which never fires a download event) silently foreclose capture on a LATER attempt that actually
+   * succeeds and downloads. Each internal `s.core.navigate()` this verb runs against the real target
+   * therefore mints its own FRESH operation from this host (`#targetNavOpts`) — "no operation is reused
+   * cross-call" (Task 2 §6). Whichever attempt's snapshot is ultimately returned already carries THAT
+   * attempt's own `artifactOutcome` (attached per-call by the browser core), so no extra bookkeeping is
+   * needed to surface the winning attempt's result.
+   */
+  #navigateHost?: string;
   #handle?: string;
   /** True once the current session's first navigate landed a page — its exit/mode is committed. */
   #pinned = false;
@@ -123,6 +152,8 @@ export class GatewayDriveController implements DriveController {
       vault?: VaultEntryStore | null;
       consumerId?: string;
       allowlist?: { allows(host: string): boolean };
+      /** Task 2 §6 — wire artifact capture for this graph's navigate verb. Absent = no capture. */
+      artifacts?: { runtime: ArtifactRuntime; consumerId: string };
     } = {},
   ) {
     this.#gateway = gateway;
@@ -140,6 +171,7 @@ export class GatewayDriveController implements DriveController {
     this.#vault = opts.vault;
     this.#consumerId = opts.consumerId;
     this.#allowlist = opts.allowlist;
+    this.#artifacts = opts.artifacts;
   }
 
   /**
@@ -366,6 +398,37 @@ export class GatewayDriveController implements DriveController {
     });
   }
 
+  /**
+   * Task 2 §6 drive behavior — create the ONE capture operation for a navigate verb, owned by this
+   * graph's drive lineage (`{ scope: "drive", consumerId, controllerId }`). `sourceHost` is derived
+   * SERVER-SIDE from the caller's own already-validated target `url` (never a caller-supplied field).
+   * Never throws: a malformed host, a poisoned/invalidated runtime, or any other closed refusal simply
+   * means this navigate proceeds uncaptured — capture must never block the primary drive function.
+   */
+  #beginNavigateCapture(host: string): ArtifactCaptureOperation | undefined {
+    if (!this.#artifacts) return undefined;
+    try {
+      return this.#artifacts.runtime.createOperation({
+        owner: { scope: "drive", consumerId: this.#artifacts.consumerId, controllerId: this.controllerId },
+        sourceHost: host,
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Task 2 §6 — build `RenderOptions` for ONE internal `s.core.navigate()` attempt at this verb's
+   * actual target host, with its OWN fresh capture operation (never the same object across two calls —
+   * see `#navigateHost`'s doc). Called at every internal navigate site that targets the real URL
+   * (direct, pinned single-shot, warm, proxied re-roll) — NOT the warm-up hop, which navigates a
+   * different (shallow) URL that is infrastructure, not the page the caller asked for.
+   */
+  #targetNavOpts(base: RenderOptions): RenderOptions {
+    const operation = this.#navigateHost ? this.#beginNavigateCapture(this.#navigateHost) : undefined;
+    return operation ? { ...base, artifactOperation: operation } : base;
+  }
+
   async navigate(url: string, opts: { forceProxy?: boolean } = {}): Promise<PageSnapshot> {
     const t0 = performance.now(); // BEFORE #serialize — totalMs includes any queue wait (#42)
     // #45 (codex r3): the per-call budget deadline is t0-relative (BEFORE #serialize), so serialized queue
@@ -373,16 +436,25 @@ export class GatewayDriveController implements DriveController {
     // full-budget verb would receive a FRESH callBudgetMs and the caller-visible time could reach multiples
     // of the bound. Threaded into #navigate (not recomputed there) so the whole verb shares ONE deadline.
     const budgetDeadlineMs = t0 + this.#timeouts.callBudgetMs;
-    const snap = await this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts, budgetDeadlineMs)));
-    // #48: annotate a SILENT HOME-FALLBACK on the returned snapshot — the requested DEEP link (non-root path
-    // / query) landed on the site's bare root (snap.url is the raw post-redirect page.url()). NON-FATAL: a
-    // homepage is a legitimately returnable snapshot (never a drive failure), so this ANNOTATES and returns,
-    // letting the in-loop agent decide — unlike retrieve, which surfaces it as an outcome flag. The SHARED
-    // isHomeFallback predicate keeps drive/retrieve detection from drifting (the parity invariant). Only
-    // navigate() has a requested target; post-action snapshot()/click()/… never carry this. A drive nav that
-    // FAILS throws before here (the block/nav class is the story there); the fallback-on-failure envelope
-    // slot is a documented deferral.
-    return isHomeFallback(url, snap.url) ? { ...snap, homeFallback: true } : snap;
+    // Task 2 §6: the target host for THIS navigate call only, cleared in the finally below. `new
+    // URL(url)` can throw on a malformed target; caught here so a bad URL still reaches #navigate's own
+    // `isHttpUrl` rejection inside the serialized turn (unchanged ordering/behavior) instead of
+    // throwing early, out of turn.
+    try { this.#navigateHost = canonicalizeHost(new URL(url).hostname); } catch { this.#navigateHost = undefined; }
+    try {
+      const snap = await this.#serialize(() => this.#timedSnap(t0, () => this.#navigate(url, opts, budgetDeadlineMs)));
+      // #48: annotate a SILENT HOME-FALLBACK on the returned snapshot — the requested DEEP link (non-root path
+      // / query) landed on the site's bare root (snap.url is the raw post-redirect page.url()). NON-FATAL: a
+      // homepage is a legitimately returnable snapshot (never a drive failure), so this ANNOTATES and returns,
+      // letting the in-loop agent decide — unlike retrieve, which surfaces it as an outcome flag. The SHARED
+      // isHomeFallback predicate keeps drive/retrieve detection from drifting (the parity invariant). Only
+      // navigate() has a requested target; post-action snapshot()/click()/… never carry this. A drive nav that
+      // FAILS throws before here (the block/nav class is the story there); the fallback-on-failure envelope
+      // slot is a documented deferral.
+      return isHomeFallback(url, snap.url) ? { ...snap, homeFallback: true } : snap;
+    } finally {
+      this.#navigateHost = undefined;
+    }
   }
 
   async #navigate(url: string, opts: { forceProxy?: boolean }, budgetDeadlineMs: number): Promise<PageSnapshot> {
@@ -456,7 +528,7 @@ export class GatewayDriveController implements DriveController {
       // #45 (codex r1): the PINNED single-shot also carries the shared per-call deadline, so a small
       // BGW_CALL_BUDGET_MS bounds it too (else its nav + clearance could run past the expired budget). r2: the
       // configured proxied clearance applies (was the hardcoded const).
-      s.core.navigate(url, { ...(this.#proxiedSession ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs }),
+      s.core.navigate(url, this.#targetNavOpts({ ...(this.#proxiedSession ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs })),
     );
     if (navFailed(snap)) {
       // #80: a SELF-inflicted policy block (the gateway's OWN guard aborted the nav — an off-owner redirect
@@ -539,7 +611,7 @@ export class GatewayDriveController implements DriveController {
       return this.#openHealthyAndNavigate(url, true, budgetDeadlineMs);
     }
     if (!this.#handle) await this.#openSession(undefined); // reuse a pre-opened (direct) session if any
-    const direct = await this.#run((s) => s.core.navigate(url, { budgetDeadlineMs })); // #45 (codex r1): bound the direct attempt too
+    const direct = await this.#run((s) => s.core.navigate(url, this.#targetNavOpts({ budgetDeadlineMs }))); // #45 (codex r1): bound the direct attempt too
     if (!navFailed(direct)) {
       this.#pinned = true; // direct works → commit it (no residential GB spent)
       return direct;
@@ -742,7 +814,7 @@ export class GatewayDriveController implements DriveController {
     await this.#warmUpForTarget(url, budgetDeadlineMs);
     const snap = await this.#run((s) =>
       // #45 (codex r1): the warm target navigate carries the shared per-call deadline too. r2: configured clearance.
-      s.core.navigate(url, { ...(override.proxy ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs }),
+      s.core.navigate(url, this.#targetNavOpts({ ...(override.proxy ? { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs } : {}), budgetDeadlineMs })),
     );
     if (navFailed(snap)) {
       // #80: a self-inflicted policy block (a redirect hop off the owner host, or an origination-boundary
@@ -990,7 +1062,7 @@ export class GatewayDriveController implements DriveController {
       // #45: pass the shared per-call deadline into the core so this attempt's goto + clearance poll are
       // bounded by it too (parity with render) — a single attempt starting near the deadline can't overrun it.
       const snap = await this.#run((s) =>
-        s.core.navigate(url, { clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs, budgetDeadlineMs }),
+        s.core.navigate(url, this.#targetNavOpts({ clearanceTimeoutMs: this.#timeouts.proxyClearanceTimeoutMs, budgetDeadlineMs })),
       );
       if (!navFailed(snap)) {
         this.#pinned = true;

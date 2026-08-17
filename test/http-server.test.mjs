@@ -8,9 +8,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest } from "node:http";
+import { z } from "zod";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createHttpHandler, createGatewayMcpServer, awaitBounded } from "../dist/mcp/index.js";
+import { createHttpHandler, createGatewayMcpServer, awaitBounded, getArtifactLeaseTracker } from "../dist/mcp/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 
 const outcome = (over = {}) => ({ markdown: "# T\n\nbody", title: "T", status: 200, blocked: false, reason: null, degraded: false, proxyUsed: false, captchaSolved: false, ...over });
@@ -596,5 +597,587 @@ test("#53 r11: healthToken set with NO operatorHealth producer → the token is 
   } finally {
     await new Promise((r) => server.close(r));
     server.closeAllConnections?.();
+  }
+});
+
+// --- Task 2 Slice B: ArtifactLeaseTracker HTTP integration (H1-H9) --------------------------
+//
+// `browser_get_artifact` itself is Task 7 (out of this slice's scope) and does not exist yet. Every
+// test below drives the REAL production seam — `createHttpHandler`, the real
+// `@modelcontextprotocol/sdk` client/server over a real loopback socket, `createArtifactLeaseTracker`,
+// and the request-context correlation helper — through a TEST-ONLY stand-in tool that plays the part
+// Task 7 will implement: look up the active tracker via `extra.requestId`, acquire a (fake) lease,
+// register it, and follow the exact guarded-fallback contract Task 2 §4.2/§5.1 documents for that
+// future tool. This proves the tracker/context mechanics H1-H9 are ABOUT, without depending on a real
+// ArtifactRuntime or the not-yet-built production tool.
+
+const ARTIFACT_ID = "a".repeat(22);
+
+/** A fake `ArtifactResponseLease.complete()` is idempotent, exactly like the real one built in
+ *  `src/artifacts/index.ts` (`makeResponseLease`'s `if (completion) return completion;` latch): the
+ *  FIRST outcome wins and every later call is a no-op observation of that same settled outcome. A
+ *  non-idempotent fake would let a caller bug (double-completing a lease) masquerade as two DIFFERENT
+ *  recorded outcomes instead of the one a real lease would ever produce. */
+function fakeArtifactLease(overrides = {}) {
+  const calls = [];
+  const artifactId = overrides.artifactId ?? ARTIFACT_ID;
+  let settled;
+  const lease = {
+    metadata: Object.freeze({
+      artifactId,
+      kind: "pdf",
+      disposition: "attachment",
+      sizeBytes: overrides.sizeBytes ?? 3,
+      sha256: "x".repeat(64),
+      createdAt: new Date(0).toISOString(),
+      expiresAt: new Date(1).toISOString(),
+      sourceHost: "example.com",
+    }),
+    resource: Object.freeze({
+      type: "resource",
+      resource: Object.freeze({ uri: `artifact:${artifactId}`, mimeType: "application/pdf", blob: overrides.blob ?? "AAA=" }),
+    }),
+    deadlineMs: overrides.deadlineMs ?? Date.now() + 15_000,
+    complete(outcome) {
+      if (settled) return settled;
+      calls.push(outcome);
+      settled = (async () => {
+        await overrides.onComplete?.(outcome);
+      })();
+      return settled;
+    },
+  };
+  return { lease, calls };
+}
+
+/**
+ * Registers the TEST-ONLY stand-in for `browser_get_artifact` described above. `acquire(args, tracker,
+ * extra)` decides what "acquisition" produces for a given call — a lease, `null` (denial), or a throw.
+ *
+ * Follows Task 2 §4.2 EXACTLY: "every exception after acquisition but before registration invokes one
+ * guarded fallback `lease.complete('transport-failed')`; the tool never directly completes a
+ * successfully registered lease." So the guarded fallback below runs ONLY in the acquire-to-register
+ * window (`preRegisterThrow`); once `tracker.register()` has succeeded, only the tracker itself may
+ * ever call `lease.complete()` (via finish/close/error/deadline) — the tool must let a later throw
+ * propagate untouched.
+ */
+function registerFakeArtifactTool(server, acquire) {
+  const DENIED = { isError: true, content: [{ type: "text", text: "Artifact is unavailable." }] };
+  server.registerTool(
+    "browser_get_artifact",
+    {
+      title: "Get artifact",
+      description: "test stand-in",
+      inputSchema: {
+        artifactId: z.string(),
+        // Test-only knobs (Task 7's real schema is exactly `{ artifactId }`, per Task 2 §3.3) that
+        // pick which side of the acquire-to-register boundary a simulated failure lands on.
+        preRegisterThrow: z.boolean().optional(),
+        postRegisterThrow: z.boolean().optional(),
+      },
+    },
+    async (args, extra) => {
+      const tracker = getArtifactLeaseTracker(extra.requestId);
+      if (!tracker) return DENIED; // Task 2 §4.2: registration outside an active HTTP context is closed-invariant denial
+      let lease;
+      try {
+        lease = await acquire(args, tracker, extra);
+      } catch {
+        return DENIED;
+      }
+      if (!lease) return DENIED;
+      if (args?.preRegisterThrow) {
+        // Simulates a resource/context-construction failure in the acquire-to-register window
+        // (Task 2 §3.5/§4.2): the lease was acquired but NEVER registered, so the guarded fallback is
+        // the ONLY completion this lease will ever see.
+        await lease.complete("transport-failed").catch(() => {});
+        return DENIED;
+      }
+      try {
+        tracker.register(lease);
+      } catch {
+        return DENIED; // register() already fail-completed the lease it rejected
+      }
+      if (args?.postRegisterThrow) throw new Error("boom-after-register"); // only the tracker may complete this lease now
+      return { content: [lease.resource], structuredContent: { artifact: lease.metadata } };
+    },
+  );
+}
+
+function artifactDeps(acquire, over = {}) {
+  const registry = new ConsumerRegistry([
+    { id: "alice", token: "tok-alice", allow: ["*"] },
+    { id: "bob", token: "tok-bob", allow: ["*"] },
+  ]);
+  const policy = new PolicyEngine({ registry });
+  return {
+    authenticate: (t) => policy.authenticate(t),
+    buildServer: (consumer) => {
+      const server = createGatewayMcpServer({ retrieve: async ({ url }) => outcome({ markdown: `${consumer.id} read ${url}` }) });
+      registerFakeArtifactTool(server, acquire);
+      return { server, dispose: async () => {} };
+    },
+    artifactsEnabled: true,
+    ...over,
+  };
+}
+
+/** POST a raw request against an already-initialized MCP session, pausing the response the instant
+ *  headers arrive so the caller controls exactly when (or whether) the body is drained. */
+function pausedPost(port, sessionId, token, jsonBody) {
+  const bodyStr = JSON.stringify(jsonBody);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/mcp",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "mcp-session-id": sessionId,
+          Authorization: `Bearer ${token}`,
+          "Content-Length": Buffer.byteLength(bodyStr),
+        },
+      },
+      (res) => {
+        res.pause();
+        resolve({ status: res.statusCode, res, req });
+      },
+    );
+    req.on("error", reject);
+    req.end(bodyStr);
+  });
+}
+
+/** The installed SDK (Task 0.5) answers a POST tool call as either a plain `application/json` body OR
+ *  an SSE stream (`event: message\ndata: {...}\n\n`) — which one it picks is the transport's choice,
+ *  not something a raw client should assume. Parse both without weakening what gets asserted: for SSE,
+ *  take the LAST `data:` frame (the final JSON-RPC response), exactly what a real EventSource-based
+ *  client would deliver to `onmessage`. */
+function parseSseOrJson(text) {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith("event:") && !trimmed.startsWith("data:")) {
+    return JSON.parse(text);
+  }
+  const dataLines = text.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim());
+  if (dataLines.length === 0) throw new Error("SSE body carried no data: frame");
+  return JSON.parse(dataLines[dataLines.length - 1]);
+}
+
+/** Drain a paused response to completion and parse it (JSON or SSE — see {@link parseSseOrJson}). */
+function drainJson(res) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    res.on("data", (c) => chunks.push(c));
+    res.on("end", () => {
+      try {
+        resolve(parseSseOrJson(Buffer.concat(chunks).toString("utf8")));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    res.on("error", reject);
+    res.resume();
+  });
+}
+
+/** Poll `check` until it returns true or `maxMs` elapses; returns whether it became true. */
+async function pollUntil(check, maxMs, stepMs = 10) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (await check()) return true;
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+  return await check();
+}
+
+async function initSession(url, token) {
+  const c = connect(url, token);
+  await c.client.connect(c.transport);
+  return { client: c.client, sessionId: c.transport.sessionId };
+}
+
+test("Task2/H0 (Task 0.5 seam): a tool handler reaches ITS OWN tracker via extra.requestId across real async SDK dispatch", async () => {
+  let observedTracker;
+  const deps = artifactDeps(async (args, _tracker, extra) => {
+    // Cross a real await boundary (a macrotask) before touching the tracker again — proving the
+    // AsyncLocalStorage context (and the extra.requestId correlation) survives the SDK's actual
+    // asynchronous tool-dispatch machinery, not just a synchronous callback.
+    await new Promise((r) => setTimeout(r, 5));
+    observedTracker = getArtifactLeaseTracker(extra.requestId);
+    return fakeArtifactLease({ artifactId: args.artifactId }).lease;
+  });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const res = await client.callTool({ name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } });
+    assert.equal(res.isError, undefined);
+    assert.ok(observedTracker, "the tool observed a tracker after an async gap");
+    assert.equal(typeof observedTracker.register, "function");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H1: real Node 'finish' — not handler return — completes the lease 'sent'", async () => {
+  const blob = Buffer.alloc(12 * 1024 * 1024, 65).toString("base64"); // large enough to backpressure loopback
+  const { lease, calls } = fakeArtifactLease({ blob });
+  const deps = artifactDeps(async () => lease);
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const { res } = await pausedPost(url.port, s.sessionId, "tok-alice", {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: { name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } },
+    });
+    // While the client holds the response paused (not reading), the tracker must NOT have completed
+    // yet — this is the exact claim Task 2 §5.3/§5.4 makes: handler return / res.end() is too early.
+    const settledEarly = await pollUntil(() => calls.length > 0, 300);
+    assert.equal(settledEarly, false, "must not complete before the client has read the response");
+    await drainJson(res);
+    await pollUntil(() => calls.length > 0, 2_000);
+    assert.deepEqual(calls, ["sent"]);
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H2: a real client reset under backpressure completes 'transport-failed' exactly once, then the next call proceeds", async () => {
+  const blob = Buffer.alloc(12 * 1024 * 1024, 65).toString("base64");
+  const { lease, calls } = fakeArtifactLease({ blob });
+  const deps = artifactDeps(async () => lease);
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const { res, req } = await pausedPost(url.port, s.sessionId, "tok-alice", {
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: { name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } },
+    });
+    assert.equal(await pollUntil(() => calls.length > 0, 300), false);
+    req.destroy(); // abrupt client-side reset while the response is still paused/backpressured
+    res.destroy();
+    await pollUntil(() => calls.length > 0, 2_000);
+    assert.deepEqual(calls, ["transport-failed"]);
+    // The session/handler must not be left wedged: a normal subsequent call still succeeds.
+    const again = await client.callTool({ name: "retrieve", arguments: { url: "https://example.com/" } });
+    assert.equal(again.content[0].text, "alice read https://example.com/");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H3: no finish/reset before the deadline — the tracker destroys the response, completes 'timed-out' once, and the next request proceeds", async () => {
+  // A large, never-drained blob is what makes this deterministic: a small body can flush to the
+  // kernel (and fire 'finish') within a few milliseconds regardless of whether the client is reading
+  // it, which would race the 60ms deadline. Held back by real backpressure, the deadline is the ONLY
+  // thing that can end this response.
+  const blob = Buffer.alloc(12 * 1024 * 1024, 65).toString("base64");
+  const { lease, calls } = fakeArtifactLease({ deadlineMs: Date.now() + 60, blob });
+  const deps = artifactDeps(async () => lease);
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const { res } = await pausedPost(url.port, s.sessionId, "tok-alice", {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: { name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } },
+    });
+    // Never resume/read `res` — only the deadline can end this. Whether the tracker actually called
+    // `res.destroy()` on the real Node `ServerResponse` BEFORE completing `timed-out` (the fencing
+    // order this is meant to prove) is already asserted directly, with full control over the exact
+    // object, in http-response-lease.test.mjs — a client-side stream's `.destroyed`/`.aborted` flags
+    // are not a reliable proxy for that server-side fact on a paused, never-drained response. Here the
+    // integration-level proof is behavioral: the session is left usable, not wedged.
+    await pollUntil(() => calls.length > 0, 2_000);
+    assert.deepEqual(calls, ["timed-out"]);
+    res.destroy(); // release the client-side socket so the process can exit cleanly
+    const again = await client.callTool({ name: "retrieve", arguments: { url: "https://example.com/" } });
+    assert.equal(again.content[0].text, "alice read https://example.com/");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H4: a failure BEFORE registration completes the lease exactly once via the guarded fallback (pre-header fixed error)", async () => {
+  const { lease, calls } = fakeArtifactLease({ artifactId: "b".repeat(22) });
+  const deps = artifactDeps(async () => lease);
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const res = await client.callTool({ name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID, preRegisterThrow: true } });
+    assert.equal(res.isError, true, "no response has started — the fixed external error is returned");
+    assert.deepEqual(calls, ["transport-failed"], "the never-registered lease is completed exactly once via the guarded fallback");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H4b: a throw AFTER successful registration is never hand-completed by the tool — only the tracker's own finish/close/error decides the outcome, exactly once", async () => {
+  const { lease, calls } = fakeArtifactLease({ artifactId: "b1".padEnd(22, "0") });
+  const deps = artifactDeps(async () => lease);
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const res = await client.callTool({ name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID, postRegisterThrow: true } });
+    assert.equal(res.isError, true, "the tool's own throw surfaces as a tool error");
+    // Whatever the SDK does with the throw, the REAL response still reaches ONE Node completion —
+    // the tracker (never the tool) decides it, and decides it only once.
+    assert.equal(calls.length, 1, "exactly one completion, driven solely by the tracker");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H5: a JSON-RPC batch containing browser_get_artifact is rejected before any dispatch; the session is untouched", async () => {
+  let acquireCalls = 0;
+  const deps = artifactDeps(async (args) => {
+    acquireCalls++;
+    return fakeArtifactLease({ artifactId: args.artifactId }).lease;
+  });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "mcp-session-id": s.sessionId, Authorization: "Bearer tok-alice" },
+      body: JSON.stringify([
+        { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } } },
+      ]),
+    });
+    assert.equal(r.status, 400);
+    const body = await r.json();
+    assert.equal(body.error.code, -32600);
+    assert.equal(acquireCalls, 0, "zero acquisitions from a rejected batch");
+    assert.equal(handler.sessionCount(), 1, "the session itself is untouched by the rejected batch");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/disabled-parity: artifacts disabled — a batch naming browser_get_artifact follows legacy SDK dispatch, not top-level rejection", async () => {
+  let acquireCalls = 0;
+  const deps = artifactDeps(
+    async (args) => {
+      acquireCalls++;
+      return fakeArtifactLease({ artifactId: args.artifactId }).lease;
+    },
+    { artifactsEnabled: false },
+  );
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "mcp-session-id": s.sessionId, Authorization: "Bearer tok-alice" },
+      body: JSON.stringify([
+        { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } } },
+      ]),
+    });
+    assert.notEqual(r.status, 400, "disabled mode must not top-level-reject the batch");
+    const text = await r.text();
+    assert.match(text, /"id":1/, "the batch reached real dispatch — the tools/list entry answered");
+    assert.match(text, /"id":2/, "the batch reached real dispatch — the tools/call entry answered");
+    // The tool itself sees no tracker (disabled mode installs no context for a batch either way), so
+    // it denies — but the acquisition path was exercised by real dispatch, not short-circuited.
+    assert.equal(handler.sessionCount(), 1, "the session itself is untouched");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/disabled-parity: artifacts disabled — a single browser_get_artifact call installs no tracker/context (legacy dispatch, no listeners, no inFlight extension)", async () => {
+  let observedTracker = "unset";
+  const deps = artifactDeps(
+    async (_args, tracker) => {
+      observedTracker = tracker;
+      return fakeArtifactLease({ artifactId: ARTIFACT_ID }).lease;
+    },
+    { artifactsEnabled: false },
+  );
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const res = await client.callTool({ name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } });
+    // registerFakeArtifactTool looks up its tracker via `getArtifactLeaseTracker(extra.requestId)`
+    // BEFORE calling `acquire` — with no context installed, that lookup is undefined, so the tool
+    // takes its "no active context" denial branch and `acquire` (and this callback) never runs.
+    assert.equal(observedTracker, "unset", "acquire never ran — no tracker/context was installed for this call");
+    assert.equal(res.isError, true, "the fake tool's closed-invariant denial fires with no tracker present");
+    // The call still completed normally through legacy dispatch (no wedge, no leaked inFlight): the
+    // session is immediately reusable and reports no lingering in-flight extension.
+    const again = await client.callTool({ name: "retrieve", arguments: { url: "https://example.com/y" } });
+    assert.equal(again.content[0].text, "alice read https://example.com/y");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H6: concurrent artifact + non-artifact POSTs on ONE session bind to their own response, no cross-completion", async () => {
+  const first = fakeArtifactLease({ artifactId: "c".repeat(22) });
+  const deps = artifactDeps(async () => first.lease);
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const [artifactRes, retrieveRes] = await Promise.all([
+      client.callTool({ name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } }),
+      client.callTool({ name: "retrieve", arguments: { url: "https://example.com/x" } }),
+    ]);
+    assert.equal(artifactRes.structuredContent.artifact.artifactId, "c".repeat(22));
+    assert.equal(retrieveRes.content[0].text, "alice read https://example.com/x");
+    assert.deepEqual(first.calls, ["sent"], "the artifact lease completed exactly once, tied to its own response");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H7: a reset that lands DURING acquisition is latched; the lease acquired afterward is immediately transport-failed", async () => {
+  let releaseAcquire;
+  const acquireGate = new Promise((r) => (releaseAcquire = r));
+  const { lease, calls } = fakeArtifactLease({ artifactId: "d".repeat(22) });
+  const deps = artifactDeps(async (_args, tracker) => {
+    tracker.activate(); // mirrors what http-server.ts already does before dispatch; idempotent here
+    await acquireGate; // simulate a slow acquisition (real store I/O) the reset can land during
+    return lease;
+  });
+  const handler = createHttpHandler(deps);
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const s = await initSession(url, "tok-alice");
+    client = s.client;
+    const { res, req } = await pausedPost(url.port, s.sessionId, "tok-alice", {
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: { name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } },
+    });
+    req.destroy(); // reset while the fake tool is still "acquiring" (has not called register() yet)
+    res.destroy();
+    await new Promise((r) => setTimeout(r, 30)); // let the reset propagate to the tracker
+    releaseAcquire(); // now let acquisition "complete" and try to register the lease it produced
+    await pollUntil(() => calls.length > 0, 2_000);
+    assert.deepEqual(calls, ["transport-failed"], "a lease acquired after a reset can never be delivered");
+  } finally {
+    await stop({ server, handler, client });
+  }
+});
+
+test("Task2/H8: handleRequest() resolving does not drain inFlight — closeAll() waits for tracker settlement, not handler return", async () => {
+  const blob = Buffer.alloc(12 * 1024 * 1024, 65).toString("base64");
+  const { lease, calls } = fakeArtifactLease({ blob });
+  const deps = artifactDeps(async () => lease);
+  const handler = createHttpHandler({ ...deps, cleanupAwaitMs: 5_000 });
+  const { server, url } = await startServer(handler);
+  try {
+    const s = await initSession(url, "tok-alice");
+    const { res } = await pausedPost(url.port, s.sessionId, "tok-alice", {
+      jsonrpc: "2.0",
+      id: 13,
+      method: "tools/call",
+      params: { name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } },
+    });
+    assert.equal(await pollUntil(() => calls.length > 0, 200), false, "not yet completed (still paused)");
+    let closeAllDone = false;
+    const closeP = handler.closeAll().then(() => (closeAllDone = true));
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(closeAllDone, false, "closeAll must not resolve while the artifact response is still in flight");
+    await drainJson(res); // now let the client actually read — 'finish' fires, the tracker settles
+    await closeP;
+    assert.equal(closeAllDone, true);
+    assert.deepEqual(calls, ["sent"]);
+    await s.client.close().catch(() => {});
+  } finally {
+    await new Promise((r) => server.close(r));
+    server.closeAllConnections?.();
+  }
+});
+
+test("Task2/H9: registration failures each complete the exact acquired lease exactly once", async () => {
+  // (a) a lookup with the wrong requestId never returns a foreign tracker (never crosses requests).
+  {
+    const deps = artifactDeps(async () => {
+      const wrongTracker = getArtifactLeaseTracker("not-the-real-request-id");
+      assert.equal(wrongTracker, undefined, "a mismatched requestId never returns a foreign tracker");
+      return null; // simulated denial — no acquisition attempted
+    });
+    const handler = createHttpHandler(deps);
+    const { server, url } = await startServer(handler);
+    let client;
+    try {
+      const s = await initSession(url, "tok-alice");
+      client = s.client;
+      const res = await client.callTool({ name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } });
+      assert.equal(res.isError, true);
+    } finally {
+      await stop({ server, handler, client });
+    }
+  }
+
+  // (b) duplicate registration: the tool (mis)behaves and registers twice against the same tracker.
+  {
+    const first = fakeArtifactLease({ artifactId: "e".repeat(22) });
+    const second = fakeArtifactLease({ artifactId: "f".repeat(22) });
+    const deps = artifactDeps(async (_args, tracker) => {
+      tracker.register(first.lease);
+      try {
+        tracker.register(second.lease); // duplicate — must throw and fail-complete `second`
+        assert.fail("duplicate register() must throw");
+      } catch {
+        /* expected */
+      }
+      throw new Error("stop here — first is already registered and owns the tracker");
+    });
+    const handler = createHttpHandler(deps);
+    const { server, url } = await startServer(handler);
+    let client;
+    try {
+      const s = await initSession(url, "tok-alice");
+      client = s.client;
+      await client.callTool({ name: "browser_get_artifact", arguments: { artifactId: ARTIFACT_ID } }).catch(() => {});
+      await pollUntil(() => first.calls.length > 0, 2_000);
+      assert.deepEqual(first.calls, ["sent"], "the first, legitimately registered lease still completes normally");
+      assert.deepEqual(second.calls, ["transport-failed"], "the duplicate is fail-completed exactly once");
+    } finally {
+      await stop({ server, handler, client });
+    }
   }
 });
