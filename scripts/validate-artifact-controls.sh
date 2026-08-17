@@ -68,7 +68,19 @@ RUN grep -q "config.core.captureEnabled = true;" /app/dist/mcp/runtime.js \\
  && ! grep -q "config.core.captureEnabled = true" /app/dist/mcp/runtime.js
 EOF
 
-DIST_CONTROLS=(muted-listener forced-capture-failure unwire-capture)
+# REVERTED DISPOSAL EVIDENCE: puts the confirmation predicate back to "both promises must resolve",
+# which against a real driver is unsatisfiable — cancel() and delete() are mutually exclusive. This is
+# the regression control for the defect-2 fix, and it is what entitles the gate header to call three
+# specific legs that fix's alarm. If it ever stops going RED, either the evidence is no longer being
+# consulted or those legs have stopped depending on it.
+cat > "$CTX/revert-disposal-evidence.Dockerfile" <<EOF
+FROM $GATE_TAG
+RUN grep -q 'settle(reported || this.#stagedBytesGone())' /app/dist/artifacts/index.js \\
+ && sed -i 's@settle(reported || this.#stagedBytesGone())@settle(reported) /* EVIDENCE REVERTED (RED control) */@' /app/dist/artifacts/index.js \\
+ && ! grep -q 'settle(reported || this.#stagedBytesGone())' /app/dist/artifacts/index.js
+EOF
+
+DIST_CONTROLS=(muted-listener forced-capture-failure unwire-capture revert-disposal-evidence)
 for c in "${DIST_CONTROLS[@]}"; do
   printf '==> building control image: %-24s ' "$c"
   if docker build --platform linux/amd64 -f "$CTX/$c.Dockerfile" -t "browse-gateway:red-$c" "$CTX" >/dev/null 2>&1; then

@@ -30,19 +30,22 @@
  * forced capture failure — are deliberately NOT knobs here: they are produced by patching the built
  * `dist` in an overlay image, so what goes RED is the real shipping code path, not a harness branch.
  *
- * KNOWN OPEN DEFECT — this gate does NOT currently exit 0, and that is the gate working.
- * Three checks fail against a real, unfixed defect (see
- * docs/solutions/integration-issues/driver-disposal-calls-are-mutually-exclusive-not-concurrent.md):
- * `ArtifactOperation#startCleanup` requires both `cancel()` and `delete()` to confirm, but on a real
- * driver those two are mutually exclusive, so ONE refused download poisons the runtime permanently and
- * every later capture silently stops. The exact expected-failing set is:
+ * THE EXPECTED-FAILING SET IS NOW EMPTY. This gate exits 0 on a clean tree; ANY failure is a
+ * regression. It did not always: three checks used to fail against a real defect (see
+ * docs/solutions/integration-issues/driver-disposal-calls-are-mutually-exclusive-not-concurrent.md)
+ * in which `ArtifactOperation#startCleanup` required both `cancel()` and `delete()` to confirm, while
+ * on a real driver those two are mutually exclusive — so ONE refused download poisoned the runtime
+ * permanently and every later capture silently stopped. The set was:
  *
  *   - "a sub-magic-length download is refused as artifact-not-pdf"
  *   - "an oversize download is refused as artifact-size-limit"
  *   - "a capture still seals after four consecutive refusals"
  *
- * ANY other failure is a new regression. The assertions are deliberately NOT relaxed to make this
- * green — a gate that lowers its bar to match a defect is worth nothing.
+ * Those three are exactly the legs that pass BECAUSE the disposal confirmation now reads the staged
+ * path instead of two mutually-exclusive promises. They are the gate's regression alarm for it: if
+ * they go red together, the confirmation predicate has been reverted or the staged path is no longer
+ * being recorded. The assertions were never relaxed to make this green — a gate that lowers its bar
+ * to match a defect is worth nothing.
  *
  * Exit 0 only when every leg passed.
  *

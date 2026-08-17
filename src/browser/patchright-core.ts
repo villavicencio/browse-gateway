@@ -1753,6 +1753,28 @@ export class PatchrightBrowserCore implements BrowserCore {
    *  - the combined confirmation is bounded by the claim-anchored `finish` its caller already armed,
    *    so an unanswerable driver call turns the session dirty and is DETACHED rather than retained
    *    forever — and the bound covers these reads and calls, not just what follows them.
+   *
+   * WHERE THE TWO HALVES NOW DIFFER, AND WHY IT IS NOT DRIFT. Both confirm the same contract — the
+   * driver's copy is gone — but they can prove it from different evidence, because they know
+   * different things. `ArtifactOperation` staged the download, so it already holds the path and
+   * confirms from the FILE. This site never staged anything: it disposes of orphans, late events and
+   * refusals it has no record of, so the only way to learn the path is to ask the driver, and
+   * measurement rules that out (docs/solutions/integration-issues/
+   * driver-disposal-calls-are-mutually-exclusive-not-concurrent.md):
+   *
+   *  - `path()` invoked AFTER the disposal calls REJECTS — the download is already cancelled;
+   *  - `path()` invoked before them and awaited after is non-deterministic: it rejected in 2 of 3
+   *    in-container runs, and in the run where it resolved the file was ALREADY gone, so "existed
+   *    before" was unobservable and the path could not be told apart from one naming nothing;
+   *  - `path()` AWAITED before invoking disposal does answer — but it defers the mandatory `delete()`
+   *    behind an unbounded untrusted call, which is precisely the trade this contract forbids.
+   *
+   * So this site confirms from the disposal calls, corrected for what the driver actually does: the
+   * two operations are MUTUALLY EXCLUSIVE, so whichever lands first makes the other reject. Requiring
+   * both was requiring an outcome no real driver can produce — it dirtied the session on every
+   * ordinary disposal. One success across two MANDATORY invocations is the confirmation; the
+   * `offered < 2` guard below is what keeps this honest, because it is the case the measurements
+   * refute — `cancel()` alone resolves and leaves the bytes ON DISK.
    */
   #disposeDriverCopy(download: DownloadLike, finish: (confirmed: boolean) => void): void {
     const attempts: Array<Promise<boolean>> = [];
@@ -1775,7 +1797,8 @@ export class PatchrightBrowserCore implements BrowserCore {
       attempts.push(invokeDriverDisposal(() => Reflect.apply(fn as () => Promise<void> | void, download, [])));
     }
     if (offered < 2) { finish(false); return; }
-    void Promise.all(attempts).then((results) => finish(results.every(Boolean)), () => finish(false));
+    // Both were offered and both were invoked, so `some` cannot be reached by a lone `cancel()`.
+    void Promise.all(attempts).then((results) => finish(results.some(Boolean)), () => finish(false));
   }
 
   /**

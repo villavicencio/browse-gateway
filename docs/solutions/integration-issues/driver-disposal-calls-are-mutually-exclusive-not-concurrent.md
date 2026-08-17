@@ -2,15 +2,16 @@
 title: A driver's cancel() and delete() are mutually exclusive — requiring both to confirm poisons the runtime
 date: 2026-08-17
 category: docs/solutions/integration-issues
-module: artifacts/index (ArtifactOperation#startCleanup), mcp/runtime, mcp/http-main, scripts/validate-artifact
+module: artifacts/index (ArtifactOperation#startCleanup), browser/patchright-core (#disposeDriverCopy), mcp/runtime, mcp/http-main, scripts/validate-artifact
 problem_type: integration_defect
 component: artifact-disposal
 severity: critical
-status: one defect FIXED (capture enablement); one defect OPEN and evidenced (disposal confirmation)
+status: both defects FIXED — capture enablement, and the disposal confirmation predicate at both sites
 applies_when:
   - "You require two third-party driver operations to BOTH confirm before you call a resource released"
   - "A capture/cleanup protocol was specified against a documented API surface but never run against the real driver"
   - "An artifact/capture runtime latches a permanent 'poisoned' state on one unconfirmed cleanup"
+  - "You are choosing between a third party's reported success and direct evidence of the effect it claims"
 ---
 
 ## Problem
@@ -29,7 +30,7 @@ operation handed to a capture-disabled session, so the moment artifacts were ena
 browse-gateway error: artifact capture: an operation was supplied to a session with capture disabled
 ```
 
-**2. One refused download permanently poisons the artifact runtime. (OPEN — evidenced, not fixed.)**
+**2. One refused download permanently poisons the artifact runtime. (FIXED — see "The fix" below.)**
 After a single non-PDF, sub-magic-length or oversize download, every later `createOperation` throws
 `artifact-cleanup-failed` for the life of the process — and because both verbs' `beginCapture()`
 swallow that throw, capture just silently stops happening. For the EID use case that means one HTML
@@ -58,13 +59,51 @@ Whichever call lands first makes the other reject. So `every(Boolean)` is false 
 capture, and the race makes *which* download poisons the runtime non-deterministic — it moved between
 `/notpdf.bin` and `/tiny.bin` across runs, which is why it never looked like a reproducible bug.
 
-## Why this was NOT fixed in the same change
+## The fix
+
+**Confirmation is now two independent proofs, either of which suffices: the driver reported success,
+or the bytes are demonstrably gone.** Neither is necessary alone, and the second is what a real driver
+can actually produce.
+
+`ArtifactOperation#startCleanup` confirms from **filesystem evidence**. The staging job already read
+the driver's staged path on its way to `store.capture()`, so the operation records it (`#stagedPath`)
+and, once the disposal calls settle *or* the confirmation budget expires, asks the only question that
+matters: does that path still name a file? It never calls back into the driver to find out — a
+terminal operation touches nothing further on the driver's behalf, and `path()` rejects after disposal
+anyway. The evidence only ever *adds* confirmation, so a cooperative driver's own success report still
+counts and no existing behaviour was withdrawn.
+
+`PatchrightBrowserCore#disposeDriverCopy` **cannot use that evidence, and this was measured rather than
+assumed.** It disposes of orphans, late events and refusals it never staged, so its only route to the
+path is to ask the driver, and all three routes are closed:
+
+| how the core could ask | result |
+|---|---|
+| `path()` invoked AFTER the disposal calls | **rejects** — the download is already cancelled |
+| `path()` invoked before them, awaited after | **non-deterministic**: rejected in 2 of 3 in-container runs; in the run where it resolved the file was ALREADY gone, so "existed before" was unobservable and a real path could not be told apart from one naming nothing |
+| `path()` awaited BEFORE invoking disposal | answers — but defers the mandatory `delete()` behind an unbounded untrusted call, which is the trade this contract exists to forbid |
+
+So that site confirms from the disposal calls, corrected for what the driver actually does: **one
+success across two mandatory invocations**. The `offered < 2` guard is what keeps that honest — it
+excludes the one measured row where bytes survive, `cancel()` alone.
+
+The two halves therefore prove the same contract from different evidence, which is not drift: they
+know different things. Both docblocks say so, and point at each other.
+
+**Residual risk, stated plainly:** a driver that reports a successful `delete()` while leaving the
+bytes on disk is still believed at both sites. Nothing in this change detects that, and the operation
+site would catch it only if the staged path happened to be the surviving file. The bytes in question
+live in the container's own ephemeral download directory.
+
+## Why this was NOT fixed in the change that found it
 
 Two candidate fixes were considered and both were rejected on evidence:
 
 - **Relax to `some(Boolean)`.** Refuted by the last row of the table: `cancel()` alone leaves the bytes
   on disk. This would report a confirmed disposal that deleted nothing — the exact outcome the
-  confirmation exists to prevent.
+  confirmation exists to prevent. *(The core site does now use `some(Boolean)` — but only behind the
+  `offered < 2` guard, which excludes that exact row by requiring `delete()` to have been offered and
+  invoked. The refutation stands; it was a refutation of an UNGUARDED `some`.)*
 - **Sequence the calls (`cancel()`, then `delete()` once cancel settles or a short bound elapses).**
   Implemented, and it turned the gate fully GREEN — then reverted, because it broke **10 deliberate
   tests** in `test/artifact-runtime.test.mjs`, and those tests are defending something real. The
@@ -82,11 +121,11 @@ Two candidate fixes were considered and both were rejected on evidence:
   trades a silent capture outage for a possible undeleted private document — the wrong trade, and not
   one to make without an explicit decision.
 
-The real fix needs a design call, not a sequencing tweak: **confirm disposal from filesystem evidence
-(the staged path no longer exists) rather than from two mutually-exclusive API calls both resolving.**
-That keeps `delete()` synchronous and mandatory, and makes the confirmation a fact about the bytes
-instead of a fact about the driver's promise plumbing. It is a change to Amendment 7's confirmation
-predicate and belongs in its own reviewed slice.
+The fix that shipped is the one named at the end of that session — confirm from filesystem evidence,
+not from two mutually-exclusive API calls both resolving — and it keeps `delete()` synchronous and
+mandatory, so the ten tests around `test/artifact-runtime.test.mjs:2367` stayed green untouched. See
+"The fix" above for what had to change once the core's own site turned out not to be able to reach
+that evidence.
 
 ## What WAS fixed
 
