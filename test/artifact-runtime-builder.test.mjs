@@ -209,3 +209,50 @@ test("buildArtifactRuntime: an invalid artifact root fails closed at the shared 
     (e) => e.code === "artifact-root-invalid",
   );
 });
+
+// ---- captureEnabled wiring (Task G) --------------------------------------------------------------
+//
+// The defect these guard against was invisible to every other test in this repo, because every other
+// test injects a FAKE browser core and a fake core has no download listener to install. What broke was
+// the wiring between the artifact config and `config.core`, and that is host-side and cheap to assert.
+// The end-to-end proof lives in scripts/validate-artifact.mjs (in-container, real Chrome).
+
+test("buildGatewayRuntime: captureEnabled omitted leaves config.core untouched (the pre-artifact path)", async () => {
+  const rt = buildGatewayRuntime(gatewayFixtureEnv(), { log: noLog });
+  try {
+    assert.equal(rt.config.core.captureEnabled, undefined, "an unasked-for capture capability was installed");
+  } finally {
+    await rt.gateway.shutdown().catch(() => {});
+  }
+});
+
+test("buildGatewayRuntime: captureEnabled:true reaches config.core, which is what the session pool launches with", async () => {
+  // `Gateway.create(config, ...)` hands `config.core` to SessionManager as `coreOptions`, and every
+  // core it launches is built from that object — so this IS the property. Without it,
+  // PatchrightBrowserCore installs no download listener, and `#requireCaptureReady` then REFUSES every
+  // operation handed to such a session: measured in-container as "artifact capture: an operation was
+  // supplied to a session with capture disabled" on every retrieve and every browser_navigate.
+  const rt = buildGatewayRuntime(gatewayFixtureEnv(), { log: noLog, captureEnabled: true });
+  try {
+    assert.equal(rt.config.core.captureEnabled, true);
+  } finally {
+    await rt.gateway.shutdown().catch(() => {});
+  }
+});
+
+test("buildGatewayRuntime: an artifact-ENABLED env alone does not enable capture — the caller must opt in", async () => {
+  // The safety property for `cli/vault-host.ts`, which shares this builder and runs INSIDE the live
+  // gateway container with the same artifact env. It owns no runtime and creates no operation, so a
+  // listener installed on its sessions would attribute nothing: a stray download would become an
+  // orphan, mark the core dirty, and brick that session. Enablement is therefore the caller's
+  // decision, taken by http-main from the same loadArtifactConfig() that builds the store — never
+  // inferred from the environment here.
+  const env = gatewayFixtureEnv({ BGW_ARTIFACT_CAPTURE_ENABLED: "1", BGW_ARTIFACT_ROOT: join(temp(), "artifacts") });
+  assert.equal(loadArtifactConfig(env).enabled, true, "the fixture env must really be artifact-enabled");
+  const rt = buildGatewayRuntime(env, { log: noLog });
+  try {
+    assert.equal(rt.config.core.captureEnabled, undefined, "the shared builder inferred capture from the env");
+  } finally {
+    await rt.gateway.shutdown().catch(() => {});
+  }
+});
