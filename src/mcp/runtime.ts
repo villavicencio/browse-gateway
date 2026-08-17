@@ -13,6 +13,7 @@
 import { readFileSync } from "node:fs";
 import { Gateway, loadConfig, poolSizingError } from "../gateway/index.js";
 import type { GatewayConfig } from "../gateway/index.js";
+import type { ArtifactRuntime } from "../artifacts/index.js";
 import {
   PolicyEngine,
   ConsumerRegistry,
@@ -58,6 +59,19 @@ export interface GatewayRuntime {
   warmupHosts: ReturnType<typeof parseForceProxyHosts>;
   warmupPaths: ReturnType<typeof parseWarmupPaths>;
   verifyEgress: boolean;
+  /**
+   * Task 2 §4.3/§6 — ALWAYS `undefined` from this shared builder, and kept only so the field's absence
+   * is part of the published contract rather than an omission a caller has to infer.
+   *
+   * The process-owned `ArtifactRuntime` holds an EXCLUSIVE, mkdir-based root lock that no later boot
+   * reclaims, so exactly one process may own it: the HTTP entrypoint, which constructs it itself
+   * (`http-main.ts`, inside the guard that releases it on a failed boot). This builder is shared with
+   * auxiliary callers that run against the SAME artifact env — `cli/vault-host.ts` executes inside the
+   * running gateway container — and constructing it here made every one of them either fail against the
+   * live gateway's lock or leak the lock and brick the gateway's next boot. Ownership is therefore not
+   * something a caller opts out of; the shared builder simply never takes it.
+   */
+  artifactRuntime?: ArtifactRuntime;
 }
 
 export interface BuildRuntimeOptions {
@@ -97,6 +111,13 @@ function loadConsumers(env: NodeJS.ProcessEnv, secrets: SecretStore): ConsumerSp
 export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOptions): GatewayRuntime {
   const { log } = opts;
   const config = loadConfig(env);
+  // Task 2 §4.3/§6: the process-owned artifact runtime is deliberately NOT built here — see
+  // GatewayRuntime.artifactRuntime. It takes an exclusive root lock nothing reclaims, and this builder
+  // is shared with auxiliary callers (cli/vault-host.ts runs inside the live gateway container), so
+  // ownership belongs to the HTTP entrypoint alone. Building it here also placed the lock BEFORE every
+  // fail-closed guard below, so an ordinary config typo abandoned it and masked itself behind
+  // artifact-root-locked on every later boot. `loadArtifactConfig`/`buildArtifactRuntime` remain the one
+  // shared construction boundary; http-main calls them itself, inside the guard that releases the lock.
   // Bind the SecretStore to the SAME env the rest of the runtime reads (prod callers pass process.env
   // → identical to before; the in-process gate's controlled env then fully governs the runtime).
   const secrets = opts.secrets ?? new SecretStore(() => env);
@@ -155,5 +176,8 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // minted sticky password can't leak the exit's geo/session/lifetime structure past redactSecrets (R9).
   secrets.addRedactable(stickySuffixRedactables(stickySuffix));
 
-  return { config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress };
+  return {
+    config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts,
+    freshExitHosts, warmupHosts, warmupPaths, verifyEgress,
+  };
 }

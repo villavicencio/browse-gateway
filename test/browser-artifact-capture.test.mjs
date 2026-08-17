@@ -1666,12 +1666,15 @@ test("a routed download becomes a real stored artifact, with the owner's metadat
   const result = await core.render("https://origin.test/doc", { artifactOperation: operation });
 
   assert.equal(result.artifactOutcome.outcome, "available", "the routed event did not become an artifact");
-  const record = result.artifactOutcome.artifact;
-  assert.equal(record.consumerId, "owner-consumer", "the stored artifact lost its owner");
-  assert.equal(record.bytes, Buffer.from("%PDF-1.7\nreal bytes").length);
+  const metadata = result.artifactOutcome.artifact;
+  // Task 2 §3.1: the owner is not READABLE from the public projection, so ownership is proved where
+  // it is decided — the store authorizes exactly the bound identity and nobody else.
+  assert.equal("consumerId" in metadata, false, "the public projection carried the owning consumer");
+  assert.equal(metadata.sizeBytes, Buffer.from("%PDF-1.7\nreal bytes").length);
+  assert.equal(await observedStore().acquire(metadata.artifactId, "other-consumer"), null, "the stored artifact lost its owner");
 
   // And it is genuinely retrievable by that owner, once.
-  const lease = await observedStore().acquire(record.id, "owner-consumer");
+  const lease = await observedStore().acquire(metadata.artifactId, "owner-consumer");
   assert.ok(lease, "the published artifact was not retrievable by its owner");
   assert.equal(Buffer.from(lease.base64, "base64").toString(), "%PDF-1.7\nreal bytes");
   lease.complete();

@@ -4,6 +4,7 @@
  * agent. stdout is the MCP protocol channel, so all logging goes to stderr.
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { assertStdioArtifactUnsupported } from "../artifacts/runtime-builder.js";
 import { Gateway, loadConfig } from "../gateway/index.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary, Allowlist } from "../policy/index.js";
 import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
@@ -27,6 +28,10 @@ function loadConsumer(env: NodeJS.ProcessEnv = process.env) {
 }
 
 async function main(): Promise<void> {
+  // Task 2 §4.3/§7: fail closed BEFORE any other boot work — no artifact root, lock, or runtime is
+  // ever reachable on this stdio path, so an artifact-enabled flag here is refused first, not built
+  // and then found unusable. Full stdio artifact delivery is out of scope (Task 2 non-goals).
+  assertStdioArtifactUnsupported(process.env);
   const consumer = loadConsumer();
   if (!consumer.token) throw new Error("BGW_MCP_CONSUMER_TOKEN is required");
   if (consumer.allow.length === 0) throw new Error("BGW_MCP_ALLOWLIST is required (no hosts allowed)");

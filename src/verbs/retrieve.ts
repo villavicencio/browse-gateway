@@ -32,6 +32,7 @@ import type { Gateway } from "../gateway/index.js";
 import { DEFAULT_CALL_TIMEOUTS, type CallTimeouts } from "../gateway/config.js";
 import { isHttpUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
+import type { ArtifactCaptureOperation, ArtifactOutcome, ArtifactRuntime } from "../artifacts/index.js";
 import { extractMarkdown } from "./extract.js";
 import { shouldEscalateToProxy } from "./escalation.js";
 import type { EscalationContext } from "./escalation.js";
@@ -87,6 +88,21 @@ export interface RetrieveOptions {
    *  clearance timeouts. Defaults to {@link DEFAULT_CALL_TIMEOUTS} (the shipped values) when omitted, so
    *  behavior is unchanged. http-main sources this from the gateway config. */
   timeouts?: CallTimeouts;
+  /**
+   * Task 2 §6 "Transient retrieve behavior" — wire artifact capture for this call. Absent = no capture
+   * (byte-identical to pre-Task-2 output: `RetrieveResult.artifactOutcome` stays unset). `consumerId`
+   * is the server-minted transient owner (`{ scope: "consumer", consumerId }`), never caller input.
+   *
+   * Deliberately a runtime+owner descriptor, NOT a single pre-built `ArtifactCaptureOperation`: this
+   * verb may render the SAME target multiple times (a direct attempt, then a proxied re-roll loop) and
+   * `ArtifactOperation.seal()` commits PERMANENTLY on its first render call — reusing one operation
+   * across those attempts would let an uneventful first attempt (e.g. a CF-blocked direct render, which
+   * never fires a download event) silently foreclose capture on a later attempt that actually succeeds.
+   * So a FRESH operation is created for every internal render call against the real target ("no
+   * operation is reused cross-call"); whichever attempt's `RenderResult` is ultimately returned already
+   * carries THAT attempt's own `artifactOutcome` (attached per-call by the browser core).
+   */
+  artifactCapture?: { runtime: ArtifactRuntime; consumerId: string };
 }
 
 /**
@@ -166,6 +182,9 @@ export interface RetrieveResult {
    * retrieve the SAME Timing is folded into {@link diagnostics}, so the two can never disagree.
    */
   timing: Timing;
+  /** Task 2 §3.2 — the sealed capture outcome for this retrieve, when {@link RetrieveOptions.artifactCapture}
+   *  is wired. Absent means artifact-disabled: the result stays byte-identical to pre-Task-2 retrieve. */
+  artifactOutcome?: ArtifactOutcome;
 }
 
 /**
@@ -814,6 +833,33 @@ export async function retrieve(
     onDatacenterIp: opts.escalation?.onDatacenterIp ?? false,
     proxyAvailable: opts.escalation?.proxyAvailable ?? Boolean(proxy),
   };
+  // Task 2 §6 — this retrieve's capture host, derived ONCE, server-side, from the already
+  // scheme-validated requested url (never re-read from a later redirect/landing). `beginCapture()`
+  // mints a FRESH `ArtifactCaptureOperation` on every call — never a shared one — because this verb may
+  // render the same target more than once (direct, then a proxied re-roll loop) and `seal()` commits
+  // permanently on its first render call; sharing one operation across attempts would let an uneventful
+  // first attempt silently foreclose capture on a later, successful one ("no operation is reused
+  // cross-call"). Never throws: a malformed host or a poisoned/invalidated runtime just means that one
+  // render proceeds uncaptured, matching drive-controller's `#beginNavigateCapture`.
+  let captureHost: string | undefined;
+  if (opts.artifactCapture) {
+    try {
+      captureHost = canonicalizeHost(new URL(url).hostname);
+    } catch {
+      captureHost = undefined;
+    }
+  }
+  const beginCapture = (): ArtifactCaptureOperation | undefined => {
+    if (!opts.artifactCapture || !captureHost) return undefined;
+    try {
+      return opts.artifactCapture.runtime.createOperation({
+        owner: { scope: "consumer", consumerId: opts.artifactCapture.consumerId },
+        sourceHost: captureHost,
+      });
+    } catch {
+      return undefined;
+    }
+  };
 
   let budgetExceeded = false; // #43: set when the escalation loop hits the global call budget → typed timeout
   // #45: set true once ANY proxied attempt reaches the site (a live response — a block/challenge, not a dead
@@ -843,7 +889,7 @@ export async function retrieve(
   // 1) Direct render through an authenticated, allowlist-guarded session — skipped when forcing proxy.
   let render: RenderResult | undefined;
   if (!forced) {
-    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, { ...renderOpts, artifactOperation: beginCapture() }));
   }
 
   // 2) CAPTCHA hook (retrieve path) — detect a widget for the block-reason diagnostic. Full
@@ -911,7 +957,7 @@ export async function retrieve(
       const attempt0 = performance.now();
       render = await gateway.withConsumerSession(
         token,
-        (s) => s.core.render(url, proxiedRenderOpts),
+        (s) => s.core.render(url, { ...proxiedRenderOpts, artifactOperation: beginCapture() }),
         { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: timeouts.proxyNavTimeoutMs },
       );
       attemptMs.push(performance.now() - attempt0);
@@ -958,7 +1004,7 @@ export async function retrieve(
       // and budgetExceeded → failureClass=timeout.
       render = { url, status: null, title: "", text: "", html: "", clearanceWaitedMs: 0, diagnostics: { finalUrl: url, status: null } };
     } else {
-      render = await gateway.withConsumerSession(token, (s) => s.core.render(url, renderOpts));
+      render = await gateway.withConsumerSession(token, (s) => s.core.render(url, { ...renderOpts, artifactOperation: beginCapture() }));
     }
   }
   // #45 (codex r8): on a MIXED proxied exhaustion — an earlier attempt REACHED the site (a live block) but the
@@ -1200,5 +1246,9 @@ export async function retrieve(
     ...(homeFallback ? { homeFallback } : {}), // #48: omit-when-false; carries the SUCCESS shape too
     ...(proxyDiagnostic ? { proxyDiagnostic } : {}),
     ...(diagnostics ? { diagnostics } : {}),
+    // Task 2 §3.2/§6: whichever render ultimately won already carries its own operation's outcome
+    // (each internal render call minted its own — see beginCapture's doc); absent when
+    // artifactCapture wasn't wired, so a disabled retrieve stays byte-identical to pre-Task-2 output.
+    ...(render.artifactOutcome !== undefined ? { artifactOutcome: render.artifactOutcome } : {}),
   };
 }

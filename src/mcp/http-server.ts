@@ -25,6 +25,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Consumer } from "../policy/index.js";
+import { batchContainsArtifactRetrieval, createArtifactLeaseTracker, isArtifactToolCall } from "./http-response-lease.js";
+import { runWithArtifactRequestContext } from "./http-request-context.js";
 
 /** A per-consumer MCP server plus a teardown that releases any resources it holds (drive session). */
 export interface ConsumerServer {
@@ -140,6 +142,14 @@ export interface HttpHandlerDeps {
   now?: () => number;
   /** Injectable session-id generator (tests). Default `randomUUID`. */
   generateSessionId?: () => string;
+  /** Disabled-parity gate (final-review blocker): the artifact batch-rejection check and the
+   *  per-POST tracker/context installation are BOTH conditioned on this. Absent/false preserves the
+   *  exact pre-Task-2 dispatch path — no batch is ever top-level-rejected for naming
+   *  `browser_get_artifact`, and no tracker/context/listeners/inFlight extension is ever installed —
+   *  so a deployment with no `ArtifactRuntime` (`artifactRuntime` undefined in http-main) behaves
+   *  identically to before Task 2. Only `http-main` (from `Boolean(artifactRuntime)`) and harnesses
+   *  that intentionally exercise artifact delivery should ever set this `true`. */
+  artifactsEnabled?: boolean;
 }
 
 export interface HttpHandler {
@@ -204,6 +214,7 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
   const idleTtlMs = deps.sessionIdleTtlMs ?? DEFAULT_IDLE_TTL_MS;
   const cleanupAwaitMs = deps.cleanupAwaitMs ?? DEFAULT_CLEANUP_AWAIT_MS;
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY;
+  const artifactsEnabled = deps.artifactsEnabled === true;
 
   const sessions = new Map<string, SessionEntry>();
   /** In-flight cleanups, keyed by session id. Makes cleanup SINGLE-FLIGHT so the fire-and-forget callers
@@ -355,6 +366,16 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
         return sendError(res, tooBig ? 413 : 400, -32700, tooBig ? "request body too large" : "invalid JSON body");
       }
 
+      // Task 2 §3.6: reject a JSON-RPC BATCH containing browser_get_artifact before any dispatch —
+      // a response-scoped lease cannot represent multiple acquisitions, and two artifact calls in
+      // one batch could deadlock the single global response permit against each other's response.
+      // Gated on `artifactsEnabled` (final-review blocker): with artifacts disabled there is no
+      // response-scoped lease to protect, so a batch naming `browser_get_artifact` must fall through
+      // to ordinary SDK dispatch exactly as it did before Task 2 existed.
+      if (artifactsEnabled && batchContainsArtifactRetrieval(body)) {
+        return sendError(res, 400, -32600, "a batch request must not contain browser_get_artifact");
+      }
+
       if (sessionId) {
         const entry = requireOwnedSession(sessionId, consumer, res);
         if (!entry) return;
@@ -363,6 +384,27 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
         // long call isn't reaped on the next tick.
         entry.lastActivity = now();
         entry.inFlight++;
+        // Task 2 §5.1: a repo-owned per-POST tracker/context, created and activated BEFORE
+        // dispatch — so a client reset landing during acquisition (H7) is latched even though the
+        // tool has not registered a lease yet. Scoped to a recognized browser_get_artifact call
+        // only; every other POST costs nothing extra (no listener, no timer, no context).
+        if (artifactsEnabled && isArtifactToolCall(body)) {
+          const tracker = createArtifactLeaseTracker(req, res, { now });
+          tracker.activate();
+          try {
+            await runWithArtifactRequestContext({ tracker, requestId: jsonRpcRequestId(body) }, () =>
+              entry.transport.handleRequest(req, res, body),
+            );
+          } finally {
+            // Keep inFlight elevated until the tracker has fully terminalized (finish/reset/error/
+            // deadline) — not just until handleRequest() resolves, which Task 2 §5.4/H8 proves can
+            // happen well before the real Node response completion.
+            await tracker.settled;
+            entry.inFlight--;
+            entry.lastActivity = now();
+          }
+          return;
+        }
         try {
           await entry.transport.handleRequest(req, res, body);
         } finally {
@@ -451,6 +493,12 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
 
   async function closeAll(): Promise<void> {
     stopReaper();
+    // Task 2 §5.2/H8: a session cannot be considered drained while an artifact lease tracker (or
+    // any other in-flight tool call) is still active — closing its transport out from under a
+    // registered lease would strand it before finish/reset/deadline ever settles it. `inFlight`
+    // stays elevated through `tracker.settled` (see `handle()`), so bound this the same way every
+    // other cleanup wait is bounded: give it up to `cleanupAwaitMs`, then proceed regardless.
+    await drain(cleanupAwaitMs);
     // Close every transport (each fires onclose → cleanup) and dispose every controller CONCURRENTLY, then
     // await ALL cleanups — the ones just kicked off plus any already in flight (a fire-and-forget onclose /
     // overlapping reap) — under ONE shared deadline. Concurrency + a single bound is load-bearing: awaiting
@@ -463,8 +511,8 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       await entry.transport.close().catch(() => {});
       await cleanup(sid);
     });
-    const drain = Promise.all([...perSession, ...cleanups.values()]).then(() => {});
-    await awaitBounded(drain, cleanupAwaitMs);
+    const settleAll = Promise.all([...perSession, ...cleanups.values()]).then(() => {});
+    await awaitBounded(settleAll, cleanupAwaitMs);
   }
 
   return { handle, reapIdle, startReaper, stopReaper, drain, closeAll, sessionCount: () => sessions.size };
@@ -480,6 +528,19 @@ function parseBearer(header: string | string[] | undefined): string {
 
 function headerValue(header: string | string[] | undefined): string | undefined {
   return Array.isArray(header) ? header[0] : header;
+}
+
+/** The JSON-RPC `id` of a single (non-batch) request body, or `undefined` when absent/malformed
+ *  (Task 2 §5.1: this is the value a future tool's `extra.requestId` must match to reach its own
+ *  tracker). Never throws on a hostile getter. */
+function jsonRpcRequestId(body: unknown): string | number | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  try {
+    const id = (body as Record<string, unknown>).id;
+    return typeof id === "string" || typeof id === "number" ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

@@ -456,7 +456,12 @@ export class ArtifactStore {
     const timer = this.#scheduler.setTimeout(() => {
       this.#timers.delete(id);
       if (done || this.#closeRequested || this.#unhealthy) return;
-      done = true; yieldPermit(); this.#discardOwned(id);
+      done = true;
+      // Amendment 4 §1: the artifact is deleted, or proven unhealthy trying, BEFORE the permit a
+      // waiter is about to be admitted on is released — never the other way around.
+      this.#detachResponseSettle(id);
+      if (!this.#discardOwned(id)) this.#markUnhealthy();
+      yieldPermit();
     }, Math.max(0, deadline - this.#scheduler.now()));
     this.#timers.set(id, timer);
     try {
@@ -480,25 +485,73 @@ export class ArtifactStore {
       // setTimeout cannot interrupt the synchronous region above. Refuse an already-expired resource
       // synchronously rather than briefly returning bytes/permit authority before the callback runs.
       if (this.#scheduler.now() >= deadline) {
-        done = true; this.#clearTimer(id); yieldPermit(); this.#discardOwned(id); return null;
+        done = true; this.#clearTimer(id);
+        this.#detachResponseSettle(id);
+        if (!this.#discardOwned(id)) this.#markUnhealthy();
+        yieldPermit();
+        return null;
       }
       this.#responseBytes = buf.length;
+      // `claimed` is this lease's OWN flag, distinct from the shared `done`: the store's internal
+      // timer must stop being an independent completion authority the instant a claimant takes
+      // ownership, even though `done` — which the timer also consults — is not yet true. Amendment
+      // 4 §1/plan §4.1: "the acquisition path owns pre-return timeout; after return, the active
+      // request tracker owns the remaining deadline... The current store timer must not
+      // independently release the permit while an HTTP adapter still references the
+      // response/resource." A direct `ArtifactStore` caller that never calls `claimTimeout()` keeps
+      // the existing store-owned auto-timeout behavior unchanged; ArtifactRuntime calls it
+      // immediately upon receiving this lease, before constructing the public one.
+      let claimed = false;
       return {
         record: publish(rec), bytes: buf.length, base64, deadline,
+        claimTimeout: () => { if (claimed) return; claimed = true; this.#clearTimer(id); },
         complete: () => {
           if (done) return;
-          done = true; this.#clearTimer(id); yieldPermit();
-          if (this.#closeRequested || this.#unhealthy) return;
-          this.#discardOwned(id);
+          done = true; this.#clearTimer(id);
+          if (this.#closeRequested || this.#unhealthy) { yieldPermit(); return; }
+          // Amendment 4 §1: "complete() first makes the artifact permanently unavailable/
+          // deletion-pending, then performs/awaits private owned discard, then releases
+          // permit/reservation." Detach THIS lease's own settle hook first, so
+          // `#deletePhysical`'s close-owned early-settle branch (shared with the close sweep,
+          // which this must not alter) is inert here: the durable discard — and the failure
+          // handling a discard that cannot prove deletion demands — happens BEFORE the permit is
+          // released, never after.
+          this.#detachResponseSettle(id);
+          if (!this.#discardOwned(id)) this.#markUnhealthy();
+          yieldPermit();
         },
       };
     } catch {
       if (!done) {
-        done = true; this.#clearTimer(id); yieldPermit();
+        done = true; this.#clearTimer(id);
+        this.#detachResponseSettle(id);
         if (!this.#discardOwned(id)) this.#markUnhealthy();
+        yieldPermit();
       }
       return null;
     } finally { if (fd >= 0) try { closeSync(fd); } catch {} }
+  }
+
+  /**
+   * Detach THIS lease's own settle hook without invoking it (Amendment 4 §1).
+   *
+   * `#deletePhysical` unconditionally force-settles whatever `#responseSettle` currently holds as
+   * its first action — before the physical unlink — which is exactly right for the store-CLOSE
+   * sweep that shares that method: close must be able to drain a blocked waiter queue with refusals
+   * without waiting on a live lease's own discard. But when the same helper runs from a lease's OWN
+   * completion (`complete()`, its timeout, its pre-return-expiry check, or its catch path), that
+   * early settle releases the very permit this call is about to yield BEFORE the discard it
+   * triggers has run at all.
+   *
+   * Called first, by the live lease's own completion sites only, so `#deletePhysical`'s `settle` is
+   * already `undefined` by the time it reads it — its early-release branch becomes inert for this
+   * lease — and the explicit `yieldPermit()` each of those sites already calls after discard is the
+   * only thing that releases it. The store-close sweep never calls this, so its behavior is
+   * unchanged. Guarded by `#responseId === id`, the same identity check `#deletePhysical` itself
+   * uses, so a call for an ID that is not (or no longer) the live response is inert.
+   */
+  #detachResponseSettle(id: string): void {
+    if (this.#responseId === id) this.#responseSettle = undefined;
   }
 
   #leasable(id: string, consumerId: string) { this.#reapExpired(); if (this.#closeRequested || this.#unhealthy) return false; const rec = this.#records.get(id); return !!rec && rec.consumerId === consumerId && rec.status === "available"; }
