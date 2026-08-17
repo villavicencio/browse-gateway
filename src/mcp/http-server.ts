@@ -175,6 +175,11 @@ interface SessionEntry {
    *  closes a session with an in-flight call, so a long-running verb (e.g. browser_wait_for) can't
    *  have its transport reaped out from under it mid-response. */
   inFlight: number;
+  /** The JSON-RPC request ids currently dispatched on this session (artifact-enabled builds only).
+   *  The SDK routes a response by id ALONE — `_requestToStreamMapping.set(message.id, streamId)` is an
+   *  unconditional overwrite — so two in-flight requests sharing an id collapse onto one mapping entry
+   *  and the first request's response is written to the second's stream. See `jsonRpcRequestIds`. */
+  inFlightIds: Set<string | number>;
 }
 
 const DEFAULT_IDLE_TTL_MS = 6 * 60_000; // a touch above the browser idle reaper, so Chrome frees first
@@ -186,8 +191,12 @@ const DEFAULT_MAX_BODY = 4 * 1024 * 1024;
  * `drive.close()` → the gateway release indefinitely — can't deadlock `closeAll` and prevent http-main from
  * ever reaching `gateway.shutdown()` (the authoritative force-kill). gateway.shutdown() then reclaims the
  * stalled browser directly. Generous enough that a clean teardown always completes first.
+ *
+ * Exported because `closeAll()` spends it TWICE in series, so the process shutdown budget — and the
+ * container `stop_grace_period` that must cover it — is derived from this number rather than a copy of
+ * it. See `worstCaseShutdownMs`.
  */
-const DEFAULT_CLEANUP_AWAIT_MS = 8_000;
+export const DEFAULT_CLEANUP_AWAIT_MS = 8_000;
 
 /** Await `p`, but give up after `ms` so a hung cleanup can't block a caller (the timer is cleared the
  *  instant `p` settles, so a normal fast cleanup incurs no delay). NOT unref'd: it must fire to unblock.
@@ -270,7 +279,7 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       allowedHosts,
       allowedOrigins,
       onsessioninitialized: (sid) => {
-        sessions.set(sid, { transport, consumerId: consumer.id, dispose: built.dispose, lastActivity: now(), inFlight: 0 });
+        sessions.set(sid, { transport, consumerId: consumer.id, dispose: built.dispose, lastActivity: now(), inFlight: 0, inFlightIds: new Set() });
         log(`session ${sid} open (consumer=${consumer.id}); ${sessions.size} live`);
       },
       onsessionclosed: (sid) => void cleanup(sid), // explicit DELETE
@@ -379,6 +388,23 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
       if (sessionId) {
         const entry = requireOwnedSession(sessionId, consumer, res);
         if (!entry) return;
+        // Same class of request-shape restriction as the batch gate above (Task 2 §3.6), for the same
+        // reason: the installed SDK resolves a response by request id ALONE — its
+        // `_requestToStreamMapping.set(message.id, streamId)` is an unconditional overwrite — so a
+        // duplicate id among CONCURRENT requests on one session is unrepresentable. Measured, not
+        // argued: the second dispatch overwrites the first's mapping, the first request's response
+        // (artifact bytes included) is written to the SECOND request's socket, the first request hangs,
+        // and its lease is terminalized never-sent — an audit that says "not sent" for bytes already
+        // handed to the kernel. Refuse the newcomer: the already-dispatched call keeps its own stream,
+        // and a client reusing an in-flight id (which the SDK cannot honour either way — its own
+        // `send()` would throw "No connection established" for the loser) is told so instead of being
+        // silently cross-routed. Gated on `artifactsEnabled`, so a build without artifacts keeps its
+        // exact prior behavior.
+        const requestIds = artifactsEnabled ? jsonRpcRequestIds(body) : [];
+        if (requestIds.some((id) => entry.inFlightIds.has(id))) {
+          return sendError(res, 400, -32600, "a JSON-RPC request id is already in flight on this session");
+        }
+        for (const id of requestIds) entry.inFlightIds.add(id);
         // Mark the call in-flight so the idle reaper won't close this session mid-response (a long
         // tool call can outlive the idle TTL); re-stamp activity on completion so a just-finished
         // long call isn't reaped on the next tick.
@@ -400,6 +426,7 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
             // deadline) — not just until handleRequest() resolves, which Task 2 §5.4/H8 proves can
             // happen well before the real Node response completion.
             await tracker.settled;
+            for (const id of requestIds) entry.inFlightIds.delete(id);
             entry.inFlight--;
             entry.lastActivity = now();
           }
@@ -408,6 +435,7 @@ export function createHttpHandler(deps: HttpHandlerDeps): HttpHandler {
         try {
           await entry.transport.handleRequest(req, res, body);
         } finally {
+          for (const id of requestIds) entry.inFlightIds.delete(id);
           entry.inFlight--;
           entry.lastActivity = now();
         }
@@ -541,6 +569,30 @@ function jsonRpcRequestId(body: unknown): string | number | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Every JSON-RPC REQUEST id this body will dispatch — one for a single request, one per element for a
+ * batch — so a duplicate among CONCURRENT requests on one session can be refused before the SDK's
+ * id-keyed stream mapping silently collapses them onto one entry.
+ *
+ * Deliberately ids only, never a shape judgement: an element with no id is a notification (no response,
+ * no mapping entry, nothing to collide) and is skipped. A batch is included because the collision is
+ * the SDK's `_requestToStreamMapping`, which does not care whether the colliding dispatch arrived alone
+ * or inside a batch. Never throws on a hostile getter.
+ */
+function jsonRpcRequestIds(body: unknown): (string | number)[] {
+  const ids: (string | number)[] = [];
+  const push = (entry: unknown) => {
+    const id = jsonRpcRequestId(entry);
+    if (id !== undefined) ids.push(id);
+  };
+  if (Array.isArray(body)) {
+    for (const entry of body) push(entry);
+  } else {
+    push(body);
+  }
+  return ids;
 }
 
 /**

@@ -13,6 +13,14 @@ services:
       dockerfile: docker/Dockerfile
     image: browse-gateway:latest
     init: true # reap Chrome's child processes (no zombies)
+    # Must cover the WHOLE bounded shutdown sequence, because its last bounded step —
+    # ArtifactRuntime.close() — is what releases the artifact root lock. Worst case is
+    # 5s drain + 2x8s in closeAll (it spends cleanupAwaitMs twice, measured) + 10s artifact close = 31s;
+    # Docker's default grace is 10s, so the default would SIGKILL with the lock still held. The lock is a
+    # plain mkdir'd directory with no staleness reclamation, so that bricks every later boot with
+    # artifact-root-locked. This is a ceiling, not a cost: an ordinary shutdown finishes in milliseconds.
+    # Kept in step with worstCaseShutdownMs() by a test — see test/artifact-http-lifecycle.test.mjs.
+    stop_grace_period: 45s
     shm_size: "1gb" # headful Chrome needs more than the 64MB default /dev/shm
     cpus: 2.0 # placeholder cap — tuned in U7
     mem_limit: 2gb # placeholder cap — tuned in U7

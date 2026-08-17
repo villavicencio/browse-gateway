@@ -9,7 +9,7 @@
  */
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -22,7 +22,11 @@ import {
   createConsumerGraphDisposer,
   closeArtifactRuntimeBounded,
   runShutdownSequence,
+  worstCaseShutdownMs,
+  SHUTDOWN_DRAIN_MS,
+  ARTIFACT_CLOSE_TIMEOUT_MS,
 } from "../dist/mcp/artifact-graph-lifecycle.js";
+import { DEFAULT_CLEANUP_AWAIT_MS } from "../dist/mcp/http-server.js";
 
 /** A promise that outlives every bound this file tests against, via an UNREF'D real timer — never a
  *  bare `new Promise(() => {})`, which Node's test runner flags as a dangling-resolution leak once the
@@ -293,6 +297,111 @@ test("runShutdownSequence: disabled (no artifactRuntime) reaches gateway.shutdow
   const { target, order } = orderedFakeShutdownTarget();
   await runShutdownSequence(target, { drainMs: 10, artifactCloseTimeoutMs: 100, log: () => {} });
   assert.deepEqual(order, ["httpServer.close", "handler.drain(10)", "handler.closeAll", "httpServer.closeAllConnections", "gateway.shutdown"]);
+});
+
+// ---- Shutdown budget vs the container's stop grace -------------------------------------------------
+
+test("shutdown budget composition: closeAll spends cleanupAwaitMs TWICE, and every bound is additive", async () => {
+  // The MEASUREMENT that `worstCaseShutdownMs`'s formula rests on — the doubling is not obvious from
+  // reading `closeAll()`, so it is timed against the REAL handler rather than reasoned about. One
+  // session, one hung in-flight tool call (so neither drain can finish early) and a hung dispose (so
+  // the bounded settle also runs to its bound).
+  const DRAIN = 200;
+  const CLEANUP = 300;
+  const ARTIFACT_CLOSE = 400;
+
+  const registry = new ConsumerRegistry([{ id: "alice", token: "tok-alice", allow: ["*"] }]);
+  const policy = new PolicyEngine({ registry });
+  const handler = createHttpHandler({
+    authenticate: (t) => policy.authenticate(t),
+    cleanupAwaitMs: CLEANUP,
+    buildServer: () => ({
+      server: createGatewayMcpServer({ retrieve: () => neverResolvesInTime() }), // the hung tool call
+      dispose: () => neverResolvesInTime(), // the hung graph dispose
+    }),
+  });
+  const { server, url } = await startServer(handler);
+  let client;
+  try {
+    const c = connect(url, "tok-alice");
+    client = c.client;
+    await client.connect(c.transport);
+    // Fire and DON'T await: this keeps the session's inFlight elevated for the whole sequence.
+    void client.callTool({ name: "retrieve", arguments: { url: "https://example.com/" } }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 50)); // let the call actually reach the handler
+
+    const target = {
+      httpServer: { close: () => {}, closeAllConnections: () => {} },
+      handler,
+      gateway: { shutdown: async () => {} },
+      artifactRuntime: { close: () => neverResolvesInTime() }, // the hung artifact close
+    };
+    const t0 = Date.now();
+    await runShutdownSequence(target, { drainMs: DRAIN, artifactCloseTimeoutMs: ARTIFACT_CLOSE, log: () => {} });
+    const elapsed = Date.now() - t0;
+
+    // The bracket below is what makes this a measurement rather than a restatement: a formula that
+    // counted ONE cleanup bound fails the upper assertion, and one that counted THREE fails the lower.
+    const formula = worstCaseShutdownMs({ drainMs: DRAIN, cleanupAwaitMs: CLEANUP, artifactCloseTimeoutMs: ARTIFACT_CLOSE });
+    // At least the formula (minus timer slack): drain + closeAll's TWO cleanup bounds + artifact close.
+    assert.ok(elapsed >= formula - 60, `shutdown took ${elapsed}ms, expected >= ~${formula}ms — the bounds are not additive as the budget assumes`);
+    // And not a third cleanup bound on top, which would mean the formula understates the real budget.
+    assert.ok(elapsed < formula + CLEANUP, `shutdown took ${elapsed}ms, which exceeds the formula by more than one cleanup bound — the budget understates the real worst case`);
+  } finally {
+    await client?.close().catch(() => {});
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("shutdown budget vs stop grace: SIGKILL must not be able to land while the artifact root lock is held", async () => {
+  // The artifact root lock is a plain `mkdir`'d directory with NO staleness reclamation — a
+  // pre-existing lock always refuses (`artifact-root-locked`, pinned by test/artifact-store.test.mjs).
+  // It is released only by `ArtifactRuntime.close()`, the LAST bounded step of the shutdown sequence.
+  // So if Docker's stop grace can expire before that step completes, SIGKILL leaves the lock behind and
+  // every later boot of the container fails closed on a lock nothing will ever reclaim.
+  const worstCase = worstCaseShutdownMs({
+    drainMs: SHUTDOWN_DRAIN_MS,
+    cleanupAwaitMs: DEFAULT_CLEANUP_AWAIT_MS,
+    artifactCloseTimeoutMs: ARTIFACT_CLOSE_TIMEOUT_MS,
+  });
+  const compose = readFileSync(new URL("../docker/compose.yaml", import.meta.url), "utf8");
+  const match = /^\s*stop_grace_period:\s*"?(\d+)(ms|s|m)?"?/m.exec(compose);
+  assert.ok(
+    match,
+    `docker/compose.yaml sets no stop_grace_period, so Docker's 10000ms default applies — but the ` +
+      `shutdown sequence can hold the artifact root lock for up to ${worstCase}ms`,
+  );
+  const unit = match[2] ?? "s";
+  const graceMs = Number(match[1]) * (unit === "ms" ? 1 : unit === "m" ? 60_000 : 1_000);
+  assert.ok(
+    graceMs >= worstCase,
+    `stop_grace_period is ${graceMs}ms but the shutdown sequence can hold the artifact root lock for ` +
+      `up to ${worstCase}ms — SIGKILL would land with the lock held`,
+  );
+
+  // And the path production ACTUALLY uses. `launch-http.sh` is the single source of truth for the
+  // `docker run`, and compose is not on the deploy path at all — so a compose-only grace would fix
+  // nothing that ships. Text guards (the alternative is a live container), but they pin the exact
+  // regression: a bare `docker rm -f` on a running gateway is SIGKILL with no grace whatsoever.
+  const launch = readFileSync(new URL("../scripts/deploy/launch-http.sh", import.meta.url), "utf8");
+  assert.equal(
+    /docker\s+rm\s+-f\s+"\$CONTAINER"/.test(launch),
+    false,
+    "launch-http.sh force-removes the running gateway (SIGKILL, no grace) — the lock would never be released",
+  );
+  assert.ok(
+    /docker\s+stop\s+-t\s+"\$STOP_TIMEOUT"\s+"\$CONTAINER"/.test(launch),
+    "launch-http.sh does not stop the old container gracefully with the shutdown budget",
+  );
+  assert.ok(/--stop-timeout\s+"\$STOP_TIMEOUT"/.test(launch), "the docker run sets no --stop-timeout, so a later docker stop uses the 10s default");
+  // The one place the number is written, resolved from the script itself so the guard cannot drift.
+  const stopTimeout = /^STOP_TIMEOUT="\$\{BGW_STOP_TIMEOUT:-(\d+)\}"/m.exec(launch);
+  assert.ok(stopTimeout, "launch-http.sh does not define a default STOP_TIMEOUT");
+  assert.ok(
+    Number(stopTimeout[1]) * 1_000 >= worstCase,
+    `launch-http.sh's default stop timeout is ${stopTimeout[1]}s but the artifact root lock can be held for ${worstCase}ms`,
+  );
 });
 
 // ---- Cross-layer: the REAL createHttpHandler wired exactly like http-main.ts's buildServer ---------

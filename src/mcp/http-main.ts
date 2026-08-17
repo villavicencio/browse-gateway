@@ -19,7 +19,13 @@ import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError, buildOperatorHealth } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
-import { createConsumerGraphDisposer, closeArtifactRuntimeBounded, runShutdownSequence } from "./artifact-graph-lifecycle.js";
+import {
+  createConsumerGraphDisposer,
+  closeArtifactRuntimeBounded,
+  runShutdownSequence,
+  SHUTDOWN_DRAIN_MS,
+  ARTIFACT_CLOSE_TIMEOUT_MS,
+} from "./artifact-graph-lifecycle.js";
 import { describeInit } from "../gateway/init-identity.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
@@ -31,10 +37,8 @@ const OBSCURA_BOOT_BANNER = "(o,o) OBSCURA — see without being seen";
 const DRIVE_IDLE_TTL_MS = 5 * 60_000; // browser-session idle reap (frees Chrome)
 const DRIVE_REAPER_INTERVAL_MS = 60_000;
 const MCP_SESSION_REAPER_INTERVAL_MS = 60_000;
-const SHUTDOWN_DRAIN_MS = 5_000; // bounded wait for in-flight tool calls before force-closing
-// Task 2 §6 — bounds ArtifactRuntime.close(): generous enough to safely exceed a hung-cleanup's own
-// D+C=10s worst case (Amendment 7 §2), so this bound is a true safety net, not a routine truncation.
-const ARTIFACT_CLOSE_TIMEOUT_MS = 10_000;
+// The shutdown budgets live with `runShutdownSequence` (which they parametrize) so a test can assert
+// the container's stop grace actually covers them — see `worstCaseShutdownMs`.
 const DEFAULT_PORT = 8080;
 const DEFAULT_BIND = "127.0.0.1"; // fail-closed: deployment sets the Tailnet address explicitly
 
