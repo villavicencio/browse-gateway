@@ -1,75 +1,70 @@
 ---
-scope: browse-gateway-eid-artifact-task1
-updated_at: 2026-08-15T11:35:43-07:00
+scope: browse-gateway-eid-artifact-task2
+updated_at: 2026-08-17T01:09:26-07:00
 status: done
 kind: project
 review_after: null
 ---
 
-# Handoff: Site-neutral browser artifact capture
+# Handoff: Authorized MCP artifact retrieval
 
 ## Objective
-Complete the reusable browser-to-artifact slice for private statement ingestion: capture one attributed browser download before teardown, publish it atomically through `ArtifactRuntime` / `ArtifactCaptureOperation`, and fail closed across lifecycle and cleanup races. MCP/HTTP retrieval, authentication, deployment, and live EID access remain out of scope.
+Build Obscura into a scheduled personal bill-intelligence workflow for EID: at configured times each month, check for a new invoice, reuse an authenticated session through durable cookies with credential re-authentication as fallback, retrieve the private bill, compare it with prior months, and report useful changes, anomalies, or noteworthy details. Extract only the site-neutral primitives demanded by this working flow so the same browser-session, artifact, ingestion, and analysis capabilities can later support other utilities, banking sites, and authenticated services without turning the first implementation into a speculative platform.
 
 ## Current State
-The site-neutral artifact runtime/browser integration is complete in the approved tree. Operation/runtime internals use JavaScript private fields; public operation identity remains directly readable but non-enumerable, and serializing either object yields `{}`. `createOperation()` and public `store.capture()` snapshot untrusted properties exactly once and normalize getter/proxy failures without exposing raw exceptions. Controller verification, a fresh real-browser/container run, targeted specification review, code-quality review, and final adversarial-security review all passed. David explicitly authorized committing and pushing the exact approved tree; this handoff is the terminal record for the completed slice.
+Task 2 is implemented and locally checkpointed on `atlas/eid-pdf-artifact-task2` at commit `9217f8b96f0e2af0910581637f79a5477c63d805`. Typecheck, the complete 1,482-test suite, and a real loopback capture-to-`browser_get_artifact` acceptance test pass. One independent final specification/security review found a disabled-mode HTTP parity defect; the two HTTP gates were scoped behind a snapshotted `artifactsEnabled` flag, regression tests were added, and the full suite passed afterward. Nothing was pushed, deployed, or exercised against live EID.
+
+## Project Charter
+- **Operational outcome:** scheduled detection, retrieval, analysis, month-over-month comparison, and concise reporting for new EID bills.
+- **Authentication:** preserve authenticated sessions with cookies; fall back to stored credentials when the session expires, within explicit private-data controls.
+- **Reuse:** extract site-neutral capabilities only after the EID path demonstrates the seam; future utilities/banks should reuse proven primitives rather than drive speculative abstractions now.
+- **Engineering posture:** keep it simple, safe enough for private financial documents, and iterative. Prefer fixing observed bugs over defending against low-probability hypothetical futures.
+- **Risk tolerance:** medium-high for this project, while preserving hard boundaries around credential leakage, cross-consumer authorization, destructive actions, and production release.
+- **Model/cost posture:** Claude Code carries most implementation work; Atlas uses OpenAI for architecture, acceptance, adjudication, and final judgment while conserving OpenAI usage.
+- **Authority:** local commits are standing-authorized. Production release/deployment requires David’s explicit approval.
 
 ## Canonical Sources
-- `/home/node/.hermes/plans/2026-08-13-obscura-private-pdf-artifact-contract.md` — base artifact contract.
-- `/home/node/.hermes/plans/2026-08-13-obscura-private-pdf-artifact-contract-amendment-1.md` through `-amendment-6.md` — normative amendments in precedence order; later amendments override.
-- `/tmp/bgw-page-scoped-disposal-correction.md` — approved page-owned disposal correction matrix.
-- `src/artifacts/index.ts` — operation state, immutable identity, settlement, cleanup, publication, and invalidation.
-- `src/browser/patchright-core.ts` — generation routing, page ownership, disposal accounting, and teardown.
-- `test/artifact-runtime.test.mjs` and `test/browser-artifact-capture.test.mjs` — strict lifecycle/security regressions.
+- `/home/node/Projects/browse-gateway-eid-artifact/.hermes/plans/2026-08-16-artifact-retrieval-mcp-transport-task2.md` — reconciled Task 2 implementation plan.
+- `/home/node/.hermes/plans/2026-08-13-obscura-private-pdf-artifact-contract.md` and Amendments 3, 4, 6, and 7 — controlling artifact and response-lease contracts.
+- `src/mcp/http-response-lease.ts` — Node response tracking and exactly-once lease completion.
+- `src/mcp/server.ts` — `browser_get_artifact`, trusted identity snapshots, denial collapsing, and safe metadata projection.
+- `src/mcp/artifact-graph-lifecycle.ts` and `src/mcp/http-main.ts` — controller disposal and process shutdown ordering.
+- `test/artifact-loopback-acceptance.test.mjs` — real loopback capture/retrieval/one-shot verification.
 
 ## Completed
-- Implemented caller-created owner-bound artifact operations with atomic publication, invalidation precedence, fixed 5,000 ms operation deadline, bounded hostile-accessor handling, exactly-once attributed cleanup, runtime poison, and reservation safety.
-- Implemented site-neutral browser generation routing for render, navigate, click, type, selectOption, pressKey, and waitFor.
-- Implemented pre-accounted, independently invoked, bounded cancel/delete disposal for orphan, late, refused, and duplicate downloads.
-- Added immutable page ownership for browser-owned disposal records: orphan uses emitting page; late/duplicate/refused uses generation owner iff captured, otherwise emitting page.
-- Added one-turn fixed-snapshot owner-filtered drains for active-page and transient-render teardown; graceful close drains all owners; kill remains synchronous and non-draining.
-- Fixed delayed `closeActivePage()` race: it closes the captured page identity and clears active state only if that identity remains current.
-- Strengthened fake browser pages to retain page-local listeners and corrected the full-close test to hold records from two real owner identities.
-- Current hostile-input-hardened tree: build/typecheck passed; focused 170/170; browser suite 10/10 repeated; full suite 1,261/1,261; diff/mutation/NUL hygiene clean. Separate compiling mutations for `createOperation()` and `store.capture()` made the hostile-input regression RED; both were restored. Direct built-JavaScript probe still shows operation/runtime keys empty, JSON `{}`, readable identity, and source-compatible runtime store access.
-- Fresh `browse-gateway:eid-artifact-final7` container passed teardown; deterministic measurement was VALID with 6 events, 0 unattributed events, and 0 stat/accessor/settlement/cleanup errors.
-- Final hostile-input-hardened tree passed targeted specification (`deleg_6915a23a`), code quality (`deleg_471ac6f4`), and adversarial security (`deleg_a87c28c2`) in order.
+- Added runtime acquisition that owns permit acquisition, file verification, hashing, base64 MCP-resource construction, and one-shot consumption.
+- Added per-POST response tracking correlated through SDK `extra.requestId`, with `sent`, `transport-failed`, and fenced `timed-out` completion.
+- Added queued-reset cancellation, artifact-containing batch rejection, tracker-aware `inFlight` drain, and exactly-once cleanup/reference release.
+- Added conditional `browser_get_artifact` registration with server-derived consumer/controller authorization and indistinguishable denial responses.
+- Wired fresh artifact capture operations into retrieve attempts and drive controllers without reusing operation identity across attempts.
+- Added fail-closed artifact-enabled stdio refusal before artifact filesystem/runtime construction.
+- Added idempotent controller lifecycle disposal and ordered process shutdown: stop intake, drain HTTP responses, close consumer graphs, close artifact runtime, then gateway shutdown.
+- Added disabled-mode parity gating after final review found unconditional HTTP artifact interception.
+- Final verification: `npm run typecheck` passed; `npm test` passed 1,482/1,482; loopback acceptance passed 1/1.
+- Created local checkpoint commit `9217f8b` (`feat: add authorized MCP artifact retrieval`).
 
 ## Decisions
-- **Operation owns attributed staging; browser core owns only unattributed disposal.** No core-wide operation staging ledger.
-- **Owner identity is immutable object identity.** Closed/detached/liveness state never erases ownership; fallback occurs only when a generation owner was never captured.
-- **Teardown snapshots once after exactly one injected event-loop turn.** No polling, resnapshotting, or admission extension.
-- **Identity-bearing public operation properties must be runtime immutable.** TypeScript `readonly` is insufficient at the JavaScript boundary; own properties are non-writable and non-configurable.
-- **Commit and push required explicit authorization.** David provided it on 2026-08-15 for the exact approved tree.
+- **Node `ServerResponse` finish is the local success boundary.** It does not claim remote receipt.
+- **Timeout authority transfers from store to HTTP tracker.** The tracker fences the actual response before completing `timed-out` and releasing the permit.
+- **Artifact IDs are not bearer credentials.** Consumer and controller identities are immutable server-derived snapshots.
+- **Disabled deployments take the legacy HTTP path.** Batch rejection and tracker/context installation run only when the process artifact runtime exists.
+- **Pre-production engineering is delegated; production remains gated.** Local commits are standing-authorized. Branch/PR work follows repository policy, while any production release or deploy requires David's explicit approval.
 
 ## Active Tasks
-- [x] Close this slice by committing and pushing the exact approved tree.
-- [ ] Begin the separately bounded Streamable HTTP `browser_get_artifact` retrieval slice.
+- [x] Implement, review, accept, and locally checkpoint Task 2.
+- [ ] Publish the reviewed branch and open a pull request as the next pre-production step.
 
 ## Blockers and Open Questions
-- **Real private portal capture remains intentionally untested.** Only site-neutral fake-driver and local real-browser/container validation is authorized.
-
-## Failed or Ruled-Out Approaches
-- **Stale Claude supervisor.** A queued prompt sat unexecuted at exhausted capacity for about 5.5 hours; the supervisor was killed.
-- **Standalone `codex` fallback.** Exit 127: `codex` is not installed on this host. Do not retry without installing/configuring it explicitly.
-- **Global unattributed-disposal drain on page close.** Rejected because one page could block teardown of another.
-- **TypeScript-only `readonly`.** Built JavaScript allowed replacement of operation owner/ID/host properties; strict runtime descriptors are required.
-- **Enumerable TypeScript-private constructor properties.** They exposed store roots and private operation identity through `Object.keys`/JSON; internal authority now uses JavaScript private fields and public identity is non-enumerable.
-- **Pre-validation public property reads.** `createOperation(null)` and hostile operation/store getters previously leaked raw exceptions; both boundaries now structurally validate, snapshot once, and emit closed artifact errors.
+- **No technical blocker remains.** Production release is intentionally approval-gated; pre-production engineering may continue under the project charter.
 
 ## Evidence and Artifacts
-- `/home/node/.hermes/cache/delegation/subagent-summary-0-20260814_221941_036772.txt` — page-scoped implementation report and mutation evidence.
-- `/home/node/.hermes/cache/delegation/subagent-summary-0-20260814_222904_325426.txt` — specification rejection that found delayed-close identity race.
-- `/home/node/.hermes/cache/delegation/live/deleg_8471fd20/task-0.log` — subsequent targeted specification approval.
-- `/home/node/.hermes/cache/delegation/live/deleg_30c14fc2/task-0.log` — code-quality rejection finding runtime-writable operation identity.
-- `/home/node/.hermes/cache/delegation/live/deleg_6915a23a/task-0.log` — final targeted specification approval.
-- `/home/node/.hermes/cache/delegation/live/deleg_471ac6f4/task-0.log` — final code-quality pass.
-- `/home/node/.hermes/cache/delegation/live/deleg_a87c28c2/task-0.log` — final adversarial-security approval.
-- `browse-gateway:eid-artifact-final7` — latest fully exercised local container image including hostile-input hardening.
+- `/tmp/task2-full-final.log` — final complete-suite output: 1,482 passed, 0 failed.
+- `/home/node/.claude/plans/final-independent-specification-security-magical-glacier.md` — final independent review and its single corrected finding.
+- `9217f8b96f0e2af0910581637f79a5477c63d805` — verified local checkpoint commit.
 
 ## Uncertainty and Freshness
-- Test counts, container evidence, and all three ordered reviews describe the current exact hostile-input-hardened tree.
-- This capsule describes the exact tree authorized for commit and push on `atlas/eid-pdf-artifact-task1`; verify the remote branch tip and clean status before starting the next slice.
-- No live EID account, private credentials, MCP retrieval, HTTP response tracking, auth changes, deployment, or production injection were used.
+- Verification applies to exact implementation checkpoint `9217f8b`; this handoff/project-charter update is documentation-only and should remain a separate local commit.
+- The acceptance test uses a real temporary artifact runtime and real loopback MCP HTTP transport, but no live portal, credentials, production deployment, or live EID access.
 
 ## Exact Next Action
-Verify the pushed branch and clean working tree, then begin a new bounded slice for authenticated `browser_get_artifact` retrieval over Streamable HTTP. Do not add stdio artifact delivery, deployment, or live EID access without separate authorization.
+Commit this handoff/project-charter update separately, then prepare the reviewed branch and PR as the next pre-production step. Do not release, deploy, enable production configuration, or use live credentials without the production approval gate.
