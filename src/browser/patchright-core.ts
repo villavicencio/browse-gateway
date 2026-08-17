@@ -32,8 +32,10 @@ import {
 } from "./launch-options.js";
 import type { ChildProcess } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
+import type { ArtifactCaptureOperation, ArtifactOutcome, DownloadLike } from "../artifacts/types.js";
 import type {
   BrowserCore,
+  CaptureContext,
   BrowserCoreOptions,
   DriveTarget,
   FieldState,
@@ -518,6 +520,81 @@ export function deadlineBoundedTimeout(rawTimeoutMs: number, deadlineMs: number 
   return Math.max(floorMs, Math.min(rawTimeoutMs, deadlineMs - now));
 }
 
+/**
+ * Invoke ONE closed driver disposal operation and report whether it CONFIRMED.
+ *
+ * The mirror of the artifact layer's own disposal helper, kept local so the browser core does not
+ * pull the artifact runtime into its module graph. Everything about the value is untrusted: the call
+ * can throw synchronously (a throw while evaluating `fn()` happens before any promise wrapping could
+ * catch it), and CLASSIFYING the return value reads `then`, which can itself be a getter that throws
+ * — so the probe lives inside the same try. A value whose `then` is not callable is not a thenable:
+ * that is a completed call, like any `void` return.
+ */
+function invokeDriverDisposal(run: () => Promise<void> | void): Promise<boolean> {
+  let raw: Promise<void> | void;
+  let then: unknown;
+  try {
+    raw = run();
+    // ONE read, and the callable it produced is the one adopted below. `Promise.resolve(raw)` read
+    // `then` a SECOND time, so a value answering callable-first and non-callable-second was
+    // classified as a promise and then adopted as a plain value — fulfilling with the object itself
+    // and confirming a disposal nobody ever performed.
+    then = raw !== null && (typeof raw === "object" || typeof raw === "function") ? (raw as { then?: unknown }).then : undefined;
+  } catch {
+    return Promise.resolve(false);
+  }
+  if (typeof then !== "function") return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    // The adoption is OURS: one settlement wins, a `then` that throws after settling cannot rewrite
+    // its own answer, and a `then` that settles nothing stays pending for the core's claim-anchored
+    // bound to decide.
+    let settled = false;
+    const settleOnce = (confirmed: boolean): void => { if (!settled) { settled = true; resolve(confirmed); } };
+    try {
+      Reflect.apply(then as (...args: unknown[]) => unknown, raw as object, [() => settleOnce(true), () => settleOnce(false)]);
+    } catch {
+      settleOnce(false);
+    }
+  });
+}
+
+/**
+ * One capture generation, and the HANDLE its opening verb holds.
+ *
+ * Ownership is explicit and identity-based: a verb settles or invalidates only the exact object
+ * {@link PatchrightBrowserCore.#beginGeneration} handed it. A verb whose begin was REFUSED holds no
+ * handle and therefore cannot close out an operation belonging to someone else — the cross-operation
+ * bug that a shared "current generation" slot invites, where a rejected overlapping render settled
+ * (and timed out) the generation the first render was still using.
+ *
+ * `owner` is the page the generation was opened for. Routing still consults the single core-wide
+ * current generation, but page-scoped teardown (`closeActivePage`) compares it, so destroying the
+ * drive page cannot invalidate a transient render's generation. Core close/kill remain global.
+ */
+interface CaptureGeneration {
+  readonly operation: ArtifactCaptureOperation;
+  readonly owner?: PatchrightPage;
+  state: "open" | "sealing";
+  /**
+   * Where this generation's ONE event stands (Amendment 7 §8.2).
+   *
+   * `claiming` is the window the boolean receipt made observable: the core has handed the event to
+   * the operation and does not yet know whether the operation took it. A re-entrant event arriving
+   * inside that window is a SECOND event — it can never be handed to an operation whose first
+   * receipt is still outstanding, and it must not be dropped either.
+   */
+  claim: "unclaimed" | "claiming" | "claimed";
+  /** Set once this handle's OWNER has closed it out, with the outcome it obtained. A verb's `finally`
+   *  runs after its own cutoff, and must return that same outcome rather than seal a second time. */
+  settled?: boolean;
+  outcome?: ArtifactOutcome;
+}
+
+interface UnattributedDisposal {
+  readonly owner: PatchrightPage;
+  readonly pending: Promise<unknown>;
+}
+
 export class PatchrightBrowserCore implements BrowserCore {
   readonly kind = "patchright";
   readonly #context: PatchrightContext;
@@ -537,6 +614,37 @@ export class PatchrightBrowserCore implements BrowserCore {
    * before it is written. Absent (tests / smoke) = URL-strip only, the prior behavior.
    */
   readonly #redact?: (s: string) => string;
+  /**
+   * Whether this session may capture at all. Set by the owning caller at construction, because the
+   * download listener has to exist before the first navigation — earlier than any per-operation
+   * context arrives. False = no listener anywhere, and behaviour is exactly what it was before
+   * artifacts existed.
+   */
+  readonly #captureEnabled: boolean = false;
+  /** Unattributed-disposal work in flight, and its count. A successor generation may not start while
+   *  any disposal is still pending: until it resolves we cannot say the driver's bytes are gone. */
+  readonly #disposals = new Set<UnattributedDisposal>();
+  #disposalsPending = 0;
+  readonly #capturePages = new WeakSet<PatchrightPage>();
+  /**
+   * The ONE capture generation this core may have open at a time (Amendment 2 §4). Core-scoped, not
+   * page-scoped: a popup has no operation of its own, and every page/frame/popup download in this core
+   * belongs to whichever generation is currently open. Two live generations in one core is an
+   * invariant failure, not a supported shape.
+   */
+  #generation?: CaptureGeneration;
+  /**
+   * Set when a download arrived that belonged to no generation (Amendment 2 §4 `orphan-download`). The
+   * core's routing can no longer be trusted to attribute events correctly, so the next verb fails
+   * closed and the session is replaced rather than silently continuing.
+   */
+  #captureDirty = false;
+  /**
+   * The one deterministic event-loop turn the cutoff drains before snapshotting registered jobs
+   * (Amendment 2 §4 step 5). Production gets a single `setImmediate`; a test injects its own so it can
+   * act exactly at that boundary. The seam passes no data in either direction.
+   */
+  readonly #captureDrainTurn: () => Promise<void>;
   /**
    * The drive active page's current OS-presentation mode. Tracked so a REUSED active page actively
    * RESTORES the native identity when it navigates from a listed host to a non-listed one — the
@@ -591,6 +699,10 @@ export class PatchrightBrowserCore implements BrowserCore {
   readonly #leaderStartTime?: string;
   /** The single persistent page the interactive `drive` verbs act on (absent until navigate()). */
   #activePage?: PatchrightPage;
+  /** Page-identity teardown fences. A count preserves the existing concurrent-close contract: two
+   *  closers may race the same old page, but neither can admit work onto it, and a replacement page is
+   *  independent while the slower old-page closer drains. */
+  readonly #closingActivePages = new Map<PatchrightPage, number>();
   /**
    * HTTP status of the active page's last main-frame navigation, kept current by a response listener
    * so it reflects click/submit-triggered navigations too — not just navigate(). Lets a post-action
@@ -649,6 +761,14 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   #pendingActionTiming?: { clearancePollMs: number; captchaSolveMs?: number; domContentLoadedMs?: number };
   /**
+   * The sealed capture outcome of the last drive ACTION, stashed for the next {@link snapshot} — the
+   * same cross-call bridge as {@link #pendingActionTiming}, and for the same reason: an action verb
+   * returns void while its snapshot is a separate core call. Consumed once, so a later bare snapshot()
+   * can never re-report a previous action's artifact, and cleared by {@link navigate} so an action whose
+   * snapshot was never taken cannot leak its outcome into an unrelated navigation.
+   */
+  #pendingArtifactOutcome?: ArtifactOutcome;
+  /**
    * #44: the typed error code from the last ATTEMPTED captcha solve that FAILED (vendor-error / timeout /
    * budget-exhausted / missing-sitekey), stashed by {@link #trySolveCaptcha} and consumed ONCE by the next
    * {@link #snapshotOf} — the same cross-call bridge as {@link #pendingActionTiming} (the solve runs inside
@@ -678,12 +798,17 @@ export class PatchrightBrowserCore implements BrowserCore {
     solver?: CaptchaSolver,
     windowsUaHosts: readonly string[] = [],
     redact?: (s: string) => string,
+    captureEnabled?: boolean,
+    captureDrainTurn?: () => Promise<void>,
   ) {
     this.#context = context;
     this.#resolved = resolved;
     this.#solver = solver;
     this.#windowsUaHosts = windowsUaHosts;
     this.#redact = redact;
+    this.#captureEnabled = captureEnabled === true;
+    this.#captureDrainTurn = captureDrainTurn ?? (() => new Promise<void>((resolve) => setImmediate(resolve)));
+    this.#installPopupCapture();
     const captured = captureBrowserProcess(context);
     this.#pid = captured?.pid;
     this.#child = captured?.child;
@@ -732,10 +857,11 @@ export class PatchrightBrowserCore implements BrowserCore {
     // force-kill-CONFIRM the just-launched browser rather than best-effort-closing it (which could orphan a
     // live browser on a wedged close — codex #50 r4). The solver + windowsUaHosts + redactor are runtime
     // dependencies (not launch args) — pass through.
-    const core = new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? [], redact);
+    const core = new PatchrightBrowserCore(context, resolved, opts.solver, opts.windowsUaHosts ?? [], redact, opts.captureEnabled, opts.captureDrainTurn);
     await restoreOrClose(context, opts.restoreState, () => core.#teardownDiscarded(redact));
     return core;
   }
+
 
   /**
    * BOUNDED confirmable teardown of a just-launched-then-DISCARDED browser (issue #50 r5) — used when a
@@ -836,6 +962,7 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   async render(url: string, opts: RenderOptions = {}): Promise<RenderResult> {
+    this.#requireCaptureReady(opts.artifactOperation);
     const clearanceTimeoutMs =
       opts.clearanceTimeoutMs ?? DEFAULT_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -847,8 +974,19 @@ export class PatchrightBrowserCore implements BrowserCore {
     // pageerror / requestfailed collectors so this render's failure envelope reflects only this page.
     this.#resetEvidence();
     const page = await this.#context.newPage();
+    // Contract §5: the download listener is installed the INSTANT the page exists — before the OS
+    // override, before goto, before anything that can start a navigation. An attachment can be emitted
+    // by the very first navigation, and the driver delivers `download` only to listeners registered at
+    // emit time, so a registration made after the goto silently loses the artifact with no error.
+    this.#installDownloadCapture(page);
     this.#attachEvidenceListeners(page);
+    // Declared out here so the finally can see it: begin runs INSIDE the try (so a refusal still
+    // closes the page), and a refused begin must leave this undefined so the finally settles NOTHING.
+    let generation: CaptureGeneration | undefined;
     try {
+      // Open this navigation's generation before the goto: an attachment can be emitted by the
+      // navigation itself.
+      generation = this.#beginGeneration(opts.artifactOperation, page);
       // Present as Windows for opt-in hosts BEFORE the first navigation (fresh per-call page). Inside the
       // try so the finally still closes the page if it throws; fail-closed — a listed host that can't get
       // the Windows identity errors out rather than rendering as Linux. Non-listed host = no-op (native).
@@ -864,6 +1002,7 @@ export class PatchrightBrowserCore implements BrowserCore {
         try {
           if (resp.request().isNavigationRequest() && resp.frame() === page.mainFrame()) {
             responseReceived = true;
+            this.#noteMainResponse(resp);
           }
         } catch {
           // a superseded/aborted response can throw on access — ignore; a real main-frame receipt still flips it
@@ -951,8 +1090,13 @@ export class PatchrightBrowserCore implements BrowserCore {
         clearancePollMs,
         snapshotMs,
       });
+      // §5.1 ordering: settle the capture ledger and COMMIT before building the result, so the verdict
+      // this render reports is the operation's final one — not a guess taken while staging was still
+      // running. The finally below repeats this only for the paths that threw before reaching here.
+      const artifactOutcome = await this.#settleGeneration(generation);
       return {
         url,
+        ...(artifactOutcome !== undefined ? { artifactOutcome } : {}),
         status,
         responseReceived,
         ...final,
@@ -962,7 +1106,22 @@ export class PatchrightBrowserCore implements BrowserCore {
         ...(this.#policyBlockedNav ? { policyBlocked: this.#policyBlockedNav } : {}), // #80
       };
     } finally {
-      await page.close().catch(() => {});
+      // §5.1 barrier on the FAILURE path: an aborted navigation can still have produced an attachment,
+      // so staging must finish and the operation must be committed before this page is destroyed.
+      // Settles ONLY this render's own handle: a render whose begin was refused holds none, so it
+      // cannot close out — or time out — a generation another operation is still using.
+      await this.#settleGeneration(generation);
+      await this.#drainUnattributedDisposals(page);
+      try {
+        await page.close();
+      } catch {
+        // A rejected close is not proof that this listener-bearing page died. Admitting another
+        // generation would let a delayed event from the old page attach to the successor operation.
+        // Poison globally and surface only a closed error; full core teardown may still retire the
+        // context, but ordinary work must never continue from this ambiguous lifetime.
+        this.#captureDirty = true;
+        throw new Error("artifact capture: page close failed; session must be replaced");
+      }
     }
   }
 
@@ -1097,6 +1256,7 @@ export class PatchrightBrowserCore implements BrowserCore {
   // the guard. Element targeting uses snapshot refs (aria-ref=) per `targetToSelector`.
 
   async navigate(url: string, opts: RenderOptions = {}): Promise<PageSnapshot> {
+    this.#requireCaptureReady(opts.artifactOperation);
     const clearanceTimeoutMs = opts.clearanceTimeoutMs ?? DEFAULT_DRIVE_CLEARANCE_TIMEOUT_MS;
     const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     // #42 per-stage timing: t0 bounds this core navigate() (goto + settle + snapshot). The drive
@@ -1121,6 +1281,15 @@ export class PatchrightBrowserCore implements BrowserCore {
       page = await this.#ensureActivePage(); // fresh page ⇒ native identity, #osMode reset
       if (wantWindows) await this.#applyOsMode(page, "windows"); // a non-listed host is already correct (native)
     }
+    // Bind THIS navigation's capture operation, after any fail-closed page replacement above (so it
+    // binds to the page that will actually navigate) and before the goto (so an attachment emitted by
+    // the navigation has an operation to attach to). The drive page is reused across navigations, so
+    // this is also the point where the previous navigation's operation is atomically retired.
+    const generation = this.#beginGeneration(opts.artifactOperation, page);
+    try {
+    // A navigation supersedes any action whose snapshot was never taken: its sealed outcome must not
+    // resurface on a later snapshot of a different page state.
+    this.#pendingArtifactOutcome = undefined;
     // Reset the tracked status; the active-page response listener (#ensureActivePage) repopulates it
     // from THIS nav's main-frame responses — INCLUDING a post-clearance reload. We deliberately do
     // NOT freeze status at the goto's first response: a CF interstitial answers 403 then reloads to
@@ -1195,16 +1364,35 @@ export class PatchrightBrowserCore implements BrowserCore {
     //    critical; the naive "goto threw ⇒ failed" precisely breaks that clearance path), and
     //  - not visibly blocked: a still-showing interstitial is already navFailed with a RICHER class
     //    (anti-bot + vendor) — the truncation flag must not override that story with a bare `timeout`.
+    // §5.1 ordering on the drive path: settle this navigation's capture ledger and COMMIT before the
+    // snapshot is returned, so the verdict the consumer sees is final. The page is NOT destroyed here —
+    // the drive page is reused — so this is the barrier without a teardown.
+    const artifactOutcome = await this.#settleGeneration(generation);
     const truncSig = { title: base.title, text: base.tree };
     const deadlineTruncated =
       (gotoTimedOut || settled.dclTimedOut || settled.deadlineCut) &&
       !isVisiblyBlocked(truncSig) &&
       truncSig.text.trim().length < MIN_CONTENT_LENGTH;
-    return { ...base, ...(deadlineTruncated ? { deadlineTruncated: true } : {}), timing };
+    return {
+      ...base,
+      ...(artifactOutcome !== undefined ? { artifactOutcome } : {}),
+      ...(deadlineTruncated ? { deadlineTruncated: true } : {}),
+      timing,
+    };
+    } finally {
+      // Idempotent by identity: a navigation that reached its own cutoff above finds its handle no
+      // longer current. A navigation that DIED before it must still close ITS OWN generation out, or
+      // the one-generation invariant would fail the next verb for a slot this one abandoned.
+      await this.#settleGeneration(generation);
+    }
   }
 
   async snapshot(): Promise<PageSnapshot> {
-    return this.#snapshotOf(this.#requireActivePage());
+    const base = await this.#snapshotOf(this.#requireActivePage());
+    // Consume-once: the last action's sealed outcome belongs to THIS snapshot and to no later one.
+    const artifactOutcome = this.#pendingArtifactOutcome;
+    this.#pendingArtifactOutcome = undefined;
+    return { ...base, ...(artifactOutcome !== undefined ? { artifactOutcome } : {}) };
   }
 
   async readField(target: DriveTarget): Promise<FieldState> {
@@ -1223,31 +1411,48 @@ export class PatchrightBrowserCore implements BrowserCore {
     return { present: true, value };
   }
 
-  async click(target: DriveTarget): Promise<void> {
+  async click(target: DriveTarget, capture?: CaptureContext): Promise<void> {
     await this.#act("click", target, (loc) =>
       loc.click({ timeout: DEFAULT_ACTION_TIMEOUT_MS }),
-    );
+    capture);
   }
 
   async type(
     target: DriveTarget,
     text: string,
     opts: { submit?: boolean } = {},
+    capture?: CaptureContext,
   ): Promise<void> {
+    // A typed submit is as capable of triggering an attachment as a click: it gets its own generation,
+    // opened before the action and settled in #act's finally like every other action verb.
     await this.#act("type", target, async (loc) => {
       await loc.fill(text, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
       if (opts.submit) await loc.press("Enter");
-    });
+    }, capture);
   }
 
-  async selectOption(target: DriveTarget, values: string[]): Promise<void> {
+  async selectOption(target: DriveTarget, values: string[], capture?: CaptureContext): Promise<void> {
+    // A select with an onchange handler can start a download without any navigation.
     await this.#act("selectOption", target, (loc) =>
       loc.selectOption(values, { timeout: DEFAULT_ACTION_TIMEOUT_MS }),
-    );
+    capture);
   }
 
-  async pressKey(key: string): Promise<void> {
+  async pressKey(key: string, capture?: CaptureContext): Promise<void> {
+    this.#requireCaptureReady(capture?.artifactOperation);
     const page = this.#requireActivePage();
+    // Same generation rule as #act: a key press (Enter on a form) can trigger an attachment with no
+    // navigation, so it is its own capture operation, bound before the press. The replay below re-sends
+    // the SAME key, so it stays inside this generation.
+    const generation = this.#beginGeneration(capture?.artifactOperation, page);
+    try {
+      await this.#pressKeyBody(page, key);
+    } finally {
+      this.#pendingArtifactOutcome = await this.#settleGeneration(generation);
+    }
+  }
+
+  async #pressKeyBody(page: PatchrightPage, key: string): Promise<void> {
     await page.keyboard.press(key);
     // A key press (Enter) can submit a form / trigger navigation — wait out any challenge it lands on.
     // If a submit-gated CAPTCHA was solved, replay the key once so the submit completes with the token.
@@ -1270,8 +1475,21 @@ export class PatchrightBrowserCore implements BrowserCore {
     };
   }
 
-  async waitFor(condition: WaitCondition): Promise<void> {
+  async waitFor(condition: WaitCondition, capture?: CaptureContext): Promise<void> {
+    this.#requireCaptureReady(capture?.artifactOperation);
     const page = this.#requireActivePage();
+    // Amendment 2 §4 lists waitFor among the generation-opening verbs: a wait can outlast the action
+    // that triggered a download, so an event arriving during it must have a generation to attach to
+    // rather than becoming an orphan that dirties the core.
+    const generation = this.#beginGeneration(capture?.artifactOperation, page);
+    try {
+      await this.#waitForCondition(page, condition);
+    } finally {
+      this.#pendingArtifactOutcome = await this.#settleGeneration(generation);
+    }
+  }
+
+  async #waitForCondition(page: PatchrightPage, condition: WaitCondition): Promise<void> {
     if (condition.text) {
       await page
         .getByText(condition.text)
@@ -1291,7 +1509,37 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   async closeActivePage(): Promise<void> {
-    await this.#activePage?.close().catch(() => {});
+    // Destroying the page ends the capture lifecycle running ON THIS PAGE — and only that one. A
+    // generation belonging to another page (a transient render's) is none of this call's business.
+    // Invalidate the active page's operation synchronously before the first await. Only
+    // unattributed-download disposal is core-owned and drained here; operation-internal staging is
+    // non-queued and cannot publish after invalidation.
+    const active = this.#activePage;
+    if (active) {
+      // Fence this exact page BEFORE invalidation: invalidation reaches operation-owned cleanup and
+      // hostile driver getters, either of which may synchronously re-enter a capture-capable verb.
+      this.#closingActivePages.set(active, (this.#closingActivePages.get(active) ?? 0) + 1);
+      try {
+        this.#invalidateGenerationSync(active);
+        await this.#drainUnattributedDisposals(active);
+        // Close the SAME identity whose generation and disposal set were captured above. Another
+        // close can retire it and admit a replacement while this call is parked in the injected turn;
+        // consulting `this.#activePage` here would then close that unrelated successor.
+        try {
+          await active.close();
+        } catch {
+          // Keep #activePage pointing at the unconfirmed page. Losing the handle and reopening would
+          // admit a replacement while this page's registered download listener may still be alive.
+          this.#captureDirty = true;
+          throw new Error("artifact capture: page close failed; session must be replaced");
+        }
+        if (this.#activePage !== active) return;
+      } finally {
+        const closers = this.#closingActivePages.get(active) ?? 1;
+        if (closers <= 1) this.#closingActivePages.delete(active);
+        else this.#closingActivePages.set(active, closers - 1);
+      }
+    }
     this.#activePage = undefined;
     this.#lastDocStatus = undefined;
     this.#lastMainFrameResponseReceived = false; // #66: receipt resets with status
@@ -1326,11 +1574,465 @@ export class PatchrightBrowserCore implements BrowserCore {
   }
 
   /**
-   * Install console / pageerror / requestfailed collectors on `page`, feeding the bounded evidence
-   * buffers (issue #39). Best-effort per event — a detached/racing message can throw on access, so each
-   * handler is wrapped. Only error/warning console messages are kept (info/log/debug are noise). Used on
-   * BOTH render()'s per-call page and the drive active page, so the two paths capture the same evidence.
+   * Install the PERSISTENT download listener on a page (contract §5, Amendment 2 §4). Idempotent per
+   * page: the context-level popup hook and the explicit per-page calls can both reach the same page,
+   * and a second listener would deliver one driver event twice — which the operation would then read
+   * as `multiple-artifacts` on a session that only ever downloaded once.
+   *
+   * A no-op when capture is disabled for this session, so nothing is installed at all.
    */
+  #installDownloadCapture(page: PatchrightPage): void {
+    if (!this.#captureEnabled || this.#capturePages.has(page)) return;
+    this.#capturePages.add(page);
+    page.on("download", (download) => this.#routeDownload(download, page));
+  }
+
+  /**
+   * Install the context-level popup hook once, so every page the driver opens — popups included — has
+   * its listener attached the instant it is observed, not when someone remembers to navigate it.
+   */
+  #installPopupCapture(): void {
+    if (!this.#captureEnabled) return;
+    this.#context.on("page", (page: PatchrightPage) => {
+      try {
+        this.#installDownloadCapture(page);
+      } catch {
+        // a page that died between announcement and listener attach is not worth failing a session over
+      }
+    });
+  }
+
+  /**
+   * Route one driver download event. Three outcomes, none of them silent:
+   *
+   *  - a generation is `open`  -> hand the event to the operation, which owns the staging;
+   *  - a generation is `sealing` -> LATE event: discarded, and it terminalizes that generation as
+   *    `download-lifecycle-race`. It is never added to the ledger, so it cannot extend the barrier it
+   *    arrived behind, and it can never decide the operation's result;
+   *  - no generation at all -> ORPHAN: discarded, and the core is marked dirty.
+   */
+  #routeDownload(download: DownloadLike, emittingPage: PatchrightPage): void {
+    const generation = this.#generation;
+    if (!generation) {
+      this.#captureDirty = true;
+      this.#discardUnattributed(download, emittingPage);
+      return;
+    }
+    if (generation.state !== "open") {
+      this.#discardUnattributed(download, generation?.owner ?? emittingPage);
+      try {
+        generation.operation.invalidate("download-lifecycle-race");
+      } catch {
+        // the operation owns its own terminal accounting
+      }
+      return;
+    }
+    if (generation.claim !== "unclaimed") {
+      // A SECOND event. `claimed` is the ordinary duplicate; `claiming` is a synchronous RE-ENTRANT
+      // event, arriving while the first event's receipt is still outstanding — and it is a second
+      // event just the same. Neither may be handed to the operation: it is already spoken for, and
+      // the core would be left unable to say who owns this driver copy. Enter sealing synchronously
+      // so a third event in the same tick takes the late path, terminalize the operation (which
+      // disposes of the download IT owns), and dispose of this one here.
+      generation.state = "sealing";
+      try {
+        generation.operation.invalidate("multiple-artifacts");
+      } catch {
+        // the operation owns its own terminal accounting
+      }
+      this.#discardUnattributed(download, generation.owner ?? emittingPage);
+      return;
+    }
+    // `claiming` is installed BEFORE the call, so an event re-entering from inside `registerDownload`
+    // takes the second-event path above instead of finding an unclaimed generation to claim again.
+    generation.claim = "claiming";
+    let receipt: unknown;
+    try {
+      // Staging stays internal to the operation; the ONLY thing that comes back is the ownership
+      // receipt (Amendment 7 §8.1), and nothing else here is retained or awaited.
+      receipt = generation.operation.registerDownload(download);
+    } catch {
+      // Never rethrow: this runs inside the driver's event emitter, where a throw would surface as
+      // an unrelated page error carrying the raw text.
+      this.#refuseClaim(generation, download, emittingPage, "violation");
+      return;
+    }
+    if (receipt === true) {
+      // Ownership transferred. Synchronous re-entry may already have moved this generation to
+      // `sealing`; that does not revoke the transfer, and the state it set stands.
+      generation.claim = "claimed";
+      return;
+    }
+    // EXACT `false` is a legitimate refusal — the operation is already spoken for or already
+    // terminal. Anything else (a non-boolean, however truthy) is a broken ownership contract: it
+    // cannot be read as "owned" without leaving the driver's copy behind, which is the whole defect.
+    this.#refuseClaim(generation, download, emittingPage, receipt === false ? "refusal" : "violation");
+  }
+
+  /**
+   * The operation did not take an attachment that really happened. Seal the generation synchronously
+   * so a second event in the same tick cannot be handed to an operation that has just refused one,
+   * terminalize (first-reason-wins, so an operation that already has a reason keeps it), and take
+   * core ownership of the driver copy nobody else will.
+   *
+   * A REFUSAL is a legitimate answer, so a confirmed disposal leaves the session usable. A VIOLATION —
+   * a throw, or any non-boolean receipt — means the operation broke the ownership contract, so the
+   * core can no longer trust its own attribution and the session must be replaced.
+   */
+  #refuseClaim(generation: CaptureGeneration, download: DownloadLike, emittingPage: PatchrightPage, kind: "refusal" | "violation"): void {
+    generation.state = "sealing";
+    if (kind === "violation") this.#captureDirty = true;
+    try {
+      // This is the FIRST event and the operation refused it. That is a capture failure, not a
+      // duplicate. If the operation already has a terminal reason, first-reason-wins keeps it.
+      // Genuine second/re-entrant events take the separate multiple-artifacts path above.
+      generation.operation.invalidate("download-capture-failed");
+    } catch {
+      // An operation that cannot even be invalidated leaves the core dirty, which a violation already
+      // is; the verb's settlement-refusal path owns turning that into a sanitized action failure.
+      this.#captureDirty = true;
+    }
+    this.#discardUnattributed(download, generation.owner ?? emittingPage);
+  }
+
+  /**
+   * Dispose of a download that belongs to no operation — an orphan between generations, a late event
+   * after a cutoff, or one an operation refused. Site-neutral: only the closed driver operations are
+   * used, the path is never read, and the core reads nothing back.
+   */
+  #discardUnattributed(download: DownloadLike, owner: PatchrightPage): void {
+    // ACCOUNTING FIRST — synchronously, before a single untrusted property is read or method called.
+    // A hostile getter or method body can re-enter a capture-capable verb, and during that re-entry
+    // the core must already look busy: `#disposalsPending` and the tracked promise are installed here,
+    // ahead of every driver touch, so a re-entrant verb observes the pending state and fails closed
+    // instead of finding a clean core and opening a successor generation.
+    let settle!: (confirmed: boolean) => void;
+    const pending = new Promise<boolean>((resolve) => { settle = resolve; }).then((confirmed) => {
+      this.#disposalsPending -= 1;
+      // Undisposed driver bytes mean this session's download state is no longer accounted for.
+      if (!confirmed) this.#captureDirty = true;
+    });
+    this.#disposalsPending += 1;
+    const record: UnattributedDisposal = { owner, pending };
+    this.#disposals.add(record);
+    void pending.then(() => this.#disposals.delete(record));
+    // THE BOUND OPENS HERE TOO, at the claim, for the same reason the accounting does. Reading a
+    // driver-supplied property IS a driver call: a getter can consume the whole budget before it
+    // returns the callable, and a method can do it again. A bound armed only after that work was
+    // never armed for the window it exists to survive, and then expired one full budget past an
+    // instant already gone. One-shot: whichever lands first — expiry, or both confirmations —
+    // decides, and the other is inert.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let done = false;
+    const finish = (confirmed: boolean): void => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      settle(confirmed);
+    };
+    timer = setTimeout(() => finish(false), this.#resolved.captureSettleTimeoutMs);
+    // A disposal bound must never hold the process open on its own.
+    timer.unref?.();
+    // Only now, under accounting AND a bound that are already installed, may the driver be touched.
+    this.#disposeDriverCopy(download, finish);
+  }
+
+  /**
+   * Read and invoke the closed disposal operations on a download the core owns, then confirm them
+   * under ONE bound. Structurally the sibling of `ArtifactOperation`'s attributed cleanup, and
+   * deliberately the same shape — the two halves of the disposal contract must not drift:
+   *
+   *  - each property is read ONCE, inside its own try. A getter is as untrusted as the call: it can
+   *    throw, and re-reading it hands it a second re-entry and lets it return a different function
+   *    from the one that was validated;
+   *  - `cancel()` then `delete()` are both INVOKED before either is awaited, so a hung, throwing or
+   *    rejecting cancel cannot prevent the delete attempt — which is exactly the case where the
+   *    driver's copy would otherwise be left on disk;
+   *  - BOTH are mandatory here, unlike the operation's cleanup: a source offering either one alone
+   *    cannot prove its bytes are gone, and the core has no other relationship to these bytes;
+   *  - the combined confirmation is bounded by the claim-anchored `finish` its caller already armed,
+   *    so an unanswerable driver call turns the session dirty and is DETACHED rather than retained
+   *    forever — and the bound covers these reads and calls, not just what follows them.
+   */
+  #disposeDriverCopy(download: DownloadLike, finish: (confirmed: boolean) => void): void {
+    const attempts: Array<Promise<boolean>> = [];
+    let offered = 0;
+    for (const method of ["cancel", "delete"] as const) {
+      let fn: unknown;
+      try {
+        fn = download[method];
+      } catch {
+        // Unreadable is not "not offered": the operation exists and could not even be reached.
+        offered += 1;
+        attempts.push(Promise.resolve(false));
+        continue;
+      }
+      if (typeof fn !== "function") continue;
+      offered += 1;
+      // `Reflect.apply` reads NO property of the callable — `call` is as driver-controlled as any
+      // other property of a driver-supplied function — while still passing the download as the
+      // receiver the driver's own method expects.
+      attempts.push(invokeDriverDisposal(() => Reflect.apply(fn as () => Promise<void> | void, download, [])));
+    }
+    if (offered < 2) { finish(false); return; }
+    void Promise.all(attempts).then((results) => finish(results.every(Boolean)), () => finish(false));
+  }
+
+  /**
+   * Open this operation's generation (Amendment 2 §4 step 1). Every verb that can cause a download
+   * calls it before doing anything that could emit one.
+   *
+   * THROWS when the core is dirty: an earlier download could not be attributed, so routing is no
+   * longer trustworthy and the session must be replaced rather than quietly continue.
+   *
+   * The caller already bound owner and source host to the operation it created; this method derives
+   * neither and never sees them.
+   */
+  /**
+   * Refuse a dual-configuration mismatch BEFORE any browser work: an operation handed to a session
+   * that cannot capture. Running the navigation anyway and reporting a bland "none" would be
+   * indistinguishable, to the caller, from a page that simply produced no download — so the operation
+   * it created is invalidated with a closed reason and the verb fails closed with a sanitized message.
+   */
+  #requireCaptureReady(operation?: ArtifactCaptureOperation): void {
+    if (operation && !this.#captureEnabled) {
+      try {
+        operation.invalidate("artifact-config-invalid");
+      } catch {
+        // the operation owns its own terminal accounting
+      }
+      throw new Error("artifact capture: an operation was supplied to a session with capture disabled");
+    }
+    // Then the state of the session itself, WITH OR WITHOUT an operation. A verb invoked without one
+    // is not a licence to keep driving a session whose attribution is already untrustworthy: the very
+    // next download would be routed by the same broken ledger. Only a capture-DISABLED session (no
+    // listeners, no generations, nothing to attribute) is an unconditional no-op.
+    this.#assertCaptureUsable();
+  }
+
+  /**
+   * The two unusable capture states, in the contract's deterministic policy: REJECT and require
+   * session replacement — never wait. Called from every capture-capable verb before any driver call,
+   * and again inside {@link #beginGeneration} ahead of its no-operation return, so neither seam can
+   * be the one that lets an untrustworthy session continue.
+   *
+   * The messages are fixed, sanitized text: no driver object, operation, path or download identity.
+   */
+  #assertCaptureUsable(): void {
+    if (!this.#captureEnabled) return;
+    // close() raises this synchronously before invalidating the current generation and before its
+    // cutoff-turn await. That flag is an admission fence, not only a network-interception policy:
+    // no successor generation may enter the browser context teardown is already destroying.
+    if (this.#closing) {
+      throw new Error("artifact capture: core is closing; session must be replaced");
+    }
+    if (this.#captureDirty) {
+      throw new Error("artifact capture: core is dirty; session must be replaced");
+    }
+    if (this.#disposalsPending > 0) {
+      // Until an unattributed disposal resolves we cannot say whether the driver's bytes are gone,
+      // and continuing anyway would run on a session whose download state is unaccounted for.
+      throw new Error("artifact capture: unattributed download disposal pending; session must be replaced");
+    }
+  }
+
+  #beginGeneration(operation: ArtifactCaptureOperation | undefined, owner?: PatchrightPage): CaptureGeneration | undefined {
+    // BEFORE the no-operation return: dirty/pending state disqualifies the session, not just this
+    // generation. Returning early on `!operation` first is exactly the ordering defect this closes.
+    this.#assertCaptureUsable();
+    if (owner !== undefined) this.#assertPageCaptureUsable(owner);
+    if (!operation) return undefined; // no capture for this operation
+    if (this.#generation) {
+      // INVARIANT (Amendment 2 §4): one generation per core. Replacing the slot would let two
+      // overlapping operations each believe the open generation is theirs.
+      this.#captureDirty = true;
+      throw new Error("artifact capture: a capture generation is already open; session must be replaced");
+    }
+    const generation: CaptureGeneration = {
+      operation,
+      ...(owner !== undefined ? { owner } : {}),
+      state: "open",
+      claim: "unclaimed",
+    };
+    this.#generation = generation;
+    return generation;
+  }
+
+  /**
+   * The Amendment 2 §4 cutoff, in exactly its normative order:
+   *
+   *  4. enter `sealing` and detach routing — no later event can attach to this or any generation;
+   *  5. drain ONE deterministic event-loop turn, then snapshot the registered jobs;
+   *  6. await THAT FIXED SNAPSHOT under the single settle bound;
+   *  7. produce the outcome — `seal()` when the snapshot settled, `download-settle-timeout` when it
+   *     did not;
+   *  8. enter sealed and return.
+   *
+   * The snapshot is fixed deliberately. Re-reading the ledger after each wait — the shape this
+   * replaced — let an event that arrived after the cutoff extend the barrier and decide the result,
+   * which is precisely what `download-lifecycle-race` exists to reject.
+   *
+   * Idempotent: the generation is cleared before the outcome is produced, so a second call (the
+   * `finally` path of a verb that already cut off) finds nothing and returns undefined.
+   */
+  async #settleGeneration(handle: CaptureGeneration | undefined): Promise<ArtifactOutcome | undefined> {
+    if (!handle) return undefined; // this verb never opened a generation
+    // Already closed out by this same owner (the verb's own `finally` after its cutoff): report the
+    // outcome it obtained. Sealing again would re-run the budget race and double-commit.
+    if (handle.settled) return handle.outcome;
+    if (this.#generation !== handle) {
+      // Teardown cleared or replaced the slot while this verb was still running. Identity stops it
+      // from closing out somebody else's generation — but the OWNER is still entitled to its own
+      // operation's result, so it seals its own handle and projects capture-failed rather than
+      // reporting undefined and losing the outcome entirely.
+      return this.#recordOutcome(handle, await this.#sealWithinBudget(handle));
+    }
+    const generation = handle;
+    // Enter sealing and detach routing: from here every event is late.
+    generation.state = "sealing";
+    await this.#captureDrainTurn();
+    const outcome = await this.#sealWithinBudget(generation);
+    // Compare identity before clearing: teardown may have replaced the slot while we waited.
+    if (this.#generation === generation) this.#generation = undefined;
+    return this.#recordOutcome(generation, outcome);
+  }
+
+  /** Remember what this handle settled to, so its owner's `finally` reports it instead of re-sealing. */
+  #recordOutcome(handle: CaptureGeneration, outcome: ArtifactOutcome | undefined): ArtifactOutcome | undefined {
+    handle.settled = true;
+    handle.outcome = outcome;
+    return outcome;
+  }
+
+  /**
+   * Commit a generation under the single settle bound. `seal()` awaits the operation's own internal
+   * staging, so this is where the 5-second ceiling applies. On expiry the operation is terminalized
+   * with the EXACT closed reason and then asked for its result — the core never fabricates an outcome,
+   * it reports what the operation decided once told why.
+   */
+  async #sealWithinBudget(generation: CaptureGeneration): Promise<ArtifactOutcome | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expiry = new Promise<"timed-out">((resolve) => {
+      timer = setTimeout(() => resolve("timed-out"), this.#resolved.captureSettleTimeoutMs);
+      // A settle deadline must never hold the process open on its own: it exists to bound a wait, not
+      // to keep the runtime alive waiting for a capture nobody is left to receive.
+      timer.unref?.();
+    });
+    try {
+      let outcome: ArtifactOutcome | "timed-out";
+      try {
+        outcome = await Promise.race([generation.operation.seal(), expiry]);
+      } catch {
+        // The operation itself failed to settle. Returning undefined here would be indistinguishable
+        // from "capture was never configured" — a silent loss of an operation the caller asked for.
+        // Terminalize with a closed capture code and take the operation's own result instead.
+        return this.#failedSettlement(generation, "download-capture-failed");
+      }
+      if (outcome !== "timed-out") return outcome;
+      generation.operation.invalidate("download-settle-timeout");
+      // An already-terminal operation seals immediately, so this can never queue behind the hung copy.
+      try {
+        return await generation.operation.seal();
+      } catch {
+        return this.#failedSettlement(generation, "download-settle-timeout");
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The operation refused to settle. Invalidate it synchronously with a closed capture code and ask
+   * once more for its result. If it refuses again the core has no trustworthy view of this session's
+   * capture state, so it turns dirty and fails the verb closed with a SANITIZED error — the raw
+   * exception text never crosses this seam.
+   */
+  async #failedSettlement(generation: CaptureGeneration, code: "download-capture-failed" | "download-settle-timeout"): Promise<ArtifactOutcome> {
+    try {
+      generation.operation.invalidate(code);
+    } catch {
+      // an operation that cannot even be invalidated is exactly the unhealthy case below
+    }
+    try {
+      return await generation.operation.seal();
+    } catch {
+      this.#captureDirty = true;
+      throw new Error("artifact capture: operation failed to settle; session must be replaced");
+    }
+  }
+
+  /**
+   * Synchronously invalidate the open/sealing generation. Runs BEFORE the first await of `close()` and
+   * before `kill()` signals anything (Amendment 1 §6 rule 6-7): invalidation is in-memory and must win
+   * the race against a capture that is still copying, so a late completion finds its generation gone,
+   * cleans up, and cannot publish.
+   */
+  #invalidateGenerationSync(owner?: PatchrightPage): void {
+    const generation = this.#generation;
+    if (!generation) return;
+    // Page-scoped callers pass their page: destroying the drive page must not invalidate a transient
+    // render's generation, which belongs to a page this caller has never seen. Core close/kill pass
+    // nothing and invalidate whatever is current, globally.
+    if (owner !== undefined && generation.owner !== owner) return;
+    this.#generation = undefined;
+    try {
+      generation.operation.invalidate("artifact-runtime-invalidated");
+    } catch {
+      // the retired operation owns its own cleanup accounting
+    }
+  }
+
+  /**
+   * Wait, boundedly, for UNATTRIBUTED-DISPOSAL work still in flight — the only capture-related work the
+   * core itself owns. Teardown does this so a disposal that can still finish does before the context
+   * (and its temp storage) is destroyed.
+   *
+   * Operation-internal STAGING is deliberately not drained here and there is no core staging ledger to
+   * drain: staging belongs to the artifact operation, and teardown invalidates that operation
+   * synchronously and non-queued, which is what guarantees a late completion cannot publish
+   * (Amendment 1 §6 rules 6-7). A transient render still seals before its own page is closed, because
+   * that is its verb's cutoff — not a teardown drain.
+   */
+  async #drainUnattributedDisposals(owner?: PatchrightPage): Promise<void> {
+    // THE CUTOFF TURN COMES FIRST, AND THE SNAPSHOT AFTER IT (Amendment 7 §7). A download emitted
+    // during this turn is exactly the one teardown is racing; snapshotting before it would miss that
+    // record and close the page while its held `delete()` was still unresolved.
+    await this.#captureDrainTurn();
+    const pending = Array.from(this.#disposals)
+      .filter((record) => owner === undefined || record.owner === owner)
+      .map((record) => record.pending);
+    if (pending.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expiry = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, this.#resolved.captureSettleTimeoutMs);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([Promise.allSettled(pending), expiry]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Report one MAIN-FRAME document response to the open generation (Amendment 2 §8's inline marker).
+   * Callers have already established this is a main-frame navigation response, so a subframe response
+   * never reaches here and an embedded viewer cannot masquerade as the landed navigation.
+   *
+   * LAST-WINS: a redirect chain emits one response per hop, so the final call carries the landed
+   * response. The core reports the observation and decides nothing — normalization and the predicate
+   * belong to the operation. The raw header value is passed through unexamined and never logged.
+   */
+  #noteMainResponse(resp: { status(): number; headers(): Record<string, string> }): void {
+    const generation = this.#generation;
+    if (!generation || generation.state !== "open") return;
+    try {
+      generation.operation.noteMainResponseContentType({ status: resp.status(), contentType: resp.headers()["content-type"] ?? null });
+    } catch {
+      // an observation is never worth breaking a navigation over
+    }
+  }
+
   #attachEvidenceListeners(page: PatchrightPage): void {
     // Scope the evidence to the CURRENT top-level navigation. A main-frame navigation request resets the
     // buffers at its START (its first hop — `redirectedFrom() === null`) and appends each hop (incl.
@@ -1412,8 +2114,15 @@ export class PatchrightBrowserCore implements BrowserCore {
    * for hard-block detection, even though only navigate() returns a goto response directly.
    */
   async #ensureActivePage(): Promise<PatchrightPage> {
+    if (this.#activePage) this.#assertPageCaptureUsable(this.#activePage);
     if (!this.#activePage) {
       const page = await this.#context.newPage();
+      // Contract §5: the drive path's download listener is installed the instant the page exists —
+      // before the UA baseline read, before the OS override, before any goto or action. This is the
+      // sole active-page creation point, so the REPLACEMENT page opened after a fail-closed
+      // OS-presentation recovery (navigate()) is covered by the same line rather than by a second,
+      // driftable registration.
+      this.#installDownloadCapture(page);
       this.#lastDocStatus = undefined;
       this.#lastMainFrameResponseReceived = false; // #66: receipt resets with status (fresh page, no nav yet)
       this.#resetOsPresentation(); // a fresh page starts native; its OS mode is decided on the first nav
@@ -1441,6 +2150,10 @@ export class PatchrightBrowserCore implements BrowserCore {
             // ("the exit responded") is still true, which is exactly what isDeadExit needs to know.
             this.#lastMainFrameResponseReceived = true;
             this.#lastDocStatus = resp.status();
+            // Amendment 2 §8: the drive path needs the same landed main-frame observation the render
+            // path reports, or an inline PDF reached by navigate/action can never classify. Main-frame
+            // only (checked above), last-landed wins, so a redirect hop cannot decide it.
+            this.#noteMainResponse(resp);
           }
         } catch {
           // a superseded/aborted response can throw on access — ignore; the next nav updates status
@@ -1456,7 +2169,14 @@ export class PatchrightBrowserCore implements BrowserCore {
     if (!this.#activePage) {
       throw new Error("no active page — call navigate() to open one before acting");
     }
+    this.#assertPageCaptureUsable(this.#activePage);
     return this.#activePage;
+  }
+
+  #assertPageCaptureUsable(page: PatchrightPage): void {
+    if (this.#closingActivePages.has(page)) {
+      throw new Error("artifact capture: active page is closing; session must be replaced");
+    }
   }
 
   /** Run an action against a resolved locator, mapping driver errors to a clean, labeled message. */
@@ -1464,9 +2184,33 @@ export class PatchrightBrowserCore implements BrowserCore {
     op: string,
     target: DriveTarget,
     fn: (loc: PatchrightLocator) => Promise<unknown>,
+    capture?: CaptureContext,
   ): Promise<void> {
+    this.#requireCaptureReady(capture?.artifactOperation);
     const page = this.#requireActivePage();
     const loc = page.locator(targetToSelector(target.target));
+    // Contract §5: an ACTION can emit an attachment with no navigation at all (any control that
+    // triggers a download), so it gets its own generation, bound before the action runs. Per-action rather than
+    // per-navigation is deliberate: two downloading clicks are two operations, and must not collapse
+    // into one operation that then misreads them as `multiple-artifacts`. The host is the page's
+    // CURRENT canonical host — the raw URL is read here and nowhere else, and is never carried further.
+    // A CAPTCHA replay below re-runs the SAME action, so it stays inside this generation.
+    const generation = this.#beginGeneration(capture?.artifactOperation, page);
+    try {
+      await this.#actBody(op, target, loc, fn);
+    } finally {
+      // Always close out THIS action's generation, including when the action threw — and only that one.
+      this.#pendingArtifactOutcome = await this.#settleGeneration(generation);
+    }
+  }
+
+  async #actBody(
+    op: string,
+    target: DriveTarget,
+    loc: PatchrightLocator,
+    fn: (loc: PatchrightLocator) => Promise<unknown>,
+  ): Promise<void> {
+    const page = this.#requireActivePage();
     try {
       await fn(loc);
     } catch (err) {
@@ -1859,6 +2603,24 @@ export class PatchrightBrowserCore implements BrowserCore {
     // drops the interception and the paused requests die with the context.close() that follows. No
     // Fetch consumer outlives Chrome.
     this.#closing = true;
+    // §5.1 two-phase close: the fail-closed flag above establishes the no-new-work state, THEN the
+    // bounded capture barrier runs, and only then does the real teardown proceed. Closing the context
+    // is what destroys the driver temp file a staging copy is reading from, so this is the last point
+    // at which an in-flight capture can still complete.
+    //
+    // Deliberately NOT mirrored in kill(): force-kill is the escalation for a wedged session, and
+    // queueing it behind the very capture that may be doing the wedging would deadlock the one path
+    // that exists to break the deadlock. The barrier's own hard timeout keeps this bounded.
+    //
+    // SCOPED RESIDUAL (documented): this covers the ACTIVE drive page. A transient render page is
+    // local to its render() call and owns its own barrier there; a close racing an in-flight render is
+    // a session-manager-level concurrency the core cannot see, and the store fails such a capture
+    // closed rather than publishing partial bytes.
+    this.#invalidateGenerationSync();
+    // Only now may we await. The core owns only unattributed-download disposal; operation-internal
+    // staging was invalidated synchronously above and remains non-queued, so it cannot publish after
+    // teardown begins.
+    await this.#drainUnattributedDisposals();
     if (this.#cdpGuardSession) {
       await this.#cdpGuardSession.detach().catch(() => {});
       this.#cdpGuardSession = undefined;
@@ -1889,6 +2651,14 @@ export class PatchrightBrowserCore implements BrowserCore {
    * Rejects immediately when no PID was captured (force-kill unavailable).
    */
   async kill(confirmMs: number): Promise<void> {
+    // Raise the no-new-work fence before invalidation: invalidation enters operation-owned cleanup and
+    // hostile driver accessors, so a successor must already be inadmissible at that boundary.
+    this.#closing = true;
+    // Invalidate synchronously (Amendment 1 §6 rule 6-7): a force-kill destroys the browser
+    // out from under any capture still copying, so the generation must be marked dead before the
+    // signal — never after, and never behind an await. Kill is deliberately NOT drained: queueing it
+    // behind the capture that may be doing the wedging would deadlock the one path that breaks it.
+    this.#invalidateGenerationSync();
     const pid = this.#pid;
     // Refuse unless force-kill is SAFELY available (a captured PID, plus the /proc generation marker on
     // Linux — codex #50 r6). Refusing here degrades a wedged teardown to a counted zombie (the caller
@@ -1896,7 +2666,6 @@ export class PatchrightBrowserCore implements BrowserCore {
     if (pid === undefined || !this.forceKillAvailable) {
       throw new Error("force-kill unavailable: no Chromium PID / generation marker captured at launch");
     }
-    this.#closing = true; // fail-closed during teardown, same as close()
     if (this.#ourGroupGone(pid)) return; // our whole tree already gone (or the pgid was recycled) — no signal
     this.#sigkill(-pid); // process group: reaps renderers/GPU/zygote even if the leader already died
     if (!childTerminated(this.#child)) this.#sigkill(pid); // leader, only while its pid can't be recycled

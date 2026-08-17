@@ -13,6 +13,15 @@ export type Category = "cloudflare" | "datadome";
 
 import type { CaptchaSolver, CaptchaKind, CaptchaSolveReason } from "./captcha.js";
 import type { FailureDiagnostics, SelfBlockedNav, Timing } from "../observability/index.js";
+import type { ArtifactCaptureOperation, ArtifactOutcome, DownloadLike } from "../artifacts/types.js";
+
+/**
+ * The capture operation the browser layer drives (Amendment 3 §1). It is created by the CALLER — the
+ * authenticated entrypoint or drive controller — which alone knows the owner, and handed in per
+ * operation. Browser code never invents owner or source host, never touches the store, and reads
+ * nothing back out of the operation except its sealed result.
+ */
+export type { ArtifactCaptureOperation } from "../artifacts/types.js";
 
 /** Upstream proxy for a session (Playwright-shaped). Used by R7 scoped escalation. */
 export interface ProxyConfig {
@@ -160,11 +169,58 @@ export interface BrowserCoreOptions {
    * for a direct launch; a proxy/solver launch that omits it falls back to a process-env store.
    */
   secrets?: { redactableValues(): readonly string[] };
+  /**
+   * The narrow artifact-capture sink (contract §5). When present, every page-creation path installs a
+   * persistent `download` listener that forwards driver download events to it. A runtime dependency,
+   * NOT a launch arg — like {@link solver} and {@link restoreState}. Absent (the default, and every
+   * artifact-disabled deployment) = no listener, no capture, unchanged behavior.
+   */
+
+  /**
+   * Hard ceiling on an operation's own capture-settlement cutoff and on teardown's bounded wait for
+   * unattributed-download disposal, in ms. Operation-internal staging is invalidated synchronously and
+   * is never queued behind teardown. A runtime dependency, NOT a launch arg. Defaults to
+   * {@link import("./launch-options.js").DEFAULT_CORE_OPTIONS}.
+   */
+  captureSettleTimeoutMs?: number;
+  /**
+   * @internal test seam: the one deterministic event-loop turn the cutoff drains before snapshotting
+   * registered jobs (Amendment 2 §4 step 5). Production leaves this unset and gets a single
+   * `setImmediate`. A test supplies its own turn so it can act exactly at that boundary; the seam
+   * carries no data in either direction.
+   */
+  captureDrainTurn?: () => Promise<void>;
+  /**
+   * Whether this session may capture at all. The download listener must exist before the first
+   * navigation — earlier than any per-operation context arrives — so enablement is a construction-time
+   * decision by the owning caller. Absent/false = no listener anywhere and unchanged behaviour.
+   */
+  captureEnabled?: boolean;
+}
+
+/**
+ * Per-operation capture context. The CALLER creates the operation (it alone knows the owner) and hands
+ * it in for exactly one browser operation. Absent = no capture for that operation, and behaviour is
+ * byte-for-byte what it was before artifacts existed — which is what keeps every existing caller and
+ * test that omits it working unchanged.
+ */
+export interface CaptureContext {
+  artifactOperation?: ArtifactCaptureOperation;
 }
 
 /** A point-in-time snapshot of a rendered page. */
 export interface RenderResult {
   url: string;
+  /**
+   * The sealed capture outcome for this navigation, when artifact capture is configured. Carried
+   * through UNRESHAPED — the browser layer commits the operation and passes its verdict along without
+   * reading, projecting or logging any part of it; deciding what a consumer may see is the retrieval
+   * layer's job. ABSENT entirely when no capture sink is wired, so an artifact-disabled result is
+   * shape-identical to what it has always been.
+   *
+   * Never folded into {@link FailureDiagnostics} or any snapshot text.
+   */
+  artifactOutcome?: ArtifactOutcome;
   /** HTTP status of the main navigation response, or `null` if none was captured. */
   status: number | null;
   /**
@@ -215,6 +271,8 @@ export interface RenderResult {
 }
 
 export interface RenderOptions {
+  /** The caller-created capture operation for THIS navigation (Amendment 3 §3). */
+  artifactOperation?: ArtifactCaptureOperation;
   /**
    * Max time to poll for challenge clearance after navigation, in ms. Anti-bot
    * interstitials (notably Cloudflare) clear client-side on a variable delay, so the
@@ -249,6 +307,13 @@ export interface RenderOptions {
 export interface PageSnapshot {
   url: string;
   title: string;
+  /**
+   * The sealed capture outcome for the operation this snapshot closes out, when artifact capture is
+   * configured. Carried INTERNALLY and unreshaped (contract §6): `formatSnapshot` must never inject it
+   * into the accessibility text — the retrieval layer returns metadata in structured content instead.
+   * Absent when no capture sink is wired, so an artifact-disabled snapshot is shape-identical.
+   */
+  artifactOutcome?: ArtifactOutcome;
   /**
    * HTTP status of the navigation that produced this page, or `null` when the navigation failed
    * (dead proxy exit, timeout, off-allowlist block). Present on `navigate()`; absent on a pure
@@ -502,15 +567,15 @@ export interface BrowserCore {
    */
   readField(target: DriveTarget): Promise<FieldState>;
   /** Click the element identified by `target` (a snapshot ref or a selector). */
-  click(target: DriveTarget): Promise<void>;
+  click(target: DriveTarget, capture?: CaptureContext): Promise<void>;
   /** Fill `text` into the element; `submit` presses Enter afterward. */
-  type(target: DriveTarget, text: string, opts?: { submit?: boolean }): Promise<void>;
+  type(target: DriveTarget, text: string, opts?: { submit?: boolean }, capture?: CaptureContext): Promise<void>;
   /** Select option(s) by value/label on a `<select>`-like element. */
-  selectOption(target: DriveTarget, values: string[]): Promise<void>;
+  selectOption(target: DriveTarget, values: string[], capture?: CaptureContext): Promise<void>;
   /** Press a key (e.g. `"Enter"`, `"Escape"`, `"ArrowDown"`) on the active page. */
-  pressKey(key: string): Promise<void>;
+  pressKey(key: string, capture?: CaptureContext): Promise<void>;
   /** Wait for `text` to appear, or for a fixed delay. */
-  waitFor(condition: WaitCondition): Promise<void>;
+  waitFor(condition: WaitCondition, capture?: CaptureContext): Promise<void>;
   /** PNG screenshot of the active page, base64-encoded (for MCP image content). */
   screenshot(): Promise<string>;
   /** Close the active page (ends the drive interaction; the context/core stays alive). */
