@@ -217,9 +217,15 @@ export function safeFilename(raw) {
  * Three-valued on purpose. `unknown` means the driver never gave us a path to stat (the download
  * failed, never settled inside {@link DOWNLOAD_SETTLE_MS}, or the stat itself threw) — reporting that
  * as `absent` would manufacture a finding ("the file is already gone") out of an unanswered question.
+ *
+ * BOTH ARGUMENTS MUST BE EXACT BOOLEANS (Amendment 7 §6). Truthiness is not enough: `exists ? …` made
+ * every non-`true` value — an omitted field, a `null`, a string, a number — read as a confident
+ * `absent`, which is precisely the manufactured finding this function exists to prevent. A value
+ * outside `{true, false}` is an unanswered question and reads `unknown`.
  */
 export function tempFileState(pathKnown, exists) {
-  if (!pathKnown) return "unknown";
+  if (pathKnown !== true) return "unknown";
+  if (exists !== true && exists !== false) return "unknown";
   return exists ? "present" : "absent";
 }
 
@@ -291,6 +297,10 @@ export function attributeLedger(records, cases = CASES) {
   return { byKey, unattributed };
 }
 
+/** The EXACT closed set a reported temp-file state may belong to. `unknown` and `mixed` are honest
+ *  reports of an unanswered question, and neither is a member: a run carrying one is not valid. */
+const TEMP_STATES = new Set(["present", "absent"]);
+
 /** Collapse per-record values: one value when they agree, `mixed` when they do not. */
 function agree(values) {
   const unique = [...new Set(values)];
@@ -298,13 +308,21 @@ function agree(values) {
   return unique.length === 1 ? unique[0] : "mixed";
 }
 
-/** One record's temp-file reading for a side, honouring a stat that failed. */
+/**
+ * One record's temp-file reading for a side.
+ *
+ * Every way of NOT having observed reads `unknown` (Amendment 7 §6): a stat that threw, an accessor
+ * that threw, a settle that never completed, a path that never resolved, and an existence value that
+ * is anything other than an exact boolean — omitted, `null`, `undefined`, a number, a string. Only a
+ * stat that actually ran, on a path that actually resolved, can say `absent`.
+ *
+ * Passing the raw observations through (rather than pre-coercing them with `&&` / `=== true`) is the
+ * point: the coercion happened here, so the strictness has to happen here too.
+ */
 function recordTempState(record, side) {
-  if (record.statError) return "unknown";
+  if (record.statError || record.accessorError || record.settleError) return "unknown";
   const value = side === "before" ? record.existsBeforeClose : record.existsAfterClose;
-  // A reading that was never TAKEN (`null` — the core never closed, or the stat never ran) is
-  // `unknown`, exactly like a path that never resolved. Only a stat that actually ran says `absent`.
-  return tempFileState(record.pathKnown && value !== null, value === true);
+  return tempFileState(record.pathKnown, value);
 }
 
 /**
@@ -369,6 +387,21 @@ export function finalizeRows(rows, records, fault) {
 }
 
 /**
+ * The ONE counter predicate: finite, non-negative, integral. `Number.isInteger` decides type,
+ * finiteness and integrality together, so a string, a `null`, an omitted field, a boolean, an object,
+ * `NaN` and either infinity are all refused by it.
+ *
+ * `> 0` was never this test. `NaN` is a number and satisfies neither `> 0` nor `< 1`, so a report
+ * whose event counts, unattributed count and observation-failure counts were all `NaN` answered every
+ * question with "no problem" and came back `{ valid: true, problems: [] }` — a confident reading
+ * assembled from evidence that does not exist. A negative, a fraction and a numeric string passed the
+ * same way. Every counter the guard reads as EVIDENCE goes through here.
+ */
+export function exactCounter(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+/**
  * The measurement's own guard. It answers "can this reading be trusted", never "did the stack
  * behave well" — a row saying no download fired is a finding; a row saying the INSTRUMENT never
  * fired is a broken instrument. Every arm is reachable: see the fault modes in the file header.
@@ -393,7 +426,59 @@ export function measurementValidity(rows, fixture, env = {}) {
     return { valid: false, problems };
   }
 
-  const surfaces = Array.isArray(env.surfaces) && env.surfaces.length ? env.surfaces : [...new Set(rows.map((r) => r.surface))];
+  /**
+   * Check ONE counter, in ONE place, so no comparison below can quietly consume a malformed value:
+   * every `> 0` / `< 1` test downstream is gated on this having passed first. The counter is NAMED
+   * and its value is never printed — interpolating a malformed value is how a hostile string would
+   * reach the report the hygiene guard then has to catch.
+   */
+  const requireCounter = (value, name, surface) => {
+    if (exactCounter(value)) return true;
+    problems.push({ code: "malformed-counter", ...(surface ? { surface } : {}), detail: `${name} was not reported as an exact non-negative integer count` });
+    return false;
+  };
+  // Every row, not only the selected surfaces: a malformed counter on a row nobody aggregates is
+  // still malformed evidence, and a valid sibling must not be able to stand in for it.
+  for (const row of rows) {
+    requireCounter(row.download?.eventCount, "download.eventCount", row.surface);
+    requireCounter(row.coresObserved, "coresObserved", row.surface);
+  }
+
+  const selectedSurfaceMetadataPresent = Array.isArray(env.surfaces) && env.surfaces.length > 0;
+  const surfaces = selectedSurfaceMetadataPresent ? env.surfaces : [];
+  if (!selectedSurfaceMetadataPresent) {
+    problems.push({ code: "surface-selection-missing", detail: "the selected-surface inventory was not recorded" });
+  }
+  if (new Set(surfaces).size !== surfaces.length) {
+    problems.push({ code: "surface-selection-duplicate", detail: "the selected-surface inventory contained a duplicate" });
+  }
+
+  // The row set is a closed KEY SET — exactly one row for every expected (surface, case) and nothing
+  // else — not a lookup table. Every question below is asked through `rows.find(...)`, which answers
+  // from the first match and never looks at the rest: a second row contradicting the one it read was
+  // invisible, and so was a row for a pair this measurement never ran. Neither the surface nor the
+  // case of an unrecognised row is echoed into the report; it is the one value here this file did
+  // not author, and the missing-row arms below already name every pair that was expected.
+  const expectedKeys = new Set();
+  for (const surface of surfaces) for (const testCase of CASES) expectedKeys.add(`${surface}\u0000${testCase.id}`);
+  const counted = new Map();
+  for (const r of rows) {
+    const key = `${r.surface}\u0000${r.case}`;
+    const seen = counted.get(key);
+    if (seen) seen.count += 1;
+    else counted.set(key, { surface: r.surface, case: r.case, count: 1 });
+  }
+  let unknownRows = 0;
+  for (const [key, entry] of counted) {
+    if (!expectedKeys.has(key)) { unknownRows += entry.count; continue; }
+    if (entry.count > 1) {
+      problems.push({ code: "duplicate-row", surface: entry.surface, detail: `${entry.case} produced more than one row on this surface` });
+    }
+  }
+  if (unknownRows > 0) {
+    problems.push({ code: "unknown-row", detail: `${unknownRows} row(s) were reported for surface/case pairs this measurement did not run` });
+  }
+
   for (const surface of surfaces) {
     const of = (caseId) => rows.find((r) => r.surface === surface && r.case === caseId);
     for (const testCase of CASES) {
@@ -408,46 +493,47 @@ export function measurementValidity(rows, fixture, env = {}) {
       if (row.navigationEvidence !== true) {
         problems.push({ code: "no-navigation-evidence", surface, detail: `${testCase.id} produced a row with no evidence the navigation was attempted` });
       }
-      if (
-        row.download?.eventCount > 0 &&
-        (row.download.tempFileBeforeClose === "unknown" || row.download.tempFileAfterClose === "unknown")
-      ) {
+      // Amendment 7 §6: for an OBSERVED download both readings must be members of the exact closed
+      // set {present, absent}. Rejecting only `unknown` let an omitted field, a `mixed` aggregated
+      // across records that disagreed, or any other malformed value pass as a valid lifecycle
+      // reading — a row asserting a download happened while answering neither question about it.
+      if (exactCounter(row.download?.eventCount) && row.download.eventCount > 0 && !(TEMP_STATES.has(row.download.tempFileBeforeClose) && TEMP_STATES.has(row.download.tempFileAfterClose))) {
         problems.push({ code: "lifecycle-incomplete", surface, detail: `${testCase.id} has a download without complete before/after-close observations` });
       }
     }
     const pos = of(POSITIVE_CONTROL);
     const neg = of(NEGATIVE_CONTROL);
-    if (pos && pos.download.eventCount < 1) {
+    if (pos && exactCounter(pos.download?.eventCount) && pos.download.eventCount < 1) {
       problems.push({
         code: "positive-control-silent",
         surface,
         detail: "an octet-stream attachment produced NO download event — the observer is not measuring anything on this surface, so every quiet row is uninterpretable",
       });
     }
-    if (neg && neg.download.eventCount > 0) {
+    if (neg && exactCounter(neg.download?.eventCount) && neg.download.eventCount > 0) {
       problems.push({
         code: "negative-control-fired",
         surface,
         detail: "an ordinary HTML page reported a download event — the observer is over-firing, so every loud row is uninterpretable",
       });
     }
-    if (!rows.some((r) => r.surface === surface && r.coresObserved > 0)) {
+    if (!rows.some((r) => r.surface === surface && exactCounter(r.coresObserved) && r.coresObserved > 0)) {
       problems.push({ code: "no-core-observed", surface, detail: "no browser core was observed on this surface — the injection seam did not take" });
     }
   }
 
   const unattributed = env.unattributedDownloads;
-  if (typeof unattributed !== "number" || unattributed > 0) {
+  if (requireCounter(unattributed, "unattributedDownloads") && unattributed > 0) {
     problems.push({
       code: "unattributed-download",
-      detail: `${unattributed ?? "an unstated number of"} download events could not be filed against a case — a quiet row cannot be read as "no download happened"`,
+      detail: `${unattributed} download events could not be filed against a case — a quiet row cannot be read as "no download happened"`,
     });
   }
 
   for (const key of ["statErrors", "accessorErrors", "settleErrors"]) {
     const count = env[key];
-    if (typeof count !== "number" || count > 0) {
-      problems.push({ code: "observation-failed", detail: `${key}=${count ?? "unstated"} — an observation that threw cannot be reported as a reading` });
+    if (requireCounter(count, key) && count > 0) {
+      problems.push({ code: "observation-failed", detail: `${key}=${count} — an observation that threw cannot be reported as a reading` });
     }
   }
   if (!Array.isArray(env.cleanupErrors) || env.cleanupErrors.length > 0) {
@@ -460,17 +546,40 @@ export function measurementValidity(rows, fixture, env = {}) {
     problems.push({ code: "teardown-incomplete", detail: "teardown observations or download-core inventory were not reported" });
   } else {
     const teardownIds = new Set(teardown.map((t) => t.coreId));
+    // One core, one close, one record. Two records for the same core are two statements about the
+    // same teardown, and the checks below read whichever they reach first.
+    if (teardownIds.size !== teardown.length) {
+      problems.push({ code: "teardown-duplicate", detail: "a core filed more than one teardown record — one close cannot have two readings" });
+    }
     for (const coreId of downloadCoreIds) {
       if (!teardownIds.has(coreId)) {
         problems.push({ code: "teardown-record-missing", detail: "a core that observed downloads has no teardown record" });
       }
+    }
+    // The inventory and the per-core records state the SAME fact — which cores took a download — and
+    // are built from the same ledger, so they must agree exactly. Checking only that the inventory
+    // was a subset of the teardown records accepted an inventory naming no downloading core at all
+    // standing beside a record reporting one.
+    const downloadedCores = new Set(teardown.filter((t) => exactCounter(t.downloadCount) && t.downloadCount > 0).map((t) => t.coreId));
+    const inventory = new Set(downloadCoreIds);
+    if (inventory.size !== downloadCoreIds.length) {
+      problems.push({ code: "core-inventory-duplicate", detail: "a browser core appears more than once in the download-core inventory" });
+    }
+    if (inventory.size !== downloadedCores.size || [...inventory].some((coreId) => !downloadedCores.has(coreId))) {
+      problems.push({ code: "core-inventory-mismatch", detail: "the download-core inventory does not name exactly the cores whose teardown reported downloads" });
+    }
+    // And a row asserting a download was observed cannot stand beside an apparatus naming no core
+    // that took one. A run in which nothing downloaded is a RESULT — the controls are what read it —
+    // so this arm fires only when a row itself claims the opposite.
+    if (inventory.size === 0 && rows.some((r) => exactCounter(r.download?.eventCount) && r.download.eventCount > 0)) {
+      problems.push({ code: "core-inventory-missing", detail: "rows report observed downloads while no browser core is named as having taken one" });
     }
     for (const t of teardown) {
       if (t.hookErrors?.length) {
         problems.push({ code: "teardown-hook-failed", surface: t.surface, detail: `a teardown hook threw (${t.hookErrors.map((h) => `${h.phase}:${h.name}`).join(", ")})` });
       }
       // A core that observed no download has nothing to stat; one that did must have both sides.
-      if (t.downloadCount > 0 && (t.beforeClose !== "ok" || t.afterClose !== "ok")) {
+      if (requireCounter(t.downloadCount, "teardown downloadCount", t.surface) && t.downloadCount > 0 && (t.beforeClose !== "ok" || t.afterClose !== "ok")) {
         problems.push({
           code: "teardown-incomplete",
           surface: t.surface,
@@ -651,6 +760,7 @@ export function resolveSurfaces(raw) {
   const picked = raw.split(",").map((s) => s.trim()).filter(Boolean);
   const unknown = picked.filter((s) => !ALL_SURFACES.includes(s));
   if (unknown.length) throw new Error(`unknown BGW_EID_MEASURE_SURFACES entry: expected from ${ALL_SURFACES.join(", ")}`);
+  if (new Set(picked).size !== picked.length) throw new Error("duplicate BGW_EID_MEASURE_SURFACES entry");
   return picked;
 }
 
@@ -863,7 +973,11 @@ export function readDownloadIdentity(dl) {
     accessorError = true;
   }
   try {
-    suggestedFilenameRaw = typeof dl.suggestedFilename === "function" ? dl.suggestedFilename() : "";
+    // Snapshot the site-controlled property exactly once, then invoke that exact accepted callable
+    // without consulting caller-controlled `.call`. A stateful getter previously supplied one
+    // callable to `typeof` and a different one to the method call below it.
+    const suggestedFilename = dl.suggestedFilename;
+    suggestedFilenameRaw = typeof suggestedFilename === "function" ? Reflect.apply(suggestedFilename, dl, []) : "";
   } catch {
     accessorError = true;
   }

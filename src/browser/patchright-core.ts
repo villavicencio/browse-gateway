@@ -532,18 +532,29 @@ export function deadlineBoundedTimeout(rawTimeoutMs: number, deadlineMs: number 
  */
 function invokeDriverDisposal(run: () => Promise<void> | void): Promise<boolean> {
   let raw: Promise<void> | void;
-  let awaitable: boolean;
+  let then: unknown;
   try {
     raw = run();
-    awaitable = raw !== null && (typeof raw === "object" || typeof raw === "function") && typeof (raw as { then?: unknown }).then === "function";
+    // ONE read, and the callable it produced is the one adopted below. `Promise.resolve(raw)` read
+    // `then` a SECOND time, so a value answering callable-first and non-callable-second was
+    // classified as a promise and then adopted as a plain value — fulfilling with the object itself
+    // and confirming a disposal nobody ever performed.
+    then = raw !== null && (typeof raw === "object" || typeof raw === "function") ? (raw as { then?: unknown }).then : undefined;
   } catch {
     return Promise.resolve(false);
   }
-  if (!awaitable) return Promise.resolve(true);
+  if (typeof then !== "function") return Promise.resolve(true);
   return new Promise<boolean>((resolve) => {
-    // Adoption reads `then` a second time; a getter that throws only then is caught by the promise
-    // machinery itself, which rejects — landing here as an unconfirmed call.
-    Promise.resolve(raw as Promise<void>).then(() => resolve(true), () => resolve(false));
+    // The adoption is OURS: one settlement wins, a `then` that throws after settling cannot rewrite
+    // its own answer, and a `then` that settles nothing stays pending for the core's claim-anchored
+    // bound to decide.
+    let settled = false;
+    const settleOnce = (confirmed: boolean): void => { if (!settled) { settled = true; resolve(confirmed); } };
+    try {
+      Reflect.apply(then as (...args: unknown[]) => unknown, raw as object, [() => settleOnce(true), () => settleOnce(false)]);
+    } catch {
+      settleOnce(false);
+    }
   });
 }
 
@@ -564,10 +575,15 @@ interface CaptureGeneration {
   readonly operation: ArtifactCaptureOperation;
   readonly owner?: PatchrightPage;
   state: "open" | "sealing";
-  /** Set the instant this generation's ONE event is handed to the operation. `registerDownload()`
-   *  returns void, so the core cannot learn from it what became of a second event — it must know
-   *  locally that the operation is already spoken for, and dispose of the extra itself. */
-  claimed?: boolean;
+  /**
+   * Where this generation's ONE event stands (Amendment 7 §8.2).
+   *
+   * `claiming` is the window the boolean receipt made observable: the core has handed the event to
+   * the operation and does not yet know whether the operation took it. A re-entrant event arriving
+   * inside that window is a SECOND event — it can never be handed to an operation whose first
+   * receipt is still outstanding, and it must not be dropped either.
+   */
+  claim: "unclaimed" | "claiming" | "claimed";
   /** Set once this handle's OWNER has closed it out, with the outcome it obtained. A verb's `finally`
    *  runs after its own cutoff, and must return that same outcome rather than seal a second time. */
   settled?: boolean;
@@ -683,6 +699,10 @@ export class PatchrightBrowserCore implements BrowserCore {
   readonly #leaderStartTime?: string;
   /** The single persistent page the interactive `drive` verbs act on (absent until navigate()). */
   #activePage?: PatchrightPage;
+  /** Page-identity teardown fences. A count preserves the existing concurrent-close contract: two
+   *  closers may race the same old page, but neither can admit work onto it, and a replacement page is
+   *  independent while the slower old-page closer drains. */
+  readonly #closingActivePages = new Map<PatchrightPage, number>();
   /**
    * HTTP status of the active page's last main-frame navigation, kept current by a response listener
    * so it reflects click/submit-triggered navigations too — not just navigate(). Lets a post-action
@@ -1092,7 +1112,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       // cannot close out — or time out — a generation another operation is still using.
       await this.#settleGeneration(generation);
       await this.#drainUnattributedDisposals(page);
-      await page.close().catch(() => {});
+      try {
+        await page.close();
+      } catch {
+        // A rejected close is not proof that this listener-bearing page died. Admitting another
+        // generation would let a delayed event from the old page attach to the successor operation.
+        // Poison globally and surface only a closed error; full core teardown may still retire the
+        // context, but ordinary work must never continue from this ambiguous lifetime.
+        this.#captureDirty = true;
+        throw new Error("artifact capture: page close failed; session must be replaced");
+      }
     }
   }
 
@@ -1487,13 +1516,29 @@ export class PatchrightBrowserCore implements BrowserCore {
     // non-queued and cannot publish after invalidation.
     const active = this.#activePage;
     if (active) {
-      this.#invalidateGenerationSync(active);
-      await this.#drainUnattributedDisposals(active);
-      // Close the SAME identity whose generation and disposal set were captured above. Another
-      // close can retire it and admit a replacement while this call is parked in the injected turn;
-      // consulting `this.#activePage` here would then close that unrelated successor.
-      await active.close().catch(() => {});
-      if (this.#activePage !== active) return;
+      // Fence this exact page BEFORE invalidation: invalidation reaches operation-owned cleanup and
+      // hostile driver getters, either of which may synchronously re-enter a capture-capable verb.
+      this.#closingActivePages.set(active, (this.#closingActivePages.get(active) ?? 0) + 1);
+      try {
+        this.#invalidateGenerationSync(active);
+        await this.#drainUnattributedDisposals(active);
+        // Close the SAME identity whose generation and disposal set were captured above. Another
+        // close can retire it and admit a replacement while this call is parked in the injected turn;
+        // consulting `this.#activePage` here would then close that unrelated successor.
+        try {
+          await active.close();
+        } catch {
+          // Keep #activePage pointing at the unconfirmed page. Losing the handle and reopening would
+          // admit a replacement while this page's registered download listener may still be alive.
+          this.#captureDirty = true;
+          throw new Error("artifact capture: page close failed; session must be replaced");
+        }
+        if (this.#activePage !== active) return;
+      } finally {
+        const closers = this.#closingActivePages.get(active) ?? 1;
+        if (closers <= 1) this.#closingActivePages.delete(active);
+        else this.#closingActivePages.set(active, closers - 1);
+      }
     }
     this.#activePage = undefined;
     this.#lastDocStatus = undefined;
@@ -1582,45 +1627,72 @@ export class PatchrightBrowserCore implements BrowserCore {
       }
       return;
     }
-    if (generation.claimed) {
-      // A SECOND event for a generation that already has one. It is not handed to the void
-      // `registerDownload()` seam: the operation would count it and terminalize, but the core would
-      // be left unable to tell whether anyone owns this driver copy — and while the first download's
-      // accessor is hung, nobody does. Enter sealing synchronously so a third event in the same tick
-      // takes the late path, terminalize the operation (which disposes of the download it owns), and
-      // dispose of this one here.
+    if (generation.claim !== "unclaimed") {
+      // A SECOND event. `claimed` is the ordinary duplicate; `claiming` is a synchronous RE-ENTRANT
+      // event, arriving while the first event's receipt is still outstanding — and it is a second
+      // event just the same. Neither may be handed to the operation: it is already spoken for, and
+      // the core would be left unable to say who owns this driver copy. Enter sealing synchronously
+      // so a third event in the same tick takes the late path, terminalize the operation (which
+      // disposes of the download IT owns), and dispose of this one here.
       generation.state = "sealing";
       try {
         generation.operation.invalidate("multiple-artifacts");
       } catch {
         // the operation owns its own terminal accounting
       }
-      this.#discardUnattributed(download, generation?.owner ?? emittingPage);
+      this.#discardUnattributed(download, generation.owner ?? emittingPage);
       return;
     }
+    // `claiming` is installed BEFORE the call, so an event re-entering from inside `registerDownload`
+    // takes the second-event path above instead of finding an unclaimed generation to claim again.
+    generation.claim = "claiming";
+    let receipt: unknown;
     try {
-      // Staging is internal to the operation: nothing is returned, retained or awaited here.
-      generation.claimed = true;
-      generation.operation.registerDownload(download);
+      // Staging stays internal to the operation; the ONLY thing that comes back is the ownership
+      // receipt (Amendment 7 §8.1), and nothing else here is retained or awaited.
+      receipt = generation.operation.registerDownload(download);
     } catch {
-      // The operation REFUSED an attachment that really happened. Swallowing this loses the download
-      // and lets the verb report an ordinary outcome, so the caller cannot tell its artifact was lost.
-      // Fail closed instead, and never rethrow: this runs inside the driver's event emitter, where a
-      // throw would surface as an unrelated page error carrying the raw text.
-      //
-      // Stop attributing to this generation first, synchronously, so a second event in the same tick
-      // cannot be handed to an operation that has just refused one.
-      generation.state = "sealing";
-      this.#captureDirty = true;
-      try {
-        generation.operation.invalidate("download-capture-failed");
-      } catch {
-        // An operation that cannot even be invalidated leaves the core dirty, which it already is;
-        // the verb's settlement-refusal path owns turning that into a sanitized action failure.
-      }
-      // The driver still holds a copy of an attachment nobody is going to stage.
-      this.#discardUnattributed(download, generation?.owner ?? emittingPage);
+      // Never rethrow: this runs inside the driver's event emitter, where a throw would surface as
+      // an unrelated page error carrying the raw text.
+      this.#refuseClaim(generation, download, emittingPage, "violation");
+      return;
     }
+    if (receipt === true) {
+      // Ownership transferred. Synchronous re-entry may already have moved this generation to
+      // `sealing`; that does not revoke the transfer, and the state it set stands.
+      generation.claim = "claimed";
+      return;
+    }
+    // EXACT `false` is a legitimate refusal — the operation is already spoken for or already
+    // terminal. Anything else (a non-boolean, however truthy) is a broken ownership contract: it
+    // cannot be read as "owned" without leaving the driver's copy behind, which is the whole defect.
+    this.#refuseClaim(generation, download, emittingPage, receipt === false ? "refusal" : "violation");
+  }
+
+  /**
+   * The operation did not take an attachment that really happened. Seal the generation synchronously
+   * so a second event in the same tick cannot be handed to an operation that has just refused one,
+   * terminalize (first-reason-wins, so an operation that already has a reason keeps it), and take
+   * core ownership of the driver copy nobody else will.
+   *
+   * A REFUSAL is a legitimate answer, so a confirmed disposal leaves the session usable. A VIOLATION —
+   * a throw, or any non-boolean receipt — means the operation broke the ownership contract, so the
+   * core can no longer trust its own attribution and the session must be replaced.
+   */
+  #refuseClaim(generation: CaptureGeneration, download: DownloadLike, emittingPage: PatchrightPage, kind: "refusal" | "violation"): void {
+    generation.state = "sealing";
+    if (kind === "violation") this.#captureDirty = true;
+    try {
+      // This is the FIRST event and the operation refused it. That is a capture failure, not a
+      // duplicate. If the operation already has a terminal reason, first-reason-wins keeps it.
+      // Genuine second/re-entrant events take the separate multiple-artifacts path above.
+      generation.operation.invalidate("download-capture-failed");
+    } catch {
+      // An operation that cannot even be invalidated leaves the core dirty, which a violation already
+      // is; the verb's settlement-refusal path owns turning that into a sanitized action failure.
+      this.#captureDirty = true;
+    }
+    this.#discardUnattributed(download, generation.owner ?? emittingPage);
   }
 
   /**
@@ -1644,8 +1716,25 @@ export class PatchrightBrowserCore implements BrowserCore {
     const record: UnattributedDisposal = { owner, pending };
     this.#disposals.add(record);
     void pending.then(() => this.#disposals.delete(record));
-    // Only now, under accounting that is already visible, may the driver be touched at all.
-    this.#disposeDriverCopy(download, settle);
+    // THE BOUND OPENS HERE TOO, at the claim, for the same reason the accounting does. Reading a
+    // driver-supplied property IS a driver call: a getter can consume the whole budget before it
+    // returns the callable, and a method can do it again. A bound armed only after that work was
+    // never armed for the window it exists to survive, and then expired one full budget past an
+    // instant already gone. One-shot: whichever lands first — expiry, or both confirmations —
+    // decides, and the other is inert.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let done = false;
+    const finish = (confirmed: boolean): void => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      settle(confirmed);
+    };
+    timer = setTimeout(() => finish(false), this.#resolved.captureSettleTimeoutMs);
+    // A disposal bound must never hold the process open on its own.
+    timer.unref?.();
+    // Only now, under accounting AND a bound that are already installed, may the driver be touched.
+    this.#disposeDriverCopy(download, finish);
   }
 
   /**
@@ -1661,10 +1750,11 @@ export class PatchrightBrowserCore implements BrowserCore {
    *    driver's copy would otherwise be left on disk;
    *  - BOTH are mandatory here, unlike the operation's cleanup: a source offering either one alone
    *    cannot prove its bytes are gone, and the core has no other relationship to these bytes;
-   *  - the combined confirmation is bounded by the core's own settle timeout, so an unanswerable
-   *    driver call turns the session dirty and is DETACHED rather than retained forever.
+   *  - the combined confirmation is bounded by the claim-anchored `finish` its caller already armed,
+   *    so an unanswerable driver call turns the session dirty and is DETACHED rather than retained
+   *    forever — and the bound covers these reads and calls, not just what follows them.
    */
-  #disposeDriverCopy(download: DownloadLike, settle: (confirmed: boolean) => void): void {
+  #disposeDriverCopy(download: DownloadLike, finish: (confirmed: boolean) => void): void {
     const attempts: Array<Promise<boolean>> = [];
     let offered = 0;
     for (const method of ["cancel", "delete"] as const) {
@@ -1679,20 +1769,12 @@ export class PatchrightBrowserCore implements BrowserCore {
       }
       if (typeof fn !== "function") continue;
       offered += 1;
-      attempts.push(invokeDriverDisposal(() => (fn as () => Promise<void> | void).call(download)));
+      // `Reflect.apply` reads NO property of the callable — `call` is as driver-controlled as any
+      // other property of a driver-supplied function — while still passing the download as the
+      // receiver the driver's own method expects.
+      attempts.push(invokeDriverDisposal(() => Reflect.apply(fn as () => Promise<void> | void, download, [])));
     }
-    if (offered < 2) { settle(false); return; }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let done = false;
-    const finish = (confirmed: boolean) => {
-      if (done) return;
-      done = true;
-      if (timer) clearTimeout(timer);
-      settle(confirmed);
-    };
-    timer = setTimeout(() => finish(false), this.#resolved.captureSettleTimeoutMs);
-    // A disposal bound must never hold the process open on its own.
-    timer.unref?.();
+    if (offered < 2) { finish(false); return; }
     void Promise.all(attempts).then((results) => finish(results.every(Boolean)), () => finish(false));
   }
 
@@ -1738,6 +1820,12 @@ export class PatchrightBrowserCore implements BrowserCore {
    */
   #assertCaptureUsable(): void {
     if (!this.#captureEnabled) return;
+    // close() raises this synchronously before invalidating the current generation and before its
+    // cutoff-turn await. That flag is an admission fence, not only a network-interception policy:
+    // no successor generation may enter the browser context teardown is already destroying.
+    if (this.#closing) {
+      throw new Error("artifact capture: core is closing; session must be replaced");
+    }
     if (this.#captureDirty) {
       throw new Error("artifact capture: core is dirty; session must be replaced");
     }
@@ -1752,6 +1840,7 @@ export class PatchrightBrowserCore implements BrowserCore {
     // BEFORE the no-operation return: dirty/pending state disqualifies the session, not just this
     // generation. Returning early on `!operation` first is exactly the ordering defect this closes.
     this.#assertCaptureUsable();
+    if (owner !== undefined) this.#assertPageCaptureUsable(owner);
     if (!operation) return undefined; // no capture for this operation
     if (this.#generation) {
       // INVARIANT (Amendment 2 §4): one generation per core. Replacing the slot would let two
@@ -1763,6 +1852,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       operation,
       ...(owner !== undefined ? { owner } : {}),
       state: "open",
+      claim: "unclaimed",
     };
     this.#generation = generation;
     return generation;
@@ -1904,6 +1994,9 @@ export class PatchrightBrowserCore implements BrowserCore {
    * that is its verb's cutoff — not a teardown drain.
    */
   async #drainUnattributedDisposals(owner?: PatchrightPage): Promise<void> {
+    // THE CUTOFF TURN COMES FIRST, AND THE SNAPSHOT AFTER IT (Amendment 7 §7). A download emitted
+    // during this turn is exactly the one teardown is racing; snapshotting before it would miss that
+    // record and close the page while its held `delete()` was still unresolved.
     await this.#captureDrainTurn();
     const pending = Array.from(this.#disposals)
       .filter((record) => owner === undefined || record.owner === owner)
@@ -2021,6 +2114,7 @@ export class PatchrightBrowserCore implements BrowserCore {
    * for hard-block detection, even though only navigate() returns a goto response directly.
    */
   async #ensureActivePage(): Promise<PatchrightPage> {
+    if (this.#activePage) this.#assertPageCaptureUsable(this.#activePage);
     if (!this.#activePage) {
       const page = await this.#context.newPage();
       // Contract §5: the drive path's download listener is installed the instant the page exists —
@@ -2075,7 +2169,14 @@ export class PatchrightBrowserCore implements BrowserCore {
     if (!this.#activePage) {
       throw new Error("no active page — call navigate() to open one before acting");
     }
+    this.#assertPageCaptureUsable(this.#activePage);
     return this.#activePage;
+  }
+
+  #assertPageCaptureUsable(page: PatchrightPage): void {
+    if (this.#closingActivePages.has(page)) {
+      throw new Error("artifact capture: active page is closing; session must be replaced");
+    }
   }
 
   /** Run an action against a resolved locator, mapping driver errors to a clean, labeled message. */
@@ -2550,7 +2651,10 @@ export class PatchrightBrowserCore implements BrowserCore {
    * Rejects immediately when no PID was captured (force-kill unavailable).
    */
   async kill(confirmMs: number): Promise<void> {
-    // Invalidate FIRST and synchronously (Amendment 1 §6 rule 6-7): a force-kill destroys the browser
+    // Raise the no-new-work fence before invalidation: invalidation enters operation-owned cleanup and
+    // hostile driver accessors, so a successor must already be inadmissible at that boundary.
+    this.#closing = true;
+    // Invalidate synchronously (Amendment 1 §6 rule 6-7): a force-kill destroys the browser
     // out from under any capture still copying, so the generation must be marked dead before the
     // signal — never after, and never behind an await. Kill is deliberately NOT drained: queueing it
     // behind the capture that may be doing the wedging would deadlock the one path that breaks it.
@@ -2562,7 +2666,6 @@ export class PatchrightBrowserCore implements BrowserCore {
     if (pid === undefined || !this.forceKillAvailable) {
       throw new Error("force-kill unavailable: no Chromium PID / generation marker captured at launch");
     }
-    this.#closing = true; // fail-closed during teardown, same as close()
     if (this.#ourGroupGone(pid)) return; // our whole tree already gone (or the pgid was recycled) — no signal
     this.#sigkill(-pid); // process group: reaps renderers/GPU/zygote even if the leader already died
     if (!childTerminated(this.#child)) this.#sigkill(pid); // leader, only while its pid can't be recycled

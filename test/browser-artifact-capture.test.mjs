@@ -15,9 +15,28 @@ import assert from "node:assert/strict";
 import { PatchrightBrowserCore } from "../dist/browser/patchright-core.js";
 import { DEFAULT_CORE_OPTIONS, resolveCoreOptions } from "../dist/browser/launch-options.js";
 import { ArtifactRuntime } from "../dist/artifacts/index.js";
+// The concrete store is INTERNAL to `src/artifacts/` (Amendment 3 §1) and is not on the public
+// barrel; the prototype wrapper below reaches it as the module-local class it is.
+import { ArtifactStore } from "../dist/artifacts/store.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// The runtime publishes NO concrete store (Amendment 3 §1), so the end-to-end test below observes the
+// one a capture actually published through from the TEST side: this module-local wrapper records the
+// receiver by identity — no property of it is read — and forwards to the untouched original with the
+// original receiver and arguments, returning its result verbatim. Production gains no seam.
+const stagedStores = new Set();
+const originalCapture = ArtifactStore.prototype.capture;
+ArtifactStore.prototype.capture = function (...args) {
+  stagedStores.add(this);
+  return Reflect.apply(originalCapture, this, args);
+};
+/** The store the capture under test staged through, since the last `stagedStores.clear()`. */
+function observedStore() {
+  assert.equal(stagedStores.size, 1, "no single store staged a capture, so none was observed");
+  return [...stagedStores][0];
+}
 
 /**
  * Construct a core over an already-open (fake) driver context.
@@ -196,9 +215,12 @@ function operationFactory({ stage, sealResult, mirror } = {}) {
       registerDownload(download) {
         log.push(`register:${index}`);
         operation.downloads.push(download);
-        // Staging is internal: the core gets nothing back. `stage` models it finishing later, and
-        // seal() is the only thing that waits for it.
+        // Staging is internal: the core gets back the OWNERSHIP RECEIPT and nothing else. `stage`
+        // models the staging finishing later, and seal() is the only thing that waits for it.
         operation.staging = stage ? stage(index) : Promise.resolve();
+        // Amendment 7 §8.1: every implementation AND FAKE returns the exact receipt. This fake
+        // accepts, so it owns the driver object and the core must not dispose of it.
+        return true;
       },
       noteMainResponseContentType({ status, contentType }) { log.push(`note:${index}:${status}:${contentType}`); },
       async seal() {
@@ -882,6 +904,138 @@ test("close(): invalidates the open generation synchronously, before its first a
   await closing;
 });
 
+test("close(): its synchronous closing fence rejects a successor capture before browser work", async () => {
+  const context = fakeContext();
+  const sink = operationFactory();
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  // close() sets its fence and reaches the cutoff-turn await. A normal concurrent verb can run in
+  // that interval; it must not install a fresh generation in the context being destroyed.
+  const closing = core.close();
+  await assert.rejects(
+    core.waitFor({ timeMs: 1 }, { artifactOperation: sink.make() }),
+    /artifact capture: core is closing; session must be replaced/,
+  );
+  assert.deepEqual(sink.log, ["begin:0"], "teardown touched the successor operation after rejecting admission");
+  await closing;
+});
+
+test("kill(): raises its closing fence before invalidation can re-enter with a successor", async () => {
+  const context = fakeContext({ duringGoto: (emit) => emit("download", disposableDownload()) });
+  const sink = operationFactory({ stage: () => new Promise(() => {}) });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+  const current = sink.make();
+  const successor = sink.make();
+  let reentry;
+  const invalidate = current.invalidate;
+  current.invalidate = function (reason) {
+    if (reentry === undefined) {
+      reentry = assert.rejects(
+        core.waitFor({ timeMs: 1 }, { artifactOperation: successor }),
+        /artifact capture: core is closing; session must be replaced/,
+      );
+    }
+    return Reflect.apply(invalidate, current, [reason]);
+  };
+
+  void core.navigate("https://origin.test/doc", { artifactOperation: current }).catch(() => {});
+  await drain();
+  await assert.rejects(core.kill(50), /force-kill unavailable/);
+  await reentry;
+  await core.close();
+});
+
+test("closeActivePage(): raises a page fence before invalidation can re-enter on that page", async () => {
+  const context = fakeContext({ duringGoto: (emit) => emit("download", disposableDownload()) });
+  const sink = operationFactory({ stage: () => new Promise(() => {}) });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+  const current = sink.make();
+  const successor = sink.make();
+  let reentry;
+  const invalidate = current.invalidate;
+  current.invalidate = function (reason) {
+    if (reentry === undefined) {
+      reentry = assert.rejects(
+        core.waitFor({ timeMs: 1 }, { artifactOperation: successor }),
+        /artifact capture: active page is closing; session must be replaced/,
+      );
+    }
+    return Reflect.apply(invalidate, current, [reason]);
+  };
+
+  void core.navigate("https://origin.test/doc", { artifactOperation: current }).catch(() => {});
+  await drain();
+  await core.closeActivePage();
+  await reentry;
+  await core.close();
+});
+
+test("closeActivePage(): its page fence survives the acquisition-to-generation await", async () => {
+  const context = fakeContext();
+  const sink = operationFactory();
+  let closingPhase = false;
+  let releaseClose;
+  const closeHeld = new Promise((resolve) => { releaseClose = resolve; });
+  const core = coreWith(context, {
+    captureEnabled: true,
+    captureSettleTimeoutMs: 100,
+    captureDrainTurn: async () => {
+      if (closingPhase) await closeHeld;
+      else await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+
+  await core.navigate("https://origin.test/first", { artifactOperation: sink.make() });
+  // navigate() has synchronously acquired the existing page, then yields on its async helper before it
+  // opens the successor generation. Teardown must fence that same page during the yield.
+  const successor = core.navigate("https://origin.test/successor", { artifactOperation: sink.make() });
+  closingPhase = true;
+  const closing = core.closeActivePage();
+  await assert.rejects(successor, /artifact capture: active page is closing; session must be replaced/);
+  releaseClose();
+  await closing;
+  await core.close();
+});
+
+test("closeActivePage(): a rejected driver close retains the page and poisons successor capture", async () => {
+  const context = fakeContext();
+  const sink = operationFactory();
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+  await core.navigate("https://origin.test/drive", { artifactOperation: sink.make() });
+  const retained = context.page;
+  retained.close = async () => { throw new Error("private driver close detail"); };
+
+  await assert.rejects(core.closeActivePage(), /artifact capture: page close failed; session must be replaced/);
+  assert.equal(context.page, retained, "a failed close discarded the only handle to the still-live page");
+  await assert.rejects(
+    core.waitFor({ timeMs: 1 }, { artifactOperation: sink.make() }),
+    /artifact capture: core is dirty; session must be replaced/,
+  );
+  await core.close();
+});
+
+test("render(): a rejected transient-page close poisons successor capture", async () => {
+  const context = fakeContext();
+  const sink = operationFactory();
+  const originalNewPage = context.newPage;
+  context.newPage = async function () {
+    const page = await Reflect.apply(originalNewPage, context, []);
+    page.close = async () => { throw new Error("private driver close detail"); };
+    return page;
+  };
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  await assert.rejects(
+    core.render("https://origin.test/transient", { artifactOperation: sink.make() }),
+    /artifact capture: page close failed; session must be replaced/,
+  );
+  await assert.rejects(
+    core.render("https://origin.test/successor", { artifactOperation: sink.make() }),
+    /artifact capture: core is dirty; session must be replaced/,
+  );
+  await core.close();
+});
+
 test("kill(): invalidates synchronously and never queues behind a capture", async () => {
   const download = { path: async () => "/driver/tmp/attachment.pdf" };
   const context = fakeContext({ duringGoto: (emit) => emit("download", download) });
@@ -1508,6 +1662,7 @@ test("a routed download becomes a real stored artifact, with the owner's metadat
   const owner = { scope: "consumer", consumerId: "owner-consumer" };
 
   const operation = runtime.createOperation({ owner, sourceHost: "origin.test" });
+  stagedStores.clear();  // only THIS render's capture may identify the store retrieved from below
   const result = await core.render("https://origin.test/doc", { artifactOperation: operation });
 
   assert.equal(result.artifactOutcome.outcome, "available", "the routed event did not become an artifact");
@@ -1516,7 +1671,7 @@ test("a routed download becomes a real stored artifact, with the owner's metadat
   assert.equal(record.bytes, Buffer.from("%PDF-1.7\nreal bytes").length);
 
   // And it is genuinely retrievable by that owner, once.
-  const lease = await runtime.store.acquire(record.id, "owner-consumer");
+  const lease = await observedStore().acquire(record.id, "owner-consumer");
   assert.ok(lease, "the published artifact was not retrievable by its owner");
   assert.equal(Buffer.from(lease.base64, "base64").toString(), "%PDF-1.7\nreal bytes");
   lease.complete();
@@ -1575,6 +1730,111 @@ test("a registerDownload that throws fails closed: disposed, invalidated, dirty,
   for (const [surface, text] of Object.entries({ result: JSON.stringify(rest), stderr: written.join("") })) {
     assert.equal(text.includes("sentinel"), false, `${surface} leaked the refusal's raw text`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// B2 — `registerDownload()` is an explicit SYNCHRONOUS ownership receipt (Amendment 7 §8).
+//
+// It returned void, so the core could not learn whether the operation had actually taken the driver
+// object. It pre-set `claimed` and assumed acceptance: an operation that refused left its driver copy
+// owned by nobody — never staged, never cancelled, never deleted — with the core still believing the
+// generation was spoken for.
+// ---------------------------------------------------------------------------------------------
+
+/** An operation whose `registerDownload` receipt is exactly what a test dictates. */
+function receiptOperation(receipt, { label = "op-receipt" } = {}) {
+  const invalidations = [];
+  const seen = [];
+  return {
+    operationId: label,
+    owner: { scope: "consumer", consumerId: "owner" },
+    registerDownload(download) { seen.push(download); return typeof receipt === "function" ? receipt(download) : receipt; },
+    noteMainResponseContentType() {},
+    invalidate(reason) { invalidations.push(reason); },
+    async seal() {
+      return invalidations.length > 0 ? { outcome: "capture-failed", failure: invalidations[0] } : { outcome: "none" };
+    },
+    get invalidations() { return invalidations; },
+    get seen() { return seen; },
+  };
+}
+
+test("an operation that REFUSES ownership leaves the core owning the driver copy, disposed exactly once", async () => {
+  const download = disposableDownload();
+  const refusing = receiptOperation(false);
+  const context = fakeContext({ duringGoto: (emit) => emit("download", download) });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  const result = await core.render("https://origin.test/doc", { artifactOperation: refusing });
+
+  // The core kept ownership of what the operation would not take.
+  assert.deepEqual(download.calls, ["cancel", "delete"], "an exactly-false refusal left the driver copy owned by nobody");
+  assert.deepEqual(refusing.invalidations, ["download-capture-failed"], "a refused first download was misreported as a duplicate");
+  assert.equal(result.artifactOutcome.outcome, "capture-failed", "a refused attribution reported a normal outcome");
+  // A refusal is not a contract violation, so a CONFIRMED disposal need not dirty the core.
+  await core.render("https://origin.test/next", { artifactOperation: receiptOperation(true) });
+});
+
+test("an operation that ACCEPTS ownership never has its download core-disposed", async () => {
+  const download = disposableDownload();
+  const accepting = receiptOperation(true);
+  const context = fakeContext({ duringGoto: (emit) => emit("download", download) });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  await core.render("https://origin.test/doc", { artifactOperation: accepting });
+
+  assert.deepEqual(accepting.seen, [download], "the accepted event never reached the operation");
+  assert.deepEqual(download.calls, [], "the core disposed of a download the operation had taken ownership of");
+  assert.deepEqual(accepting.invalidations, [], "an accepted first event invalidated its generation");
+});
+
+for (const [label, receipt] of [
+  ["undefined", undefined],
+  ["null", null],
+  ["a truthy non-boolean", 1],
+  ["a falsy non-boolean", 0],
+  ["a string", "true"],
+]) {
+  test(`a registerDownload returning ${label} is a contract violation: disposed AND the core turns dirty`, async () => {
+    // Only EXACT booleans are receipts. A truthy non-boolean is the dangerous half: coercion would
+    // read it as "owned", and the driver's copy would be left behind exactly as before.
+    const download = disposableDownload();
+    const malformed = receiptOperation(receipt);
+    const context = fakeContext({ duringGoto: (emit) => emit("download", download) });
+    const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+    const result = await core.render("https://origin.test/doc", { artifactOperation: malformed });
+
+    assert.deepEqual(download.calls, ["cancel", "delete"], "a malformed receipt left the driver copy owned by nobody");
+    assert.equal(result.artifactOutcome.outcome, "capture-failed");
+    await assert.rejects(
+      core.render("https://origin.test/next", { artifactOperation: receiptOperation(true) }),
+      "an operation that violated its ownership contract left the session usable",
+    );
+  });
+}
+
+test("a hostile re-entrant event during `claiming` is a second event: disposed, never a second claim", async () => {
+  // The re-entrant emit happens INSIDE registerDownload, before the first event's receipt has been
+  // returned — the window in which the generation is neither unclaimed nor claimed. It must be
+  // treated as a second event, and it must not steal or void the first event's accepted ownership.
+  const first = disposableDownload();
+  const reentrant = disposableDownload();
+  let emitAgain;
+  const hostile = receiptOperation((download) => {
+    if (download === first) emitAgain("download", reentrant);
+    return true;
+  });
+  const context = fakeContext({ duringGoto: (emit) => { emitAgain = emit; emit("download", first); } });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  const result = await core.render("https://origin.test/doc", { artifactOperation: hostile });
+
+  assert.deepEqual(hostile.seen, [first], "the re-entrant event was registered as a second claim");
+  assert.deepEqual(first.calls, [], "the accepted first event lost its ownership to a re-entrant one");
+  assert.deepEqual(reentrant.calls, ["cancel", "delete"], "the re-entrant event was dropped rather than disposed");
+  assert.deepEqual(hostile.invalidations, ["multiple-artifacts"], "a second event did not terminalize with multiple-artifacts");
+  assert.equal(result.artifactOutcome.outcome, "capture-failed");
 });
 
 for (const mode of ["cancel", "delete"]) {
@@ -2096,6 +2356,72 @@ test("render(): drains transient-page disposal after sealing and before page clo
   assert.ok(context.calls.includes("close"), "transient page was not closed");
 });
 
+// ---------------------------------------------------------------------------------------------
+// T1 — the disposal snapshot is built AFTER the cutoff turn, on EVERY teardown path.
+//
+// The sibling guards below emit their late download BEFORE the teardown they are testing, so the
+// record is in `#disposals` whichever side of the cutoff turn the snapshot is built on: they pass
+// under both orderings and say nothing about the ordering itself. Only an event emitted DURING the
+// cutoff turn distinguishes them — and that is precisely the event teardown is racing.
+// ---------------------------------------------------------------------------------------------
+
+test("close(): a download emitted DURING the cutoff turn is drained before the context closes", async () => {
+  const context = fakeContext();
+  const sink = operationFactory();
+  const late = hungDisposableDownload();
+  let turns = 0;
+  const core = coreWith(context, {
+    captureEnabled: true,
+    captureSettleTimeoutMs: 100,
+    captureDrainTurn: async () => {
+      turns += 1;
+      if (turns === 2) context.page.emit("download", late); // inside close()'s own cutoff turn
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  await core.navigate("https://origin.test/drive", { artifactOperation: sink.make() }); // turn 1: the nav's seal cutoff
+  const closing = core.close();
+  await drain(3);
+
+  assert.deepEqual(late.calls, ["cancel", "delete"], "the cutoff-turn event was never disposed");
+  assert.equal(
+    context.calls.includes("context-close"),
+    false,
+    `the context closed while a cutoff-turn disposal was still held (calls: ${context.calls.join(",")})`,
+  );
+  late.release();
+  await closing;
+  assert.ok(context.calls.includes("context-close"), "the context never closed after its disposal settled");
+});
+
+test("render(): a download emitted DURING the transient page's cutoff turn is drained before it closes", async () => {
+  const context = fakeContext();
+  const sink = operationFactory();
+  const late = hungDisposableDownload();
+  let turns = 0;
+  const core = coreWith(context, {
+    captureEnabled: true,
+    captureSettleTimeoutMs: 100,
+    captureDrainTurn: async () => {
+      turns += 1;
+      if (turns === 2) context.page.emit("download", late); // inside the render's disposal cutoff turn
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  const rendering = core.render("https://origin.test/transient", { artifactOperation: sink.make() }); // turn 1: seal cutoff
+  await drain(4);
+
+  assert.deepEqual(late.calls, ["cancel", "delete"], "the cutoff-turn event was never disposed");
+  assert.equal(
+    context.calls.includes("close"),
+    false,
+    `the transient page closed while a cutoff-turn disposal was still held (turns=${turns}, calls: ${context.calls.join(",")})`,
+  );
+  late.release();
+  await rendering;
+  assert.ok(context.calls.includes("close"), "the transient page never closed after its disposal settled");
+});
+
 test("closeActivePage(): a delayed close cannot close or clear a replacement page", async () => {
   const context = fakeContext();
   const sink = operationFactory();
@@ -2161,4 +2487,181 @@ test("close(): drains all owner pages after one cutoff turn", async () => {
   popupLate.release();
   await closing;
   assert.ok(context.calls.includes("context-close"), "context did not close after all-owner drain");
+});
+
+// ---------------------------------------------------------------------------------------------
+// The CALLABLE BOUNDARY and the CLAIM ANCHOR, on the core's own mandatory disposal path.
+//
+// These are the browser-core halves of the artifact runtime's cleanup invariants, and the two must
+// not drift: a driver-supplied `cancel`/`delete` is a function whose every property — `call` included
+// — the driver controls; classifying its return value must read `then` exactly once; and the bound
+// that decides an unconfirmed disposal opens when the core CLAIMS the copy, not after the untrusted
+// property reads and calls that bound exists to survive.
+// ---------------------------------------------------------------------------------------------
+
+/** The successor verb, and the exact sanitized refusal it must produce. Run while the owning verb is
+ *  still parked in its own disposal drain, which is the state under test. */
+async function assertSuccessorRefused(core, message, label) {
+  await assert.rejects(
+    core.render("https://origin.test/successor", { artifactOperation: receiptOperation(true) }),
+    (err) => {
+      assert.equal(err.message, message, `${label}: wrong refusal (${err.message})`);
+      return true;
+    },
+    label,
+  );
+}
+
+test("core disposal invokes a callable with a hostile `call` getter without reading it", async () => {
+  const sentinel = "/driver/tmp/hostile-call sentinel";
+  let callReads = 0, cancelCalls = 0, deleteCalls = 0;
+  let cancelReceiver, deleteReceiver;
+  const order = [];
+  // A cancel that answers immediately, behind a `call` property that traps. Reading `call` to invoke
+  // it hands the driver a getter it can throw from — and loses the mandatory invocation entirely.
+  const cancel = function () { cancelCalls += 1; cancelReceiver = this; order.push("cancel"); };
+  Object.defineProperty(cancel, "call", {
+    configurable: true,
+    get() { callReads += 1; throw new Error(sentinel); },
+  });
+  const download = {
+    path: async () => "/driver/tmp/never-read.pdf",
+    cancel,
+    delete: function () { deleteCalls += 1; deleteReceiver = this; order.push("delete"); },
+  };
+  const refusing = receiptOperation(false);
+  const context = fakeContext({ duringGoto: (emit) => emit("download", download) });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  const result = await core.render("https://origin.test/doc", { artifactOperation: refusing });
+  await drain();
+
+  assert.equal(callReads, 0, "the core read a caller-controlled `call` property off a disposal callable");
+  assert.equal(cancelCalls, 1, "the hostile property read displaced the mandatory cancel() invocation");
+  assert.equal(deleteCalls, 1, "delete() was not invoked exactly once");
+  assert.equal(cancelReceiver, download, "cancel() did not run against the download it came from");
+  assert.equal(deleteReceiver, download, "delete() did not run against the download it came from");
+  assert.deepEqual(order, ["cancel", "delete"], "the synchronous cancel-then-delete order was not preserved");
+  assert.equal(result.artifactOutcome.outcome, "capture-failed", "the refused attribution reported a normal outcome");
+  assert.equal(JSON.stringify(result).includes(sentinel), false, "the hostile getter's raw text escaped into the result");
+
+  // Both mandatory operations answered, so this disposal is CONFIRMED and the session stays usable.
+  await core.render("https://origin.test/next", { artifactOperation: receiptOperation(true) });
+});
+
+/** A disposal return value whose `then` is CALLABLE on its first read and non-callable afterwards.
+ *  The first read's callable keeps the adopter's callbacks without ever invoking them, so a correct
+ *  adoption stays pending and only the core's own claim-anchored bound can decide it. */
+function statefulDisposalThenable(sink) {
+  let reads = 0;
+  const value = {
+    get then() {
+      reads += 1;
+      if (reads === 1) return function (onFulfilled) { sink.settlers.push(onFulfilled); };
+      // What the old adoption saw on its second read: not callable, so `Promise.resolve()` treated
+      // this exact object as an ordinary value and fulfilled with it — a disposal confirmed by nobody.
+      return 0;
+    },
+    get reads() { return reads; },
+  };
+  sink.values.push(value);
+  return value;
+}
+
+test("a core disposal thenable whose `then` changes between reads is read once and never falsely confirmed", async (t) => {
+  // Captured BEFORE the mock replaces the global: a wedged await must FAIL, not hang the runner.
+  const realSetTimeout = setTimeout;
+  const guarded = async (promise, label) => {
+    const guard = new Promise((resolve) => { const h = realSetTimeout(() => resolve(`WEDGED:${label}`), 5_000); h.unref?.(); });
+    assert.notEqual(await Promise.race([promise, guard]), `WEDGED:${label}`, `${label} never completed`);
+  };
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const SETTLE = 1_000;                     // virtual milliseconds: no real time passes here
+
+  const sink = { values: [], settlers: [] };
+  const calls = [];
+  const download = {
+    path: async () => "/driver/tmp/never-read.pdf",
+    cancel() { calls.push("cancel"); return statefulDisposalThenable(sink); },
+    delete() { calls.push("delete"); return statefulDisposalThenable(sink); },
+  };
+  const context = fakeContext({ duringGoto: (emit) => emit("download", download) });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: SETTLE });
+
+  const rendering = core.render("https://origin.test/doc", { artifactOperation: receiptOperation(false) });
+  await drain();
+
+  assert.deepEqual(calls, ["cancel", "delete"], "both mandatory disposal operations were not attempted");
+  assert.equal(sink.values.length, 2, "each disposal call did not return its own thenable");
+  assert.deepEqual(sink.values.map((v) => v.reads), [1, 1], "a disposal return value's `then` was read more than once");
+
+  // One virtual millisecond before the claim-anchored bound: still genuinely OUTSTANDING, and the
+  // core is PENDING rather than dirty — the two states proven apart, not as one lump.
+  t.mock.timers.tick(SETTLE - 1);
+  await drain();
+  await assertSuccessorRefused(core, PENDING_MESSAGE, "an adoption nothing had confirmed was resolved before its budget expired");
+
+  // Exactly at the bound: unconfirmed turns the session dirty.
+  t.mock.timers.tick(1);
+  await drain();
+  await assertSuccessorRefused(core, DIRTY_MESSAGE, "a disposal nothing ever confirmed left the session usable");
+
+  // The retained callbacks finally answer, long past the bound. Late settlement heals nothing.
+  assert.equal(sink.settlers.length, 2, "the adoption never handed its callbacks to the thenable");
+  for (const settle of sink.settlers) settle();
+  t.mock.timers.tick(SETTLE * 4);
+  await drain();
+  await assertSuccessorRefused(core, DIRTY_MESSAGE, "a late settlement healed a dirty core");
+
+  await guarded(rendering, "render-stateful-thenable");
+});
+
+test("the core's unattributed disposal bound opens at the ownership claim, not after the driver work", async (t) => {
+  const realSetTimeout = setTimeout;
+  const guarded = async (promise, label) => {
+    const guard = new Promise((resolve) => { const h = realSetTimeout(() => resolve(`WEDGED:${label}`), 5_000); h.unref?.(); });
+    assert.notEqual(await Promise.race([promise, guard]), `WEDGED:${label}`, `${label} never completed`);
+  };
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const SETTLE = 1_000;                     // virtual milliseconds: no real time passes here
+
+  const calls = [];
+  let cancelReceiver, deleteReceiver;
+  const download = {
+    path: async () => "/driver/tmp/never-read.pdf",
+    // UNTRUSTED CODE INSIDE THE CLAIM. A property read is a driver call, and it can burn the whole
+    // bound before it returns anything at all. A bound armed only afterwards was never armed for
+    // this window — and then expires a full budget past an instant that is already gone.
+    get cancel() {
+      t.mock.timers.tick(SETTLE - 1);
+      return function () { calls.push("cancel"); cancelReceiver = this; return new Promise(() => {}); };
+    },
+    delete: function () { calls.push("delete"); deleteReceiver = this; return new Promise(() => {}); },
+  };
+  const context = fakeContext({ duringGoto: (emit) => emit("download", download) });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: SETTLE });
+
+  const rendering = core.render("https://origin.test/doc", { artifactOperation: receiptOperation(false) });
+  await drain();
+
+  // Both mandatory operations were still attempted, in order, against their own receiver.
+  assert.deepEqual(calls, ["cancel", "delete"], "the clock-burning getter displaced a mandatory disposal call");
+  assert.equal(cancelReceiver, download, "cancel() did not run against the download it came from");
+  assert.equal(deleteReceiver, download, "delete() did not run against the download it came from");
+
+  // The driver consumed all but one millisecond of the bound. It has NOT expired yet.
+  await assertSuccessorRefused(core, PENDING_MESSAGE, "the disposal bound expired before the claim-anchored instant");
+
+  // One more millisecond — exactly one budget after the CLAIM. A bound armed after the driver work
+  // is not due for another whole budget, so this is the assertion that separates the two.
+  t.mock.timers.tick(1);
+  await drain();
+  await assertSuccessorRefused(core, DIRTY_MESSAGE, "the disposal bound was armed after the untrusted driver work, not at the claim");
+
+  // The bound settles exactly once: a further budget changes nothing.
+  t.mock.timers.tick(SETTLE * 4);
+  await drain();
+  await assertSuccessorRefused(core, DIRTY_MESSAGE, "a second expiry rewrote a settled disposal");
+
+  await guarded(rendering, "render-claim-anchor");
 });

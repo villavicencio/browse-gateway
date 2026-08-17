@@ -112,6 +112,47 @@ test("tempFileState reports unknown when no path was ever resolved", () => {
   assert.equal(tempFileState(true, false), "absent");
 });
 
+test("tempFileState requires EXACT booleans and never coerces a non-observation to absent", () => {
+  // Amendment 7 §6. `exists === true` alone made every non-true value — a missing field, a null, a
+  // string, a number — read as a confident `absent`: "the driver wrote no file", which is a finding
+  // the run never made. Only two real readings may produce a reading.
+  for (const exists of [undefined, null, 0, 1, "", "false", "true", "absent", {}, []]) {
+    assert.equal(tempFileState(true, exists), "unknown", `existence ${JSON.stringify(exists)} was coerced to a reading`);
+  }
+  for (const known of [undefined, null, 0, 1, "yes", "true", {}, []]) {
+    assert.equal(tempFileState(known, true), "unknown", `pathKnown ${JSON.stringify(known)} was coerced to a reading`);
+  }
+  assert.equal(tempFileState(), "unknown", "omitted observations were coerced to a reading");
+});
+
+test("downloadBlock never turns a missing, malformed or failed observation into `absent`", () => {
+  const at = (over) => downloadBlock([rec("browser", "http://127.0.0.1:1/attachment.pdf", over)], NO_FAULT);
+  // The two real readings still read.
+  assert.equal(at({ pathKnown: true, existsBeforeClose: true, existsAfterClose: false }).tempFileBeforeClose, "present");
+  assert.equal(at({ pathKnown: true, existsBeforeClose: false, existsAfterClose: false }).tempFileBeforeClose, "absent");
+
+  assert.equal(at({ pathKnown: true }).tempFileBeforeClose, "unknown", "an omitted existence field read as `absent`");
+  for (const value of [null, undefined, 0, 1, "true", "false", {}, []]) {
+    assert.equal(
+      at({ pathKnown: true, existsBeforeClose: value }).tempFileBeforeClose,
+      "unknown",
+      `existsBeforeClose ${JSON.stringify(value)} was coerced to a reading`,
+    );
+  }
+  assert.equal(at({ pathKnown: "yes", existsBeforeClose: true }).tempFileBeforeClose, "unknown", "a non-boolean pathKnown was coerced");
+  assert.equal(at({ pathKnown: true, existsBeforeClose: true, statError: true }).tempFileBeforeClose, "unknown");
+  assert.equal(
+    at({ pathKnown: true, existsBeforeClose: true, accessorError: true }).tempFileBeforeClose,
+    "unknown",
+    "an accessor failure still produced a confident reading",
+  );
+  assert.equal(
+    at({ pathKnown: true, existsBeforeClose: true, settleError: true }).tempFileBeforeClose,
+    "unknown",
+    "a settle failure still produced a confident reading",
+  );
+});
+
 // --- closed-vocabulary error marker --------------------------------------------------------------
 
 test("errorMarker reduces a message to a closed vocabulary and never echoes it", () => {
@@ -301,20 +342,49 @@ test("readDownloadIdentity preserves the record when a site-controlled accessor 
   assert.equal(dead.suggestedFilenameRaw, null);
 });
 
+test("readDownloadIdentity snapshots suggestedFilename once and invokes that exact callable with its receiver", () => {
+  let reads = 0;
+  const invoked = [];
+  const download = {
+    url: () => "http://h/a.pdf",
+    get suggestedFilename() {
+      reads += 1;
+      if (reads === 1) return function () { invoked.push(this === download ? "first-own" : "first-wrong-this"); return "accepted.pdf"; };
+      return function () { invoked.push("second"); return "wrong.pdf"; };
+    },
+  };
+  assert.deepEqual(readDownloadIdentity(download), {
+    redactedUrl: "http://h/a.pdf",
+    suggestedFilenameRaw: "accepted.pdf",
+    accessorError: false,
+  });
+  assert.equal(reads, 1, "the site-controlled property was read more than once");
+  assert.deepEqual(invoked, ["first-own"], "a callable other than the accepted snapshot ran, or its receiver was lost");
+});
+
 // --- the validity guard, in both directions --------------------------------------------------------
 
-const row = (surface, caseId, eventCount, over = {}) => ({
+/** `download` is the whole reportable block, so a row states its observations rather than implying
+ *  them. A bare number is still accepted for a row whose observations are not what is under test. */
+const row = (surface, caseId, download, over = {}) => ({
   ...legRow(surface, caseId),
-  download: { eventCount },
+  download: typeof download === "number" ? { eventCount: download } : { ...download },
   ...over,
 });
 
-/** A reading in which every arm is satisfied: the control fired, the page did not, a core was seen. */
+/**
+ * A reading in which every arm is satisfied: the control fired, the page did not, a core was seen.
+ *
+ * A row that OBSERVED a download carries both of its temp-file readings, exactly as the contract
+ * requires. Omitting them was not "healthy": it was a row asserting a download happened while
+ * answering neither question about it, and the guard called that VALID.
+ */
+const observed = (eventCount) => ({ eventCount, tempFileBeforeClose: "present", tempFileAfterClose: "absent" });
 const healthyRows = () => [
-  row("browser", POSITIVE_CONTROL, 1),
-  row("browser", NEGATIVE_CONTROL, 0),
-  row("browser", "attachment-pdf", 1),
-  row("browser", "inline-pdf", 0),
+  row("browser", POSITIVE_CONTROL, observed(1)),
+  row("browser", NEGATIVE_CONTROL, { eventCount: 0 }),
+  row("browser", "attachment-pdf", observed(1)),
+  row("browser", "inline-pdf", { eventCount: 0 }),
 ];
 
 const okFixture = { ok: true, problems: [] };
@@ -338,6 +408,96 @@ test("measurementValidity is GREEN on a healthy reading — including a quiet me
   assert.equal(v.valid, true, JSON.stringify(v.problems));
   // The point of the guard: "the inline PDF produced no download" is a RESULT, not a failure.
   assert.deepEqual(v.problems, []);
+});
+
+test("measurementValidity rejects any observed download whose two states are not exactly present|absent", () => {
+  // Amendment 7 §6: the closed set is {present, absent}. Rejecting only `unknown` let a row that
+  // never answered the question at all — an omitted field, an aggregated `mixed` across disagreeing
+  // records — pass as a VALID reading of the download lifecycle.
+  for (const side of ["tempFileBeforeClose", "tempFileAfterClose"]) {
+    for (const bad of [undefined, null, "unknown", "mixed", "", "PRESENT", "Absent", 0, false, true, {}]) {
+      const rows = healthyRows();
+      const target = rows.find((r) => r.case === "attachment-pdf");
+      if (bad === undefined) delete target.download[side];
+      else target.download[side] = bad;
+      const v = measurementValidity(rows, okFixture, env());
+      const label = `${side}=${bad === undefined ? "<omitted>" : JSON.stringify(bad)}`;
+      assert.equal(v.valid, false, `${label} was accepted as a valid reading`);
+      assert.ok(v.problems.some((p) => p.code === "lifecycle-incomplete"), label);
+    }
+  }
+  // And a row that observed NO download states nothing, which stays valid — the inline case.
+  const quiet = measurementValidity(healthyRows(), okFixture, env());
+  assert.equal(quiet.valid, true, JSON.stringify(quiet.problems));
+});
+
+// The row set is a KEY SET, not a lookup table. Every question the guard asks it went through
+// `rows.find(...)`, which answers from the first match and never notices the rest: a second,
+// contradicting row for a case it had already read was invisible, and a row for a (surface, case)
+// this measurement never ran was invisible too. A reading assembled from rows nobody can account for
+// is not a reading of this measurement.
+test("measurementValidity requires exactly one row per expected (surface, case) and no others", () => {
+  const duplicate = measurementValidity([...healthyRows(), row("browser", "attachment-pdf", { eventCount: 0 })], okFixture, env());
+  assert.equal(duplicate.valid, false, "a second, contradicting row for an expected case was accepted");
+  assert.ok(duplicate.problems.some((p) => p.code === "duplicate-row" && p.surface === "browser"), JSON.stringify(duplicate.problems));
+
+  const unknownCase = measurementValidity([...healthyRows(), row("browser", "not-a-case", { eventCount: 0 })], okFixture, env());
+  assert.equal(unknownCase.valid, false, "a row for a case this measurement never ran was accepted");
+  assert.ok(unknownCase.problems.some((p) => p.code === "unknown-row"), JSON.stringify(unknownCase.problems));
+
+  const unknownSurface = measurementValidity([...healthyRows(), row("drive", "attachment-pdf", { eventCount: 0 })], okFixture, env());
+  assert.equal(unknownSurface.valid, false, "a row for a surface this measurement never selected was accepted");
+  assert.ok(unknownSurface.problems.some((p) => p.code === "unknown-row"), JSON.stringify(unknownSurface.problems));
+
+  // The exact set is still the healthy reading.
+  assert.equal(measurementValidity(healthyRows(), okFixture, env()).valid, true);
+});
+
+test("measurementValidity rejects a duplicate selected-surface inventory before set conversion", () => {
+  const duplicate = measurementValidity(healthyRows(), okFixture, env({ surfaces: ["browser", "browser"] }));
+  assert.equal(duplicate.valid, false, "a duplicated selected surface was silently collapsed");
+  assert.ok(duplicate.problems.some((p) => p.code === "surface-selection-duplicate"), JSON.stringify(duplicate.problems));
+});
+
+test("measurementValidity rejects missing selected-surface metadata instead of inferring it from rows", () => {
+  const environment = env();
+  delete environment.surfaces;
+  const missing = measurementValidity(healthyRows(), okFixture, environment);
+  assert.equal(missing.valid, false, "missing selected-surface metadata was inferred from result rows");
+  assert.ok(missing.problems.some((p) => p.code === "surface-selection-missing"), JSON.stringify(missing.problems));
+});
+
+// The per-core teardown records and the download-core inventory are two statements about the same
+// fact, and the guard checked only that the inventory was a SUBSET of the records. So an inventory
+// that named no downloading core at all agreed with a teardown record reporting a download, and one
+// core could file two teardown records that disagreed with each other.
+test("measurementValidity requires unique teardown records and a core inventory that matches them", () => {
+  const record = (over = {}) => ({ coreId: 1, surface: "browser", beforeClose: "ok", afterClose: "ok", hookErrors: [], downloadCount: 1, ...over });
+
+  const duplicated = measurementValidity(healthyRows(), okFixture, env({ teardown: [record(), record()] }));
+  assert.equal(duplicated.valid, false, "two teardown records for one core were accepted");
+  assert.ok(duplicated.problems.some((p) => p.code === "teardown-duplicate"), JSON.stringify(duplicated.problems));
+
+  const duplicateInventory = measurementValidity(healthyRows(), okFixture, env({ downloadCoreIds: [1, 1] }));
+  assert.equal(duplicateInventory.valid, false, "a duplicate core in the download inventory was silently deduplicated");
+  assert.ok(duplicateInventory.problems.some((p) => p.code === "core-inventory-duplicate"), JSON.stringify(duplicateInventory.problems));
+
+  const noInventory = measurementValidity(healthyRows(), okFixture, env({ downloadCoreIds: [] }));
+  assert.equal(noInventory.valid, false, "an empty inventory was accepted against a teardown record reporting a download");
+  assert.ok(noInventory.problems.some((p) => p.code === "core-inventory-mismatch"), JSON.stringify(noInventory.problems));
+
+  const nobodyDownloaded = measurementValidity(healthyRows(), okFixture, env({ downloadCoreIds: [], teardown: [record({ downloadCount: 0 })] }));
+  assert.equal(nobodyDownloaded.valid, false, "rows reporting observed downloads were accepted with no downloading core anywhere");
+  assert.ok(nobodyDownloaded.problems.some((p) => p.code === "core-inventory-missing"), JSON.stringify(nobodyDownloaded.problems));
+
+  // A run in which nothing downloaded is not a contradiction — it is what the deaf-apparatus control
+  // is for, and it must still report exactly that and nothing else.
+  const muted = measurementValidity(
+    healthyRows().map((r) => ({ ...r, download: { eventCount: 0 } })),
+    okFixture,
+    env({ downloadCoreIds: [], teardown: [record({ downloadCount: 0 })] }),
+  );
+  assert.deepEqual(muted.problems.map((p) => p.code), ["positive-control-silent"], JSON.stringify(muted.problems));
 });
 
 test("measurementValidity goes RED when the positive control is silent (deaf apparatus)", () => {
@@ -726,11 +886,12 @@ test("resolveFault defaults to none and rejects a typo instead of silently disar
   for (const mode of FAULT_MODES) assert.equal(resolveFault(mode).mode, mode);
 });
 
-test("resolveSurfaces defaults to all three and rejects an unknown surface", () => {
+test("resolveSurfaces defaults to all three and rejects unknown or duplicate surfaces", () => {
   assert.deepEqual(resolveSurfaces(undefined), ["browser", "retrieve", "drive"]);
   assert.deepEqual(resolveSurfaces("browser"), ["browser"]);
   assert.deepEqual(resolveSurfaces("browser, drive"), ["browser", "drive"]);
   assert.throws(() => resolveSurfaces("browsr"), /unknown BGW_EID_MEASURE_SURFACES/);
+  assert.throws(() => resolveSurfaces("browser,browser"), /duplicate BGW_EID_MEASURE_SURFACES/);
 });
 
 // --- fixture self-check --------------------------------------------------------------------------------
@@ -816,4 +977,106 @@ test("the real fixture serves every expected shape (and the break-fixture fault 
   // The inline route is unaffected by the fault — otherwise the fault would prove nothing specific.
   const inline = FIXTURE_EXPECTATIONS.find((e) => e.path === "/inline.pdf");
   assert.deepEqual(fixtureRouteProblems(inline, await fetchHead(brokenBase, "/inline.pdf")), []);
+});
+
+// ---------------------------------------------------------------------------------------------
+// PR #139 adversarial-security correction — malformed numeric evidence.
+//
+// The guard compared counters with `> 0` / `< 1`. `NaN` is a number and satisfies neither, so a
+// report whose event count, unattributed count and observation-failure counts were all `NaN` came
+// back `{ valid: true, problems: [] }` — a confident reading built from evidence that does not exist.
+// Negative, fractional, infinite, string and omitted counters passed the same way.
+// ---------------------------------------------------------------------------------------------
+
+import * as measureModule from "../scripts/measure-eid-download.mjs";
+
+/** Every shape a counter must refuse. `undefined` is spelled by deleting the field, so an omitted
+ *  counter is tested as an omission rather than as an explicit `undefined`. */
+const MALFORMED_COUNTERS = [
+  ["NaN", NaN],
+  ["Infinity", Number.POSITIVE_INFINITY],
+  ["-Infinity", Number.NEGATIVE_INFINITY],
+  ["a negative count", -1],
+  ["a fractional count", 0.5],
+  ["a numeric string", "1"],
+  ["a string", "/tmp/pw-artifacts/leak"],
+  ["null", null],
+  ["a boolean", true],
+  ["an object", {}],
+  ["an omitted value", undefined],
+];
+
+test("the exact counter predicate accepts only finite non-negative integers", () => {
+  const { exactCounter } = measureModule;
+  assert.equal(typeof exactCounter, "function", "the measurement exposes no single counter predicate");
+  for (const good of [0, 1, 2, 42, Number.MAX_SAFE_INTEGER]) assert.equal(exactCounter(good), true, `${good} is a valid counter`);
+  for (const [label, bad] of MALFORMED_COUNTERS) assert.equal(exactCounter(bad), false, `${label} was accepted as a counter`);
+});
+
+test("measurementValidity rejects malformed download event counts on every row", () => {
+  for (const [label, bad] of MALFORMED_COUNTERS) {
+    for (const target of [POSITIVE_CONTROL, NEGATIVE_CONTROL, "attachment-pdf"]) {
+      const rows = healthyRows();
+      const subject = rows.find((r) => r.case === target);
+      if (bad === undefined) delete subject.download.eventCount;
+      else subject.download.eventCount = bad;
+      const v = measurementValidity(rows, okFixture, env());
+      assert.equal(v.valid, false, `${target}: ${label} was accepted as valid evidence`);
+      assert.ok(v.problems.some((p) => p.code === "malformed-counter"), `${target}: ${label} produced no closed malformed-counter diagnostic`);
+    }
+  }
+  // A row with no download block at all states nothing, and must be refused rather than throw.
+  const rows = healthyRows();
+  delete rows.find((r) => r.case === "attachment-pdf").download;
+  const v = measurementValidity(rows, okFixture, env());
+  assert.equal(v.valid, false, "a row with no download block was accepted");
+  assert.ok(v.problems.some((p) => p.code === "malformed-counter"));
+});
+
+test("measurementValidity rejects a malformed observed-core count", () => {
+  for (const [label, bad] of MALFORMED_COUNTERS) {
+    const rows = healthyRows();
+    if (bad === undefined) delete rows[0].coresObserved;
+    else rows[0].coresObserved = bad;
+    const v = measurementValidity(rows, okFixture, env());
+    assert.equal(v.valid, false, `${label} was accepted as an observed-core count`);
+    assert.ok(v.problems.some((p) => p.code === "malformed-counter"), `${label} produced no closed malformed-counter diagnostic`);
+  }
+});
+
+test("measurementValidity rejects malformed environment counters", () => {
+  for (const key of ["unattributedDownloads", "statErrors", "accessorErrors", "settleErrors"]) {
+    for (const [label, bad] of MALFORMED_COUNTERS) {
+      const environment = env();
+      if (bad === undefined) delete environment[key];
+      else environment[key] = bad;
+      const v = measurementValidity(healthyRows(), okFixture, environment);
+      assert.equal(v.valid, false, `${key}: ${label} was accepted as a count`);
+      assert.ok(v.problems.some((p) => p.code === "malformed-counter"), `${key}: ${label} produced no closed malformed-counter diagnostic`);
+      // The counter is NAMED, never printed: a hostile value must not be interpolated into a report.
+      assert.equal(v.problems.some((p) => String(p.detail).includes("/tmp/pw-artifacts/leak")), false, `${key}: ${label} interpolated the raw value`);
+      assert.ok(v.problems.some((p) => p.code === "malformed-counter" && String(p.detail).includes(key)), `${key}: ${label} did not name the counter`);
+    }
+  }
+});
+
+test("measurementValidity rejects a malformed teardown download count", () => {
+  for (const [label, bad] of MALFORMED_COUNTERS) {
+    const teardown = [{ coreId: 1, surface: "browser", beforeClose: "pending", afterClose: "pending", hookErrors: [] }];
+    if (bad !== undefined) teardown[0].downloadCount = bad;
+    const v = measurementValidity(healthyRows(), okFixture, env({ teardown }));
+    assert.equal(v.valid, false, `${label} was accepted as a teardown download count`);
+    assert.ok(v.problems.some((p) => p.code === "malformed-counter"), `${label} produced no closed malformed-counter diagnostic`);
+  }
+});
+
+test("healthy integer counters — zero and positive — remain valid evidence", () => {
+  const v = measurementValidity(healthyRows(), okFixture, env());
+  assert.equal(v.valid, true, JSON.stringify(v.problems));
+  const busy = measurementValidity(
+    healthyRows().map((r) => ({ ...r, coresObserved: 3, download: { ...r.download, eventCount: r.case === NEGATIVE_CONTROL ? 0 : r.download.eventCount } })),
+    okFixture,
+    env({ teardown: [{ coreId: 1, surface: "browser", beforeClose: "ok", afterClose: "ok", hookErrors: [], downloadCount: 7 }] }),
+  );
+  assert.equal(busy.valid, true, JSON.stringify(busy.problems));
 });
