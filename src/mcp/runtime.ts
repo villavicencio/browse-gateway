@@ -90,6 +90,22 @@ export interface BuildRuntimeOptions {
    * loopback as anti-SSRF). Not env-reachable, so a deployed process can never weaken egress.
    */
   policyEgress?: (host: string) => boolean;
+  /**
+   * Whether the sessions this gateway launches may capture artifacts at all (Task G).
+   *
+   * This is NOT a second enablement switch: the caller derives it from the same
+   * `loadArtifactConfig(env).enabled` that decides whether the process-owned `ArtifactRuntime` is
+   * built, so the browser-side listener and the store can never disagree about being on.
+   *
+   * It has to be an option rather than an env read here because the download listener is installed at
+   * BROWSER-CORE CONSTRUCTION — before any per-operation context exists — so it must be part of
+   * `config.core` before `Gateway.create` builds the session pool. And it has to be an option rather
+   * than a fact of this builder because this builder is shared with `cli/vault-host.ts`, which owns no
+   * runtime, creates no operation, and must keep its pre-Task-2 behaviour.
+   *
+   * Omitted/false = no listener anywhere, byte-identical to the pre-artifact path.
+   */
+  captureEnabled?: boolean;
 }
 
 function loadConsumers(env: NodeJS.ProcessEnv, secrets: SecretStore): ConsumerSpec[] {
@@ -139,6 +155,18 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // secret, not just URL-strip — closes the audit-#3 gap (a proxy password not in URL form). Passing the
   // store (not a redactor fn) lets the core union these values with a launch's proxy creds in one pass.
   config.core.secrets = secrets;
+  // Task G: artifact capture is a CONSTRUCTION-time property of every browser core this gateway
+  // launches — `#installDownloadCapture` is a no-op unless the core was built with it, and a driver
+  // delivers `download` only to listeners registered at emit time. Set here, before `Gateway.create`
+  // below hands `config.core` to the session pool.
+  //
+  // Without it, an artifact-enabled deployment did not merely fail to capture: `#requireCaptureReady`
+  // refuses an operation handed to a capture-disabled session, so EVERY retrieve and EVERY
+  // browser_navigate failed with "an operation was supplied to a session with capture disabled" the
+  // moment BGW_ARTIFACT_CAPTURE_ENABLED=1 was set. Measured in-container by
+  // `scripts/validate-artifact.mjs`, which no unit test could see: the unit suites inject fake cores,
+  // and a fake core has no listener to install.
+  if (opts.captureEnabled) config.core.captureEnabled = true;
 
   const specs = loadConsumers(env, secrets);
   const registry = new ConsumerRegistry(specs);

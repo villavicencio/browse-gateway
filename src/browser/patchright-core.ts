@@ -1753,29 +1753,70 @@ export class PatchrightBrowserCore implements BrowserCore {
    *  - the combined confirmation is bounded by the claim-anchored `finish` its caller already armed,
    *    so an unanswerable driver call turns the session dirty and is DETACHED rather than retained
    *    forever — and the bound covers these reads and calls, not just what follows them.
+   *
+   * WHERE THE TWO HALVES NOW DIFFER, AND WHY IT IS NOT DRIFT. Both confirm the same contract — the
+   * driver's copy is gone — but they can prove it from different evidence, because they know
+   * different things. `ArtifactOperation` staged the download, so it already holds the path and
+   * confirms from the FILE. This site never staged anything: it disposes of orphans, late events and
+   * refusals it has no record of, so the only way to learn the path is to ask the driver, and
+   * measurement rules that out (docs/solutions/integration-issues/
+   * driver-disposal-calls-are-mutually-exclusive-not-concurrent.md):
+   *
+   *  - `path()` invoked AFTER the disposal calls REJECTS — the download is already cancelled;
+   *  - `path()` invoked before them and awaited after is non-deterministic: it rejected in 2 of 3
+   *    in-container runs, and in the run where it resolved the file was ALREADY gone, so "existed
+   *    before" was unobservable and the path could not be told apart from one naming nothing;
+   *  - `path()` AWAITED before invoking disposal does answer — but it defers the mandatory `delete()`
+   *    behind an unbounded untrusted call, which is precisely the trade this contract forbids.
+   *
+   * So this site confirms from the disposal calls, corrected for what the driver actually does: the
+   * two operations are MUTUALLY EXCLUSIVE, so whichever lands first makes the other reject. Requiring
+   * both was requiring an outcome no real driver can produce — it dirtied the session on every
+   * ordinary disposal. A successful `delete()` across two MANDATORY invocations is the confirmation; the
+   * `invoked < 2` guard below is what keeps this honest, because it is the case the measurements
+   * refute — `cancel()` alone resolves and leaves the bytes ON DISK.
+   *
+   * INVOKED, not offered. The guard counts driver calls this method actually made, which is the only
+   * thing that can have removed bytes. A `delete` that is absent, non-callable, or present behind a
+   * getter that THROWS are the same fact told three ways: no delete ran, so the download is in the
+   * `cancel()`-alone state and a resolving `cancel()` must not be allowed to confirm it. Reading a
+   * property is not performing an operation, and the earlier `offered` counter — which credited an
+   * unreadable getter as an offer — let exactly that through.
    */
   #disposeDriverCopy(download: DownloadLike, finish: (confirmed: boolean) => void): void {
     const attempts: Array<Promise<boolean>> = [];
-    let offered = 0;
+    let invoked = 0;
+    let deleteAttemptIndex = -1;
     for (const method of ["cancel", "delete"] as const) {
       let fn: unknown;
       try {
         fn = download[method];
       } catch {
-        // Unreadable is not "not offered": the operation exists and could not even be reached.
-        offered += 1;
+        // Unreadable is not "not offered" — the operation exists and could not even be reached — but
+        // it is emphatically NOT INVOKED, and invocation is what the guard below counts. A failed
+        // read runs no driver code at all, so it removes exactly as many bytes as an absent method.
         attempts.push(Promise.resolve(false));
         continue;
       }
       if (typeof fn !== "function") continue;
-      offered += 1;
+      invoked += 1;
       // `Reflect.apply` reads NO property of the callable — `call` is as driver-controlled as any
       // other property of a driver-supplied function — while still passing the download as the
       // receiver the driver's own method expects.
-      attempts.push(invokeDriverDisposal(() => Reflect.apply(fn as () => Promise<void> | void, download, [])));
+      const attempt = invokeDriverDisposal(() => Reflect.apply(fn as () => Promise<void> | void, download, []));
+      if (method === "delete") deleteAttemptIndex = attempts.length;
+      attempts.push(attempt);
     }
-    if (offered < 2) { finish(false); return; }
-    void Promise.all(attempts).then((results) => finish(results.every(Boolean)), () => finish(false));
+    // BOTH mandatory operations must have actually RUN before one success is allowed to speak for the
+    // pair. Counting anything weaker — presence, readability — lets the measured `cancel()`-alone row
+    // back in wearing a `delete` that never executed a line, and that row leaves the bytes ON DISK.
+    if (invoked < 2 || deleteAttemptIndex < 0) { finish(false); return; }
+    // `cancel()` success is not deletion evidence: the real driver reports it while leaving bytes on
+    // disk. Both calls still settle before the verdict, but only delete's result can confirm removal.
+    void Promise.all(attempts).then(
+      (results) => finish(results[deleteAttemptIndex] === true),
+      () => finish(false),
+    );
   }
 
   /**

@@ -118,6 +118,37 @@ export async function closeArtifactRuntimeBounded(
   });
 }
 
+/** Bounded wait for in-flight tool calls (and any active artifact response lease, which keeps a
+ *  session's `inFlight` elevated until its tracker settles) before force-closing transports. */
+export const SHUTDOWN_DRAIN_MS = 5_000;
+/** Bounds `ArtifactRuntime.close()` — the step that RELEASES THE ARTIFACT ROOT LOCK. Generous enough
+ *  to safely exceed a hung cleanup's own D+C=10s worst case (Amendment 7 §2), so it is a true safety
+ *  net rather than a routine truncation. */
+export const ARTIFACT_CLOSE_TIMEOUT_MS = 10_000;
+
+/**
+ * The worst-case wall clock of {@link runShutdownSequence} up to and including the artifact close —
+ * i.e. the longest the ARTIFACT ROOT LOCK can still be held after SIGTERM.
+ *
+ * `cleanupAwaitMs` is charged TWICE, because `closeAll()` spends it twice in series: once on its own
+ * `drain(cleanupAwaitMs)` (a session with an in-flight call is not drained) and again on the bounded
+ * settle of every transport close + graph dispose. That doubling is measured, not assumed — see the
+ * composition test in `test/artifact-http-lifecycle.test.mjs`.
+ *
+ * A container's `stop_grace_period` MUST cover this. The root lock is a plain `mkdir`'d directory with
+ * no staleness reclamation (`ArtifactStore`: "a pre-existing lock always refuses here"), so a SIGKILL
+ * landing before the artifact close completes leaves the lock behind and every later boot fails
+ * `artifact-root-locked`. `gateway.shutdown()` runs AFTER the lock is released and so is deliberately
+ * not counted here.
+ */
+export function worstCaseShutdownMs(opts: {
+  drainMs: number;
+  cleanupAwaitMs: number;
+  artifactCloseTimeoutMs: number;
+}): number {
+  return opts.drainMs + 2 * opts.cleanupAwaitMs + opts.artifactCloseTimeoutMs;
+}
+
 export interface ShutdownSequenceTarget {
   httpServer: { close: () => unknown; closeAllConnections?: () => void };
   handler: { drain: (ms: number) => Promise<void>; closeAll: () => Promise<void> };

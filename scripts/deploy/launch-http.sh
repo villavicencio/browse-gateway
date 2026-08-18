@@ -25,6 +25,8 @@
 #                           (defaults: 1.75 / 4g / 512 / 1g — matches the tuned live container)
 #   BGW_RESTART             docker restart policy (default: unless-stopped; the pre-swap smoke uses 'no'
 #                           so a throwaway container can't self-resurrect if a deploy is interrupted)
+#   BGW_STOP_TIMEOUT        SIGTERM->SIGKILL grace, seconds (default: 45). Must cover the whole bounded
+#                           shutdown sequence, whose last bounded step releases the artifact root lock.
 set -euo pipefail
 
 : "${BGW_DEPLOY_IMAGE:?set BGW_DEPLOY_IMAGE (image digest or tag to run)}"
@@ -35,6 +37,12 @@ export DOCKER_HOST="${BGW_DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
 CONTAINER="${BGW_CONTAINER:-browse-gateway-http}"
 BIND_ADDR="${BGW_BIND_ADDR:-127.0.0.1}"
 HOST_PORT="${BGW_HOST_PORT:-8080}"
+# Grace for SIGTERM -> the full bounded shutdown sequence, whose LAST bounded step releases the artifact
+# root lock: 5s drain + 2x8s in closeAll (it spends cleanupAwaitMs twice — measured, not assumed) + 10s
+# artifact close = 31s worst case. Docker's default is 10s, which would SIGKILL mid-sequence. Kept in
+# step with worstCaseShutdownMs() by a test (test/artifact-http-lifecycle.test.mjs). A ceiling, not a
+# cost — the ordinary path finishes in milliseconds.
+STOP_TIMEOUT="${BGW_STOP_TIMEOUT:-45}"
 
 [ -r "$BGW_ENV_FILE" ] || { echo "launch-http: env file not readable: $BGW_ENV_FILE" >&2; exit 1; }
 [ -r "$BGW_CONSUMERS_HOST_PATH" ] || { echo "launch-http: consumers.json not readable: $BGW_CONSUMERS_HOST_PATH" >&2; exit 1; }
@@ -64,10 +72,20 @@ if [ -n "${BGW_VAULT_HOST_PATH:-}" ]; then
 fi
 
 echo "launch-http: (re)creating ${CONTAINER} on ${BIND_ADDR}:${HOST_PORT} from ${BGW_DEPLOY_IMAGE}"
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+# Retire the old container GRACEFULLY, then remove it. `docker rm -f` is SIGKILL with no grace at all —
+# survivable for a stateless process, but it means the shutdown sequence never runs: no drain of in-flight
+# tool calls (#129), no graph disposal, and no ArtifactRuntime.close(), which is the ONLY thing that
+# releases the artifact root lock. That lock is a plain mkdir'd directory with no staleness reclamation,
+# so any later boot against the same artifact root fails closed on artifact-root-locked. `docker stop`
+# sends SIGTERM and waits up to BGW_STOP_TIMEOUT before escalating; an ordinary shutdown takes
+# milliseconds, so this costs nothing on the happy path.
+# `|| true` on the stop keeps a first-ever deploy (no such container) working exactly as before.
+docker stop -t "$STOP_TIMEOUT" "$CONTAINER" >/dev/null 2>&1 || true
+docker rm "$CONTAINER" >/dev/null 2>&1 || true
 
 docker run -d --name "$CONTAINER" \
   --restart "${BGW_RESTART:-unless-stopped}" --init \
+  --stop-timeout "$STOP_TIMEOUT" \
   --cpus="${BGW_CPUS:-1.75}" --memory="${BGW_MEMORY:-4g}" --memory-swap="${BGW_MEMORY:-4g}" \
   --pids-limit="${BGW_PIDS_LIMIT:-512}" --shm-size="${BGW_SHM_SIZE:-1g}" \
   -p "${BIND_ADDR}:${HOST_PORT}:8080" \

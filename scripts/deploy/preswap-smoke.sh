@@ -60,7 +60,8 @@ preswap_smoke() {
   # from the sourced config, but a throwaway name/port, --restart no, and tiny caps incl. a small shm
   # (the smoke never opens a browser session). The app reads its listen port from BGW_HTTP_PORT (not
   # BGW_HOST_PORT), so it still listens on 8080 inside; BGW_HOST_PORT only moves the host-side -p map.
-  # launch-http's own `docker rm -f` is scoped to $SMOKE_CONTAINER, so the live container is never touched.
+  # launch-http's own retire step (docker stop + rm) is scoped to $SMOKE_CONTAINER via BGW_CONTAINER, so
+  # the live container is never touched — and the rm -f above already evicted it, so that stop is a no-op.
   if ! BGW_DEPLOY_IMAGE="$BGW_DEPLOY_IMAGE" BGW_CONTAINER="$SMOKE_CONTAINER" BGW_HOST_PORT="$SMOKE_PORT" \
        BGW_RESTART=no \
        BGW_CPUS="${BGW_SMOKE_CPUS:-0.5}" BGW_MEMORY="${BGW_SMOKE_MEMORY:-1g}" \

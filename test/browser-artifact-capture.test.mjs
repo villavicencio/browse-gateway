@@ -1127,11 +1127,50 @@ test("a late event is disposed through the driver and, when disposal succeeds, t
   await core.render("https://origin.test/again", { artifactOperation: sink.make() });
 });
 
-test("a late event whose disposal FAILS turns the core dirty and the next action fails closed", async () => {
-  for (const mode of ["delete-rejects", "cancel-rejects", "no-disposal"]) {
+// The sibling of the runtime-side regression, at the core's own disposal site. Same measured driver
+// shape (`cancel()` and `delete()` are mutually exclusive, so one of them rejects), different
+// consequence: `#discardUnattributed` sets `#captureDirty`, and `#assertCaptureUsable` then refuses
+// EVERY later capture-capable verb on the session — including calls that supply no operation. Nothing
+// outside patchright-core reads that flag or retires a dirty core, so a pinned drive session stays
+// bricked until the idle reaper takes it.
+test("a late event whose cancel() rejects while delete() succeeds leaves the session usable", async () => {
+  const late = disposableDownload({ failCancel: true });
+  let emitEvent;
+  const context = fakeContext({ duringGoto: (emit) => { emitEvent = emit; emit("download", disposableDownload()); } });
+  let stageCalls = 0;
+  const sink = operationFactory({
+    stage: () => {
+      const nth = ++stageCalls;
+      return new Promise((resolve) => setImmediate(resolve)).then(() => {
+        if (nth === 1) emitEvent("download", late);
+      });
+    },
+  });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  await core.render("https://origin.test/doc", { artifactOperation: sink.make() });
+  await drain();
+
+  assert.deepEqual(late.calls, ["cancel", "delete"], "a rejected cancel skipped the delete");
+  // `delete()` reported success, so the copy is accounted for. Bricking the session here is the
+  // defect: on a real driver this is what EVERY disposal looks like.
+  await core.render("https://origin.test/again", { artifactOperation: sink.make() });
+});
+
+// The complement of the test above, and the line between them is what the driver can actually do. ONE
+// rejection is the ordinary shape of a successful disposal (the two calls are mutually exclusive), so
+// it is not a failure. These are: nothing succeeded, or there was nothing to succeed with.
+//
+// `cancel-only` is the load-bearing one now that a single success confirms. It is the measured row in
+// which the bytes SURVIVE — `cancel()` alone resolves and leaves the file on disk — so it is exactly
+// what a lone success must never be allowed to confirm. The `invoked < 2` guard is what excludes it.
+test("a late event whose disposal proves NOTHING turns the core dirty and the next action fails closed", async () => {
+  for (const mode of ["both-reject", "cancel-only", "no-disposal"]) {
     const late = mode === "no-disposal"
       ? { path: async () => "/driver/tmp/late.pdf" }
-      : disposableDownload(mode === "delete-rejects" ? { failDelete: true } : { failCancel: true });
+      : mode === "cancel-only"
+        ? { path: async () => "/driver/tmp/late.pdf", async cancel() {} }
+        : disposableDownload({ failCancel: true, failDelete: true });
     let emitEvent;
     const context = fakeContext({ duringGoto: (emit) => { emitEvent = emit; emit("download", disposableDownload()); } });
     let stageCalls = 0;
@@ -1148,12 +1187,96 @@ test("a late event whose disposal FAILS turns the core dirty and the next action
     await core.render("https://origin.test/doc", { artifactOperation: sink.make() });
     await drain();
 
-    // EITHER failure counts, and a driver offering no disposal at all cannot prove its bytes are gone.
+    // Both mandatory calls failed, or the driver offered no disposal at all. Neither can prove the
+    // bytes are gone, so the session's download state is no longer accounted for.
     await assert.rejects(
       core.render("https://origin.test/again", { artifactOperation: sink.make() }),
       `${mode} did not dirty the core`,
     );
   }
+});
+
+// The third route to the measured `cancel()`-alone row, and the one neither test above can reach.
+// `cancel-only` gets there by OMITTING `delete`; these get there with `delete` PRESENT on the
+// download and never invoked, because reading it threw. A getter that throws is a driver operation
+// that could not be reached, so nothing ran to remove the bytes — the file is on disk exactly as it
+// is in the row the confirmation exists to exclude — yet a resolving `cancel()` is still a success
+// for `some()` to find.
+//
+// Both directions are asserted because the guard is about INVOCATION, not about which name failed:
+// one mandatory operation running is one mandatory operation running, whichever it was. The existing
+// getter-throw test near the end of this file cannot prove any of this — it emits an ORPHAN, and the
+// orphan path dirties the core unconditionally in `#routeDownload`, before disposal is even started.
+// A LATE event is the vehicle that leaves the verdict to the confirmation predicate alone.
+for (const shape of ["delete-unreachable", "cancel-unreachable"]) {
+  test(`a late event whose ${shape.split("-")[0]}() could never be INVOKED cannot confirm its own disposal`, async () => {
+    const ran = [];
+    const unreachable = shape === "delete-unreachable" ? "delete" : "cancel";
+    const reachable = shape === "delete-unreachable" ? "cancel" : "delete";
+    // Defined rather than spread: an object literal's getter is READ by the spread itself, which would
+    // move the throw into this test and never hand the core a download with an unreadable operation.
+    const late = { path: async () => "/driver/tmp/late.pdf" };
+    Object.defineProperty(late, reachable, { value: async () => { ran.push(reachable); }, enumerable: true });
+    Object.defineProperty(late, unreachable, {
+      get() { throw new Error("/private/driver-internals SENTINEL"); },
+      enumerable: true,
+    });
+    let emitEvent;
+    const context = fakeContext({ duringGoto: (emit) => { emitEvent = emit; emit("download", disposableDownload()); } });
+    let stageCalls = 0;
+    const sink = operationFactory({
+      stage: () => {
+        const nth = ++stageCalls;
+        return new Promise((resolve) => setImmediate(resolve)).then(() => {
+          if (nth === 1) emitEvent("download", late);
+        });
+      },
+    });
+    const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+    await core.render("https://origin.test/doc", { artifactOperation: sink.make() });
+    await drain();
+
+    // Exactly ONE of the two mandatory operations ran. The unreadable one never executed a line.
+    assert.deepEqual(ran, [shape === "delete-unreachable" ? "cancel" : "delete"], `${shape}: the unreadable operation was invoked anyway`);
+    // So the bytes are unaccounted for, and the session must be replaced rather than reused. A
+    // confirmed disposal here would be confirmed by a call that removed nothing.
+    await assert.rejects(
+      core.render("https://origin.test/again", { artifactOperation: sink.make() }),
+      (err) => err.message === "artifact capture: core is dirty; session must be replaced" && !err.message.includes("SENTINEL"),
+      `${shape}: an uninvoked mandatory disposal left the session usable`,
+    );
+  });
+}
+
+// Regression for PR #141 review: cancel() resolves, delete() is INVOKED and rejects. The old
+// `some(Boolean)` predicate confirmed that as disposal even though the measured cancel-only path
+// leaves bytes on disk. Only delete() success is evidence that the driver removed its copy.
+//
+// Run it on a late, non-orphan event so the verdict comes from the confirmation predicate alone.
+test("a late event whose cancel() resolves while delete() rejects must not confirm", async () => {
+  const late = disposableDownload({ failDelete: true });
+  let emitEvent;
+  const context = fakeContext({ duringGoto: (emit) => { emitEvent = emit; emit("download", disposableDownload()); } });
+  let stageCalls = 0;
+  const sink = operationFactory({
+    stage: () => {
+      const nth = ++stageCalls;
+      return new Promise((resolve) => setImmediate(resolve)).then(() => {
+        if (nth === 1) emitEvent("download", late);
+      });
+    },
+  });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  await core.render("https://origin.test/doc", { artifactOperation: sink.make() });
+  await drain();
+
+  assert.deepEqual(late.calls, ["cancel", "delete"], "delete was not invoked");
+  await assert.rejects(
+    core.render("https://origin.test/again", { artifactOperation: sink.make() }),
+    "a rejected delete left the session usable",
+  );
 });
 
 test("the cutoff drain turn is a real awaited boundary: an event injected there is already late", async () => {
@@ -1535,12 +1658,12 @@ for (const verb of [
   });
 }
 
-test("disposal attempts delete even when cancel rejects, and the successor fails closed", async () => {
+test("disposal attempts delete even when cancel rejects, and a disposal that proves nothing fails closed", async () => {
   const attempted = [];
   const late = {
     path: async () => "/driver/tmp/late.pdf",
     async cancel() { attempted.push("cancel"); throw new Error("driver refused to cancel"); },
-    async delete() { attempted.push("delete"); },
+    async delete() { attempted.push("delete"); throw new Error("driver refused to delete"); },
   };
   let emitEvent;
   const context = fakeContext({ duringGoto: (emit) => { emitEvent = emit; emit("download", disposableDownload()); } });

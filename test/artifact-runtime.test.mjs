@@ -2405,6 +2405,70 @@ test("a hung cancel() still gets delete() invoked, and unconfirmed cleanup poiso
   await r.close();
 });
 
+// The REAL driver's shape, measured in-container (docs/solutions/integration-issues/
+// driver-disposal-calls-are-mutually-exclusive-not-concurrent.md): `cancel()` and `delete()` are
+// mutually exclusive, so whichever call loses the race REJECTS — while the bytes are genuinely gone.
+// Requiring both to confirm therefore fails on an ORDINARY refused download, and because the failure
+// poisons the runtime for the life of the process, one HTML login redirect served as an attachment
+// disabled capture entirely until the container restarted.
+//
+// The staged path is the evidence that settles it: the operation's staging job already read it, and
+// after disposal it names nothing.
+test("a driver whose cancel() rejects while delete() removes the bytes does not poison the runtime", async () => {
+  const root = join(temp(), "a"), staged = join(temp(), "login-redirect.bin");
+  writeFileSync(staged, Buffer.from("<html>sign in to view your bill</html>"));
+  const r = new ArtifactRuntime({ enabled: true, root });
+  const op = r.createOperation({ owner: OWNER, sourceHost: "example.com", artifactId: "P".repeat(22) });
+  const download = {
+    calls: [],
+    failure: () => undefined,
+    path() { this.calls.push("path"); return staged; },
+    cancel() { this.calls.push("cancel"); return Promise.reject(new Error("download.cancel: canceled")); },
+    delete() { this.calls.push("delete"); unlinkSync(staged); return Promise.resolve(); },
+  };
+  op.registerDownload(download);
+
+  // The store refuses the bytes (they are not a PDF), which invalidates and takes disposal ownership.
+  assert.deepEqual(await op.seal(), { outcome: "capture-failed", failure: "artifact-integrity-failed" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(download.calls.filter((c) => c !== "path"), ["cancel", "delete"], "a rejected cancel skipped the delete");
+  assert.equal(existsSync(staged), false, "the driver's copy is still on disk, so this proves nothing");
+  // The whole point: ONE refused download may not disable capture for the rest of the process.
+  assert.doesNotThrow(
+    () => r.createOperation({ owner: OWNER, sourceHost: "example.com" }),
+    "a refused download poisoned the runtime even though its bytes are provably gone",
+  );
+  await r.close();
+});
+
+// The one way filesystem evidence could be WEAKER than the promises it replaces: a path that never
+// named a file is absent after disposal for the trivial reason that it was absent before it. Evidence
+// is therefore a positive cut — the staged path is recorded only if it exists at that instant — so a
+// driver that hands back somewhere it never wrote confirms nothing, exactly as before.
+test("a staged path that never existed is not evidence, and cannot confirm a disposal", async () => {
+  const r = new ArtifactRuntime({ enabled: true, root: join(temp(), "a") });
+  const op = r.createOperation({ owner: OWNER, sourceHost: "example.com", artifactId: "Q".repeat(22) });
+  const download = {
+    failure: () => undefined,
+    path: () => join(temp(), "the-driver-never-wrote-this.bin"),
+    cancel: () => Promise.reject(new Error("download.cancel: canceled")),
+    delete: () => Promise.resolve(),      // resolves, but removed nothing: there was nothing to remove
+  };
+  op.registerDownload(download);
+  assert.equal((await op.seal()).outcome, "capture-failed");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.throws(
+    () => r.createOperation({ owner: OWNER, sourceHost: "example.com" }),
+    (e) => e.code === "artifact-cleanup-failed",
+    "a path that never existed was accepted as proof that a disposal removed something",
+  );
+  await r.close();
+});
+
 test("cleanup settling after the deadline cannot unpoison, release or reuse an identity", async () => {
   const scheduler = fakeScheduler();
   const root = join(temp(), "a"), id = "M".repeat(22);

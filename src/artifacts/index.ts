@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { ArtifactStore, SYSTEM_SCHEDULER, canonicalizeStoreOptions } from "./store.js";
 import { ARTIFACT_ID, ArtifactStoreError, type ArtifactFailureCode, type ArtifactDiscardResult, type ArtifactMetadata, type ArtifactOwner, type ArtifactRecord, type ArtifactResponseLease, type ArtifactResponseOutcome, type ArtifactScheduler, type ArtifactStoreOptions, type DownloadLike, type OperationResult, type ResponseLease } from "./types.js";
 import { canonicalizeHost, canonicalizeHostForIp } from "../security/url.js";
@@ -246,6 +247,12 @@ function adoptUntrusted<T>(then: (...args: unknown[]) => unknown, raw: object, s
  * caller can start `cancel()` and then `delete()` without waiting for the first to settle — a hung,
  * throwing or rejecting `cancel()` must never prevent the `delete()` attempt, which is exactly the
  * case where the driver's copy would otherwise be left on disk.
+ *
+ * The boolean is what the driver REPORTED, not whether the bytes are gone. Those are different facts:
+ * against a real driver the two disposal calls are mutually exclusive, so one of them reports failure
+ * on a disposal that fully succeeded. Callers holding the staged path decide from the file instead —
+ * see `ArtifactOperation`'s `#startCleanup` — and this answer is what they fall back on when they
+ * have no path to consult.
  */
 function invokeDisposal(run: () => Promise<void> | void): Promise<boolean> {
   let raw: Promise<void> | void;
@@ -355,6 +362,11 @@ export class ArtifactOperation {
   /** The ONE attributed download, while it is still this operation's to dispose of. Cleared the
    *  instant cleanup takes ownership of it, and when the staging job that consumed it finishes. */
   #download?: DownloadLike;
+  /** Where the driver staged its copy, as the staging job read it — the only evidence this operation
+   *  can consult to decide whether disposal actually removed the bytes. Absent until the path read
+   *  succeeds, and never re-read from the driver: a terminal operation touches nothing further on the
+   *  driver's behalf, and `path()` REJECTS once disposal has been invoked anyway (measured). */
+  #stagedPath?: string;
   /** The single cleanup record for that download. `idle -> running -> confirmed | failed`, advanced
    *  by compare-and-set: the first request becomes owner and invokes the driver, later ones only
    *  observe. Repeated invalidation, close, kill or a late accessor can never dispose twice. */
@@ -603,6 +615,22 @@ export class ArtifactOperation {
       }, stop, () => !this.#isTerminal());
       if (path.state === "stopped" || this.#isTerminal()) return;
       if (path.state === "threw" || !path.value) { this.invalidate("download-capture-failed"); return; }
+      // The ONE place the driver's staged path is legitimately known, recorded so `#startCleanup()`
+      // can confirm disposal from the bytes themselves without ever calling back into the driver.
+      //
+      // Recorded ONLY if it names a file RIGHT NOW, which makes the later absence a positive cut —
+      // present, then gone — rather than an absence that was always true. Without that, a driver
+      // handing back a path it never wrote would have its "disposal" confirmed by a file that never
+      // existed, which is the one way filesystem evidence could be weaker than the promises it
+      // replaces. The type is erased too, so a non-string is not a path and is never recorded. An
+      // unrecorded path is "no evidence", which leaves the decision to the driver's own answer.
+      if (typeof path.value === "string") {
+        try {
+          if (existsSync(path.value)) this.#stagedPath = path.value;
+        } catch {
+          // an unreadable path is not evidence in either direction
+        }
+      }
       const captured = await this.#store.capture(path.value, { id: this.artifactId, consumerId: this.owner.consumerId });
       if (this.#isTerminal()) {
         // Invalidated while the copy was in flight: it cannot publish, and its file goes with it.
@@ -632,6 +660,23 @@ export class ArtifactOperation {
    * confirmations are awaited, together, under {@link CLEANUP_CONFIRM_BUDGET_MS} — which opens HERE,
    * at the claim, and is never the remainder of the operation's settlement deadline.
    *
+   * WHAT COUNTS AS CONFIRMATION. Two independent proofs, either of which is sufficient:
+   *
+   *  - both closed operations reported success — a cooperative driver's own answer; or
+   *  - FILESYSTEM EVIDENCE: the path the staging job read no longer names a file.
+   *
+   * The second exists because the first is unobtainable from a real driver. Measured in-container
+   * (docs/solutions/integration-issues/driver-disposal-calls-are-mutually-exclusive-not-concurrent.md):
+   * `cancel()` and `delete()` are MUTUALLY EXCLUSIVE — whichever lands first makes the other reject —
+   * so requiring both turned every ordinary refused download into an unconfirmed cleanup, and an
+   * unconfirmed cleanup poisons the runtime for the life of the process. One HTML login redirect
+   * served as an attachment therefore disabled capture until the container restarted.
+   *
+   * Evidence only ever ADDS confirmation; it never withdraws one the driver already gave. And the
+   * relaxation that was refuted stays refuted: `cancel()` alone leaves the bytes ON DISK (measured),
+   * so it satisfies neither proof — the disposal it did not perform cannot be evidenced by a file
+   * that is still there, and a missing `delete()` is a failed confirmation under the first.
+   *
    * The timer that SPENDS that budget is therefore armed here too, at the claim, before the first
    * caller-supplied property is read. `cancel()`/`delete()` are untrusted code invoked synchronously
    * from this frame, so a driver can advance the injected clock through the whole budget before it
@@ -654,7 +699,11 @@ export class ArtifactOperation {
       if (timer !== undefined) { this.#scheduler.clearTimeout(timer); timer = undefined; }
       this.#finishCleanup(confirmed);
     };
-    timer = this.#scheduler.setTimeout(() => { timer = undefined; settle(false); }, CLEANUP_CONFIRM_BUDGET_MS);
+    // The driver's own answer first, then the bytes. Consulted on the EXPIRY path too: a `delete()`
+    // whose promise never settles has still removed the file, and a budget that ignored that would
+    // poison the runtime over a disposal it can see succeeded.
+    const confirm = (reported: boolean): void => settle(reported || this.#stagedBytesGone());
+    timer = this.#scheduler.setTimeout(() => { timer = undefined; confirm(false); }, CLEANUP_CONFIRM_BUDGET_MS);
     const attempts: Array<Promise<boolean>> = [];
     for (const method of ["cancel", "delete"] as const) {
       let fn: unknown;
@@ -682,7 +731,29 @@ export class ArtifactOperation {
     // Promise settlement is still guarded by the same one-shot. A hung driver promise retains this
     // operation through `settle`, exactly as the previous call-site `.then(... this.#finishCleanup)`
     // did; the timer makes that retention bounded in authority even though the promise may stay live.
-    void Promise.all(attempts).then((results) => settle(results.every(Boolean)), () => settle(false));
+    void Promise.all(attempts).then((results) => confirm(results.every(Boolean)), () => confirm(false));
+  }
+
+  /**
+   * FILESYSTEM EVIDENCE: is the driver's staged copy gone?
+   *
+   * A fact about the bytes, not about the driver's promise plumbing — which is the whole point, since
+   * the two disposal promises cannot both succeed. Deliberately conservative in every uncertain
+   * direction: an unrecorded path, or a stat that throws, is NO evidence rather than good news, so it
+   * leaves the decision entirely to the driver's own reported confirmations.
+   *
+   * `#stagedPath` is only ever set for a path that EXISTED when the staging job read it, so a `false`
+   * here is a positive cut — present, then gone — and never the vacuous absence of a file that was
+   * never written.
+   */
+  #stagedBytesGone(): boolean {
+    const staged = this.#stagedPath;
+    if (staged === undefined) return false;
+    try {
+      return !existsSync(staged);
+    } catch {
+      return false;
+    }
   }
 
   /** Land the cleanup record. Confirmed cleanup can release the identity; unconfirmed retains it for

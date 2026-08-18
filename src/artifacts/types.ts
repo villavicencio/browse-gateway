@@ -220,6 +220,14 @@ export type OperationResult = ArtifactOutcome;
  *
  *  Every method here is UNTRUSTED third-party code: it may throw synchronously, reject, or never
  *  settle at all. Callers invoke `cancel` then `delete` without waiting for the first, and bound every
- *  wait — an accessor that never settles is abandoned, never awaited indefinitely. */
+ *  wait — an accessor that never settles is abandoned, never awaited indefinitely.
+ *
+ *  THE TWO DISPOSAL OPERATIONS ARE MUTUALLY EXCLUSIVE. Measured against a real driver, whichever call
+ *  lands first makes the other REJECT, and the bytes are gone either way; `cancel` alone resolves and
+ *  leaves them on disk. So a rejection here is not evidence of a failed disposal, and requiring both
+ *  to resolve is requiring an outcome the driver cannot produce. `path` is the honest evidence where
+ *  a caller already holds it — but only where it was read BEFORE disposal was invoked, because
+ *  afterwards `path` rejects. See docs/solutions/integration-issues/
+ *  driver-disposal-calls-are-mutually-exclusive-not-concurrent.md for the measurement table. */
 export interface DownloadLike { path(): Promise<string | null> | string | null; failure?(): Promise<unknown> | unknown; cancel?(): Promise<void> | void; delete?(): Promise<void> | void; }
 export const ARTIFACT_ID = /^[A-Za-z0-9_-]{22,64}$/;

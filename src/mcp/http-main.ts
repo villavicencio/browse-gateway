@@ -19,7 +19,13 @@ import { createGatewayMcpServer } from "./server.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError, buildOperatorHealth } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
-import { createConsumerGraphDisposer, closeArtifactRuntimeBounded, runShutdownSequence } from "./artifact-graph-lifecycle.js";
+import {
+  createConsumerGraphDisposer,
+  closeArtifactRuntimeBounded,
+  runShutdownSequence,
+  SHUTDOWN_DRAIN_MS,
+  ARTIFACT_CLOSE_TIMEOUT_MS,
+} from "./artifact-graph-lifecycle.js";
 import { describeInit } from "../gateway/init-identity.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
@@ -31,10 +37,8 @@ const OBSCURA_BOOT_BANNER = "(o,o) OBSCURA — see without being seen";
 const DRIVE_IDLE_TTL_MS = 5 * 60_000; // browser-session idle reap (frees Chrome)
 const DRIVE_REAPER_INTERVAL_MS = 60_000;
 const MCP_SESSION_REAPER_INTERVAL_MS = 60_000;
-const SHUTDOWN_DRAIN_MS = 5_000; // bounded wait for in-flight tool calls before force-closing
-// Task 2 §6 — bounds ArtifactRuntime.close(): generous enough to safely exceed a hung-cleanup's own
-// D+C=10s worst case (Amendment 7 §2), so this bound is a true safety net, not a routine truncation.
-const ARTIFACT_CLOSE_TIMEOUT_MS = 10_000;
+// The shutdown budgets live with `runShutdownSequence` (which they parametrize) so a test can assert
+// the container's stop grace actually covers them — see `worstCaseShutdownMs`.
 const DEFAULT_PORT = 8080;
 const DEFAULT_BIND = "127.0.0.1"; // fail-closed: deployment sets the Tailnet address explicitly
 
@@ -111,8 +115,15 @@ async function main(): Promise<void> {
   // Build the shared gateway runtime (config, secrets, vault, consumers, policy, gateway, escalation
   // posture) with every fail-closed boot guard. Identical construction is used by the on-host
   // `obscura vault login` capture (cli/vault-host.ts) so the two never drift.
+  // Task G — read the artifact configuration BEFORE the gateway exists. The store is still built
+  // below, inside the guard that owns releasing its lock; this read is pure (one env lookup, no
+  // filesystem, no lock) and nothing has been constructed yet, so its fail-closed throw for an
+  // enabled-without-root configuration still leaks nothing. It has to happen here because artifact
+  // capture is a construction-time property of every browser core the gateway is about to pool — see
+  // BuildRuntimeOptions.captureEnabled.
+  const artifactConfig = loadArtifactConfig(process.env);
   const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress } =
-    buildGatewayRuntime(process.env, { log });
+    buildGatewayRuntime(process.env, { log, captureEnabled: artifactConfig.enabled });
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
   // Task 2 §4.3/§6 — the HTTP process is the SOLE owner of the artifact runtime and its exclusive root
@@ -131,7 +142,7 @@ async function main(): Promise<void> {
   // `let` does not survive into a deferred callback.
   let artifactRuntime: ArtifactRuntime | undefined;
   try {
-    artifactRuntime = buildArtifactRuntime(loadArtifactConfig(process.env));
+    artifactRuntime = buildArtifactRuntime(artifactConfig);
     const artifacts = artifactRuntime;
     // Fail-closed (R13/R17 posture): the shared HTTP surface refuses to boot without Host-based
     // DNS-rebinding protection. The listener is reachable over the Tailnet and MCP clients send no
