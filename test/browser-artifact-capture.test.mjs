@@ -1163,7 +1163,7 @@ test("a late event whose cancel() rejects while delete() succeeds leaves the ses
 //
 // `cancel-only` is the load-bearing one now that a single success confirms. It is the measured row in
 // which the bytes SURVIVE — `cancel()` alone resolves and leaves the file on disk — so it is exactly
-// what a lone success must never be allowed to confirm. The `offered < 2` guard is what excludes it.
+// what a lone success must never be allowed to confirm. The `invoked < 2` guard is what excludes it.
 test("a late event whose disposal proves NOTHING turns the core dirty and the next action fails closed", async () => {
   for (const mode of ["both-reject", "cancel-only", "no-disposal"]) {
     const late = mode === "no-disposal"
@@ -1194,6 +1194,89 @@ test("a late event whose disposal proves NOTHING turns the core dirty and the ne
       `${mode} did not dirty the core`,
     );
   }
+});
+
+// The third route to the measured `cancel()`-alone row, and the one neither test above can reach.
+// `cancel-only` gets there by OMITTING `delete`; these get there with `delete` PRESENT on the
+// download and never invoked, because reading it threw. A getter that throws is a driver operation
+// that could not be reached, so nothing ran to remove the bytes — the file is on disk exactly as it
+// is in the row the confirmation exists to exclude — yet a resolving `cancel()` is still a success
+// for `some()` to find.
+//
+// Both directions are asserted because the guard is about INVOCATION, not about which name failed:
+// one mandatory operation running is one mandatory operation running, whichever it was. The existing
+// getter-throw test near the end of this file cannot prove any of this — it emits an ORPHAN, and the
+// orphan path dirties the core unconditionally in `#routeDownload`, before disposal is even started.
+// A LATE event is the vehicle that leaves the verdict to the confirmation predicate alone.
+for (const shape of ["delete-unreachable", "cancel-unreachable"]) {
+  test(`a late event whose ${shape.split("-")[0]}() could never be INVOKED cannot confirm its own disposal`, async () => {
+    const ran = [];
+    const unreachable = shape === "delete-unreachable" ? "delete" : "cancel";
+    const reachable = shape === "delete-unreachable" ? "cancel" : "delete";
+    // Defined rather than spread: an object literal's getter is READ by the spread itself, which would
+    // move the throw into this test and never hand the core a download with an unreadable operation.
+    const late = { path: async () => "/driver/tmp/late.pdf" };
+    Object.defineProperty(late, reachable, { value: async () => { ran.push(reachable); }, enumerable: true });
+    Object.defineProperty(late, unreachable, {
+      get() { throw new Error("/private/driver-internals SENTINEL"); },
+      enumerable: true,
+    });
+    let emitEvent;
+    const context = fakeContext({ duringGoto: (emit) => { emitEvent = emit; emit("download", disposableDownload()); } });
+    let stageCalls = 0;
+    const sink = operationFactory({
+      stage: () => {
+        const nth = ++stageCalls;
+        return new Promise((resolve) => setImmediate(resolve)).then(() => {
+          if (nth === 1) emitEvent("download", late);
+        });
+      },
+    });
+    const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+    await core.render("https://origin.test/doc", { artifactOperation: sink.make() });
+    await drain();
+
+    // Exactly ONE of the two mandatory operations ran. The unreadable one never executed a line.
+    assert.deepEqual(ran, [shape === "delete-unreachable" ? "cancel" : "delete"], `${shape}: the unreadable operation was invoked anyway`);
+    // So the bytes are unaccounted for, and the session must be replaced rather than reused. A
+    // confirmed disposal here would be confirmed by a call that removed nothing.
+    await assert.rejects(
+      core.render("https://origin.test/again", { artifactOperation: sink.make() }),
+      (err) => err.message === "artifact capture: core is dirty; session must be replaced" && !err.message.includes("SENTINEL"),
+      `${shape}: an uninvoked mandatory disposal left the session usable`,
+    );
+  });
+}
+
+// Regression for PR #141 review: cancel() resolves, delete() is INVOKED and rejects. The old
+// `some(Boolean)` predicate confirmed that as disposal even though the measured cancel-only path
+// leaves bytes on disk. Only delete() success is evidence that the driver removed its copy.
+//
+// Run it on a late, non-orphan event so the verdict comes from the confirmation predicate alone.
+test("a late event whose cancel() resolves while delete() rejects must not confirm", async () => {
+  const late = disposableDownload({ failDelete: true });
+  let emitEvent;
+  const context = fakeContext({ duringGoto: (emit) => { emitEvent = emit; emit("download", disposableDownload()); } });
+  let stageCalls = 0;
+  const sink = operationFactory({
+    stage: () => {
+      const nth = ++stageCalls;
+      return new Promise((resolve) => setImmediate(resolve)).then(() => {
+        if (nth === 1) emitEvent("download", late);
+      });
+    },
+  });
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+
+  await core.render("https://origin.test/doc", { artifactOperation: sink.make() });
+  await drain();
+
+  assert.deepEqual(late.calls, ["cancel", "delete"], "delete was not invoked");
+  await assert.rejects(
+    core.render("https://origin.test/again", { artifactOperation: sink.make() }),
+    "a rejected delete left the session usable",
+  );
 });
 
 test("the cutoff drain turn is a real awaited boundary: an event injected there is already late", async () => {

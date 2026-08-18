@@ -113,14 +113,26 @@ run_gate() { # $1=label  $2=image  $3=env (may be empty)
 
 echo
 echo "=== BASELINE ==="
-run_gate BASELINE "$GATE_TAG" ""
+matrix_failed=0
+if ! run_gate BASELINE "$GATE_TAG" ""; then
+  echo "    !! BASELINE FAILED — the shipping tree is not green"
+  matrix_failed=1
+fi
 echo
 echo "=== DIST-PATCH CONTROLS (real shipping code sabotaged; each MUST exit non-zero) ==="
 for c in "${DIST_CONTROLS[@]}"; do
-  run_gate "$c" "browse-gateway:red-$c" "" && echo "    !! $c LEFT THE GATE GREEN — that leg proves nothing"
+  if run_gate "$c" "browse-gateway:red-$c" ""; then
+    echo "    !! $c LEFT THE GATE GREEN — that leg proves nothing"
+    matrix_failed=1
+  fi
 done
 echo
 echo "=== HARNESS PREMISE CONTROLS (each MUST exit non-zero) ==="
 for c in "${HARNESS_CONTROLS[@]}"; do
-  run_gate "$c" "$GATE_TAG" "BGW_ARTIFACT_GATE_RED=$c" && echo "    !! $c LEFT THE GATE GREEN — that leg proves nothing"
+  if run_gate "$c" "$GATE_TAG" "BGW_ARTIFACT_GATE_RED=$c"; then
+    echo "    !! $c LEFT THE GATE GREEN — that leg proves nothing"
+    matrix_failed=1
+  fi
 done
+
+exit "$matrix_failed"

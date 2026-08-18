@@ -83,9 +83,18 @@ path is to ask the driver, and all three routes are closed:
 | `path()` invoked before them, awaited after | **non-deterministic**: rejected in 2 of 3 in-container runs; in the run where it resolved the file was ALREADY gone, so "existed before" was unobservable and a real path could not be told apart from one naming nothing |
 | `path()` awaited BEFORE invoking disposal | answers — but defers the mandatory `delete()` behind an unbounded untrusted call, which is the trade this contract exists to forbid |
 
-So that site confirms from the disposal calls, corrected for what the driver actually does: **one
-success across two mandatory invocations**. The `offered < 2` guard is what keeps that honest — it
-excludes the one measured row where bytes survive, `cancel()` alone.
+So that site confirms from the disposal calls, corrected for what the driver actually does:
+**`delete()` must succeed, and both mandatory operations must have been invoked.** The measurement
+shows why the result is asymmetric: `delete()` success removes the bytes, while `cancel()` success
+alone leaves them on disk.
+
+**That guard has to count INVOCATIONS, and originally it did not.** It first counted operations
+*offered*, crediting a `delete` whose getter THREW as offered on the reasoning that "unreadable is not
+absent" — true, and irrelevant to the only question that matters. A failed property read executes no
+driver code, so a download whose `delete` is unreadable is in precisely the `cancel()`-alone state,
+bytes on disk. The same is true when `delete()` is invoked but rejects after `cancel()` succeeds.
+Presence, readability, invocation, and successful deletion are different facts; only the last one
+confirms that the driver removed its copy.
 
 The two halves therefore prove the same contract from different evidence, which is not drift: they
 know different things. Both docblocks say so, and point at each other.
@@ -100,10 +109,9 @@ live in the container's own ephemeral download directory.
 Two candidate fixes were considered and both were rejected on evidence:
 
 - **Relax to `some(Boolean)`.** Refuted by the last row of the table: `cancel()` alone leaves the bytes
-  on disk. This would report a confirmed disposal that deleted nothing — the exact outcome the
-  confirmation exists to prevent. *(The core site does now use `some(Boolean)` — but only behind the
-  `offered < 2` guard, which excludes that exact row by requiring `delete()` to have been offered and
-  invoked. The refutation stands; it was a refutation of an UNGUARDED `some`.)*
+  on disk. Requiring both calls to be invoked does not repair that predicate: `cancel()` may resolve
+  while an invoked `delete()` rejects, leaving the same unremoved bytes. The core therefore keys its
+  confirmation specifically to successful deletion.
 - **Sequence the calls (`cancel()`, then `delete()` once cancel settles or a short bound elapses).**
   Implemented, and it turned the gate fully GREEN — then reverted, because it broke **10 deliberate
   tests** in `test/artifact-runtime.test.mjs`, and those tests are defending something real. The
