@@ -54,5 +54,7 @@ fingerprint-*.json
 
 # Compound Engineering machine-local config
 .compound-engineering/*.local.yaml
-# ...but keep the committed example (the broad *.local.* rule above would hide it)
-!.compound-engineering/config.local.example.yaml
+# The committed example is config.example.yaml, which the rule above never matched.
+
+# Compound Engineering local scratch
+.context/compound-engineering/
