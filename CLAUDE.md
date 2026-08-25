@@ -8,6 +8,12 @@ browser core. See `README.md` for what it is and why.
 > the requirements doc, and deployment notes — is in `CONTEXT.local.md` (gitignored).
 > Read that first when picking up work.
 
+> **`HANDOFF.md` has a single owner: the primary local session.** It is overwritten wholesale on
+> every write — no merge, no per-writer sections — so a second writer silently replaces the first
+> and the only surviving copy is in git history. Agents that keep persistent context across
+> sessions do not write it; their open threads belong in the issue tracker, which survives the
+> overwrite and is where a human will look for them.
+
 ## Stack & conventions
 
 - **Language:** TypeScript on Node. ESM modules (`.mjs`/`.ts`).

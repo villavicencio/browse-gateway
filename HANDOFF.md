@@ -1,113 +1,57 @@
 ---
-scope: browse-gateway-eid-bill-intelligence
-updated_at: 2026-08-17T17:23:56-07:00
-status: PR #141 review correction verified locally; ready to push and re-review
-kind: project
-review_after: null
+created_at: "2026-08-25T14:41:39-07:00"
+branch: "main"
+head: "1bf19e4"
+resume_focus: "Deploy the three undeployed reliability fixes (VIL-117 / #131 zombie-reaping, VIL-118 / #133 stale X lock) — prod is 7 commits behind at 47e414e since 2026-07-24 and both live incidents are fixed on main but not running. The operator was about to name a different starting ticket and may redirect."
 ---
+# HANDOFF — 2026-08-25, afternoon
 
-# Handoff: PR #141 review blocker closed — core cleanup requires successful deletion
+A tracking-and-hygiene session, not a build one: **zero repo source changed**. The arc was `/dv:pickup` → discover the checkout was stale and a second agent had shipped a whole subsystem → migrate all issue tracking from GitHub Issues into Linear → file one new architecture ticket → close out a handoff-ownership collision that had been running silently for three weeks. The session's shape was that the two most valuable findings were both *coordination* failures, not code ones.
 
-## Objective
-Build Obscura into a scheduled personal bill-intelligence workflow for EID: at configured times each month, check for a new invoice, reuse an authenticated session through durable cookies with credential re-authentication as fallback, retrieve the private bill, compare it with prior months, and report useful changes, anomalies, or noteworthy details. Extract only the site-neutral primitives demanded by this working flow so the same browser-session, artifact, ingestion, and analysis capabilities can later support other utilities, banking sites, and authenticated services without turning the first implementation into a speculative platform.
+> Fleet identities are deliberately absent from this file (public repo). "The second agent" throughout is a single specific agent; its name, host, and the consumer roster live in the private vault memory notes named below.
 
-## Current State
-Branch `atlas/eid-bill-intelligence` has open PR **#141**. Commit `b7dc1a3` closes the independent review blocker locally and is ready to push. Nothing has been deployed or enabled in production.
+## What We Built
 
-The initial defect-2 correction was green, but independent exact-head review found a remaining fail-open direction in `PatchrightBrowserCore#disposeDriverCopy`: `cancel()` could resolve while an invoked `delete()` rejected, and `some(Boolean)` still left the core reusable even though the measured cancel-only path leaves bytes on disk. Commit `b7dc1a3` now requires both calls to be invoked and specifically requires successful `delete()` evidence.
+- **Linear project `Obscura`** holding **VIL-85 → VIL-120**. All 35 open GitHub issues migrated with full bodies (not summaries), epic/child hierarchy preserved, each carrying a `Migrated from GitHub #N` line plus a link attachment to the original. Epic map: VIL-85=#91, VIL-86=#92, VIL-87=#93, VIL-88=#94, VIL-89=#114, VIL-90=#115. **The GitHub issues were deliberately NOT closed** — see Decisions.
+- **VIL-120** — new: search as a first-class capability (`search(query)`, sanctioned providers, fail-fast on SERP CAPTCHA/429), filed verbatim from an operator brief. The value added on top of the brief is the "repo context at filing" header — in particular that **its fail-fast recommendation and VIL-113 (#125) are the same defect found from opposite directions**, so the 429 classification should land once in the shared detection layer rather than twice.
+- **`CLAUDE.md`** — new blockquote under the intro: `HANDOFF.md` is single-owner, overwritten wholesale, and agents with persistent context do not write it. Deliberately agent-neutral. `AGENTS.md` symlinks here, so a second agent reading either path gets it.
+- **Three memory notes** (vault, private — these carry the identities this file omits): one on the Linear migration, one on handoff single-ownership, one on the two-writer staleness trap. They are indexed in the vault's `MEMORY.md`; the third is the one most likely to save real time — see Gotchas.
+- **A message for the second agent on the macOS clipboard** — the tracking move, the auto-close-on-merge trap, and two decisions put to it (whether to file its four unfiled #140 gauntlet findings as VIL tickets; whether the private-artifact arc wants its own Linear project).
 
-## Project Charter
-- **Operational outcome:** scheduled detection, retrieval, analysis, month-over-month comparison, and concise reporting for new EID bills.
-- **Authentication:** preserve authenticated sessions with cookies; fall back to stored credentials when the session expires, within explicit private-data controls.
-- **Reuse:** extract site-neutral capabilities only after the EID path demonstrates the seam.
-- **Engineering posture:** keep it simple, safe enough for private financial documents, iterative. Prefer fixing observed bugs over defending against low-probability hypotheticals.
-- **Risk tolerance:** medium-high, while preserving hard boundaries around credential leakage, cross-consumer authorization, destructive actions, and production release.
-- **Authority:** local commits are standing-authorized. Production release/deployment requires David's explicit approval. **Atlas owns publication of this branch.**
+## Decisions Made
 
-## Canonical Sources
-- `/home/node/.hermes/plans/2026-08-13-obscura-private-pdf-artifact-contract.md` — the controlling contract. Tasks A–H shipped.
-- `/home/node/.hermes/plans/2026-08-13_212203-automate-eid-statement-ingestion-with-obscura.md` — the master ingestion plan. Live authenticated discovery has since succeeded; production artifact acceptance remains pending deployment approval.
-- `docs/solutions/integration-issues/driver-disposal-calls-are-mutually-exclusive-not-concurrent.md` — both defects, both measurement tables, and why the two disposal sites use different evidence.
-- `~/Obsidian/browse-gateway/verification-logs/2026-08-17-defect2-*.log` — gate GREEN, RED controls, full suite, container stop timing, and the driver measurement (plus the measurement script itself, `-measurement.mjs`).
-
-## What We Built This Session
-**`ece46f6` — `fix(defect 2): confirm disposal from the bytes, not from two promises that cannot both succeed`** (8 files, +289/−29)
-
-### The measurement that decided the design
-Before writing code, the driver was measured in-container against a real `Download`. The probe reported both answers within each run (`no-disposal` → file PRESENT, `delete-only` → file GONE), so it can report bad news:
-
-| trial | `path()` | existed before | cancel | delete | bytes gone |
-|---|---|---|---|---|---|
-| no-disposal (control) | resolved | true | — | — | **false** |
-| delete-only | resolved | true | — | resolved | true |
-| cancel-only | resolved | true | resolved | — | **false** |
-| path awaited, then cancel+delete | resolved | true | **rejected** | resolved | **true** |
-| path invoked first, awaited last | **non-deterministic** — rejected in 2 of 3 runs; when it resolved, `existedBefore` was already false | | | | |
-| cancel+delete, **then** path | **rejected** | — | resolved | resolved | — |
-
-### The fix
-Confirmation is now **two independent proofs, either sufficient**: the driver reported success, or the bytes are demonstrably gone.
-
-- **`ArtifactOperation#startCleanup` uses filesystem evidence.** The staging job already read the driver's staged path on its way to `store.capture()`, so it records it (`#stagedPath`) and — once the disposal calls settle *or* the budget expires — asks whether that path still names a file. It never calls back into the driver. The path is recorded **only if it exists at that instant**, making the later absence a *positive cut* rather than the vacuous absence of a file that was never written.
-- **`PatchrightBrowserCore#disposeDriverCopy` cannot reach that evidence** (rows 5 and 6 above), so it invokes both mandatory operations but confirms only when **`delete()` succeeds**. Successful `cancel()` is not deletion evidence because the real-driver measurement shows that it can leave bytes on disk. The guard counts actual invocations, not offered/readable properties, so an unreadable getter also fails closed.
-- Evidence only ever **adds** confirmation, so nothing existing was withdrawn: the ten tests around `test/artifact-runtime.test.mjs:2367` stayed green untouched, and `delete()` is still invoked synchronously, mandatorily, immediately after `cancel()`.
-
-### Tests and controls
-- Two RED regressions written first and **watched failing** on the unfixed tree: runtime-wide poisoning, and per-session `captureDirty`.
-- The review correction adds late-event regressions for unreadable disposal getters and for `cancel()` success combined with `delete()` rejection; both leave the session dirty.
-- Three core tests that encoded "one failed disposal call ⇒ dirty" were **retargeted onto cases that genuinely prove nothing** (both calls fail, cancel-only, no disposal offered) rather than having their assertions flipped.
-- New dist-patch control **`revert-disposal-evidence`** restores the old predicate in the built output. It fails on **exactly** the three legs the gate header now names as this fix's regression alarm — verified, not asserted.
-
-## Decisions
-- **The two disposal halves now prove the same contract from different evidence, and that is not drift.** They know different things: the operation staged the download and holds its path; the core disposes of orphans, late events and refusals it never staged. Both docblocks state this and cite the measurement.
-- **Filesystem evidence is `OR`, never authoritative-in-both-directions.** Making a still-present file force *unconfirmed* would have been safer in theory but broke deliberate host tests whose fakes resolve `delete()` without touching the file. `OR` fixes the defect with zero churn on the operation side; the residual is recorded below.
-- **The positive-cut requirement was added deliberately.** Without it, a driver returning a path it never wrote would have its "disposal" confirmed by a file that never existed — the one way this evidence could be *weaker* than the promises it replaces.
-- **`some(Boolean)` was removed from the core.** Invocation of both operations is mandatory, but only successful `delete()` confirms removal. This closes both cancel-only and cancel-success/delete-reject sequences.
-- **The gate's assertions were never relaxed.** The three legs went green because the defect is fixed, and `revert-disposal-evidence` proves that is why.
+- **GitHub issues stay open as read-only history rather than being closed.** Closing 35 issues is outward-facing and hard to undo at scale, and it matches the precedent set in the operator's other repo. Reversible — say the word and they get closed with a comment pointing at each VIL id. **This is still an open operator call.**
+- **Migrated full bodies, not pointers.** A pointer-only migration is not a migration; if the GH issues are ever archived the content is gone. Cost was ~35 tool round-trips and a lot of context, paid deliberately.
+- **Annotated tickets where the repo has overtaken them**, marked as migration-time notes rather than edits to the original text. The load-bearing ones: VIL-106 (#116) carries a **must-re-scope** warning because #117 measured its target page shape as *surviving*; VIL-117 and VIL-118 carry **merged-but-NOT-deployed** banners and are the only two set to Urgent.
+- **`HANDOFF.md` is single-owner as of today.** The operator confirmed the shared-file arrangement was unintentional. The second agent stops writing one because it is long-running with persistent context and never loses state; the thing it was using the file for (recording open threads for a human) is better served by the tracker.
+- **This file is scrubbed of fleet identities and the `CLAUDE.md` rule is agent-neutral — by necessity, not preference.** Public repo; the standing hygiene rule forbids fleet agent and host names in committed files. See the pre-existing violation in Gotchas.
 
 ## What Didn't Work
-- **Filesystem evidence at the core's site — measured impossible, not merely awkward.** `path()` rejects once disposal has been invoked; invoked-before-and-awaited-after is non-deterministic (rejected 2 of 3 runs, and when it resolved the file was already gone so "existed before" was unobservable); awaiting it *before* invoking disposal works but defers the mandatory `delete()` behind an unbounded untrusted call — the exact trade the contract forbids and the previous session rejected.
-- **Running the controls matrix from a copied script.** `validate-artifact-controls.sh` derives `REPO_ROOT` from `BASH_SOURCE`, so a snapshot in another directory fails the build immediately. Run the repo copy.
-- **Editing a bash script while it is executing.** Bash reads scripts incrementally; the first matrix run had to be killed and restarted after the new control was appended mid-run.
 
-## Active Tasks
-- [x] Close defect 2 — the disposal confirmation predicate, at both sites, together.
-- [x] Baseline exit 0 plus every deliberate control reporting, including `serve-small-oversize`.
-- [x] Update the four coupled contract docblocks, the gate header, and the solutions doc.
-- [x] Publish the stabilization work as PR #141.
-- [x] Complete authenticated live-portal discovery with durable-cookie replay.
-- [ ] Push `b7dc1a3`, rerun CI and exact-head independent review, then merge PR #141 if green.
+- **`/dv:pickup` oriented on the wrong session, and looked completely confident doing it.** It read a `HANDOFF.md` that was three weeks stale because local `main` was 3 commits behind `origin/main`. Nothing in the output flagged this — the file's mtime, its content, and its internal consistency all looked fine. The skill reads the working tree before touching the remote, which is safe with one writer and wrong with two.
+- **Git authorship cannot distinguish the two agents.** Every handoff commit carries the operator's identity because both agents commit as the operator. `git log --author` is useless here; the file's own format is the only tell (this file's `# HANDOFF —` title vs the other tool's `scope:` frontmatter — different tools, different schemas).
+- **I reported "32 open issues" early in the session; the real count is 35.** The first `gh issue list` was read through a `head -60` that silently truncated. Corrected once the full JSON was exported.
+- **Linear's markdown renderer mangles strikethrough around inline code.** A `~~`-wrapped code span came back as nested tildes in VIL-107. Cosmetic, content intact, not worth a fix pass — but don't wrap code spans in `~~` in future tickets.
 
-## Blockers and Open Questions
-- **Enabling capture is now unblocked *technically*, but is still a deliberate decision.** `BGW_ARTIFACT_CAPTURE_ENABLED` appears in **no** shipped config, deploy script or CI (verified), so both commits are inert until someone opts in.
-- **The diagnosability question from the last handoff is still open and now matters more.** `beginCapture()` still swallows a `createOperation` throw. The catastrophic silent-outage cause is gone, but a swallowed throw is still invisible; consider logging it.
-- **Root lock staleness reclamation is still unbuilt.** Re-measured this session: graceful `docker stop -t 45` takes **0.135s**, exits 0, drains fully and releases the lock, and the next boot reacquires it. A SIGKILL or OOM still abandons the lock and bricks the root until an operator removes the directory by hand.
+## What's Next
 
-## Evidence and Artifacts
-On the exact local correction tree committed as `b7dc1a3`:
-- `npm run typecheck` — exit 0. `npm run build` — exit 0.
-- Focused artifact suites — **263/263 passed**.
-- `npm test` — **1498/1498 passed, 0 failed**.
-- **Artifact gate, in-container: 60 PASS / 0 FAIL, exit 0** (was 55 PASS / 3 FAIL).
-- **RED control matrix: `BASELINE exit=0 pass=60 fail=0`**, and all **11** controls non-zero on their own legs — including `serve-small-oversize`, which was *unprovable* while the defect stood, and the new `revert-disposal-evidence` (fail=3, exactly the named alarm legs).
-- The matrix wrapper now aggregates expected control failures and exits **0** only when the baseline is green and every deliberate control is red. The corrected wrapper's full rerun exited 0.
-- **Container stop check: 0.135s, exit 0, full drain, lock released and reacquired by the next boot.**
-- `git diff --check` clean; secrets/private-path/IP scan clean.
+1. **Deploy the undeployed reliability fixes — VIL-117 (#131) and VIL-118 (#133).** Prod has been on `47e414e` since **2026-07-24**; `main` is now `1bf19e4`, seven commits ahead. The gap includes three image-level fixes for **live production incidents**: #135 zombie group reads as GONE (the pool-wedge fix), #137 a reaping PID 1 baked into the image, #138 stale X lock wedging the browser core while HTTP answers healthy. Deploy is `gh workflow run deploy-http.yml -f image_tag=latest`. **Read the deploy caveat in Gotchas first — the artifact subsystem rides along in the same image.**
+2. **Answer the two questions put to the second agent** (they are on the clipboard): file its four unfiled #140 gauntlet findings as VIL tickets, and decide whether the private-artifact arc gets its own Linear project. Neither can be answered from this side.
+3. **Decide whether to close the 35 GitHub issues.** Left open deliberately; the decision is the operator's.
+4. **VIL-120 phase 1** — the cheap half of the search work is the 429 classification, and it should be scoped together with VIL-113 rather than separately.
+5. **VIL-106 (#116) needs re-scoping before any implementation** — its named page shapes were measured to survive, and its link-density criterion is refuted. The ticket says so at the top, but it is easy to start from the old body.
 
 ## Gotchas & Watch-outs
-- **A residual this fix does NOT close:** a driver that reports a successful `delete()` while leaving the bytes on disk is still believed at both sites. The operation site would catch it only if the staged path happened to be the surviving file. Recorded in the solutions doc under "Residual risk".
-- **The disposal halves must still move together.** They now differ by mechanism *on purpose*; if you change one, read both docblocks first — each explains why the other is shaped differently.
-- **`revert-disposal-evidence`'s anchor is the literal built line** `settle(reported || this.#stagedBytesGone())`. Renaming `#stagedBytesGone` or restructuring `confirm` fails the control's **build**, loudly, by design — re-derive the anchor rather than dropping the control.
-- **Run the gate with `--add-host bill-fixture.test:127.0.0.1`.** A container's `/etc/hosts` is generated at run time, so an image-baked entry is discarded.
-- **`createOperation` refuses an IP-literal `sourceHost`**, and `beginCapture()` swallows the throw — it presents as "capture silently does nothing". Reach loopback fixtures by hostname.
-- **The controls matrix takes ~30 minutes** (12 gate runs against a real browser). It now exits 0 only for a green baseline plus all expected-red controls; previously it accidentally propagated the final expected failure as the script status.
-- **`scripts/deploy/launch-http.sh` is still the only production `docker run`.** `docker/compose.yaml` is not on the deploy path.
-- **Still open from the #140 gauntlet, NOT filed as issues** (open issues top out at `#136`): `retrieve`'s proxied re-roll loop may commit multiple artifacts per call — unvalidated, no verdict exists; the P3 lineage TOCTOU (any fix must `claimTimeout()` and `complete()` the raw lease before throwing, or it leaks the global response permit and deadlocks all retrieval); `activate()` never sets state, so a double-activate double-arms listeners; the lease tracker reads the HTTP handler's `now` rather than `ArtifactRuntime.now()`.
-- **The orphan path dirties the core unconditionally** (`#routeDownload`, ~line 1617), so the two synchronous-throw disposal tests at `test/browser-artifact-capture.test.mjs:1843` pass on orphan-ness alone — their dirty assertion does not exercise the confirmation predicate. Pre-existing; not touched in this slice.
-- **`test/drive.test.mjs`'s concurrency test asserts only that one session opens** — narrower than its name suggests.
-- **Codex CLI:** never omit `-c model_reasoning_effort="high"`, and dedupe its findings block by fingerprint.
-- **Resolve review bases from the remote,** never local `main`.
-- **Measurement JSON carries the egress IP** (`meta.egressIp`); `INPUT_REALISM_OUT` has no redaction.
 
-## Exact Next Action
-Commit this handoff separately, push the new PR #141 head, watch CI, and run an independent review against the exact remote base/head. Merge only if both are green. Do not deploy or enable `BGW_ARTIFACT_CAPTURE_ENABLED` without David's explicit production approval.
+- **⚠️ This repo has two writers. `git fetch` before trusting `HANDOFF.md`, always.** The second agent pushes its own branches and merges its own PRs from a remote host. A behind checkout serves a stale committed handoff that looks internally consistent. Check `git rev-list --count HEAD..origin/main` before reading anything.
+- **⚠️ PRE-EXISTING HYGIENE VIOLATION, not introduced here and not fixed here.** The handoff committed at `1bf19e4` contains absolute remote-host plan paths under a home directory. This repo is public, so those are already published and are in history regardless of what the current file says. Rewriting history is the operator's call and was not attempted. Flagged so it is a decision rather than an oversight.
+- **⚠️ The deploy is not a pure reliability deploy.** The same image carries the artifact subsystem (#139/#140/#141, ~20k lines). It is **inert** — `BGW_ARTIFACT_CAPTURE_ENABLED` appears in no shipped config, deploy script, or CI (verified by its author) — but "inert" is a claim to re-verify before the swap, not to inherit. That work's charter says production release needs explicit approval.
+- **⚠️ Naming a `VIL-…` id in a PR body can auto-close that ticket on merge.** Linear's GitHub integration scans PR text and moves the issue to Done even when the PR merely mentions it. Re-check ticket states after any merge that names one.
+- **Root-lock staleness is unbuilt and it bricks the artifact root.** A graceful `docker stop -t 45` releases the lock (0.135s, measured). A SIGKILL or OOM abandons it, and recovery is an operator removing the directory by hand.
+- **Four #140 gauntlet findings were never filed anywhere** — including a P3 lineage TOCTOU where a careless fix "leaks the global response permit and deadlocks all retrieval." They exist only in the previous handoff's prose, which this file just overwrote. **Recover with `git show 1bf19e4:HANDOFF.md`** — that is the only surviving copy until they are filed.
+- **`scripts/deploy/launch-http.sh` is the only production `docker run`.** `docker/compose.yaml` is not on the deploy path.
+- **Pool floor is `consumers × perConsumerMax + 1`, fail-closed at boot.** Prod: `MAX_SESSIONS=7`, `PER_CONSUMER_MAX=1` → floor 5, four consumers.
+- **`docker restart` is the wrong remedy for the zombie leak** — it preserves HostConfig, so an `--init`-less container stays that way. A re-create through `launch-http.sh` is what clears it.
+- **The second agent has no Linear access from its host.** The MCP server is machine-local to the operator's Mac, so tickets on its behalf get filed from here.
+- **Measurement JSON carries the egress IP** (`meta.egressIp`); `INPUT_REALISM_OUT` has no redaction. Check before pasting anywhere. (Carried over — still true.)
+- **Run `validate-*`/`measure-*` ONLY in-container**; `"${REPO}:latest"` in zsh. (Carried over.)
