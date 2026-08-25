@@ -29,6 +29,7 @@ browser core. See `README.md` for what it is and why.
 
 ```
 browse-gateway/
+├── CONCEPTS.md             # shared domain vocabulary (entities, named processes, status concepts)
 ├── docker/
 │   ├── Dockerfile          # Node + Chrome + Xvfb + driver
 │   └── compose.yaml        # capped service def, private-network bind
