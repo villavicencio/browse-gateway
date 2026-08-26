@@ -10,9 +10,12 @@
 # GHCR, tagged with the short commit SHA and `latest`. Deploy stays manual (see the deploy plan);
 # this job only produces a pullable, SHA-pinned image.
 #
-# Secrets: none configured. The only credential is the automatically-provisioned GITHUB_TOKEN,
-# scoped to `packages: write` on the build-image job for the GHCR push. The repo is PUBLIC — no
-# fleet/host/path detail appears here; the image name derives from github.repository.
+# Secrets: `BGW_DEPLOY_ID_KEY` (optional) plus the automatically-provisioned GITHUB_TOKEN, scoped to
+# `packages: write` on the build-image job for the GHCR push. BGW_DEPLOY_ID_KEY is an HMAC key, NOT a
+# credential — it authenticates nothing and grants no access. It keys the opaque deploy id stamped
+# into the image (U1/KTD9), and its absence is a SUPPORTED build: the step warns and the image ships
+# unstamped, reporting `deploy=none`. The repo is PUBLIC — no fleet/host/path detail appears here;
+# the image name derives from github.repository.
 name: ci
 
 on:
