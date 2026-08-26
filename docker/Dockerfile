@@ -82,6 +82,23 @@ ENV BGW_CHANNEL=chrome \
     DISPLAY=:99
 RUN ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime && echo "America/New_York" > /etc/timezone
 
+# U1 / KTD9 — the OPAQUE deploy stamp: HMAC(build secret, commit sha), truncated to 12 hex.
+#
+# Deliberately the LAST layer before the entrypoint. The value changes on every commit, so anything
+# placed after it rebuilds on every commit — and the Chrome layer above must never be reachable that
+# way, because the Chrome version IS the stealth surface (see the note on the tini layer).
+#
+# UNSET IS A SUPPORTED BUILD. A local `docker build` has no secret and produces an unstamped image;
+# the resolver reports a bare semver and the boot line says `deploy=none`. Production strictness
+# lives at the deploy gate (the pre-swap smoke requires a stamped boot line), not here — otherwise
+# nobody could build the image without the secret.
+#
+# NOT an ENV var: container env is frozen at create and is settable by the `--apply` provisioning
+# path against an unchanged image, so an env-sourced identity could describe a build the process is
+# not running. A file baked into the image is a property of the artifact.
+ARG BGW_DEPLOY_ID=""
+RUN if [ -n "$BGW_DEPLOY_ID" ]; then printf '%s' "$BGW_DEPLOY_ID" > /app/.deploy-id; fi
+
 # tini is PID 1 and reaps reparented orphans; the entrypoint then provisions the Xvfb display and
 # exec's the command (the kill-gate by default), so the command is tini's direct child and receives
 # SIGTERM for its graceful drain. Reaping is now a property of the IMAGE — `--init` is still passed by

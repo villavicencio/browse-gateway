@@ -772,6 +772,7 @@ async function connectInProcess(token) {
   const { buildGatewayRuntime } = await import("../dist/mcp/runtime.js");
   const { GatewayDriveController } = await import("../dist/mcp/drive-controller.js");
   const { createGatewayMcpServer } = await import("../dist/mcp/server.js");
+  const { resolveGatewayVersion } = await import("../dist/mcp/version.js");
   const { Allowlist, tokenEnvKey } = await import("../dist/policy/index.js");
   const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
 
@@ -801,7 +802,8 @@ async function connectInProcess(token) {
     timeouts: runtime.config.timeouts,
   });
   const server_ = createGatewayMcpServer({
-    version: "0.1.0",
+    // U1: stamp the build this instrument actually measured, not a literal.
+    version: resolveGatewayVersion().reported,
     drive,
     // #109 exercises the interactive verbs only; a retrieve call here would be a harness bug, so
     // make it loud rather than silently measuring a path this instrument does not model.

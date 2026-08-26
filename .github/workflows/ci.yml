@@ -70,6 +70,30 @@ jobs:
             type=sha,prefix=,format=short
             type=raw,value=latest
 
+      # U1 / KTD9 — compute the opaque deploy stamp: HMAC(secret, commit sha), truncated to 12 hex.
+      #
+      # Keyed on the COMMIT SHA, not the manifest digest. The digest is the hash of the built image,
+      # so a digest-derived stamp would have to exist inside the thing it hashes — circular. The
+      # commit sha is known before the build and is what the operator already has in hand, so
+      # recovering "which commit is this deployment?" is a local HMAC over candidate commits: no
+      # registry lookup, and no dependence on a token carrying `read:packages`.
+      #
+      # NO SECRET => NO STAMP. Never fall back to an empty key: an HMAC under a key everyone knows is
+      # forgeable and derivable, which is strictly worse than an absent stamp, because it looks like
+      # an identity. An unstamped image boots fine and reports `deploy=none`.
+      - name: Compute deploy stamp
+        id: stamp
+        env:
+          DEPLOY_ID_KEY: ${{ secrets.BGW_DEPLOY_ID_KEY }}
+        run: |
+          if [ -z "${DEPLOY_ID_KEY}" ]; then
+            echo "::warning::BGW_DEPLOY_ID_KEY is not set — building an UNSTAMPED image (deploy=none). Consumers cannot distinguish two deploys of the same contract version until this secret exists."
+            echo "deploy_id=" >> "$GITHUB_OUTPUT"
+          else
+            id="$(printf '%s' "${GITHUB_SHA}" | openssl dgst -sha256 -hmac "${DEPLOY_ID_KEY}" -hex | awk '{print $NF}' | cut -c1-12)"
+            echo "deploy_id=${id}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push (linux/amd64)
         uses: docker/build-push-action@v6
         with:
@@ -77,6 +101,8 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           push: true
+          build-args: |
+            BGW_DEPLOY_ID=${{ steps.stamp.outputs.deploy_id }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

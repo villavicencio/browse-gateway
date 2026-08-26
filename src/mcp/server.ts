@@ -14,6 +14,7 @@ import type { FailureDiagnostics, Timing } from "../observability/index.js";
 import type { ArtifactOutcome, ArtifactResponseLease } from "../artifacts/index.js";
 import { getArtifactLeaseTracker } from "./http-request-context.js";
 import { ARTIFACT_TOOL_NAME } from "./http-response-lease.js";
+import { resolveGatewayVersion } from "./version.js";
 
 /**
  * `_meta` key on a tool ERROR result carrying a machine-readable failure kind (issue #47), so a
@@ -219,10 +220,17 @@ function renderFailure(diag: FailureDiagnostics): string {
   return `\nfailure: ${JSON.stringify(summarizeFailureDiagnostics(diag))}`;
 }
 
+// U1: the default is RESOLVED, never a literal. Memoized because `createGatewayMcpServer` runs
+// once per HTTP connection — the launchers pass `deps.version` explicitly (resolved at boot), so
+// this path is for tests and for `validate-http.mjs`, which builds its own server and therefore
+// gates the RESOLVER inside the image. It does not gate the launcher; see CLAUDE.md.
+let memoizedVersion: string | undefined;
+const resolvedDefaultVersion = (): string => (memoizedVersion ??= resolveGatewayVersion().reported);
+
 export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
   const server = new McpServer({
     name: deps.name ?? "browse-gateway",
-    version: deps.version ?? "0.1.0",
+    version: deps.version ?? resolvedDefaultVersion(),
   });
 
   // Task 2 §4.2: snapshot ONCE at construction, before any tool is registered — `browser_get_artifact`

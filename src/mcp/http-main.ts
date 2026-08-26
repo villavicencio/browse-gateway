@@ -16,6 +16,7 @@ import { buildGatewayRuntime } from "./runtime.js";
 import { loadArtifactConfig, buildArtifactRuntime } from "../artifacts/runtime-builder.js";
 import type { ArtifactRuntime } from "../artifacts/index.js";
 import { createGatewayMcpServer } from "./server.js";
+import { resolveGatewayVersion } from "./version.js";
 import { GatewayDriveController } from "./drive-controller.js";
 import { createHttpHandler, dnsRebindBootError, buildOperatorHealth } from "./http-server.js";
 import type { ConsumerServer } from "./http-server.js";
@@ -161,6 +162,18 @@ async function main(): Promise<void> {
       throw new Error("BGW_HEALTH_TOKEN collides with a consumer token — the operator health token must be a distinct credential. Refusing to boot.");
     }
 
+    // U1 — resolve the contract version + deploy stamp HERE, at boot, alongside the two guards above
+    // and INSIDE this try, so an unreadable/malformed manifest is a refused boot the deploy path can
+    // see (the container never reaches listen(), so the pre-swap smoke's state check aborts the swap
+    // with the live container untouched).
+    //
+    // DO NOT move this into `buildServer` below. That callback runs PER CONNECTION, after bearer
+    // auth, so a throw there is a per-session 500 — not a boot failure — and BOTH deploy checks probe
+    // only UNAUTHENTICATED /mcp expecting 401, so neither would ever reach it. A version resolver
+    // sitting in that callback would look fail-closed and gate nothing. (Round-2 review found exactly
+    // this; the rule is recorded in CLAUDE.md under "Know which deploy gate proves what".)
+    const gatewayVersion = resolveGatewayVersion();
+
     const handler = createHttpHandler({
     authenticate: (token: string) => policy.authenticate(token),
     buildServer: (consumer: Consumer): ConsumerServer => {
@@ -190,7 +203,8 @@ async function main(): Promise<void> {
         artifacts: artifactCapture,
       });
       const server = createGatewayMcpServer({
-        version: "0.1.0",
+        // Boot-resolved above and closed over — never re-read per connection.
+        version: gatewayVersion.reported,
         drive,
         retrieve: async ({ url, forceProxy }) => {
           try {
@@ -288,6 +302,10 @@ async function main(): Promise<void> {
         `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
           `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
           `sticky=${stickySuffix !== undefined} ` +
+          // KTD13: `version=` rides the SAME boot line the pre-swap smoke already greps for
+          // readiness, which makes the launcher (not just the resolver) gateable with no new deploy
+          // step. `deploy=` is the opaque build stamp, or `none` on an unstamped local build.
+          `version=${gatewayVersion.reported} deploy=${gatewayVersion.deployId ?? "none"} ` +
           `dnsRebindProtection=${allowedHosts.length > 0 || allowedOrigins.length > 0} ` +
           `init=${describeInit()}`,
       );
