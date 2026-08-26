@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+#
+# Why this file exists: CodeRabbit reviews are rate-limited PER DEVELOPER on a rolling hourly
+# window — this account is Pro+ at 10/hr. The limit is per developer, not per repo, so this repo,
+# every other repo, and every parallel agent session all draw from the same 10. By default each
+# push triggers a re-review and spends from that pool on intermediate commits.
+#
+# auto_incremental_review: false makes re-review a deliberate act. The first review of a PR is
+# still automatic — drafts and the ignore_title_keywords below are excluded — and each later round
+# is requested with an `@coderabbitai review` comment. That matches the fix -> push -> request ->
+# re-review loop in the global CLAUDE.md "Code Review" section without spending a review on every
+# commit. `@coderabbitai rate limit` reports remaining capacity and does NOT consume a review.
+#
+# Observed in this repo on PR #142 (2026-08-26): round 1 returned two findings, both fixes were
+# batched into a single push, and that push AUTOMATICALLY triggered round 2 — a second review spent
+# without anyone asking for one. It happened to be the round we wanted, so nothing was lost that
+# time; the point is that nobody chose it. With this file, that push would have been skipped and
+# round 2 requested explicitly.
+#
+# Two clean-looking checks that mean NO review ran — do not read either as approval:
+#   "Review skipped: incremental reviews are disabled"  <- this file, working as intended
+#   "Review rate limited"                               <- throttled, i.e. unavailable, not clean
+# Both sit on a PASSING check. Read the check DESCRIPTION, never just its state.
+#
+# Note this config is read from the PR HEAD branch, not the base, so the PR that introduces it
+# governs itself immediately.
+reviews:
+  auto_review:
+    auto_incremental_review: false
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
