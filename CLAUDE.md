@@ -89,6 +89,15 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   `src/mcp/http-main.ts:152-162` and emit it on the boot line at `:286-293`, never inside the
   per-connection `buildServer:` callback, where a throw is a per-session 500 that no deploy check
   sees. A plan asserted the opposite twice before anyone read the two scripts.
+- **`main` is NOT branch-protected, so nothing mechanically blocks a merge.** There are no required
+  status checks (`gh api repos/<owner>/<repo>/branches/main/protection` → 404 "Branch not
+  protected"). A PR with **no CI run at all** still reads mergeable, which is a strictly weaker
+  signal than the global "`mergeStateStatus: CLEAN` does not mean reviewed" rule assumes. Confirm a
+  run EXISTS for the PR head sha before merging — `gh run list --limit 20 --json headSha,event,status`
+  and look for your own sha — rather than inferring it from the absence of a red X. Observed
+  2026-08-26 during a GitHub incident ("Actions and Pull Requests", ~4% of runs failed to initiate):
+  a PR sat with a CodeRabbit check and no `ci` check whatsoever, and nothing about the PR view said
+  so.
 - **A guard, probe or control must be able to report bad news, and you must have watched it do so.**
   Verify every non-trivial gate RED by construction before keeping it. See
   `docs/solutions/best-practices/a-test-whose-stub-guarantees-the-assertion-proves-nothing.md` —
