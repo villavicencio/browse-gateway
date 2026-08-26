@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -77,7 +77,17 @@ test("a MALFORMED manifest refuses the same way", () => {
 });
 
 test("a manifest with no usable version refuses — including a non-bare-semver one", () => {
-  for (const body of ['{"name":"x"}', '{"version":42}', '{"version":"1.0"}', '{"version":"1.0.0+abc"}']) {
+  for (const body of [
+    '{"name":"x"}',
+    '{"version":42}',
+    '{"version":"1.0"}',
+    '{"version":"1.0.0+abc"}',
+    // Leading zeros are NOT valid semver (spec: numeric identifiers must not include them). Accepting
+    // one would boot the gateway and report an invalid version over MCP. (CodeRabbit, PR #142.)
+    '{"version":"01.2.3"}',
+    '{"version":"1.02.3"}',
+    '{"version":"1.2.03"}',
+  ]) {
     const dir = scratchRoot({ "package.json": body });
     try {
       assert.throws(() => resolveGatewayVersion(dir), /no usable "version"/, `should refuse: ${body}`);
@@ -182,4 +192,34 @@ test("REGRESSION: the HTTP launcher resolves the version at BOOT, not per connec
   // And the boot line must actually carry it, or KTD13's pre-swap-smoke gate has nothing to grep.
   assert.match(compiled, /version=\$\{.*?\}/, "the boot line must emit version=");
   assert.ok(compiled.includes("deploy="), "the boot line must emit deploy=");
+});
+
+test("a stamp that cannot be READ refuses to boot — only true absence is unstamped", () => {
+  // The catch used to swallow every readFileSync failure, so an unreadable stamp degraded silently
+  // to "unstamped" — contradicting this module's own rule that a corrupt identity is worse than a
+  // missing one. Only ENOENT means absent. (CodeRabbit, PR #142.)
+  const dir = scratchRoot({ "package.json": '{"version":"1.2.3"}' });
+  try {
+    // A DIRECTORY named .deploy-id: a real EISDIR, constructed at the source rather than by stubbing
+    // readFileSync to throw a synthetic error.
+    mkdirSync(join(dir, ".deploy-id"));
+    assert.throws(() => resolveGatewayVersion(dir), (err) => err.code === "EISDIR" || /EISDIR/.test(err.message));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stamp with no read permission refuses to boot", () => {
+  const dir = scratchRoot({ "package.json": '{"version":"1.2.3"}', ".deploy-id": "a1b2c3d4e5f6" });
+  try {
+    chmodSync(join(dir, ".deploy-id"), 0o000);
+    // Skip when running as a user that bypasses permission bits (e.g. root in a container).
+    let readable = true;
+    try { readFileSync(join(dir, ".deploy-id"), "utf8"); } catch { readable = false; }
+    if (readable) return;
+    assert.throws(() => resolveGatewayVersion(dir), (err) => err.code === "EACCES" || /EACCES/.test(err.message));
+  } finally {
+    try { chmodSync(join(dir, ".deploy-id"), 0o600); } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

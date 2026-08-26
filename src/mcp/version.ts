@@ -28,8 +28,15 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-/** A bare semver core. `package.json` carries this and only this — build metadata is stamped, not authored. */
-const SEMVER_CORE = /^\d+\.\d+\.\d+$/;
+/**
+ * A bare semver core. `package.json` carries this and only this — build metadata is stamped, not
+ * authored.
+ *
+ * `(0|[1-9]\d*)` per component, NOT `\d+`: semver forbids leading zeros in numeric identifiers, so
+ * `"01.2.3"` is not a version. A looser pattern would boot the gateway and publish an invalid
+ * version over MCP — the exact failure this module exists to prevent.
+ */
+const SEMVER_CORE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 /** The build stamp: fixed-width lowercase hex. Narrow ON PURPOSE — see `reported` below. */
 const DEPLOY_ID = /^[0-9a-f]{12}$/;
@@ -60,13 +67,20 @@ const defaultRoot = (): string => join(dirname(fileURLToPath(import.meta.url)), 
  * MALFORMED throws: a corrupt stamp is worse than no stamp, because it is a value a consumer would
  * treat as an identity. Strictness for production lives at the deploy gate (the pre-swap smoke
  * requires a stamped boot line), not here.
+ *
+ * "ABSENT" means ENOENT and nothing else. An unreadable stamp, a DIRECTORY named `.deploy-id`, or an
+ * I/O error are all broken images, not unstamped ones — swallowing them would serve a deployment
+ * with no identity while a stamp was sitting right there, which is the same silent degradation the
+ * malformed-content rule above rejects.
  */
 function readDeployStamp(root: string): string | undefined {
   let raw: string;
   try {
     raw = readFileSync(join(root, DEPLOY_STAMP_FILE), "utf8");
-  } catch {
-    return undefined; // unstamped image — expected for local and CI-less builds
+  } catch (err) {
+    // Only a genuinely missing file means "unstamped". Everything else is a broken image.
+    if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return undefined;
+    throw err;
   }
   const stamp = raw.trim();
   if (!DEPLOY_ID.test(stamp)) {
