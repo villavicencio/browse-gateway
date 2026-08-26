@@ -10,6 +10,7 @@ import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, 
 import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
 import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, parseWarmupPaths, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { createGatewayMcpServer } from "./server.js";
+import { resolveGatewayVersion } from "./version.js";
 import { GatewayDriveController } from "./drive-controller.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-mcp] ${msg}\n`);
@@ -105,8 +106,12 @@ async function main(): Promise<void> {
     allowlist: new Allowlist(consumer.allow),
   });
 
+  // U1: resolve the contract version + deploy stamp ONCE, before the server exists. Fail-closed:
+  // an unreadable/malformed manifest throws here and the stdio launcher never serves.
+  const gatewayVersion = resolveGatewayVersion();
+
   const server = createGatewayMcpServer({
-    version: "0.1.0",
+    version: gatewayVersion.reported,
     drive,
     retrieve: async ({ url, forceProxy }) => {
       try {

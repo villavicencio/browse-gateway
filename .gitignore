@@ -58,3 +58,6 @@ fingerprint-*.json
 
 # Compound Engineering local scratch
 .context/compound-engineering/
+
+# U1: the build-time deploy stamp is baked into the image, never committed.
+.deploy-id

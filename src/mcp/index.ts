@@ -3,6 +3,8 @@
  * testable core.
  */
 export { createGatewayMcpServer, ERROR_KIND_META_KEY } from "./server.js";
+export { resolveGatewayVersion } from "./version.js";
+export type { GatewayVersion } from "./version.js";
 export type { DriveController, GatewayMcpDeps, RetrieveFn, RetrieveOutcome, ErrorKind } from "./server.js";
 export { createHttpHandler, dnsRebindBootError, awaitBounded } from "./http-server.js";
 export type { HttpHandler, HttpHandlerDeps, ConsumerServer, HealthReport } from "./http-server.js";

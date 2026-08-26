@@ -68,6 +68,15 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   real browser, and it has caught defects every unit test passed: a snapshot axis churning one
   capture pair in five while the no-churn test was green. Never accept a green unit run as evidence
   that browser-side behaviour holds.
+- **`npm test` cannot be green on macOS — there is a large pre-existing failing set.** Measured
+  2026-08-25 on `main`: **1498 tests, 1275 pass, 223 fail**, of which **211 are
+  `artifact-filesystem-unsupported`**, confined to `test/artifact-*.test.mjs`,
+  `test/browser-artifact-capture.test.mjs` and `test/retrieve.test.mjs`. The artifact store needs a
+  Linux filesystem feature the host does not have. Consequences: a raw pass/fail count is **not** a
+  signal here, and a real regression will hide in the noise. **Compare against a baseline on `main`
+  rather than reading the absolute number** — `git stash -u && git checkout main && npm test` for the
+  before-count, then the same on your branch; only a *delta* means anything. The artifact suite is
+  verified in-container, like every other gate.
 - **Know which deploy gate proves what — they are not interchangeable.** `scripts/validate-http.mjs`
   is **self-contained**: it builds its own handler and its own config (`:63-68`), and
   `scripts/deploy/deploy-on-host.sh:57-60` says so explicitly. It proves *code imported from `dist/`
