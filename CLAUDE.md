@@ -68,6 +68,18 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   real browser, and it has caught defects every unit test passed: a snapshot axis churning one
   capture pair in five while the no-churn test was green. Never accept a green unit run as evidence
   that browser-side behaviour holds.
+- **Know which deploy gate proves what — they are not interchangeable.** `scripts/validate-http.mjs`
+  is **self-contained**: it builds its own handler and its own config (`:63-68`), and
+  `scripts/deploy/deploy-on-host.sh:57-60` says so explicitly. It proves *code imported from `dist/`
+  works inside the image*; it proves **nothing** about the launcher prod actually runs, so an
+  assertion added there gates a server the gate itself constructed. The launcher gate is
+  `scripts/deploy/preswap-smoke.sh`, which boots the real `launch-http.sh` against the real env and
+  greps the boot line (`:78`). Both it and the post-swap verify probe **unauthenticated** `/mcp`
+  expecting 401, so neither ever reaches per-connection code. Corollary: **anything that must fail a
+  deploy has to be observable at boot** — resolve it beside the existing boot assertions in
+  `src/mcp/http-main.ts:152-162` and emit it on the boot line at `:286-293`, never inside the
+  per-connection `buildServer:` callback, where a throw is a per-session 500 that no deploy check
+  sees. A plan asserted the opposite twice before anyone read the two scripts.
 - **A guard, probe or control must be able to report bad news, and you must have watched it do so.**
   Verify every non-trivial gate RED by construction before keeping it. See
   `docs/solutions/best-practices/a-test-whose-stub-guarantees-the-assertion-proves-nothing.md` —
