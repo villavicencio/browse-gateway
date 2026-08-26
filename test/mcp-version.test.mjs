@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createGatewayMcpServer, resolveGatewayVersion } from "../dist/mcp/index.js";
+import { createGatewayMcpServer, resolveGatewayVersion, isOpaqueVersion, REPORTED_VERSION } from "../dist/mcp/index.js";
 
 const repoRoot = new URL("..", import.meta.url).pathname;
 const manifestVersion = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version;
@@ -149,12 +149,75 @@ test("the stamp is stable for one image and differs across images", () => {
   }
 });
 
-test("the resolved version never carries an infrastructure identifier (R7)", () => {
+// --- U4: the opacity guard (R7) ---
+//
+// The subject is what a CONSUMER is advertised, not what the resolver returns. Those are different
+// values: `createGatewayMcpServer({ version })` bypasses the resolver entirely (the injection test
+// above proves it wins), so a guard that only reads `resolveGatewayVersion().reported` cannot see the
+// one path that can publish a non-opaque version. Guard the advertised value.
+
+/** What a real MCP client reads off `serverInfo.version` — the value a consumer actually receives. */
+async function advertisedVersion(deps) {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const server = createGatewayMcpServer({ retrieve: async () => ({ markdown: "x" }), ...deps });
+  await server.connect(serverTransport);
+  const client = new Client({ name: "test", version: "1.0.0" });
+  await client.connect(clientTransport);
+  try {
+    return client.getServerVersion().version;
+  } finally {
+    await client.close();
+  }
+}
+
+test("R7 — the version a consumer is ADVERTISED is opaque", async () => {
+  assert.ok(
+    isOpaqueVersion(await advertisedVersion({})),
+    "the version published over MCP must be a bare semver core, optionally + a 12-hex build stamp",
+  );
+});
+
+test("R7 — the resolved version is opaque, and shares ONE pattern with the guard", () => {
   const reported = resolveGatewayVersion(repoRoot).reported;
-  assert.doesNotMatch(reported, /sha256:/);
-  assert.doesNotMatch(reported, /[A-Z]/);       // no host/container names
-  assert.doesNotMatch(reported, /[_/]/);
-  assert.match(reported, /^\d+\.\d+\.\d+(\+[0-9a-f]{12})?$/);
+  assert.ok(isOpaqueVersion(reported), `not opaque: ${reported}`);
+  // The pattern is imported, never re-authored here. A local copy drifted looser than the resolver
+  // once already (it accepted the leading zeros SEMVER_CORE rejects), which is a guard weaker than
+  // the thing it guards.
+  assert.match(reported, REPORTED_VERSION);
+});
+
+test("R7 RED — the guard actually REFUSES every identifier decision (a) ruled out", async () => {
+  // Watched RED by construction. Each value reaches serverInfo through the SUPPORTED injection path
+  // — a real server advertising a real value to a real client — not a string handed to a matcher.
+  // A guard nobody has seen fail is not a guard; see
+  // docs/solutions/best-practices/a-test-whose-stub-guarantees-the-assertion-proves-nothing.md.
+  const mustRefuse = {
+    "full commit sha": "1.0.0+8761780f4a2b9c3d5e6f708192a3b4c5d6e7f809",
+    "short commit sha": "1.0.0+8761780",
+    "git ref": "1.0.0+main",
+    "describe output": "1.0.0-3-g8761780",
+    "manifest digest": "1.0.0+sha256:b2e1966fe1cb",
+    "container name": "1.0.0+svc-container-01",
+    "host name": "1.0.0+deploy-host-01",
+    "uppercase hex": "1.0.0+A1B2C3D4E5F6",
+    "path-shaped": "1.0.0+app/dist",
+    "leading zeros": "01.0.0+a1b2c3d4e5f6",
+    "bare stamp, no semver": "a1b2c3d4e5f6",
+  };
+  for (const [label, value] of Object.entries(mustRefuse)) {
+    assert.equal(isOpaqueVersion(value), false, `guard must refuse a ${label}: ${value}`);
+    // And it refuses it where it counts — on the wire, as advertised to a client.
+    assert.equal(
+      isOpaqueVersion(await advertisedVersion({ version: value })),
+      false,
+      `a ${label} injected into serverInfo must fail the guard: ${value}`,
+    );
+  }
+
+  // The mirror: a well-formed stamp must PASS, or the guard is refusing everything and proving
+  // nothing. A test that only ever says "no" is satisfied by a broken predicate.
+  assert.equal(isOpaqueVersion(await advertisedVersion({ version: "1.0.0+a1b2c3d4e5f6" })), true);
+  assert.equal(isOpaqueVersion(await advertisedVersion({ version: "1.0.0" })), true);
 });
 
 // --- the round-2 regression guard ---

@@ -41,6 +41,33 @@ const SEMVER_CORE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 /** The build stamp: fixed-width lowercase hex. Narrow ON PURPOSE — see `reported` below. */
 const DEPLOY_ID = /^[0-9a-f]{12}$/;
 
+/**
+ * U4 — the OPACITY shape of what a consumer is advertised on `serverInfo.version`.
+ *
+ * This is the composition of SEMVER_CORE and DEPLOY_ID, exported so a guard cannot re-author a
+ * looser copy. It already happened once: the R7 test carried `^\d+\.\d+\.\d+(\+[0-9a-f]{12})?$`,
+ * which accepts the leading zeros `SEMVER_CORE` exists to reject, so the guard was weaker than the
+ * resolver it guarded. One definition, one place.
+ *
+ * WHY OPACITY IS A GUARDED PROPERTY AND NOT JUST A FORMAT. Decision (a) settled that deployment
+ * identity is an opaque deploy id and NOT a git ref — three reviewers rejected the ref. The pattern
+ * is what makes that decision enforceable: 12 lowercase hex admits the stamp and structurally
+ * excludes a 40-hex commit sha, a `sha256:` digest, a host or container name (uppercase, `_`, `/`),
+ * and a branch name. A consumer must be able to compare two of these for equality and learn nothing
+ * else.
+ */
+export const REPORTED_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(\+[0-9a-f]{12})?$/;
+
+/**
+ * Does `value` satisfy the opacity contract a consumer is entitled to?
+ *
+ * Deliberately total (accepts `unknown`): the value under guard reaches this from `serverInfo`, and
+ * an `undefined` or non-string there is a failure, not a type error to be asserted away upstream.
+ */
+export function isOpaqueVersion(value: unknown): boolean {
+  return typeof value === "string" && REPORTED_VERSION.test(value);
+}
+
 /** Image-root filename holding the deploy stamp. Written by docker/Dockerfile at build time. */
 const DEPLOY_STAMP_FILE = ".deploy-id";
 

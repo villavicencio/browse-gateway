@@ -87,6 +87,23 @@ preswap_smoke() {
     docker logs "$SMOKE_CONTAINER" 2>&1 | tail -8 >&2 || true
     return 1
   fi
+  # U4 — the version signal must be WELL-FORMED, not merely present. This is the only gate that boots
+  # the REAL launcher: validate-http.mjs builds its own handler and its own config, so an assertion
+  # added there gates a server the gate itself constructed. Both deploy probes hit UNAUTHENTICATED
+  # /mcp expecting 401 and never reach per-connection code, so the boot line is the one place a
+  # version defect is observable to the deploy path at all.
+  #
+  # The pattern MIRRORS REPORTED_VERSION in src/mcp/version.ts and must be changed with it: a bare
+  # semver core, optionally + a 12-lowercase-hex build stamp. Grep is BRE, so the alternation and
+  # interval are escaped; `[1-9][0-9]*\|0` rejects the leading zeros semver forbids. Anchored on both
+  # sides against the surrounding boot line via the trailing space, so a longer token (a commit sha, a
+  # digest, a branch name) cannot match a prefix and pass.
+  local vsem='\(0\|[1-9][0-9]*\)\.\(0\|[1-9][0-9]*\)\.\(0\|[1-9][0-9]*\)'
+  if ! docker logs "$SMOKE_CONTAINER" 2>&1 | grep -q " version=${vsem}\(+[0-9a-f]\{12\}\)\{0,1\} "; then
+    echo "smoke: boot line carries no well-formed version= (expected a bare semver core, optionally +12 hex)" >&2
+    docker logs "$SMOKE_CONTAINER" 2>&1 | grep -o 'version=[^ ]*' | tail -1 >&2 || true
+    return 1
+  fi
   # Connection is to the smoke port, but Host MUST equal the real bind:port the env whitelists in
   # BGW_ALLOWED_HOSTS, or the SDK's DNS-rebind Host check rejects a perfectly good image.
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --retry 3 --retry-connrefused --retry-delay 1 \
