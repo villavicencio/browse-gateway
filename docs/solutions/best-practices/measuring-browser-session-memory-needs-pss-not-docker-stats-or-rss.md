@@ -75,7 +75,7 @@ needed — read the host `/proc` directly:
 pids=$(docker top <container> aux | awk '/opt\/google\/chrome/{print $2}')
 for p in $pids; do
   awk '/^Pss:/{s+=$2} END{print s+0}' /proc/$p/smaps_rollup
-done | awk '{t+=$1} END{printf "%.0f MB PSS across %d procs\n", t/1024, NR}'
+done | awk '{t+=$1} END{printf "%.0f MiB PSS across %d procs\n", t/1024, NR}'
 ```
 
 Measure the **idle floor** the same way before any session exists (the long-lived node process and
@@ -83,7 +83,10 @@ Xvfb), then the **delta** with exactly one session open. The per-session cost is
 total.
 
 Unit hazard: `smaps_rollup` reports KiB. Decide the divisor deliberately (`/1024` for MiB) and keep
-the cap in the same unit family — `--memory 4g` is 4096 MiB, not 4096 MB. On the numbers below the
+the cap in the same unit family — `--memory 4g` is 4096 MiB, not 4096 MB. **This doc mislabelled its
+own output `MB` for a day** — the awk divided KiB by 1024, which is MiB, and printed `MB` — and the
+slip propagated into two other documents before review caught it. The arithmetic was never wrong;
+the labels were. Print the unit you actually computed. On the numbers below the
 choice moves the answer from 5.7 to 6.0 sessions; it did not change the conclusion, but on a tighter
 budget it would.
 
@@ -166,7 +169,7 @@ health surface, never from the transport log.
 
 Two successful `retrieve` calls were driven through the gateway while `docker top` was sampled
 continuously (48s at 2s intervals, then 82s at 1.5s). Both returned real page content. In neither
-window did the container exceed 4 processes or move off ~310 MB — **no Chrome process ever appeared
+window did the container exceed 4 processes or move off ~310 MiB — **no Chrome process ever appeared
 in any of the ~79 samples.**
 
 This contradicts what the source describes. `src/verbs/retrieve.ts:892`, `:958` and `:1007` each call
@@ -195,7 +198,7 @@ during this investigation and both had to be retracted:
 Note that conclusion 2 was on the *right axis for the wrong reason* only by accident: if it had been
 believed, the cap would have been cut from 7 to 3 on the basis of an instrument artifact — degrading
 real concurrency to fix a problem that did not exist. And the opposite error is worse: summed RSS
-(1556 MB/session) would have implied only ~2 sessions fit, while `docker stats` at idle (1.068 GiB)
+(1556 MiB/session) would have implied only ~2 sessions fit, while `docker stats` at idle (1.068 GiB)
 would have implied roughly 3 — from a reading taken with **no session running at all**, so it was never
 a per-session number in the first place. Three instruments, three different capacity answers, one of
 them correct.
@@ -214,7 +217,7 @@ with a session live and 1.068 GiB (~1094 MiB) at idle** — lower under more loa
 wrong way when the load went up should have disqualified the instrument on the spot, before any
 conclusion was built on it.
 
-The correct number and its consequence: with an idle floor of ~361 MB and ~651 MB per session against
+The correct number and its consequence: with an idle floor of ~361 MiB and ~651 MiB per session against
 a 4096 MiB cap, `(4096 - 361) / 651 = 5.7` — about **5 concurrent sessions** against a configured cap
 of **7**. The cap is above what the box holds. Because `poolSizingError`
 (`src/gateway/config.ts:107-120`) only enforces the lower bound, nothing at boot will ever say so;
@@ -255,7 +258,7 @@ CPU %      MEM USAGE
 ```
 
 Ground truth for the same moment, from `docker top`: the node process's cumulative CPU was `4:51`
-over ~42 hours of uptime — about **0.2% average**, not 155%. Its true process RSS was ~310 MB, not
+over ~42 hours of uptime — about **0.2% average**, not 155%. Its true process RSS was ~310 MiB, not
 1.068 GiB; the rest was page cache attributed to the cgroup. The pool surface read `0/7 sessions`
 throughout. A later sample with a session **live** read `905 MiB` — *lower* than the `1.068 GiB` idle
 reading, because cache movement dominates the process working set.
@@ -263,8 +266,8 @@ reading, because cache movement dominates the process working set.
 **Instrument 2: summed RSS from `docker top <container> aux`.** Over-counts ~2.4x.
 
 ```
-$ docker top <container> aux | awk '/opt\/google\/chrome/{s+=$6} END{printf "%.0f MB across %d procs\n", s/1024, NR}'
-1556 MB across 14 procs
+$ docker top <container> aux | awk '/opt\/google\/chrome/{s+=$6} END{printf "%.0f MiB across %d procs\n", s/1024, NR}'
+1556 MiB across 14 procs
 ```
 
 Every page shared from the zygote is counted once per process.
@@ -274,8 +277,8 @@ Every page shared from the zygote is counted once per process.
 ```
 $ pids=$(docker top <container> aux | awk '/opt\/google\/chrome/{print $2}')
 $ for p in $pids; do awk '/^Pss:/{s+=$2} END{print s+0}' /proc/$p/smaps_rollup; done \
-    | awk '{t+=$1} END{printf "%.0f MB PSS across %d procs\n", t/1024, NR}'
-651 MB PSS across 14 procs
+    | awk '{t+=$1} END{printf "%.0f MiB PSS across %d procs\n", t/1024, NR}'
+651 MiB PSS across 14 procs
 ```
 
 Same single session. 14 processes at rest, 23 during a page load.
@@ -283,31 +286,31 @@ Same single session. 14 processes at rest, 23 during a page load.
 | Instrument | One session | Implied concurrency at 4 GiB | Correct? |
 |---|---|---|---|
 | `docker stats --no-stream` | 1.068 GiB *(idle, no session at all)* | ~3, and unstable | No — cgroup cache, two-sample CPU |
-| Summed RSS, 14 procs | 1556 MB | ~2 | No — shared pages counted 14x |
-| Summed PSS, 14 procs | 651 MB | ~5 | **Yes** |
+| Summed RSS, 14 procs | 1556 MiB | ~2 | No — shared pages counted 14x |
+| Summed PSS, 14 procs | 651 MiB | ~5 | **Yes** |
 
 ### After — measure, then cross-validate before believing
 
 ```bash
 # 1. Idle floor, PSS, before any session exists
-#    node 297 MB + Xvfb 70 MB = ~361 MB
+#    node 297 MiB + Xvfb 70 MiB = ~361 MiB
 
 # 2. One session open, PSS across the Chrome tree
-#    651 MB (14 procs at rest, 23 during a page load)
+#    651 MiB (14 procs at rest, 23 during a page load)
 
 # 3. CPU ground truth for that same session, cumulative not instantaneous
 #    ~7 CPU-seconds TOTAL including a heavy page load
 #    (20 procs at 0:00, two at 0:01, one at 0:05)
 
 # 4. VALIDATE the delta by repetition — not against a summary number
-#    floor:                    ~361 MB
-#    floor + one session:      ~1012 MB   -> delta 651 MB
+#    floor:                    ~361 MiB
+#    floor + one session:      ~1012 MiB  -> delta 651 MiB
 #    open a second session, confirm the delta repeats within a few percent
 #    (do NOT "confirm" against docker stats MemUsage: different quantity,
 #     and at this moment it read 905 MiB -- BELOW the PSS total)
 
 # 5. Only now, derive the cap
-#    (4096 MiB - 361 MB) / 651 MB = 5.7  ->  ~5 concurrent sessions
+#    (4096 - 361) / 651 = 5.7   [all MiB]  ->  ~5 concurrent sessions
 #    configured BGW_MAX_SESSIONS = 7     ->  cap exceeds what the box holds
 ```
 

@@ -58,7 +58,7 @@ node dist/cli/obscura.js keys revoke <id> --apply
 
 If you actually need the higher consumer count, raise `BGW_MAX_SESSIONS` in the on-host env file to
 `≥ consumers·perConsumerMax + 1` first, mind the box's RAM (each session is a headful Chrome), then
-re-create. **"Mind the RAM" now has a number** (measured 2026-08-27): ~651 MB PSS per session against
+re-create. **"Mind the RAM" now has a number** (measured 2026-08-27): ~651 MiB PSS per session against
 a 4096 MiB container, i.e. **about 5 concurrent sessions** — while prod's `BGW_MAX_SESSIONS` is 7.
 The boot guard enforces only the *floor*; **nothing derives a ceiling from host memory**, so raising
 `BGW_MAX_SESSIONS` to clear the floor can quietly put the cap above what the box can hold. See
@@ -89,7 +89,17 @@ and the 2026-08-27 update in
   operator-run command rather than CD), but do not read "shared" as "identical". See
   `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`.
 - Regardless: treat `keys new --apply` as a deploy. When adding the consumer that crosses a
-  `perConsumerMax` boundary, bump `BGW_MAX_SESSIONS` in the same change.
+  `perConsumerMax` boundary, the floor moves and `BGW_MAX_SESSIONS` must move with it — but
+  ⚠️ **raising `BGW_MAX_SESSIONS` to clear the floor is only safe while it stays under the host's
+  memory ceiling, and production is already above it** (cap 7 vs ~5 sessions' worth of RAM). The
+  boot guard checks the floor and nothing checks the ceiling, so this bullet used to advise walking
+  further past it. Before raising the cap, do one of:
+  - **measure** PSS per session on the box and confirm `(container_limit − idle_floor) / per_session`
+    still exceeds the new cap (method: the PSS doc linked above — not `docker stats`, not summed RSS);
+  - **lower `perConsumerMax`** instead, which reduces the floor without raising the cap; or
+  - **resize the host**, deliberately — on this box that also reprices a legacy rate irreversibly.
+
+  If none of those hold, the correct outcome is to **refuse the new consumer**, not to raise the cap.
 
 ## See also
 - `docs/solutions/runtime-errors/docker-restart-cannot-activate-env-file-changes.md` — why apply must

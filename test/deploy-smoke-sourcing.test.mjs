@@ -174,3 +174,25 @@ test("no drift NOTE when the host launcher and the image's copy are identical", 
   assert.equal(r.status, 0);
   assert.ok(!/differs from the image's copy/.test(r.stderr), "identical launchers must be silent");
 });
+
+test("a PRE-VIL-134 smoke (no BGW_LAUNCH_SCRIPT support) still finds a launcher and deploys", () => {
+  // Older images carry a smoke that resolves "$HERE/launch-http.sh" and ignores BGW_LAUNCH_SCRIPT.
+  // Extracting into a bare temp FILE would leave that smoke with no launcher beside it, so any
+  // manual redeploy of an older digest would abort with a confusing "launcher not executable".
+  // The extraction dir therefore carries a copy of the HOST launcher under the name it expects.
+  const sb = sandbox({
+    imageSmoke: [
+      `#!/usr/bin/env bash`,
+      `set -euo pipefail`,
+      `HERE="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"`,
+      `[ -x "$HERE/launch-http.sh" ] || { echo "smoke: launcher not executable: $HERE/launch-http.sh" >&2; exit 2; }`,
+      `"$HERE/launch-http.sh"`,
+      `touch "$MARK_DIR/OLD-SMOKE-FOUND-LAUNCHER"`,
+      `exit 0`,
+    ].join("\n") + "\n",
+  });
+  const r = runDeploy(sb);
+  assert.equal(r.status, 0, `an image predating BGW_LAUNCH_SCRIPT must still deploy:\n${r.stdout}\n${r.stderr}`);
+  assert.ok(existsSync(join(sb.marks, "OLD-SMOKE-FOUND-LAUNCHER")), "the old smoke must resolve a launcher beside itself");
+  assert.ok(swapped(sb), "the deploy must proceed to the swap");
+});

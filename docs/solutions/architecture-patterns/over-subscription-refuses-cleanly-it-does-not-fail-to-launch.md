@@ -122,8 +122,8 @@ concurrent workload** — a resource question (memory, `/dev/shm`, PIDs, FDs) th
 deliberately cannot reach."* A per-session memory measurement has now reached it. See
 [measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss](../best-practices/measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss.md).
 
-**Measured on prod, 2026-08-27:** an idle floor of ~361 MB and **~651 MB PSS per browser session**
-against the container's 4096 MiB cap → `(4096 − 361) / 651 = 5.7`, i.e. **about 5 concurrent
+**Measured on prod, 2026-08-27:** an idle floor of ~361 MiB and **~651 MiB PSS per browser session**
+against the container's 4096 MiB cap → `(4096 − 361) / 651 = 5.7` (all MiB), i.e. **about 5 concurrent
 sessions**. Production's configured `maxSessions` is **7**.
 
 ### The consequence, stated plainly

@@ -99,13 +99,20 @@ echo "deploy: gate PASS"
 # so pulling the script out of the image never executes image code, and it does not depend on the
 # image shipping a `cat`.
 SMOKE_IN_IMAGE="/app/scripts/deploy/preswap-smoke.sh"
-SMOKE_TMP="$(mktemp "${TMPDIR:-/tmp}/bgw-preswap-smoke.XXXXXX")"
-SMOKE_ERR="$(mktemp "${TMPDIR:-/tmp}/bgw-preswap-smoke-err.XXXXXX")"
-LAUNCH_TMP="$(mktemp "${TMPDIR:-/tmp}/bgw-image-launcher.XXXXXX")"
+# A DIRECTORY, not a bare temp file. The extracted smoke is placed in it alongside a copy of the
+# host's launch-http.sh, which is what makes this safe to install ahead of the matching image:
+# a smoke predating VIL-134 does not know BGW_LAUNCH_SCRIPT and resolves "$HERE/launch-http.sh"
+# instead — "$HERE" being wherever we put it. Without a launcher beside it, deploying any older
+# image (a manual redeploy, a rollback to a pinned digest) would abort at the smoke with a
+# confusing "launcher not executable". Both old and new smokes now find the same host launcher.
+SMOKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bgw-preswap.XXXXXX")"
+SMOKE_TMP="$SMOKE_DIR/preswap-smoke.sh"
+SMOKE_ERR="$SMOKE_DIR/create.err"
+LAUNCH_TMP="$SMOKE_DIR/image-launch-http.sh"   # the IMAGE's launcher, for the drift NOTE only
 SMOKE_CID=""
 cleanup_smoke() {
   [ -n "$SMOKE_CID" ] && docker rm -f "$SMOKE_CID" >/dev/null 2>&1 || true
-  rm -f "$SMOKE_TMP" "$SMOKE_ERR" "$LAUNCH_TMP"
+  rm -rf "$SMOKE_DIR"
 }
 trap cleanup_smoke EXIT
 
@@ -132,6 +139,12 @@ docker cp "${SMOKE_CID}:/app/scripts/deploy/launch-http.sh" "$LAUNCH_TMP" >/dev/
 docker rm -f "$SMOKE_CID" >/dev/null 2>&1 || true
 SMOKE_CID=""
 chmod +x "$SMOKE_TMP"
+
+# The host launcher, beside the extracted smoke, under the name a pre-VIL-134 smoke looks for.
+# New smokes take it via BGW_LAUNCH_SCRIPT below; old ones find it as "$HERE/launch-http.sh".
+# Either way it is the HOST's launcher — the one step 6 will use for the real swap.
+cp "$HERE/launch-http.sh" "$SMOKE_DIR/launch-http.sh"
+chmod +x "$SMOKE_DIR/launch-http.sh"
 
 # Provenance in the deploy log, so a stale or unexpected gate is VISIBLE rather than silently absent.
 echo "deploy: pre-swap smoke sourced from image:${SMOKE_IN_IMAGE} sha256=$(sha256sum "$SMOKE_TMP" | cut -c1-16)"

@@ -39,7 +39,9 @@ deploy path — the highest-risk surface in this repo.
 The conclusion was wrong. The two values were never supposed to match. They are different *kinds* of
 identifier for the same image, and the mismatch is guaranteed by construction.
 
-`scripts/deploy/deploy-on-host.sh:93` captures the rollback anchor like this:
+`scripts/deploy/deploy-on-host.sh` captures the rollback anchor like this (line 173 as of
+2026-08-27 — VIL-134 inserted the image-extraction block above it, so grep the symbol rather than
+trusting the number):
 
 ```sh
 # 5 — capture the currently-running image (by ID = runnable digest) for rollback.
@@ -197,7 +199,7 @@ against the artifact that would prove or disprove it.
 
 **After (confirm the identifier kind first):**
 
-> `grep -n "ROLLBACK_IMAGE=" scripts/deploy/deploy-on-host.sh` → line 93: captured via
+> `grep -n "ROLLBACK_IMAGE=" scripts/deploy/deploy-on-host.sh` → line 173: captured via
 > `docker inspect "$CONTAINER" --format '{{.Image}}'` — a **container** inspect, image ID.
 >
 > `grep -n "Manifest.Digest" .github/workflows/deploy-http.yml` → line 42: captured via
