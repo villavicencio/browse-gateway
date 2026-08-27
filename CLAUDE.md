@@ -111,6 +111,15 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   ladder edge.** Booleans, integer counts, and floored labels are safe; a raw millisecond bucket is
   not, and a MAX is worse than a median because one request decides it. Raw distributions belong in
   a snapshot-excluded constant, never in a diffed axis.
+- **A measurement is only as good as its instrument, and `docker stats` is not one.** Its MemUsage
+  counts page cache under cgroups v2, and its `--no-stream` CPU% is a two-sample rate — it reported
+  triple-digit CPU on an idle container with zero browser processes. Summing RSS across a Chrome tree
+  is wrong in the other direction: the zygote's shared pages get counted once per process (~2.4x
+  over). Use `docker top` to enumerate, and PSS from `/proc/<pid>/smaps_rollup` to measure; the pids
+  are host-visible under rootless Docker, so no `docker exec` is needed. Validate a per-session cost
+  as a **delta that reproduces**, never as an absolute compared against a metric answering a
+  different question. Full write-up, including the invalid cross-check this rule was born from:
+  `docs/solutions/best-practices/measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss.md`.
 - **Measure; do not reason.** Several defects this project has shipped came from a comment
   asserting a property ("always false by construction", "the collector issues no requests") that a
   five-minute experiment disproved. If a claim is checkable, check it.

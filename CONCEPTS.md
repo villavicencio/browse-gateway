@@ -55,6 +55,13 @@ each session is a full headful browser, so capacity is limited by the host's mem
 policy. Sessions are admitted against both a global ceiling and a per-consumer allowance, so one
 consumer cannot starve the others.
 
+Only the lower bound of that ceiling is enforced. A declared capacity below the Pool floor aborts the
+boot, but nothing derives an upper bound from the host's actual memory, so a ceiling larger than the
+hardware can hold starts cleanly and surfaces only as memory exhaustion once enough sessions are
+genuinely concurrent. Sizing it is a measurement task rather than a configuration one, and the
+measurement is only as trustworthy as the instrument used — summary container tooling reports a
+number that includes more than the sessions themselves.
+
 ### Pool floor
 The minimum global capacity a configuration must declare to be servable: one slot for every
 consumer's per-consumer allowance, plus one held back so single-shot retrieval can still proceed
@@ -72,3 +79,10 @@ floor, and is a capacity decision rather than a routine provisioning step.
   and had been read as interchangeable. They are distinct identifiers computed over different inputs
   and are never equal for the same image, so a mismatch between them is structural and carries no
   information about what is deployed.
+
+- **Session** names two different things on two surfaces. The request log counts *transport*
+  sessions — one per client connection, created when a client initializes its transport — while the
+  operator status surface counts *browser* sessions against the Session pool ceiling. Neither count
+  tracks the other, and they diverge widely: a client can hold many transport sessions while no
+  browser session exists. Pool capacity is only ever the second; a capacity conclusion drawn from
+  the log line is reading the wrong number.
