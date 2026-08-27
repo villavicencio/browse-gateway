@@ -2,6 +2,7 @@
 title: "`keys --apply` can crash-loop the gateway — the Nth consumer trips the MAX_SESSIONS floor"
 module: cli/keys, docker/deploy
 date: 2026-06-16
+revised: 2026-08-27
 problem_type: runtime_error
 component: deployment
 severity: high
@@ -57,31 +58,48 @@ node dist/cli/obscura.js keys revoke <id> --apply
 
 If you actually need the higher consumer count, raise `BGW_MAX_SESSIONS` in the on-host env file to
 `≥ consumers·perConsumerMax + 1` first, mind the box's RAM (each session is a headful Chrome), then
-re-create.
+re-create. **"Mind the RAM" now has a number** (measured 2026-08-27): ~651 MB PSS per session against
+a 4096 MiB container, i.e. **about 5 concurrent sessions** — while prod's `BGW_MAX_SESSIONS` is 7.
+The boot guard enforces only the *floor*; **nothing derives a ceiling from host memory**, so raising
+`BGW_MAX_SESSIONS` to clear the floor can quietly put the cap above what the box can hold. See
+`docs/solutions/best-practices/measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss.md`
+and the 2026-08-27 update in
+`docs/solutions/architecture-patterns/over-subscription-refuses-cleanly-it-does-not-fail-to-launch.md`.
 
 ## Prevention
 - **Pre-flight the floor before any `keys new --apply`.** The new consumer count and `perConsumerMax`
   are known; read `BGW_MAX_SESSIONS` from the env file and refuse (or warn loudly) when the mint
   would push the count past `(MAX_SESSIONS − 1) / perConsumerMax`. This is the real product gap —
   `keysNew` should not be able to stage a config that the boot guard will reject.
-- ✅ **DONE — `keys --apply` now runs the same pre-swap smoke** (PR #26, merged 2026-06-23).
-  `scripts/deploy/preswap-smoke.sh` is the single source of truth for it, shared by the CD wrapper
-  (`deploy-on-host.sh`, which passes the NEW image) and the `obscura keys|vault --apply` path (which
-  passes the CURRENTLY-RUNNING image, since only env/manifest changed). `preswapSmoke()` runs before
-  the re-create — `src/cli/keys.ts:148`, inside `applyRecreate`. A malformed env or manifest,
-  including an undersized `BGW_MAX_SESSIONS` floor, now aborts the apply with the live container
-  untouched.
-  **Caveat — the smoke is conditional on `smokeCmd` being configured.** With it unset the apply warns
-  loudly and proceeds unsmoked (`src/cli/keys.ts:105-109`), which is the pre-#26 behaviour. An
+- ✅ **DONE — `keys --apply` runs a pre-swap smoke** (PR #26, merged 2026-06-23). `preswapSmoke()`
+  runs before the re-create — `src/cli/keys.ts:148`, inside `applyRecreate`. A malformed env or
+  manifest, including an undersized `BGW_MAX_SESSIONS` floor, aborts the apply with the live
+  container untouched.
+  **Caveat 1 — the smoke is conditional on `smokeCmd` being configured.** With it unset the apply
+  warns loudly and proceeds unsmoked (`src/cli/keys.ts:105-109`), which is the pre-#26 behaviour. An
   operator config without `smokeCmd` still carries the exposure this doc describes.
+  ⚠️ **Caveat 2 — CORRECTION 2026-08-27. This doc used to call `scripts/deploy/preswap-smoke.sh`
+  "the single source of truth … shared by the CD wrapper and `--apply`". That was never true in
+  production.** The CD deploy ran an *inline* copy of the smoke inside the host's `deploy-on-host.sh`
+  (2026-06-12 vintage), and `--apply` invoked a *separate* on-host standalone copy via `smokeCmd`.
+  Three copies existed; the repo's was the one nothing in production ran. Since VIL-134 the CD path
+  **extracts the smoke from the image it is deploying** and fails closed without one, so *that* half
+  is now genuinely single-source. **`--apply` still calls an on-host installed copy and can still
+  drift from the repo** — deliberate for now (it never changes the image, and the exposure is one
+  operator-run command rather than CD), but do not read "shared" as "identical". See
+  `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`.
 - Regardless: treat `keys new --apply` as a deploy. When adding the consumer that crosses a
   `perConsumerMax` boundary, bump `BGW_MAX_SESSIONS` in the same change.
 
 ## See also
 - `docs/solutions/runtime-errors/docker-restart-cannot-activate-env-file-changes.md` — why apply must
   re-create, not restart (the reason `keys --apply` runs `launch-http.sh` at all).
-- `scripts/deploy/preswap-smoke.sh` — the shared real-config pre-swap smoke, now run by both the CD
-  path (`deploy-on-host.sh` step 4) and `keys|vault --apply`.
+- `scripts/deploy/preswap-smoke.sh` — the real-config pre-swap smoke. The CD path (`deploy-on-host.sh`
+  step 4) runs the copy **extracted from the image being deployed**; `keys|vault --apply` runs an
+  on-host installed copy via `smokeCmd`. Same origin file, two delivery paths, only one of which is
+  drift-proof.
+- `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md` — why the CD path had
+  to stop using an on-host copy, and how to verify a gate is actually the one executing.
 - `docs/solutions/best-practices/comparing-image-id-to-manifest-digest-is-not-a-drift-check.md` —
   corrects a later misreading of this doc. `--apply` re-creates the container against a deliberately
   **unchanged** image, so it is not a code deployment; reading it as one led to a wrong conclusion
