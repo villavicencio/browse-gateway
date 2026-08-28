@@ -80,6 +80,26 @@ test("a private/metadata endpoint refuses the boot (no SSRF primitive via config
   }
 });
 
+test("KNOWN BOUNDARY: the endpoint check is literal, not DNS-resolving", () => {
+  // Pinned deliberately so this limit is never mistaken for a complete SSRF guarantee.
+  // `isBlockedEgressHost` is pure and resolves nothing (its own header says so), so a PUBLIC name
+  // that resolves to a private address passes it. The complementary layer is the container network
+  // filter, same as for the browser path — and a boot-time DNS check would not substitute, since
+  // what a name resolves to at boot says nothing about what it resolves to at request time.
+  assert.equal(searchEndpointError("https://127.0.0.1.sslip.io/search", "BGW_X"), null);
+  // What it DOES catch: IP literals in every encoding, and the internal name suffixes.
+  for (const blocked of [
+    "https://127.0.0.1/x",
+    "https://169.254.169.254/x",
+    "https://[::1]/x",
+    "https://foo.localhost/x",
+    "https://svc.internal/x",
+    "https://metadata.google.internal/x",
+  ]) {
+    assert.match(searchEndpointError(blocked, "BGW_X") ?? "", /private\/internal\/metadata/, `expected ${blocked} to be refused`);
+  }
+});
+
 test("searchEndpointError names the variable it was given, and passes a good URL", () => {
   assert.equal(searchEndpointError(BRAVE_DEFAULT_API_URL, "BGW_X"), null);
   assert.match(searchEndpointError("nope", "BGW_X"), /BGW_X is not a valid URL/);

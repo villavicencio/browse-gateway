@@ -35,6 +35,21 @@ What must not happen is a deployment pointing the adapter at a private or metada
 applied to the configured endpoint — once, at **boot**, in `searchEndpointError`, alongside an
 https-only check (the API key rides a request header). A bad endpoint refuses the boot.
 
+**Know what that check does and does not cover.** `isBlockedEgressHost` is pure and does no DNS
+resolution — by design, and stated in its own header. It catches IP literals (every private range,
+including alternate encodings and IPv4-mapped IPv6) and internal names (`localhost`, `.internal`,
+`.local`, the metadata names). It does **not** catch a public hostname that *resolves* to a private
+address — `https://127.0.0.1.sslip.io/` passes it. The complementary layer for that is the container
+network filter in compose, exactly as for the browser path; a boot-time DNS check would not be a
+substitute anyway, since what a name resolves to at boot says nothing about what it resolves to at
+request time. `test/search-config.test.mjs` pins this boundary so it is not later mistaken for a
+complete guarantee.
+
+Redirects are the other half, and they are refused outright (`redirect: "manual"`). Measured on
+Node 24: `fetch` strips `Authorization` across a cross-origin redirect but forwards a **custom**
+header verbatim, so following one would both disclose `x-subscription-token` to the redirect target
+and reach that target without any of the checks above. A 3xx is therefore a typed failure, not a hop.
+
 Boot is the right place for the same reason every other guard lives there: per the project rule,
 anything that must fail a deploy has to be observable at boot. A check inside the per-connection
 `buildServer:` callback would be a per-session 500 that no deploy probe reaches.
