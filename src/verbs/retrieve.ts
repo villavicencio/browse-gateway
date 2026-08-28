@@ -1044,7 +1044,13 @@ export async function retrieve(
       // a visible/hard block, OR — #67 — a response that arrived but timed out before DCL, not a null/chrome-error
       // dead nav), the failure is site-attributable, so this is NOT an all-exits-dead burn. Tracked across
       // attempts; if the loop exhausts still-false, every exit died.
-      if (!isDeadExit(render.responseReceived, render.status, render.diagnostics?.finalUrl, render.policyBlocked !== undefined)) {
+      const reachedSite = !isDeadExit(
+        render.responseReceived,
+        render.status,
+        render.diagnostics?.finalUrl,
+        render.policyBlocked !== undefined,
+      );
+      if (reachedSite) {
         sawLiveProxiedResponse = true;
         lastLiveRender = render; // #45 (codex r8): remember it — a later dead exit must not erase this site block
       }
@@ -1057,6 +1063,13 @@ export async function retrieve(
       // Field evidence for both arms: a thin 404 cost 90.3s and 2 residential exits on the AUTOMATIC path
       // (2026-08-27); a reCAPTCHA-200 cost 90.2s and 2 exits on the FORCED path (2026-08-25). Forced and
       // automatic share this loop, so one gate covers both.
+      // GUARD BOTH ARMS ON `reachedSite`. A dead exit (a chrome-error landing, or no response receipt) can
+      // carry a STALE status inherited from a PRIOR document — the exact hazard `classifyFailure` already
+      // defends against by giving `isChromeErrorUrl(finalUrl)` precedence over the status. Without this
+      // guard a transport failure that happens to retain a stale 404/410/429 would read as an authoritative
+      // "the resource is gone" and stop the re-roll, when the truth is that this exit never reached the site
+      // and the NEXT one might. The same reasoning applies to the CAPTCHA arm: a widget scraped off a stale
+      // DOM says nothing about what a live exit would get.
       const attemptSignal = blockSignalFrom(render);
       // (a) 404/410/429 — the resource is missing/gone, or we are being throttled. Same answer from
       //     every exit. Deliberately NOT keyed on the block reason: the vendor markers persist after a
@@ -1064,14 +1077,14 @@ export async function retrieve(
       //     reason-gating would re-roll every exit on exactly the case this ticket exists to stop.
       //     The shared rule exempts a LIVE challenge (visible phrase) so a managed challenge served on
       //     one of these statuses still gets its full budget — see isTerminalUnclearableRender.
-      if (isTerminalUnclearableRender(attemptSignal, render.status)) break;
+      if (reachedSite && isTerminalUnclearableRender(attemptSignal, render.status)) break;
       // (b) an ACTIVE interactive CAPTCHA with no solver wired. `resolveBlockReason` yields `captcha` ONLY
       //     for an otherwise-GENERIC block carrying a real widget container, so a Cloudflare managed
       //     challenge classifies `cf-challenge` and keeps re-rolling — which is correct and load-bearing:
       //     a clean residential exit DOES clear a CF challenge (screenshot-proven, see
       //     captcha-cf-clearance-architecture). Without a solver a re-roll cannot change the outcome; with
       //     one, the existing (vestigial) solve seam is left free to try.
-      if (!opts.solver && resolveBlockReason(attemptSignal) === "captcha") break;
+      if (reachedSite && !opts.solver && resolveBlockReason(attemptSignal) === "captcha") break;
     }
   }
 

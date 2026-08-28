@@ -240,6 +240,10 @@ export class GatewayDriveController implements DriveController {
     attemptMs?: number[];
     exitCheck?: EgressCheck;
     burnedExit?: boolean;
+    /** VIL-121: the call consumed its whole wall-clock budget. Mirrors the FailureDiagnostics field onto
+     *  the escalation diagnostic so EscalationError.diagnostics honours the "set on EVERY budget-exhausted
+     *  call" guarantee — drive throws EscalationErrors on paths that never build a snapshot envelope. */
+    budgetExhausted?: boolean;
   }): EscalationDiagnostics {
     return escalationDiagnostics({
       proxyConfigured: proxyFromSecrets(this.#secrets) !== undefined,
@@ -250,6 +254,7 @@ export class GatewayDriveController implements DriveController {
       ...(opts.attemptMs ? { attemptMs: opts.attemptMs } : {}), // #42: per proxied-attempt durations
       ...(opts.exitCheck ? { exitCheck: opts.exitCheck } : {}),
       ...(opts.burnedExit ? { burnedExit: true } : {}), // #45: all exits died without reaching the site
+      ...(opts.budgetExhausted ? { budgetExhausted: true } : {}), // VIL-121
     });
   }
 
@@ -665,7 +670,7 @@ export class GatewayDriveController implements DriveController {
     // #45 (codex r2): a non-escalating direct failure that hit the per-call deadline is a TIMEOUT, not nav-failed.
     // #66: same for a deadline-truncated direct nav — the message matches the seam's `timeout` class.
     const budgetExceeded = performance.now() >= budgetDeadlineMs;
-    const dx = this.#escalationDiag({ proxyApplied: false, forced: false, attempts: 0, last: direct });
+    const dx = this.#escalationDiag({ proxyApplied: false, forced: false, attempts: 0, last: direct, budgetExhausted: budgetExceeded });
     throw new EscalationError(
       budgetExceeded
         ? `navigation timed out (status=${dx.lastStatus ?? "n/a"}): the per-call budget (${this.#timeouts.callBudgetMs}ms) was exhausted`
@@ -1115,7 +1120,8 @@ export class GatewayDriveController implements DriveController {
       // drive snapshot — so a responded-but-truncated proxied attempt (deadlineTruncated, or status-null with
       // a receipt) counts as a LIVE response, not a burned exit (the same precision retrieve has). The
       // `status`-presence fallback remains only for receipt-less fixtures.
-      if (!policyBlocked && !isDeadExit(snap.responseReceived, snap.status ?? null, snap.url)) {
+      const reachedSite = !policyBlocked && !isDeadExit(snap.responseReceived, snap.status ?? null, snap.url);
+      if (reachedSite) {
         sawLiveResponse = true;
         lastLive = snap; // #45 (codex r8): a later dead exit must not erase this site block from the class
       }
@@ -1133,7 +1139,10 @@ export class GatewayDriveController implements DriveController {
       // up to proxyMaxAttempts of them. Placed at the END of the body, after the sawLiveResponse /
       // lastLive / attemptMs tracking, for the same reason retrieve's is: an early exit here would
       // leave that tracking stale and let a real site verdict be mislabelled a burned exit.
-      if (isTerminalUnclearableRender({ title: snap.title, text: snap.tree }, snap.status ?? null)) break;
+      // Gated on `reachedSite` for the same reason retrieve's is: a dead exit can retain a STALE status
+      // from a prior document, and terminating on that would read a transport failure as an authoritative
+      // "the resource is gone" while a healthy exit was still available.
+      if (reachedSite && isTerminalUnclearableRender({ title: snap.title, text: snap.tree }, snap.status ?? null)) break;
     }
     // #45 (codex r1): re-check the deadline AFTER the final attempt — the last allowed attempt can START with
     // budget remaining but RETURN past the deadline (no next iteration to set budgetExceeded). A timeout must
@@ -1171,7 +1180,7 @@ export class GatewayDriveController implements DriveController {
       this.#verifyEgressEnabled && !budgetExceeded && last?.policyBlocked === undefined && budgetDeadlineMs - performance.now() > MIN_ATTEMPT_BUDGET_MS
         ? await this.#verifyEgress(budgetDeadlineMs)
         : undefined;
-    const dx = this.#escalationDiag({ proxyApplied: attempts > 0, forced, attempts, last: failSnap, attemptMs, exitCheck, burnedExit });
+    const dx = this.#escalationDiag({ proxyApplied: attempts > 0, forced, attempts, last: failSnap, attemptMs, exitCheck, burnedExit, budgetExhausted: budgetExceeded });
     // Distinct headline per verdict so ops reads the real cause: a budget timeout, an all-exits-dead burn, or
     // a genuine per-exit exhaustion (site blocked every live exit). The typed FailureClass on #failure carries it.
     const headline = budgetExceeded
@@ -1190,7 +1199,7 @@ export class GatewayDriveController implements DriveController {
     const failure = failSnap
       ? this.#failure(failSnap, { budgetExceeded, burnedExit })
       : budgetExceeded
-        ? redactFailureDiagnostics({ finalUrl: url, status: null, failureClass: "timeout" }, this.#secrets)
+        ? redactFailureDiagnostics({ finalUrl: url, status: null, failureClass: "timeout", budgetExhausted: true }, this.#secrets)
         : undefined;
     throw new EscalationError(
       // Structural sanitize at the source (issue #39 r5): the KNOWN requested url, spelling-proof.

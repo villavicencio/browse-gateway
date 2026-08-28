@@ -401,7 +401,7 @@ test("REGRESSION GUARD: an ordinary thin 404 from a CF-fronted origin is STILL t
 // --- drive loop parity (gauntlet round 1) -----------------------------------------------------------
 
 /** A per-session-programmed gateway for the drive controller: sessions[n] is the nth opened session. */
-function makeDriveSeq(sessions) {
+function makeDriveSeq(sessions, delayMs = 0) {
   let si = -1;
   let nextId = 1;
   const open = new Map();
@@ -418,6 +418,7 @@ function makeDriveSeq(sessions) {
           async navigate(url) {
             const o = navs[Math.min(ni, navs.length - 1)] ?? {};
             ni += 1;
+            if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
             return {
               url: o.url ?? url,
               title: o.title ?? "t",
@@ -464,4 +465,63 @@ test("CONTROL: drive still re-rolls every exit on a reputation 403", async () =>
   const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", { onDatacenterIp: true });
   await assert.rejects(drive.navigate("https://target.invalid/p"), () => true);
   assert.equal(opened.length, 1 + DEFAULT_CALL_TIMEOUTS.proxyMaxAttempts, "the ladder is intact for 403");
+});
+
+// --- dead exits must not be read as authoritative verdicts (gauntlet round 2) -----------------------
+//
+// A dead exit (a chrome-error landing, or no response receipt) can retain a STALE status inherited from a
+// prior document — the hazard `classifyFailure` already guards by giving isChromeErrorUrl precedence over
+// the status. The terminal break reads the status, so it needs the same guard: a transport failure that
+// happens to carry a stale 404 must not read as "the resource is gone" while healthy exits remain.
+
+test("retrieve: a DEAD proxied exit carrying a STALE 404 keeps re-rolling", async () => {
+  const staleDead = renderOf({
+    status: 404, // stale, inherited from a prior document
+    responseReceived: false, // ...but this exit never actually responded
+    text: "",
+    html: "",
+    url: "chrome-error://chromewebdata/",
+    diagnostics: { finalUrl: "chrome-error://chromewebdata/", status: 404 },
+  });
+  const { gateway, proxiedCalls } = makeFakeGateway([
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }), // direct → escalate
+    staleDead,
+  ]);
+  await run(gateway, { timeouts: { ...DEFAULT_CALL_TIMEOUTS, proxyMaxAttempts: 3 } });
+  assert.equal(proxiedCalls().length, 3, "a dead exit's stale status must not end the re-roll");
+});
+
+test("CONTROL: a LIVE 404 (real receipt, real URL) still ends the re-roll after one exit", async () => {
+  const live404 = renderOf({
+    status: 404,
+    responseReceived: true,
+    html: fixture("thin-404.html"),
+    text: visibleText(fixture("thin-404.html")),
+  });
+  const { gateway, proxiedCalls } = makeFakeGateway([
+    renderOf({ status: 403, text: "Forbidden", html: "Forbidden" }),
+    live404,
+  ]);
+  await run(gateway, { timeouts: { ...DEFAULT_CALL_TIMEOUTS, proxyMaxAttempts: 3 } });
+  assert.equal(proxiedCalls().length, 1, "an authoritative 404 from a live exit is still terminal");
+});
+
+test("drive: budget exhaustion is surfaced on EscalationError.diagnostics, not only the envelope", async () => {
+  // The `budgetExhausted` field documents itself as set on EVERY budget-exhausted call. Drive throws
+  // EscalationErrors on paths that build no snapshot envelope, so the flag has to ride the escalation
+  // diagnostic too or the guarantee is false on the drive surface.
+  // Reached via a NON-escalating direct failure that outruns its budget: a thin 404 no longer starts
+  // escalation (this ticket), so the call falls through to the direct-failure throw with the budget spent.
+  // A zero budget would instead be refused at the queue boundary, which is a different path.
+  const { gateway } = makeDriveSeq([[{ status: 404, tree: "Not Found" }]], 120);
+  const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", {
+    onDatacenterIp: true,
+    timeouts: { ...DEFAULT_CALL_TIMEOUTS, callBudgetMs: 50 },
+  });
+  await assert.rejects(drive.navigate("https://target.invalid/p"), (err) => {
+    assert.equal(err.name, "EscalationError");
+    assert.equal(err.diagnostics.budgetExhausted, true, "the escalation diagnostic carries it");
+    assert.equal(err.failure?.budgetExhausted, true, "and so does the failure envelope");
+    return true;
+  });
 });
