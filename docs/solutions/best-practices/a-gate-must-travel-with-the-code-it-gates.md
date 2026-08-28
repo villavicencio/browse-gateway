@@ -138,3 +138,53 @@ across both. That was the first execution of that assertion in production, month
 > If a check lives anywhere other than the artifact it checks, assume it is stale until you have
 > watched it run. Count the copies: if a script exists in N places, exactly one of them executes,
 > and it is not automatically the one you edited.
+
+## Outcome: the NOTE's first catch, closed (VIL-135, 2026-08-27)
+
+The drift NOTE this doc introduced found a real second instance on its very first application, before
+it had ever run inside a deploy. The host's `launch-http.sh` was dated 2026-06-24 and predated PR
+`#141`'s graceful stop, so **every container swap since had SIGKILLed in-flight work** — the fix for
+VIL-114's mechanism sat merged and unexecuted for ten days. Same disease, different file: a merged
+fix that production never ran because production executes an on-host copy.
+
+Synced by the same backup → stage → sha256 → atomic `mv` procedure, then verified in both directions
+with the block `eval`'d verbatim out of the *installed* `deploy-on-host.sh`:
+
+- **RED control** — the block pointed at the pre-sync backup still printed
+  `NOTE — host launch-http.sh differs from the image's copy (host 981c79863747 vs image c73f85945a20)`.
+- **GREEN** — pointed at the synced file, silent.
+
+The swap itself is the proof that matters. Retiring the live container through the new launcher
+produced, for the first time in production, a shutdown sequence instead of a kill:
+
+```
+SIGTERM — draining: mcpSessions=12 browserSessions=0 budgetMs=5000
+drain finished after 0ms
+... 12 sessions closed across four consumers ...
+shutdown complete after 9ms — mcpSessions=0
+```
+
+Twelve real in-flight MCP sessions drained cleanly. Under `docker rm -f` all twelve would have died
+with no drain, no graph disposal, and no `ArtifactRuntime.close()`.
+
+**Capture the evidence before it is destroyed.** `docker stop` is immediately followed by `docker rm`,
+so the old container's shutdown lines are unrecoverable seconds later. Start a
+`nohup docker logs -f --tail 0 <container> > /tmp/x.log 2>&1 &` follower *before* the swap; the stream
+ends when the container dies and the file is the proof. Reaching for `docker events` after the fact is
+the trap — its `--until` parses a naive timestamp as local time, so a UTC value reads as future and the
+command streams forever instead of returning.
+
+## Gotcha: `--stop-timeout` is NOT at `.HostConfig.StopTimeout`
+
+On Docker 29.5.2 the flag lands at **`.Config.StopTimeout`**. `.HostConfig.StopTimeout` does not exist
+at all, and `docker inspect --format` fails loudly with `map has no entry for key "StopTimeout"` —
+which reads exactly like "this container was created without the flag."
+
+That misreading happened here: the pre-swap baseline was recorded as "`.HostConfig.StopTimeout` has no
+entry — direct evidence the old launcher created this container." The conclusion was right by luck; the
+evidence was worthless, since the key is absent on *every* container under this daemon regardless of
+launcher. The sound evidence was one `grep` away and did not require the container at all — the old
+launcher file contains only `docker rm -f`, the new one `docker stop -t "$STOP_TIMEOUT"` plus
+`--stop-timeout`. **Prefer evidence from the artifact you control over evidence from an API whose shape
+you have not verified**, and when an inspect key is missing, establish that it exists *somewhere* before
+reading meaning into its absence. (Cf. `measure; do not reason` in CLAUDE.md.)

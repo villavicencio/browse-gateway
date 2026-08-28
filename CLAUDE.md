@@ -102,7 +102,13 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   swap runs the host's, so the smoke must too — a smoke booting the candidate with a different
   launcher than the one that will deploy it is a false green; drift there is logged as a NOTE). More
   generally: **an on-host copy of a repo script is stale until you have watched it run** — the host's
-  `launch-http.sh` was two months behind by the same silent mechanism. Full write-up:
+  `launch-http.sh` was two months behind by the same silent mechanism (VIL-135; **synced and verified
+  2026-08-27**, backups `~/deploy/*.bak-20260827-vil135`, so all three deploy scripts now hash-match the
+  repo and the drift NOTE is silent). The swap was watched draining 12 live MCP sessions on SIGTERM
+  instead of SIGKILLing them. Two traps that cost time there: `docker rm` destroys the old container's
+  shutdown log seconds after `docker stop`, so start a `docker logs -f` follower **before** the swap;
+  and `--stop-timeout` lands at `.Config.StopTimeout`, **not** `.HostConfig.StopTimeout`, whose absence
+  is not evidence of anything. Full write-up:
   `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`.
 - **`main` is NOT branch-protected, so nothing mechanically blocks a merge.** There are no required
   status checks (`gh api repos/<owner>/<repo>/branches/main/protection` → 404 "Branch not
