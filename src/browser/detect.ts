@@ -416,6 +416,20 @@ export function isExitClearableHardBlock(
  * every such 404 re-roll every exit, which is precisely the burn this ticket exists to stop. The visible
  * CF phrase is absent on a cleared or ordinary page, so it separates a live challenge from a residual
  * marker. This mirrors the `pxCopy`-vs-`pxHint` precedent already relied on for warm-failure advice.
+ *
+ * **CLOUDFLARE IS THE ONLY EXEMPTED VENDOR, DELIBERATELY — this is a policy, not an oversight.** A
+ * PerimeterX press-&-hold or a DataDome interstitial arriving on one of these statuses gets ONE attempt
+ * and then stops, and that is the CORRECT outcome for both:
+ *   - Neither is exit-clearable. They are BEHAVIORAL challenges: a fresh exit does not clear one and a
+ *     retry RE-TRIGGERS it — the same conclusion {@link import("../observability/warm-advice.js").warmFailureAdvice}
+ *     already acts on when it tells an operator a live press-&-hold means "the stored login is fine, do
+ *     not retry". Re-rolling exits at them spends residential sessions to re-provoke the same challenge.
+ *   - The AUTOMATIC path never escalates them at all: `shouldEscalateToProxy` has a Cloudflare arm and a
+ *     hard-block arm, and no PX/DataDome arm (the spike found those pass direct from the datacenter). So
+ *     the one-attempt outcome here reaches only the FORCED path, and it moves that path TOWARD the
+ *     automatic path's policy rather than away from it.
+ * Adding PX/DataDome liveness signals to the exemption would therefore buy more re-rolls at exactly the
+ * two vendors this codebase has already concluded do not benefit from one.
  */
 export function isTerminalUnclearableRender(
   signal: Pick<PageSignal, "title" | "text">,

@@ -4,6 +4,10 @@
        1. a visible block phrase ("unusual traffic") so the page is `blocked` despite the 200 status;
        2. a REAL, ACTIVE widget container (class + data-sitekey) so the widget kind is attributed —
           a bare library <script> is deliberately NOT enough, and must not be added here.
+          The container class below is LOAD-BEARING: it is the public markup convention the widget
+          detector matches on, i.e. the DOM contract under test, not a provenance string. Removing it
+          would leave a fixture that no longer exercises what it exists to exercise. See rule 1 in
+          ../README.md for the provenance-vs-vocabulary line.
      The block is otherwise GENERIC — it carries no protection-vendor marker — which is what lets the block
      reason be promoted to `captcha`. Copy is written to the documented phrase list; nothing is transcribed.
      NOTE: vendor names are banned from these files INCLUDING comments — the hint scanners read raw HTML
