@@ -154,6 +154,18 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   detail in those local files, not in committed source.
 - **Fingerprint snapshots carry the egress IP** (`meta.egressIp`) and `INPUT_REALISM_OUT` has no
   redaction at all. Check any measurement JSON before pasting it into a ticket, a doc, or a commit.
+- **Never hand-roll a redaction regex, and never trust one you have not tested against a known
+  secret.** `\s` is a GNU extension — BSD `sed` (macOS) treats it as a literal `s`, so the pattern
+  matches nothing, exits 0, and prints the credential in full. A redactor that cannot match looks
+  exactly like one with nothing to redact. Redact JSON structurally by key with `jq`, then assert no
+  real value from the file survives the filter. This leaked `healthToken` to session output once
+  (2026-08-27; rotated, old token verified refused). Full write-up:
+  `docs/solutions/best-practices/redacting-a-secret-needs-a-verified-redactor-not-a-regex-you-eyeballed.md`.
+- **`~/.config/obscura/config.json` holds `healthToken` in cleartext.** Rotation is: back up the prod
+  env file, rewrite `BGW_HEALTH_TOKEN` in place, **re-create the container** (a `docker restart` keeps
+  the old env), then update the Mac config. Verify BOTH directions — the old token must make
+  `obscura status` report `pool health: unavailable … token was rejected`, and only then does the new
+  one restoring `pool healthy` mean anything.
 
 ## Vault
 
