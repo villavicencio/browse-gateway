@@ -46,13 +46,18 @@ function sandbox({ imageSmoke, imageLauncher = null, hostSmoke = "#!/usr/bin/env
 
   // Fake launcher: the SWAP marker. Its absence is how a RED proves "live container untouched".
   //
-  // It records the DIRECTORY IT WAS RUN FROM, which is what makes the marker specific. deploy-on-host
-  // copies this launcher next to the extracted smoke, so a pre-VIL-134 smoke invoking
-  // "$HERE/launch-http.sh" runs the copy in the scratch dir — and a bare "did LAUNCHED appear"
-  // assertion would then be satisfied by the SMOKE's launch and pass even if the real swap never
-  // happened. Only a line naming the deploy dir proves step 6 ran.
+  // It records the CONTAINER IT WAS ASKED TO LAUNCH, because that — not which copy of the launcher
+  // ran — is what separates the smoke's boot from step 6's swap. deploy-on-host runs the real swap
+  // against the live container name, while the smoke always targets "<container>-presmoke"
+  // (BGW_SMOKE_CONTAINER in preswap-smoke.sh). Keying on the launcher's own directory is NOT enough:
+  // it distinguishes a pre-VIL-134 smoke (which runs the scratch-dir copy) but NOT a current-format
+  // smoke, which honours BGW_LAUNCH_SCRIPT and therefore runs the very same deploy-dir launcher the
+  // swap does. A bare "did LAUNCHED appear" — or a deploy-dir check — is then satisfied by the
+  // smoke's own launch and passes with step 6 never running.
   writeFileSync(join(deploy, "launch-http.sh"),
-    `#!/usr/bin/env bash\nSELF="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"\necho "$SELF|$BGW_DEPLOY_IMAGE" >> "${marks}/LAUNCHED"\nexit 0\n`);
+    `#!/usr/bin/env bash\n` +
+    `SELF="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"\n` +
+    `echo "\${BGW_CONTAINER:-browse-gateway-http}|$SELF|$BGW_DEPLOY_IMAGE" >> "${marks}/LAUNCHED"\nexit 0\n`);
   chmodSync(join(deploy, "launch-http.sh"), 0o755);
 
   // What the "image" carries at /app/scripts/deploy/preswap-smoke.sh. null = absent.
@@ -118,19 +123,15 @@ function runDeploy(sb) {
   });
 }
 
-/** True only when the FINAL swap ran — i.e. the launcher in the host deploy dir, not the copy the
- *  extracted smoke boots the candidate with. See the launcher fixture above. */
-const swapped = (sb) => {
+const launches = (sb) => {
   const f = join(sb.marks, "LAUNCHED");
-  if (!existsSync(f)) return false;
-  return readFileSync(f, "utf8").split("\n").some((l) => l.startsWith(`${sb.deploy}|`));
+  if (!existsSync(f)) return [];
+  return readFileSync(f, "utf8").split("\n").filter(Boolean).map((l) => l.split("|")[0]);
 };
-/** True when the extracted smoke launched the candidate from its own scratch dir. */
-const smokeLaunched = (sb) => {
-  const f = join(sb.marks, "LAUNCHED");
-  if (!existsSync(f)) return false;
-  return readFileSync(f, "utf8").split("\n").some((l) => l && !l.startsWith(`${sb.deploy}|`));
-};
+/** True only when the LIVE container was launched — step 6's swap. */
+const swapped = (sb) => launches(sb).some((c) => !c.endsWith("-presmoke"));
+/** True when the smoke booted the candidate on its throwaway container. */
+const smokeLaunched = (sb) => launches(sb).some((c) => c.endsWith("-presmoke"));
 
 test("GREEN — the deploy runs the smoke that shipped in the image, not the host's copy", () => {
   const sb = sandbox({
@@ -204,7 +205,7 @@ test("a PRE-VIL-134 smoke (no BGW_LAUNCH_SCRIPT support) still finds a launcher 
       `set -euo pipefail`,
       `HERE="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"`,
       `[ -x "$HERE/launch-http.sh" ] || { echo "smoke: launcher not executable: $HERE/launch-http.sh" >&2; exit 2; }`,
-      `"$HERE/launch-http.sh"`,
+      `BGW_CONTAINER="browse-gateway-http-presmoke" "$HERE/launch-http.sh"`,
       `touch "$MARK_DIR/OLD-SMOKE-FOUND-LAUNCHER"`,
       `exit 0`,
     ].join("\n") + "\n",
@@ -214,4 +215,25 @@ test("a PRE-VIL-134 smoke (no BGW_LAUNCH_SCRIPT support) still finds a launcher 
   assert.ok(existsSync(join(sb.marks, "OLD-SMOKE-FOUND-LAUNCHER")), "the old smoke must resolve a launcher beside itself");
   assert.ok(smokeLaunched(sb), "the old smoke must have launched the candidate from its own scratch dir");
   assert.ok(swapped(sb), "the deploy must still proceed to the FINAL swap, distinct from the smoke's launch");
+});
+
+test("a CURRENT-format smoke's own launch does not count as the swap", () => {
+  // The discriminator has to be the launch TARGET, not the launcher's path. A current-format smoke
+  // honours BGW_LAUNCH_SCRIPT and therefore runs the SAME deploy-dir launcher step 6 uses, so a
+  // path-based check would read its boot as the swap. This smoke launches the candidate exactly as
+  // the real one does and then FAILS, so the deploy must abort with the live container untouched.
+  const sb = sandbox({
+    imageSmoke: [
+      `#!/usr/bin/env bash`,
+      `set -euo pipefail`,
+      `[ -n "\${BGW_LAUNCH_SCRIPT:-}" ] || { echo "expected BGW_LAUNCH_SCRIPT" >&2; exit 2; }`,
+      `BGW_CONTAINER="browse-gateway-http-presmoke" "$BGW_LAUNCH_SCRIPT"`,
+      `echo "smoke: boot line carries no well-formed version=" >&2`,
+      `exit 1`,
+    ].join("\n") + "\n",
+  });
+  const r = runDeploy(sb);
+  assert.notEqual(r.status, 0, "a failing smoke must abort the deploy");
+  assert.ok(smokeLaunched(sb), "the smoke did launch the candidate — via the deploy-dir launcher");
+  assert.ok(!swapped(sb), "yet the LIVE container must never have been launched");
 });
