@@ -145,8 +145,12 @@ test("every failure class carries caller-facing advice", async () => {
     const res = await client.callTool({ name: "search", arguments: { query: "q" } });
     const text = res.content[0].text;
     assert.match(text, new RegExp(`failureClass=${code}\\b`));
-    // The hint is whatever follows the closing paren — it must not be empty.
-    const hint = text.slice(text.indexOf(")." ) + 2).trim();
+    // Assert the marker EXISTS before slicing on it. `indexOf` returns -1 when absent, and
+    // `slice(-1 + 2)` is `slice(1)` — nearly the whole line, so a missing hint would still look
+    // non-empty and this test would report success for the one thing it exists to catch.
+    const marker = text.indexOf(").");
+    assert.ok(marker !== -1, `class ${code} rendered no ")." marker, so no hint could follow`);
+    const hint = text.slice(marker + 2).trim();
     assert.ok(hint.length > 0, `class ${code} rendered no hint`);
   }
 });
