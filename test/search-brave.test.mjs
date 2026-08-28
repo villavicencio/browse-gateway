@@ -259,15 +259,21 @@ test("the fetch is issued with redirect:manual", async () => {
   assert.equal(f.calls[0].opts.redirect, "manual");
 });
 
-test("an error response body is cancelled rather than abandoned mid-flight", async () => {
+test("an error response body is cancelled BEFORE the throw escapes, not eventually", async () => {
   // Throwing with the body unread leaves the request alive after the deadline timer is cleared;
   // a run of 429/5xx would then pin connections and defeat the advertised bound.
-  let cancelled = false;
-  const body = new ReadableStream({ pull() {}, cancel() { cancelled = true; } });
+  //
+  // The ordering is the point, so this asserts it directly instead of sleeping and re-checking: a
+  // settle-later cancel would satisfy "cancelled eventually" while still letting the exception
+  // escape with the request in flight. `ReadableStream.cancel()` runs the underlying source's
+  // cancel algorithm synchronously — only the promise it returns settles later — so the callback
+  // must already have fired by the time the caller's catch runs.
+  const order = [];
+  const body = new ReadableStream({ pull() {}, cancel() { order.push("cancel"); } });
   const fn = async () => new Response(body, { status: 429 });
   await assert.rejects(providerWith(fn).search(REQ, ctx()), (err) => err.code === "rate-limited");
-  await new Promise((r) => setTimeout(r, 10));
-  assert.ok(cancelled, "the error response body was never cancelled");
+  order.push("caller-observed-throw");
+  assert.deepEqual(order, ["cancel", "caller-observed-throw"]);
 });
 
 test("3xx maps to provider-unavailable (a redirect means the endpoint is not the API)", () => {
