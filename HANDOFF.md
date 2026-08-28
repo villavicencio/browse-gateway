@@ -1,56 +1,56 @@
 ---
-created_at: "2026-08-27T15:33:08-07:00"
+created_at: "2026-08-27T20:33:13-07:00"
 branch: "main"
-head: "9b06c74"
+head: "c864947"
+resume_focus: "VIL-135 — sync the host's launch-http.sh (and preswap-smoke.sh) so PR #141's graceful stop finally runs; the drift NOTE fires on every deploy until it does"
 ---
-# HANDOFF — 2026-08-27, afternoon
+# HANDOFF — 2026-08-27, evening
 
-Picked up the previous handoff's item 1 (U4) and finished the whole arc: U4 built and merged, U1+U4 deployed, and the version signal verified end-to-end in prod. Along the way two Urgent tickets turned out to be Urgent on a stale banner, a capacity question got its first real measurement, and the measurement's own acceptance criterion turned out to be wrong — which is now the session's most durable output.
+Picked up the previous handoff's item 1 (VIL-134) and completed it end to end: merged, host synced, and the deploy gate **watched RED in production** — the criterion that had never been met for any gate in this project. The CE-artifact backlog was cleared alongside it. The session's most valuable output is not the fix but what the fix's own drift detector found on its first live run: a *second* merged fix that has never executed in production, now VIL-135.
 
-> Fleet identities are deliberately absent (public repo). Host names, consumer names, and the prod env live in the private vault memory notes.
+> Fleet identities are deliberately absent (public repo). Host names, consumer names, the prod env, and the on-host paths live in the private vault memory notes.
 
 ## What We Built
 
-- **PR #144 → `485d423` — U4, the version guard.** The opacity guard moved to the value a consumer is *advertised*, not what the resolver returns. Those differ: `createGatewayMcpServer({ version })` bypasses the resolver entirely, so a resolver-only guard cannot see the one path that can publish a non-opaque version. Proven by mutation — a commit sha injected into `serverInfo` fails the advertised test while the resolver test stays green. `REPORTED_VERSION`/`isOpaqueVersion` now live in `src/mcp/version.ts` and are imported, because the old test carried its own looser copy that accepted the leading zeros `SEMVER_CORE` rejects.
-- **U1+U4 DEPLOYED.** Prod is `sha256:d63b2527b8b1…` (= `485d423`); rollback anchor `sha256:b2e1966fe1cb…`. Boot line now reads `version=1.0.0+ac4ec664bd8c deploy=ac4ec664bd8c`. Verified three ways, including an independent HMAC recompute from the commit that matched exactly — the deploy-id round trip is now proven end to end, not just in the image.
-- **`docs/solutions/best-practices/measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss.md`** (`9b06c74`) — the session's most reusable artifact. Read it before measuring anything in a container here.
-- **`CONCEPTS.md`** gained the transport-vs-browser "session" ambiguity and the rule that only the pool's *lower* bound is enforced — nothing derives a ceiling from host memory.
-- **`CLAUDE.md`** gained two rules: `main` is unprotected so a missing CI run does not block merging (`f406cc8`), and `docker stats` is not a measurement instrument (`9b06c74`).
-- **`docs/solutions/workflow-issues/a-tickets-deployed-claim-is-a-snapshot-not-a-fact.md`** (`568a66d`) — the three-command check for whether a ticket's deploy claim is still true.
-- **Consumer retired.** One registered consumer had zero sessions in 44h while holding a full slot in the pool floor. Revoked; floor is now `5×1+1 = 6` against a cap of 7, so there is one slot of headroom for the first time.
+- **PR #145 → `b62f14c` — VIL-134.** `deploy-on-host.sh` extracts the pre-swap smoke from the image it is deploying and fails closed without one. The reasoning that is *not* in the diff: `docker create` + `docker cp` was chosen over `docker run … cat` so extraction never starts a process from the image you are about to run on the host, and the launcher deliberately does **not** travel with it — the smoke must boot the candidate with the same launcher step 6's swap uses, or it is a false green.
+- **Host forced command replaced.** Original kept at `~/deploy/deploy-on-host.sh.bak-20260827`. The sync turned out *not* to be a one-way door, but only because of the backward-compat fix below — worth knowing before touching it again.
+- **`docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`** (`c864947`) — the rule plus the live-proof method. Read the "Proving it on the real host" section before verifying any gate here; it is the reusable part.
+- **`test/deploy-smoke-sourcing.test.mjs` + `test/preswap-smoke-version-gate.test.mjs`** — 14 assertions, every one watched failing with the fix reverted. The fixtures encode two non-obvious facts: the smoke's launch and the real swap are distinguishable only by *launch target*, and an old-format smoke resolves its launcher by path.
+- **`CLAUDE.md`** gained the gate-must-travel rule, including the two live consequences (`--apply` still drifts; `launch-http.sh` stays host-owned on purpose).
+- **CE artifacts cleared** — `docs/plans/2026-08-25-1733-*.local.md` now carries per-unit status, and three solution docs were refreshed (see Decisions).
 
 ## Decisions Made
 
-- **Do not upgrade the host.** Measured 651 MB PSS per session against a 4 GiB container → ~5 concurrent, vs a configured cap of 7. Verified pricing puts 16 GB at **$81.99/mo vs the current $19.99**. Declined: this is a single-operator box and peak observed concurrency across 44h of logs was **1 session**.
-- **Actively preserve the legacy rate.** The current spec is no longer in the catalogue (nearest current plans are 2 vCPU/4 GB and 4 vCPU/8 GB), so the box is grandfathered and **a resize very likely reprices it irreversibly.** This is now the strongest reason to leave the machine alone.
-- **Withdrew the `BGW_MEMORY` 4g→5g suggestion.** It buys 5→7 sessions free but leaves ~zero host headroom, converting a container OOM into a *host* OOM where the kernel picks the victim.
-- **Arm64 is ruled out regardless of price** — the image is amd64 by necessity (real Chrome is amd64-only).
-- **VIL-131 re-priced Urgent → Medium** after the single-operator reframe. The `--apply` half was split into its own ticket because it survives the reframe unchanged.
-- **Auto-mode config was reorganized** — the global `autoMode.environment` block described a *different project* and applied everywhere. Moved to that project; browse-gateway got its own declaring PUBLIC repo, real CI/CD, and fleet identifiers as the sensitive class. A scoped read-only prod SSH grant was added to `autoMode.allow`.
+- **The launcher stays host-owned; only the gate travels with the image.** A gate should ship with the code it gates; a production *swap* should not be dictated by the artifact being swapped in. Divergence is reported as a NOTE, never fatal. Ruled out sourcing `launch-http.sh` from the image — do not relitigate without addressing the false-green argument.
+- **`--apply`'s on-host smoke was deliberately NOT synced.** It would very likely work, but I could not exercise `--apply` to watch its gate report bad news, and this repo's rule is that an unwatched guard is untrusted. Folded into VIL-135 with a five-step procedure. This is a deliberate stopping point, not an oversight.
+- **VIL-134 auto-closed on merge** via the Linear integration, exactly as the global rule warns. Here it was correct; the check still has to be done every time.
+- **Compound-refresh corrected two claims this session's work invalidated:** `keys-apply-sizing-guard-crash-loop` called the smoke "the single source of truth shared by the CD wrapper" (never true in production), and `comparing-image-id-to-manifest-digest` cites repo line numbers as evidence about prod. The latter's conclusions survive re-checking the host file — same lines, undrifted **by luck, not method** — and that is now recorded, since the doc's whole subject is unsound method.
+- **`over-subscription-refuses-cleanly` closed on its stated open question.** The PSS measurement reframes it: admission control is correct, but `maxSessions` is 7 while the box holds ~5, so a *working* admission layer over-admits into a memory wall. Stated explicitly as a mechanism of the right shape, **not** a confirmed diagnosis of the old field report.
 
 ## What Didn't Work
 
-- **The measurement's own acceptance criterion was invalid, and this is the important one.** The first draft of the learning doc "cross-validated" a with-session PSS total against a cgroup reading captured **at idle**, restated one value three ways ~40 MiB apart, and used the very instrument the doc disqualifies. At the same moment that instrument read *below* the PSS total. An independent grounding pass caught it; the rule is now **validate a delta that reproduces**, and the failed check is kept in the doc as its own lesson. The same wrong claim was corrected on the ticket and in the memory notes.
-- **Two conclusions drawn from bad instruments, both retracted mid-session:** that live consumer traffic was occurring and a teardown had been observed (sampling artifact on an idle container), and that CPU was the binding constraint at ~2–3 concurrent (refuted — a full session including a heavy page load costs ~7 CPU-seconds; memory binds).
-- **`docker stats` is unusable here.** Triple-digit CPU on an idle container with zero browser processes; MemUsage counts page cache (1.068 GiB reported vs ~310 MB true RSS). Summed RSS is wrong the other way — Chrome's shared zygote pages counted once per process, ~2.4× over.
-- **The agent cannot help configure its own permissions.** Three attempts to draft the allowlist JSON — via the config skill, a scratch file, and the clipboard — were all blocked by the classifier. The content had to be pasted from chat by hand. There is a real bootstrap circularity here.
+- **Extracting the smoke into a bare temp file.** The deployed image's smoke predates `BGW_LAUNCH_SCRIPT` and resolves `$HERE/launch-http.sh`, so it would have found no launcher and aborted any redeploy of an older digest. Only caught by running the extraction against the real prod image — no test or review would have. Fixed by extracting into a temp *directory* carrying the host launcher.
+- **Two of my own tests proved less than they appeared to.** First, `swapped()` checked only that the marker file existed — but `deploy-on-host` copies the launcher next to the smoke, so the smoke's own launch created it; the assertion passed with the swap never running. Then the path-based fix still failed for a *current-format* smoke, which honours `BGW_LAUNCH_SCRIPT` and runs the same deploy-dir launcher the swap does. Both found by review, both the exact failure family in `a-test-whose-stub-guarantees-the-assertion-proves-nothing.md` — which this PR cites. The discriminator has to be the launch **target**.
+- **`docker build` cannot build `FROM` a bare image ID** — BuildKit resolves it as a Docker Hub repo (`pull access denied`). Tag the image locally first.
+- **Compound SSH commands are blocked by the auto-mode classifier**, as `CONTEXT.local.md` warns. Atomic single-purpose commands work; expect to split every multi-step host operation.
 
 ## What's Next
 
-1. **VIL-134 — the deploy gate that isn't there. Highest value.** U4's smoke half is **inert in production**: the CD deploy runs the host's own inline `preswap_smoke()` which greps only `dnsRebindProtection=true`, and the on-host standalone `preswap-smoke.sh` predates the change with zero `version=` assertions. Three copies of the smoke exist and prod runs the stale one, so *any* future hardening of `scripts/deploy/*.sh` is dead on arrival. The fix is to make the deploy source the smoke from the image it is deploying.
-2. **VIL-133 — pre-flight the pool floor in `keys new --apply`.** The only risk here triggered by a routine command rather than hypothetical load. `poolSizingError` is pure and exported, so the CLI can call the identical function the boot check uses.
-3. **VIL-130 — the health surface** folds every fault into one `degraded` bit and cannot see the browser core at all. Consolidates the remaining halves of the two tickets closed this session.
-4. **`/ce-compound-refresh best-practices`** — four refresh candidates surfaced, strongest being `over-subscription-refuses-cleanly-it-does-not-fail-to-launch.md`, which closes on the exact open question the new measurement answers.
-5. **Unresolved and worth a designed experiment:** two successful `retrieve` calls showed **no Chrome process** across ~79 samples, contradicting `src/verbs/retrieve.ts:42-50`, which describes a fresh session per attempt. Candidates (none verified) in the learning doc. Do not assume `docker top` sees the whole tree until this is settled.
+1. **VIL-135 — sync the host's `launch-http.sh`. Highest value.** Prod's copy is from 2026-06-24 and predates PR #141's graceful `docker stop -t 45`, so **every container swap still SIGKILLs in-flight work** — the VIL-114 mechanism, with its own fix sitting undeployed since 2026-08-17. Same backup → stage → sha256 → atomic `mv` procedure that worked today. Sync `~/deploy/preswap-smoke.sh` in the same visit so `--apply` gets the `version=` assertion, then exercise `--apply` once and *watch* its smoke run. Acceptance signal: the drift NOTE disappears from the next deploy.
+2. **VIL-130 — the health surface** folds every fault into one `degraded` bit and cannot see the browser core.
+3. **VIL-133 — pre-flight the pool floor in `keys new --apply`.** `poolSizingError` is pure and exported, so the CLI can call the identical function the boot check uses.
+4. **M2 of the versioning plan (U6/U7/U5/U9) is entirely unbuilt** and is optional follow-on, not an outstanding obligation of v1.0.0. U6/U9's axes are blocked on VIL-127.
+5. **Still unexplained, carried over:** two successful `retrieve` calls showed no Chrome process across ~79 samples, contradicting `src/verbs/retrieve.ts:42-50`. Do not assume `docker top` sees the whole tree until settled.
 
 ## Gotchas & Watch-outs
 
-- **⚠️ U4's smoke assertion has never run.** It is repo-only (see What's Next 1). The CI opacity guard *is* real and green; the deploy-time half is not. **PR #144's description overstates this** — read it beside VIL-134.
-- **⚠️ A ticket's deploy claim goes stale silently.** Two Urgent tickets sat for a day asserting a production exposure a deploy had already closed. "Merged to `main`" and "in the deployed image" are independent facts: check `gh run list --workflow=deploy-http.yml` then `git merge-base --is-ancestor <fix> <deployed-sha>`.
-- **⚠️ `main` is not branch-protected.** A PR with *no CI run at all* still reads mergeable. Confirm a run exists for the head sha before merging — during a GitHub incident this session, one PR got a CodeRabbit check and no `ci` check whatsoever, and nothing in the PR view said so. Closing and reopening the PR retriggers it without changing the head or losing the review.
-- **⚠️ Use `docker top` + PSS, never `docker stats`.** In `CLAUDE.md` and the new solutions doc.
-- **The read-only prod SSH grant is advisory, not enforced.** It steers the auto-mode classifier, but the static `permissions.allow` rule already permits everything over that transport — `docker exec` succeeded despite the grant excluding it. If that boundary should be hard, it has to move to the static rule.
-- **`npm test` cannot be green on macOS** — compare a fresh baseline on `main`, never the absolute number. The flaky artifact failure moves between files run to run.
-- **The deploy id is keyed on the FULL commit sha**; images are tagged with the short one. Always `git rev-parse` first. `BGW_DEPLOY_ID_KEY`'s only readable copy is the local Keychain item; rotation posture still undecided. (Carried over.)
-- **A push no longer triggers a CodeRabbit re-review** — request it explicitly, and read the check *description*, never its state. (Carried over.)
-- **Measurement JSON carries the egress IP**; `INPUT_REALISM_OUT` has no redaction. Run `validate-*`/`measure-*` **only in-container**. (Carried over.)
+- **⚠️ The drift NOTE now fires on every deploy** until VIL-135 lands. That is intended and non-fatal — do not "fix" it by silencing it.
+- **⚠️ An on-host copy of a repo script is stale until you have watched it run.** Two files were caught this session by the same mechanism. Count the copies before trusting one; if a script exists in N places, exactly one executes and it is not automatically the one you edited.
+- **⚠️ Capturing `docker create` with `2>&1` is a real bug here** — this daemon prints `WARNING: IPv4 forwarding is disabled` to stderr, which would be folded into the container id.
+- **⚠️ Verifying a gate live needs both directions and a verbatim probe.** `eval` the real block out of the installed file rather than re-implementing it, and give the RED image build its own `grep` guards — without them a drifted pattern yields a *working* image and you record a green run as proof the gate bites. Check the live container's **uptime did not reset**, not merely that it is running.
+- **PSS values are MiB, not MB** (`smaps_rollup` KiB ÷ 1024). The measurement doc mislabelled its own output and the slip reached two other docs before review caught it.
+- **`main` is not branch-protected** — confirm a CI run exists for the head sha before merging.
+- **A push aborts an in-flight CodeRabbit review**; land edits first, then request the round. Read the check *description*, never its state.
+- **`npm test` cannot be green on macOS** — 223 failures is the baseline, all `artifact-filesystem-unsupported`. Compare a delta, never the absolute number.
+- **Measurement JSON carries the egress IP**; run `validate-*`/`measure-*` only in-container. (Carried over.)
+- **The deploy id is keyed on the FULL commit sha**; images are tagged with the short one. (Carried over.)
