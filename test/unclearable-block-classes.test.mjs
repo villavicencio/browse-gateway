@@ -19,7 +19,13 @@ import { dirname, join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { retrieve, shouldEscalateDrive, classifyBlock, resolveBlockReason } from "../dist/verbs/index.js";
-import { isUnclearableStatus, isExitClearableHardBlock, isHardBlock } from "../dist/browser/index.js";
+import {
+  isUnclearableStatus,
+  isExitClearableHardBlock,
+  isTerminalUnclearableRender,
+  isHardBlock,
+} from "../dist/browser/index.js";
+import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import {
   finalFailureClass,
   DECISIVE_FAILURE_CLASSES,
@@ -342,4 +348,120 @@ test("resolveBlockReason promotes a generic block with an active widget to captc
   const sig = { title: "", text: visibleText(html), status: 200, captchaKind: "recaptcha" };
   assert.equal(classifyBlock(sig), "blocked", "generic: the fixture carries no vendor marker");
   assert.equal(resolveBlockReason(sig), "captcha", "and the active widget promotes it");
+});
+
+
+// --- the live-vs-persistent refinement (gauntlet round 1) -------------------------------------------
+//
+// The escalation gate ADMITS a managed challenge on an unclearable status (a clean exit really does clear
+// one), so the loop must not immediately truncate it to a single attempt. But liveness cannot be read off
+// the block REASON: the vendor markers persist after a clear, so an ordinary thin 404 from any
+// Cloudflare-fronted origin classifies `cf-challenge`. These two tests pin both halves against each other.
+
+test("isTerminalUnclearableRender: an unclearable status ends the re-roll UNLESS a live challenge is visible", () => {
+  const plain = { title: "Not Found", text: "The requested page does not exist." };
+  const liveCf = { title: "Just a moment...", text: "Enable JavaScript and cookies to continue" };
+  for (const s of [404, 410, 429]) {
+    assert.equal(isTerminalUnclearableRender(plain, s), true, `${s} with no live challenge is terminal`);
+    assert.equal(isTerminalUnclearableRender(liveCf, s), false, `${s} carrying a LIVE challenge is not terminal`);
+  }
+  assert.equal(isTerminalUnclearableRender(plain, 403), false, "a reputation 403 was never terminal");
+  assert.equal(isTerminalUnclearableRender(plain, null), false, "a dead nav is not terminal here");
+});
+
+test("a LIVE Cloudflare challenge served on a 429 still re-rolls every exit", () => {
+  // The escalation gate admits it, so the loop must too — otherwise the two disagree and a clearable
+  // challenge is abandoned after one exit.
+  const liveCfOn429 = {
+    title: "Just a moment...",
+    text: "Enable JavaScript and cookies to continue",
+    status: 429,
+  };
+  assert.equal(classifyBlock(liveCfOn429), "cf-challenge", "the vendor arm wins over rate-limited");
+  assert.equal(isTerminalUnclearableRender(liveCfOn429, 429), false, "so the loop does NOT terminate");
+});
+
+test("REGRESSION GUARD: an ordinary thin 404 from a CF-fronted origin is STILL terminal", async () => {
+  // This pins a review suggestion that was investigated and REJECTED: keying the terminal break on the
+  // block REASON instead of the status. `cfHint` is a persistent HTML marker with no liveness requirement,
+  // so classifyBlock labels this page `cf-challenge` even though nothing is challenging us. Reason-gating
+  // would therefore re-roll every exit on the single most common shape this ticket exists to stop.
+  const html = fixture("thin-404.html") + "<script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script>";
+  const cfFronted404 = renderOf({ status: 404, html, text: visibleText(fixture("thin-404.html")) });
+  assert.equal(classifyBlock({ title: "", text: cfFronted404.text, status: 404, cfHint: true }), "cf-challenge",
+    "the persistent marker alone labels it a CF challenge — which is exactly why reason-gating is unsafe");
+  assert.equal(isTerminalUnclearableRender({ title: "", text: cfFronted404.text }, 404), true,
+    "but with no VISIBLE challenge phrase it is still terminal");
+
+  const { gateway, proxiedCalls } = makeFakeGateway([cfFronted404]);
+  await run(gateway, { forceProxy: true, timeouts: { ...DEFAULT_CALL_TIMEOUTS, proxyMaxAttempts: 3 } });
+  assert.equal(proxiedCalls().length, 1, "ONE exit, not three — the burn stays closed for CF-fronted 404s");
+});
+
+// --- drive loop parity (gauntlet round 1) -----------------------------------------------------------
+
+/** A per-session-programmed gateway for the drive controller: sessions[n] is the nth opened session. */
+function makeDriveSeq(sessions) {
+  let si = -1;
+  let nextId = 1;
+  const open = new Map();
+  const opened = [];
+  const gateway = {
+    sessions: { get: (h) => open.get(h) },
+    async openConsumerSession(_token, overrides) {
+      si += 1;
+      const navs = sessions[Math.min(si, sessions.length - 1)] ?? [{}];
+      let ni = 0;
+      const id = "h" + nextId++;
+      open.set(id, {
+        core: {
+          async navigate(url) {
+            const o = navs[Math.min(ni, navs.length - 1)] ?? {};
+            ni += 1;
+            return {
+              url: o.url ?? url,
+              title: o.title ?? "t",
+              tree: o.tree ?? FAT,
+              status: "status" in o ? o.status : 200,
+              diagnostics: o.diagnostics ?? { finalUrl: o.url ?? url, status: "status" in o ? o.status : 200 },
+            };
+          },
+          async snapshot() {
+            return { url: "u", title: "t", tree: FAT, status: 200 };
+          },
+        },
+      });
+      opened.push({ id, overrides });
+      return id;
+    },
+    async useConsumerSession(_token, handle, fn) {
+      const s = open.get(handle);
+      if (!s) throw new Error("session not found");
+      return fn(s);
+    },
+    async closeConsumerSession(_token, handle) {
+      open.delete(handle);
+    },
+  };
+  return { gateway, opened };
+}
+
+test("drive: a proxied 404 stops the re-roll loop instead of spending every exit", async () => {
+  // Narrowing shouldEscalateDrive only stopped a DIRECT unclearable status from STARTING escalation.
+  // Inside the loop each proxied 404 still satisfied navFailed and drew a fresh exit, up to
+  // proxyMaxAttempts — the drive-side half of the same burn.
+  const { gateway, opened } = makeDriveSeq([
+    [{ status: 403, tree: "Forbidden" }], // direct: a reputation block, so escalation legitimately starts
+    [{ status: 404, tree: "Not Found" }], // first proxied exit: the resource is simply absent
+  ]);
+  const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", { onDatacenterIp: true });
+  await assert.rejects(drive.navigate("https://target.invalid/gone"), () => true);
+  assert.equal(opened.length, 2, "1 direct + exactly 1 proxied session — not 1 + proxyMaxAttempts");
+});
+
+test("CONTROL: drive still re-rolls every exit on a reputation 403", async () => {
+  const { gateway, opened } = makeDriveSeq([[{ status: 403, tree: "Forbidden" }]]);
+  const drive = new GatewayDriveController(gateway, new SecretStore(PROXY), "tok", { onDatacenterIp: true });
+  await assert.rejects(drive.navigate("https://target.invalid/p"), () => true);
+  assert.equal(opened.length, 1 + DEFAULT_CALL_TIMEOUTS.proxyMaxAttempts, "the ladder is intact for 403");
 });

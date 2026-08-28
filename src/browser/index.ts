@@ -56,6 +56,7 @@ export {
   isHardBlock,
   isUnclearableStatus,
   isExitClearableHardBlock,
+  isTerminalUnclearableRender,
   UNCLEARABLE_STATUSES,
   matchedBlockPhrases,
   vendorHints,

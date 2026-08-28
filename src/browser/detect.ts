@@ -401,6 +401,29 @@ export function isExitClearableHardBlock(
   return isHardBlock(signal, status) && !isUnclearableStatus(status);
 }
 
+/**
+ * VIL-121 RE-ROLL RULE, shared by every proxied retry loop (retrieve's escalation loop and the drive
+ * controller's open-and-navigate loop) so they cannot drift: **this attempt's render ends the re-roll**.
+ *
+ * True when the status is one no fresh exit can change — EXCEPT when a LIVE challenge is on the page,
+ * which a clean residential exit genuinely does clear (screenshot-proven), so it keeps its full attempt
+ * budget even when served on one of those statuses. That exception is why the escalation gate can admit
+ * a managed challenge on a 429 without the loop immediately truncating it to one attempt.
+ *
+ * **Liveness is the whole point, and it must NOT be read off the block reason.** The vendor markers
+ * (`cfHint`/`pxHint`/`ddHint`) PERSIST after a challenge clears, so `classifyBlock` labels an ordinary
+ * thin 404 from ANY Cloudflare-fronted origin `cf-challenge` — reason-gating here would therefore make
+ * every such 404 re-roll every exit, which is precisely the burn this ticket exists to stop. The visible
+ * CF phrase is absent on a cleared or ordinary page, so it separates a live challenge from a residual
+ * marker. This mirrors the `pxCopy`-vs-`pxHint` precedent already relied on for warm-failure advice.
+ */
+export function isTerminalUnclearableRender(
+  signal: Pick<PageSignal, "title" | "text">,
+  status: number | null,
+): boolean {
+  return isUnclearableStatus(status) && !isCloudflareVisible(signal);
+}
+
 /** Vendor protection scripts present in the HTML (diagnostic only). */
 export function vendorHints(signal: PageSignal): string[] {
   return VENDOR_SCRIPT_HINTS.filter((re) => re.test(signal.html)).map(String);

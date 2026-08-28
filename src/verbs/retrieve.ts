@@ -22,7 +22,7 @@ import {
   hasUnsupportedBrowserPhrase,
   hasFrameworkRoot,
   activeCaptchaKind,
-  isUnclearableStatus,
+  isTerminalUnclearableRender,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
@@ -1059,9 +1059,12 @@ export async function retrieve(
       // automatic share this loop, so one gate covers both.
       const attemptSignal = blockSignalFrom(render);
       // (a) 404/410/429 — the resource is missing/gone, or we are being throttled. Same answer from
-      //     every exit. Keyed on the status alone, NOT on the block reason, because a 404 body can be
-      //     anything (a vendor-marked branded error page still 404s from a clean IP).
-      if (isUnclearableStatus(render.status)) break;
+      //     every exit. Deliberately NOT keyed on the block reason: the vendor markers persist after a
+      //     clear, so a thin 404 from any Cloudflare-fronted origin classifies `cf-challenge`, and
+      //     reason-gating would re-roll every exit on exactly the case this ticket exists to stop.
+      //     The shared rule exempts a LIVE challenge (visible phrase) so a managed challenge served on
+      //     one of these statuses still gets its full budget — see isTerminalUnclearableRender.
+      if (isTerminalUnclearableRender(attemptSignal, render.status)) break;
       // (b) an ACTIVE interactive CAPTCHA with no solver wired. `resolveBlockReason` yields `captcha` ONLY
       //     for an otherwise-GENERIC block carrying a real widget container, so a Cloudflare managed
       //     challenge classifies `cf-challenge` and keeps re-rolling — which is correct and load-bearing:

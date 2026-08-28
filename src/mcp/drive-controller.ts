@@ -19,6 +19,7 @@ import { DEFAULT_CALL_TIMEOUTS } from "../gateway/index.js";
 import type { CallTimeouts } from "../gateway/index.js";
 import { DIAGNOSTICS_EGRESS_HOSTS } from "../policy/index.js";
 import type { BrowserCoreOptions, DriveTarget, PageSnapshot, RenderOptions, WaitCondition } from "../browser/index.js";
+import { isTerminalUnclearableRender } from "../browser/index.js";
 import type { ArtifactCaptureOperation, ArtifactRuntime } from "../artifacts/index.js";
 import {
   proxyOverrideFor,
@@ -1124,6 +1125,15 @@ export class GatewayDriveController implements DriveController {
       // totalMs but in no attemptMs entry. Exactly one push per iteration keeps attemptMs 1:1 with `attempts`.
       attemptMs.push(performance.now() - attempt0);
       if (policyBlocked) break; // #80: no fresh exit can reach an off-allowlist target — stop re-rolling now
+      // VIL-121: the same terminal rule retrieve's escalation loop uses, on the SHARED predicate — a
+      // 404/410/429 with no live challenge is the same answer from every exit, so stop instead of
+      // discarding this session and drawing another. Narrowing `shouldEscalateDrive` only stopped a
+      // DIRECT unclearable status from STARTING escalation; once inside this loop (forced, or after a
+      // qualifying direct block) every proxied attempt still satisfied `navFailed` and spent an exit —
+      // up to proxyMaxAttempts of them. Placed at the END of the body, after the sawLiveResponse /
+      // lastLive / attemptMs tracking, for the same reason retrieve's is: an early exit here would
+      // leave that tracking stale and let a real site verdict be mislabelled a burned exit.
+      if (isTerminalUnclearableRender({ title: snap.title, text: snap.tree }, snap.status ?? null)) break;
     }
     // #45 (codex r1): re-check the deadline AFTER the final attempt — the last allowed attempt can START with
     // budget remaining but RETURN past the deadline (no next iteration to set budgetExceeded). A timeout must
