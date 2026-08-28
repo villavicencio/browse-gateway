@@ -366,6 +366,78 @@ export function isHardBlock(signal: Pick<PageSignal, "text">, status: number | n
   return status !== null && status >= 400 && signal.text.trim().length < MIN_CONTENT_LENGTH;
 }
 
+/**
+ * VIL-121: document statuses a FRESH EXIT CANNOT CHANGE. Rotating to a clean residential IP is the
+ * remedy for an IP/WAF *reputation* verdict — the site would serve the page to a different client.
+ * These three are not that:
+ *   - `404` / `410` — the resource is missing or gone. It is missing from every exit; re-rolling asks
+ *     the same question from a new IP and pays a full residential session for the same answer.
+ *   - `429` — the target is rate-limiting this client and telling us to slow down. A fresh exit is
+ *     either the same answer (limit keyed on account/key/fingerprint) or evasion of a limit the site
+ *     asked us to respect. Neither is a retry we should spend an exit on.
+ * DELIBERATELY NOT here: `401`/`403`/`5xx` with a thin body. Those stay exit-clearable reputation
+ * blocks — a clean IP genuinely recovers them (F1, 2026-06-01), which is the whole reason the
+ * escalation ladder exists.
+ */
+export const UNCLEARABLE_STATUSES: ReadonlySet<number> = new Set([404, 410, 429]);
+
+/** True when `status` is one {@link UNCLEARABLE_STATUSES} names. `null` (a failed nav) is NOT one —
+ *  a dead nav says nothing about the resource, and the retry path for it is unchanged. */
+export function isUnclearableStatus(status: number | null): boolean {
+  return status !== null && UNCLEARABLE_STATUSES.has(status);
+}
+
+/**
+ * {@link isHardBlock} AND the status is one a clean exit could actually clear — the ESCALATION
+ * predicate (VIL-121). The page is still a failure either way: `navFailed` / the `blocked` decision
+ * keep reading bare `isHardBlock`, so a thin 404 is reported blocked exactly as before. This narrower
+ * predicate governs only "is a residential exit worth spending here", so the two cannot drift into
+ * "not blocked" territory by accident.
+ */
+export function isExitClearableHardBlock(
+  signal: Pick<PageSignal, "text">,
+  status: number | null,
+): boolean {
+  return isHardBlock(signal, status) && !isUnclearableStatus(status);
+}
+
+/**
+ * VIL-121 RE-ROLL RULE, shared by every proxied retry loop (retrieve's escalation loop and the drive
+ * controller's open-and-navigate loop) so they cannot drift: **this attempt's render ends the re-roll**.
+ *
+ * True when the status is one no fresh exit can change — EXCEPT when a LIVE challenge is on the page,
+ * which a clean residential exit genuinely does clear (screenshot-proven), so it keeps its full attempt
+ * budget even when served on one of those statuses. That exception is why the escalation gate can admit
+ * a managed challenge on a 429 without the loop immediately truncating it to one attempt.
+ *
+ * **Liveness is the whole point, and it must NOT be read off the block reason.** The vendor markers
+ * (`cfHint`/`pxHint`/`ddHint`) PERSIST after a challenge clears, so `classifyBlock` labels an ordinary
+ * thin 404 from ANY Cloudflare-fronted origin `cf-challenge` — reason-gating here would therefore make
+ * every such 404 re-roll every exit, which is precisely the burn this ticket exists to stop. The visible
+ * CF phrase is absent on a cleared or ordinary page, so it separates a live challenge from a residual
+ * marker. This mirrors the `pxCopy`-vs-`pxHint` precedent already relied on for warm-failure advice.
+ *
+ * **CLOUDFLARE IS THE ONLY EXEMPTED VENDOR, DELIBERATELY — this is a policy, not an oversight.** A
+ * PerimeterX press-&-hold or a DataDome interstitial arriving on one of these statuses gets ONE attempt
+ * and then stops, and that is the CORRECT outcome for both:
+ *   - Neither is exit-clearable. They are BEHAVIORAL challenges: a fresh exit does not clear one and a
+ *     retry RE-TRIGGERS it — the same conclusion {@link import("../observability/warm-advice.js").warmFailureAdvice}
+ *     already acts on when it tells an operator a live press-&-hold means "the stored login is fine, do
+ *     not retry". Re-rolling exits at them spends residential sessions to re-provoke the same challenge.
+ *   - The AUTOMATIC path never escalates them at all: `shouldEscalateToProxy` has a Cloudflare arm and a
+ *     hard-block arm, and no PX/DataDome arm (the spike found those pass direct from the datacenter). So
+ *     the one-attempt outcome here reaches only the FORCED path, and it moves that path TOWARD the
+ *     automatic path's policy rather than away from it.
+ * Adding PX/DataDome liveness signals to the exemption would therefore buy more re-rolls at exactly the
+ * two vendors this codebase has already concluded do not benefit from one.
+ */
+export function isTerminalUnclearableRender(
+  signal: Pick<PageSignal, "title" | "text">,
+  status: number | null,
+): boolean {
+  return isUnclearableStatus(status) && !isCloudflareVisible(signal);
+}
+
 /** Vendor protection scripts present in the HTML (diagnostic only). */
 export function vendorHints(signal: PageSignal): string[] {
   return VENDOR_SCRIPT_HINTS.filter((re) => re.test(signal.html)).map(String);

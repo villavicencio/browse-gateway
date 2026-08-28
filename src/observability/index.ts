@@ -14,6 +14,8 @@ export {
   attachFailure,
   failureOf,
   assembleTiming,
+  finalFailureClass,
+  DECISIVE_FAILURE_CLASSES,
   FAILURE_DIAGNOSTICS_CAP,
 } from "./failure-diagnostics.js";
 export type { FailureDiagnostics, FailureDiagnosticsInput, FailureCarrier, WafVendor, FailureClass, SelfBlockedNav, Timing } from "./failure-diagnostics.js";

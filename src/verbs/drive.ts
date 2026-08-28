@@ -8,7 +8,7 @@
  * failure is surfaced as a restart-the-session error rather than swapping exits live (which would
  * lose page state). Pure helpers — no I/O.
  */
-import { isHardBlock, isVisiblyBlocked, isCloudflareVisible } from "../browser/index.js";
+import { isHardBlock, isExitClearableHardBlock, isVisiblyBlocked, isCloudflareVisible } from "../browser/index.js";
 import type { BrowserCoreOptions, PageSnapshot } from "../browser/index.js";
 import type { SecretStore } from "../security/index.js";
 import {
@@ -159,12 +159,18 @@ export function navFailed(snap: PageSnapshot): boolean {
  * snapshot. Narrower than {@link navFailed} on purpose: a bare null-status / Chrome-error failure
  * (off-allowlist abort, unreachable host, reset socket) and a generic non-CF WAF block (e.g. "access
  * denied" on a 200) are NOT escalated — a fresh residential exit won't reliably fix those.
+ *
+ * VIL-121: the hard-block arm is {@link isExitClearableHardBlock}, mirroring retrieve's
+ * `shouldEscalateToProxy` exactly — a thin 404/410/429 is a failure ({@link navFailed} still returns
+ * true for it, via bare `isHardBlock`) that no fresh exit can clear, so drive stops re-opening
+ * sessions for it too. Keeping the two predicates on ONE shared helper is what preserves the
+ * drive↔retrieve detection-parity invariant.
  */
 export function shouldEscalateDrive(snap: PageSnapshot): boolean {
   const status = snap.status ?? null;
   return (
     isCloudflareVisible({ title: snap.title, text: snap.tree }) ||
     snap.cfHint === true ||
-    isHardBlock({ text: snap.tree }, status)
+    isExitClearableHardBlock({ text: snap.tree }, status)
   );
 }

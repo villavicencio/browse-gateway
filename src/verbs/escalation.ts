@@ -5,7 +5,7 @@
  * `isHardBlock`). It is NOT engaged for soft targets or DataDome (the spike showed those pass
  * direct from the datacenter). Pure logic.
  */
-import { assess, isHardBlock, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
+import { assess, isExitClearableHardBlock, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
 import { parseHostSuffixList, hostMatchesAnySuffix } from "../security/index.js";
 
@@ -34,6 +34,12 @@ export interface EscalationContext {
  * Engage the proxy from a datacenter IP, with a proxy available, on either block the local IP
  * cannot clear: a CF managed challenge, or a hard 4xx/5xx-with-thin-body block. `status` is the
  * final-render HTTP status (`isHardBlock` ignores it when `null` or < 400).
+ *
+ * VIL-121: the hard-block arm is {@link isExitClearableHardBlock}, not bare `isHardBlock` — a thin
+ * 404/410/429 is still a hard block (still reported blocked, still a failure) but a fresh exit
+ * cannot change it, so spending a residential session on one is pure burn. The CF arm is untouched:
+ * a managed challenge IS cleared by a clean exit (screenshot-proven), so it keeps escalating even
+ * when it arrives on one of those statuses.
  */
 export function shouldEscalateToProxy(
   signal: PageSignal,
@@ -41,7 +47,7 @@ export function shouldEscalateToProxy(
   ctx: EscalationContext,
 ): boolean {
   if (!ctx.onDatacenterIp || !ctx.proxyAvailable) return false;
-  return isCloudflareBlock(signal) || isHardBlock(signal, status);
+  return isCloudflareBlock(signal) || isExitClearableHardBlock(signal, status);
 }
 
 /**
