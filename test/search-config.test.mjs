@@ -100,6 +100,18 @@ test("KNOWN BOUNDARY: the endpoint check is literal, not DNS-resolving", () => {
   }
 });
 
+test("an endpoint embedding userinfo refuses the boot (fetch cannot use such a URL)", () => {
+  // Measured on Node 24: fetch throws "Request cannot be constructed from a URL that includes
+  // credentials". Accepting it at boot would produce a gateway that reports search=brave and then
+  // fails every call as `network-error` — broken forever, and mislabelled, while the deploy gate
+  // reads healthy.
+  for (const url of ["https://u:p@api.search.invalid/x", "https://u@api.search.invalid/x", "https://:p@api.search.invalid/x"]) {
+    assert.match(searchEndpointError(url, "BGW_X") ?? "", /must not embed credentials/, `expected ${url} to be refused`);
+  }
+  const env = { BGW_SEARCH_ENABLED: "1", BGW_BRAVE_SEARCH_API_KEY: KEY, BGW_BRAVE_SEARCH_API_URL: "https://u:p@api.search.invalid/x" };
+  assert.throws(() => buildSearch(env, store(env)), /must not embed credentials/);
+});
+
 test("searchEndpointError names the variable it was given, and passes a good URL", () => {
   assert.equal(searchEndpointError(BRAVE_DEFAULT_API_URL, "BGW_X"), null);
   assert.match(searchEndpointError("nope", "BGW_X"), /BGW_X is not a valid URL/);

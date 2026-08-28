@@ -68,6 +68,15 @@ export function searchEndpointError(rawUrl: string, envVar: string): string | nu
   if (parsed.protocol !== "https:") {
     return `${envVar} must be https (a provider API key would ride an unencrypted request otherwise)`;
   }
+  // Measured: `fetch` throws "Request cannot be constructed from a URL that includes credentials"
+  // for embedded userinfo. Without this the gateway boots reporting search=<provider> and then
+  // fails EVERY call — and fails it as `network-error`, because the TypeError surfaces where a
+  // transport fault would, so the logs point away from the actual cause. A permanently broken
+  // feature that the deploy gate calls healthy is the exact shape the boot-guard rule exists to
+  // prevent. (Credentials belong in the key env var, never in the endpoint.)
+  if (parsed.username !== "" || parsed.password !== "") {
+    return `${envVar} must not embed credentials in the URL — the HTTP client refuses such a URL, so every search would fail; put the key in its own env var`;
+  }
   if (isBlockedEgressHost(parsed.hostname)) {
     return `${envVar} resolves to a private/internal/metadata address, which is refused`;
   }
