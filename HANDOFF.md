@@ -1,55 +1,56 @@
 ---
-created_at: "2026-08-28T00:09:06-07:00"
+created_at: "2026-08-28T09:05:24-07:00"
 branch: "main"
-head: "3067e9d"
-resume_focus: "Execute docs/plans/2026-08-28-0000-feat-search-epic-overnight-plan.local.md from Phase 0 — VIL-121 → VIL-122 → VIL-123, deploy VIL-121 only"
+head: "1a28d69"
+resume_focus: "Phase 2 of the search epic — VIL-122, the search verb with a Brave adapter (merge-only, no deploy; no API keys exist)"
 ---
-# HANDOFF — 2026-08-28, just past midnight
+# HANDOFF — 2026-08-28, early morning
 
-A planning-only session. No code changed and nothing was deployed: the search epic (VIL-120) was groomed and pointed, the two provider decisions were made from a live pricing survey, and a prescriptive overnight runbook was written for an unattended lower-model session to execute the whole arc. The tree is clean at the same `main` the previous handoff left.
+Executed Phase 0 and Phase 1 of the overnight search-epic runbook. **VIL-121 is merged and live in production** with the watched RED→GREEN captured through prod; two learnings were compounded to `docs/solutions/`. Phases 2–4 (VIL-122, VIL-123, epilogue) have not been started — this session stopped after Phase 1's tail rather than continuing, so the runbook picks up cleanly at Phase 2.
 
-> Fleet identities, keys, and the epic's research-domain query are deliberately absent (public repo). The runbook itself is gitignored and must stay that way.
+> The runbook remains gitignored and uncommitted, as required. No keys, fleet identities, or research-domain queries were written anywhere.
 
 ## What We Built
 
-- **`docs/plans/2026-08-28-0000-feat-search-epic-overnight-plan.local.md`** — the runbook. Gitignored (`*.local.md`), 614 lines. Its ground-truth section carries `file:line` anchors verified against `main` @ `3067e9d`; if a line has drifted, grep the symbol. **The kickoff prompt for the new session is in its header** and was also put on the clipboard.
-- **VIL-120 / 121 / 122 / 123 in Linear** — each carries a dated "Grooming — 2026-08-27" section appended below the original text (originals untouched), estimates 5 / 8 / 5 Fibonacci, and two grooming comments on the epic (sizing rationale; provider decision with the verbatim pricing table + fetch timestamps). VIL-113 carries a note that the `rate-limited` classifier now lands via VIL-121.
-- **VIL-121 field-evidence comment** — the automatic-path reproduction captured tonight (thin 404 → `isHardBlock` → 2 proxied exits → `timeout`, 90.3 s). It widens the ticket: 404/410 join CAPTCHA-without-solver and 429 as classes a fresh exit cannot clear.
-- **Project memory** — `linear-obscura-project-tracking.md` gained the grooming + provider-decision entries; the MEMORY.md index line was updated.
+- **PR #146 → `1471f12`, deployed** — VIL-121. The escalation ladder no longer spends residential exits on failures a fresh exit cannot change. What the PR does not tell you: `DECISIVE_FAILURE_CLASSES` ships **narrower than the runbook specified** (`{rate-limited, captcha, policy-blocked}`, not including `hard-block`/`anti-bot-block`) — see Decisions, and do not "restore" the other two.
+- **`isTerminalUnclearableRender`** (`src/browser/detect.ts`) — the one predicate both re-roll loops consult. It exists because the entry gate and the loops are *different* enforcement points; adding a rule to the gate alone leaves `forceProxy` unguarded.
+- **`docs/solutions/architecture-patterns/a-fresh-exit-cannot-clear-a-404-a-429-or-a-captcha.md`** (`b7b5ca5`) — the VIL-121 learning. Its second half is the part worth reading: three of four review findings were "the same rule applied at one of several enforcement points."
+- **`docs/solutions/runtime-errors/apt-invalid-signature-in-docker-build-can-be-a-full-disk.md`** (`1a28d69`) — the Phase 0 blocker, compounded. Contains a pre-build disk guard that is **proposed, not installed**.
+- **VIL-136 (High) and VIL-137 (Medium)** — follow-ups filed with full reproduction detail. VIL-136 came out of reading the *success* measurement, not a failure.
 
 ## Decisions Made
 
-- **Providers: Brave Search (VIL-122 primary), Google Custom Search JSON (VIL-123 fallback).** Both first-party, both $5/1k past free tiers that cover current volume, different indexes. Scrapers rejected (5× entry price, Google-ToS exposure). **Bing is retired** (Microsoft hub, 2025-08-11) — never propose it. Pricing was fetched 2026-08-27 ≈23:05 PDT; the table with sources is the VIL-120 comment.
-- **No API keys exist during the overnight run** (operator). Adapters are built from provider docs fetched at kickoff plus scrubbed fixtures and a deterministic fake; live verification is a filed morning ticket.
-- **Deploy scope: merge all three, deploy VIL-121 only** (operator). The `search` tool is registered only when `BGW_SEARCH_ENABLED=1`, so merging VIL-122/123 is byte-identical for prod until keys land.
-- **Mechanism correction recorded on the tickets:** the observed 90 s was *not* the automatic ladder — `shouldEscalateToProxy` fires only on CF-challenge or hard block, and the reCAPTCHA page was a 200. It was the consumer's own `forceProxy` retry re-rolling an unclearable page until `BGW_CALL_BUDGET_MS`, then #43's timeout override erasing the root class. Tonight's 404 case showed the same burn on the automatic path, so the fix goes in the shared loop.
-- **The #43 conflict is resolved by rule, not by deletion:** budget exhaustion becomes a `budgetExhausted` field; it overrides the class only when the root is non-decisive. `validate-call-budget.mjs` leg B stays green by construction (its synthetic render has no decisive root).
-- **Scope cuts:** browser-SERP fallback adapter (no owner for HTML result extraction), query cache and URL dedup (Brave's storage-rights clause) — all deferred to follow-up tickets the runbook files in Phase 4.
-- **Vocabulary spelling:** kebab-case (`rate-limited`), matching the repo's closed enums, not the tickets' snake_case.
-- **Points:** Fibonacci; children only, epic unpointed. Estimates ARE enabled on the team — the Linear MCP just cannot read the scale, so it was asked.
+- **`DECISIVE_FAILURE_CLASSES` excludes `hard-block` and `anti-bot-block`.** The runbook listed them as decisive *and* asserted the existing #43 budget tests stay green; both cannot hold, because one of those tests drives a CF challenge whose root is `anti-bot-block`. Narrowing was chosen over rewriting the test: those two are the *exit-clearable* classes, where "we ran out of time, try again" is correct advice. The surviving membership test is **"if the caller acts on this label by asking again, are they wrong?"**
+- **The terminal break keys on STATUS, never on the block reason.** A review suggestion to use the reason was investigated and **rejected**: `cfHint` is a persistent marker with no liveness requirement, so `classifyBlock` labels an ordinary thin 404 from *any* Cloudflare-fronted origin `cf-challenge`. Reason-gating would re-roll every exit on the most common shape the ticket exists to stop. A regression test pins this — do not relitigate.
+- **Cloudflare is the only vendor exempted from the terminal break.** PerimeterX/DataDome are behavioral: a fresh exit does not clear them and a retry re-triggers them. One attempt then stop is correct, and is now documented on the predicate.
+- **Drive's loop was fixed; the login-runner's third copy was not.** Deliberate scope call — credential-capture path with its own vault gates. Routed to VIL-137, not dropped.
+- **Fixture rule sharpened:** a string identifying a *site* is banned; a string the *classifier matches on* is required. CodeRabbit asked to remove `g-recaptcha`; the rule was the thing that was wrong, not the fixture.
+- **Deploy rode `b7b5ca5`, not the merge commit.** The docs push to `main` cancelled `1471f12`'s CI via same-branch concurrency. Same code plus docs, so this was correct — but "the merge commit's CI went green" was *false*.
 
 ## What Didn't Work
 
-- **Serper's `/pricing` page 404s and its tiers are not on any fetchable page** — recorded as "not listed" rather than guessed. Tavily's paid tier price renders as an animation placeholder on both fetch tiers; only its per-credit rate from the docs was usable.
-- **The Linear MCP exposes neither the team's estimation type nor its scale** (`get_team` returns name/timestamps only) — a decision question to the operator, not a lookup.
+- **The runbook's prod probe URL cannot verify anything.** `example.com/does-not-exist-vil121` has a **288-char body** — over the 200-char `MIN_CONTENT_LENGTH` — so it is not a hard block, never escalates, and returns fast-and-clean both before *and* after the fix. Used `https://api.github.com/vil121-does-not-exist` (~100 chars) instead. **Check any future probe against the threshold before trusting it.**
+- **Clock skew as the docker-build diagnosis** — reasonable (three clocks under emulation) but wrong; ruled out by measuring all three before finding the full disk.
+- **Two fixture comments named vendors while explaining the fixtures had no vendor markers**, which gave them markers — the hint scanners read raw HTML *including comments*. Three tests failed until the comments were rewritten.
+- **`callBudgetMs: 0` does not reach drive's escalation throw** — it is refused earlier at the queue boundary as a plain `Error`. A non-escalating direct failure that outruns a small budget is the reachable path.
 
 ## What's Next
 
-1. **Start the overnight session** in this directory on the lower model and paste the kickoff prompt (clipboard, or the header of the runbook). It reads CLAUDE.md → the runbook → this file, then runs Phase 0 → Phase 4. Timebox ≈ 10.75 h wall-clock.
-2. **Morning, if the run completed:** verify per the runbook's "Verification" section — three squash-merges, one green `deploy-http` run, `obscura status` healthy with five consumers, a thin-404 retrieve through prod returning in < 30 s with `proxyUsed=false`, the `search` tool still absent from prod, four follow-up tickets filed.
-3. **Morning, regardless:** create the Brave Search API account and the Google Cloud project + Programmable Search Engine (set to search the whole web — verify that toggle's wording), then work the "Enable search in prod" ticket the runbook files: keys into the prod env, `BGW_SEARCH_ENABLED=1`, container **re-create** (not restart), boot line reads `search=brave,google`, one live search.
-4. **If the run stopped early:** the runbook's stop rules leave a pushed branch with a `WIP:` draft PR and a rewritten HANDOFF.md naming the exact gate it stopped on. Pick up from there, not from Phase 0.
-5. Still open from the previous handoff, unchanged: VIL-130 (health surface), VIL-133 (pool-floor pre-flight), the never-watched `--apply` smoke refusal, M2 of the versioning plan, the two `retrieve` calls with no Chrome process across ~79 samples.
+1. **Phase 2 — VIL-122**, the `search` verb with a Brave adapter, per the runbook's §2. Merge-only; prod has no keys so the tool stays unregistered. Provider docs for **both** Brave and Google CSE are already fetched and saved with URLs + timestamps in this session's scratchpad under `provider-docs/` — re-fetch if that scratch is gone.
+2. **Phase 3 — VIL-123** (router + Google CSE), then **Phase 4** (epilogue: follow-up tickets, epic comment, memory, handoff). Note Phase 4's follow-up list is now partly done — VIL-136/137 are filed.
+3. **Morning, operator:** create the Brave Search API account and the Google Cloud project + Programmable Search Engine (verify the "search the whole web" toggle wording), then the enable-in-prod ticket: keys into prod env, `BGW_SEARCH_ENABLED=1`, container **re-create** (not restart), boot line reads `search=brave,google`.
+4. **`browse-gateway` MCP dropped its connection** (`ConnectionRefused` on the tunnel at `127.0.0.1:8080`) after the deploy. The deploy's own post-swap verify passed and `obscura status` was healthy immediately after, so this looks like the local tunnel/session, not the gateway. Does not block Phases 2–3; **does** block any further live prod verification.
+5. Recommended maintenance: `/ce-compound-refresh xvfb-run-wedges-container-as-pid1` — its `| tail` rule covers only EOF-buffering and is now incomplete (the same pipe also masks *exit status*).
+6. Still open, unchanged: VIL-130 (health surface), VIL-131 (pool floor, Medium), VIL-133 (pool-floor pre-flight), the never-watched `--apply` smoke refusal, M2 of the versioning plan.
 
 ## Gotchas & Watch-outs
 
-- **⚠️ The runbook is gitignored and must never be committed** — it names the research-domain context by reference and is operator-private by convention (`plans-stay-local-not-proof`). `git check-ignore -q docs/plans/2026-08-28-0000-*.local.md` must print nothing and exit 0.
-- **⚠️ PR bodies auto-close named Linear ids on merge.** The runbook restricts each PR body to the one ticket it completes; after every merge re-check VIL-113/121/122/123/127 states.
-- **⚠️ `main` is not branch-protected and CodeRabbit's check state is not a review verdict.** The runbook copies the exact check-description and unresolved-thread commands from CLAUDE.md; an executor that reads `mergeStateStatus: CLEAN` as reviewed will merge unreviewed code.
-- **The only sanctioned prod mutation overnight is `gh workflow run deploy-http.yml -f image_tag=latest` for VIL-121**, after CI's build-and-push on the merge commit succeeds. No host `docker`, no prod env edits, no `~/.config/obscura/config.json` changes.
-- **Brave's FAQ forbids storing results without a storage-rights plan** — one more reason the cache stays out; do not let a "small TTL cache" slip back in during review.
-- **Google CSE caps `num` at 10 and the free tier at 100/day with a 10k/day hard cap** — the adapter must clamp and must classify the daily cap as `quota-exhausted`, not retry.
-- **A `retrieve` of a thin 404 through prod currently costs ~90 s and two residential exits** — that is the pre-deploy baseline the runbook captures before the VIL-121 deploy and re-runs after; it is the watched RED→GREEN for the night.
-- **`npm test` cannot be green on macOS** (223 baseline failures, all `artifact-filesystem-unsupported`); the runbook records a baseline in Phase 0 and compares deltas only.
-- **Assume BSD userland; redact structurally with `jq` and test the redactor against a known value first.** (Carried over — it cost a token rotation last session.)
-- **The deploy id is an HMAC of the full commit sha, not a git revision.** (Carried over.)
+- **⚠️ The clearance poll is now the dominant cost on a thin 404** — 20.2 s of the post-fix 22.0 s. That is VIL-136, and it means a "still slow" report after VIL-121 is expected, not a regression.
+- **⚠️ Do not re-add `hard-block`/`anti-bot-block` to `DECISIVE_FAILURE_CLASSES`,** and do not switch the terminal break to the block reason. Both look like obvious cleanups and both are wrong; each has a test pinning it and a rationale in the PR body.
+- **⚠️ Pushing to `main` right after a merge cancels the merge commit's CI run.** Confirm *which* run actually produced the image before deploying — "the PR was green" is not the same claim.
+- **The proposed disk guard in the new solutions doc is NOT installed.** If you install it, watch it RED *and* GREEN — the terser `&&`-chain form returns exit 1 on the healthy path.
+- **A host `df` is not evidence for Docker disk pressure** — the Mac showed 28G free while the colima VM's `/var/lib/docker` had zero. Use `colima ssh -- df -h /var/lib/docker`.
+- **`validate-call-budget` leg B silently self-skips without `BGW_PROXY_*`.** It ran this session by mapping the local spike creds by *name* (no proxy request is made). A "PASS with 1 note" there means the leg did not run.
+- **`npm test` baseline on `main` is now 1529 / 1306 / 223** (fail count unchanged from the documented 223). Compare the failing set **by name**, not by count.
+- **PR bodies auto-close named Linear ids on merge** — VIL-121 went to Done automatically. Re-check VIL-113/122/123/127 after every merge; they were verified untouched this session.
+- Carried over: assume BSD userland and redact structurally with `jq`, testing the redactor against a known value first; the deploy id is an HMAC of the full commit sha, not a git revision.
