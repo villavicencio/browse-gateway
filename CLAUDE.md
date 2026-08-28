@@ -95,7 +95,9 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   assertion never executed in production for a day. Three copies existed and prod ran the stalest.
   Since VIL-134 `deploy-on-host.sh` **extracts the smoke from the image it is deploying** and fails
   closed if the image does not carry one, so hardening the repo copy is live on the next deploy with
-  no host sync. Two consequences that still bite: the **`obscura … --apply` path invokes an on-host
+  no host sync. **The host was synced 2026-08-27 and the gate was watched RED in production** (a
+  deliberately-broken image was refused, the real one passed, the live container's uptime never
+  reset); the pre-VIL-134 forced command is kept at `~/deploy/deploy-on-host.sh.bak-20260827`. Two consequences that still bite: the **`obscura … --apply` path invokes an on-host
   installed copy** via `smokeCmd` and can still drift, and **`launch-http.sh` stays host-owned** (the
   swap runs the host's, so the smoke must too — a smoke booting the candidate with a different
   launcher than the one that will deploy it is a false green; drift there is logged as a NOTE). More

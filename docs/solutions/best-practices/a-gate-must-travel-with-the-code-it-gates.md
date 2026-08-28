@@ -94,6 +94,45 @@ Not by reading the diff. Construct the RED at the source and **watch it**:
 the real one. Every assertion in it was watched failing with the fix reverted. See
 [a-test-whose-stub-guarantees-the-assertion-proves-nothing](a-test-whose-stub-guarantees-the-assertion-proves-nothing.md).
 
+## Proving it on the real host, without a real deploy
+
+The unit tests above prove the logic. They do not prove the gate runs *in production*, which is the
+whole subject of this document — so prove that too, and do it without deploying anything.
+
+Two rules make the live proof trustworthy:
+
+**1. Execute the installed gate verbatim; do not re-implement it.** A probe that reimplements the
+extraction proves the probe works. Extract the real block out of the file that actually runs:
+
+```bash
+# Runs the REAL step-4 block from the installed forced command against an arbitrary image.
+# It stops before step 5, so the swap cannot run and the live container is structurally safe.
+IMAGE="$1"; HERE=/path/to/deploy; CONFIG=…; . "$CONFIG"
+eval "$(sed -n '101,170p' "$HERE/deploy-on-host.sh")"
+```
+
+**2. Build the RED image so it cannot silently be un-broken.** Derive it from the image actually
+running, change exactly one thing, and make the build itself assert the change landed:
+
+```bash
+FROM <prod-image-tag>
+RUN sed -i 's/version=${gatewayVersion/ver=${gatewayVersion/' /app/dist/mcp/http-main.js
+RUN grep -q 'ver=${gatewayVersion' /app/dist/mcp/http-main.js       # the patch applied
+RUN ! grep -q 'version=${gatewayVersion' /app/dist/mcp/http-main.js  # nothing left unpatched
+```
+
+Without those two `RUN` guards, a drifted pattern yields a *working* image, the gate passes, and you
+record a green run as proof the gate bites. `docker build` also needs a real tag to build `FROM` —
+BuildKit resolves a bare image ID as a Docker Hub repo and fails with `pull access denied`.
+
+**Run both directions.** A gate that only ever refuses is indistinguishable from a broken gate: RED
+must abort and GREEN must pass, on the same host, minutes apart. Then confirm the live container's
+**uptime did not reset** — not merely that it is running — and that no throwaway container leaked.
+
+Observed doing exactly this: the gate refused the broken image (`smoke: boot line carries no
+well-formed version=`, exit 1), passed the real one, and the live container held its `Up 5 hours`
+across both. That was the first execution of that assertion in production, months after it merged.
+
 ## The general rule
 
 > If a check lives anywhere other than the artifact it checks, assume it is stale until you have
