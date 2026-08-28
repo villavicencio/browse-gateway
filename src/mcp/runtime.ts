@@ -26,6 +26,8 @@ import {
 import type { ConsumerSpec } from "../policy/index.js";
 import { SecretStore, openVault, canonicalizeHost } from "../security/index.js";
 import type { VaultStore } from "../security/index.js";
+import { buildSearch } from "../search/index.js";
+import type { BuiltSearch } from "../search/index.js";
 import {
   stickySuffixBootError,
   stickySuffixRedactables,
@@ -59,6 +61,12 @@ export interface GatewayRuntime {
   warmupHosts: ReturnType<typeof parseForceProxyHosts>;
   warmupPaths: ReturnType<typeof parseWarmupPaths>;
   verifyEgress: boolean;
+  /**
+   * The `search` verb + its ordered provider names (VIL-122), or `undefined` when the feature is
+   * disabled (`BGW_SEARCH_ENABLED` unset). Absent means the MCP layer registers no `search` tool, so
+   * a disabled deployment lists exactly the tools it listed before the feature existed.
+   */
+  search?: BuiltSearch;
   /**
    * Task 2 §4.3/§6 — ALWAYS `undefined` from this shared builder, and kept only so the field's absence
    * is part of the published contract rather than an omission a caller has to infer.
@@ -204,8 +212,16 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // minted sticky password can't leak the exit's geo/session/lifetime structure past redactSecrets (R9).
   secrets.addRedactable(stickySuffixRedactables(stickySuffix));
 
+  // Discovery verb (VIL-122). `undefined` unless BGW_SEARCH_ENABLED=1; when enabled it THROWS on an
+  // unknown provider, a missing key, a non-https endpoint, or an endpoint pointing at a private
+  // address. It sits here — inside the shared boot builder — for the same reason every guard above
+  // does: a deploy can only see a refusal that happens at boot, never one raised per connection.
+  const search = buildSearch(env, secrets);
+  if (search) log(`search: enabled (providers=[${search.providers.join(", ")}])`);
+
   return {
     config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts,
     freshExitHosts, warmupHosts, warmupPaths, verifyEgress,
+    ...(search ? { search } : {}),
   };
 }

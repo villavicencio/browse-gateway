@@ -1,0 +1,27 @@
+{
+  "query": {
+    "original": "example query",
+    "more_results_available": true
+  },
+  "web": {
+    "results": [
+      {
+        "title": "First Result Title",
+        "url": "https://alpha.example.invalid/docs/getting-started",
+        "description": "A short description of the first result, as the provider returns it."
+      },
+      {
+        "title": "Second Result Title",
+        "url": "https://beta.example.invalid/",
+        "description": "A short description of the second result.",
+        "extra_snippets": ["an extra snippet the normalizer ignores"]
+      },
+      {
+        "title": "Third Result Title",
+        "url": "https://gamma.example.invalid/a/b?q=1",
+        "description": "A short description of the third result."
+      }
+    ]
+  },
+  "mixed": { "type": "mixed", "main": [] }
+}

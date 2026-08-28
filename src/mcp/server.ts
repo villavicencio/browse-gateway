@@ -12,6 +12,8 @@ import { EscalationError, isRetrieveFailure } from "../verbs/index.js";
 import { summarizeFailureDiagnostics, failureOf, sanitizeUrlForError, sanitizeUrlsInErrorText } from "../observability/index.js";
 import type { FailureDiagnostics, Timing } from "../observability/index.js";
 import type { ArtifactOutcome, ArtifactResponseLease } from "../artifacts/index.js";
+import type { SearchFn, SearchFailureClass, SearchResponse } from "../search/index.js";
+import { SearchAttemptsError } from "../search/index.js";
 import { getArtifactLeaseTracker } from "./http-request-context.js";
 import { ARTIFACT_TOOL_NAME } from "./http-response-lease.js";
 import { resolveGatewayVersion } from "./version.js";
@@ -118,6 +120,14 @@ export interface GatewayMcpDeps {
   retrieve: RetrieveFn;
   /** Optional interactive surface; when present, the `browser_*` drive tools are registered too. */
   drive?: DriveController;
+  /**
+   * Optional discovery surface (VIL-122); when present, the `search` tool is registered.
+   *
+   * Absent is the SHIPPED DEFAULT: search is off unless `BGW_SEARCH_ENABLED=1`, and with it off the
+   * tool is not registered at all — the listed tool set is byte-identical to pre-VIL-122. The
+   * enablement decision lives at boot (`search/config.ts`), never here.
+   */
+  search?: SearchFn;
   name?: string;
   version?: string;
   /**
@@ -238,6 +248,41 @@ const RETRIEVE_FAILURE_HINTS: Readonly<Record<string, string>> = Object.freeze({
     " — the target is rate-limiting this client; wait and retry, do not force the proxy (a fresh exit does not clear a 429)",
 });
 
+/**
+ * Caller-facing advice per {@link SearchFailureClass} (VIL-122). Unlike the retrieve table, EVERY
+ * class carries a hint and a test asserts it: a search failure the caller cannot act on is a dead
+ * end, and the whole point of a closed vocabulary is that each member implies a different next move.
+ *
+ * The advice is deliberately about what the CALLER should do, not about what the gateway did.
+ */
+const SEARCH_FAILURE_HINTS: Readonly<Record<SearchFailureClass, string>> = Object.freeze({
+  "rate-limited": " Wait for the retry window and ask again — the search provider is throttling this gateway, and rephrasing will not help.",
+  "quota-exhausted": " The search plan's quota is spent; this will not recover on retry. Tell the operator.",
+  "authentication-failed": " The gateway's search credential is missing or rejected — a deployment problem, not a query problem. Tell the operator.",
+  "provider-unavailable": " The search provider is down or misconfigured. Retry later; if it persists, tell the operator.",
+  timeout: " The search provider did not answer within its budget. Retry once; if it repeats, treat the provider as unavailable.",
+  "network-error": " The gateway could not reach the search provider. Retry once, then treat it as unavailable.",
+  "malformed-response": " The search provider answered with something this gateway could not parse. Retrying the same query is unlikely to help.",
+  "empty-results": " No results. Try a broader or differently-worded query.",
+  "unsupported-query": " The provider rejected the query itself — shorten it or rephrase it (there are length and word-count limits).",
+  "policy-restricted": " The query is not permitted by the configured search policy. Rephrase, or ask the operator.",
+  captcha: " The search path hit an interactive challenge no solver can clear here. Do not retry in a loop.",
+  "challenge-interstitial": " The search path hit an anti-bot interstitial. Do not retry in a loop.",
+  "total-deadline-exhausted": " The whole search budget ran out before any provider answered. Retry once with a simpler query.",
+});
+
+/** Render the success body: a machine-greppable header, then one block per result. Only the `content`
+ *  TEXT reliably reaches a consumer agent (measured — see the mcp-side-channels solution doc), so the
+ *  results must be legible HERE and not only in `structuredContent`. */
+function formatSearchResponse(res: SearchResponse): string {
+  const header = `provider=${res.provider} results=${res.results.length} durationMs=${res.durationMs}`;
+  if (res.results.length === 0) {
+    return `${header}\n\nNo results.`;
+  }
+  const blocks = res.results.map((r) => `${r.rank}. ${r.title}\n   ${r.url}\n   ${r.snippet}`);
+  return `${header}\n\n${blocks.join("\n\n")}`;
+}
+
 // U1: the default is RESOLVED, never a literal. Memoized because `createGatewayMcpServer` runs
 // once per HTTP connection — the launchers pass `deps.version` explicitly (resolved at boot), so
 // this path is for tests and for `validate-http.mjs`, which builds its own server and therefore
@@ -357,6 +402,79 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
       }
     },
   );
+
+  // --- Discovery: `search` (VIL-122). Registered ONLY when the dep is present, which happens only
+  // when the operator enabled the feature and it passed its boot guards. With search off, nothing
+  // below runs and the tool list is unchanged.
+  const search = deps.search;
+  if (search) {
+    server.registerTool(
+      "search",
+      {
+        title: "Search the web",
+        description:
+          "Search the web and get ranked results (title, URL, snippet) from a sanctioned search " +
+          "API. Use this to FIND candidate URLs, then `retrieve` to read one. Never build a " +
+          "search-engine URL and hand it to `retrieve` — that gives discovery the wrong retry, " +
+          "timeout and extraction semantics, and breaks when the engine challenges the request.",
+        inputSchema: {
+          query: z.string().min(1).max(400).describe("What to search for"),
+          count: z.number().int().min(1).max(20).optional().describe("How many results to return (default 10)"),
+          country: z.string().length(2).optional().describe("2-letter country code to target results (e.g. US)"),
+          language: z.string().length(2).optional().describe("2-letter content-language code (e.g. en)"),
+          safeSearch: z.enum(["off", "moderate", "strict"]).optional().describe("SafeSearch level (default moderate)"),
+        },
+      },
+      async ({ query, count, country, language, safeSearch }) => {
+        try {
+          const res = await search({
+            query,
+            count: count ?? 10,
+            safeSearch: safeSearch ?? "moderate",
+            ...(country ? { country } : {}),
+            ...(language ? { language } : {}),
+          });
+          // A search that found nothing is a SUCCESS with zero results, not an error: "nothing
+          // matched" is a real answer to a discovery question, and returning it as an error would
+          // push a research agent into retrying a query that worked.
+          return {
+            content: [{ type: "text", text: formatSearchResponse(res) }],
+            structuredContent: res as unknown as Record<string, unknown>,
+          };
+        } catch (err) {
+          if (err instanceof SearchAttemptsError) {
+            const { failure, attempts } = err;
+            const hint = SEARCH_FAILURE_HINTS[failure.code] ?? "";
+            const retry = failure.retryAfterMs !== undefined ? ` retryAfterMs=${failure.retryAfterMs}` : "";
+            return {
+              isError: true,
+              // #47: in-band — the search provider completed a round-trip and returned a negative
+              // verdict (throttle, rejection, empty). The gateway is healthy; a breaker must not
+              // count it toward unreachability.
+              _meta: errorKindMeta("in-band"),
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Search failed (failureClass=${failure.code}, provider=${attempts[attempts.length - 1]?.provider ?? "n/a"}, ` +
+                    `status=${failure.httpStatus ?? "n/a"}, attempts=${attempts.length}${retry}).${hint}`,
+                },
+              ],
+              structuredContent: { attempts } as unknown as Record<string, unknown>,
+            };
+          }
+          // The verb itself threw (a wiring/config defect, not a provider verdict). Same shape as
+          // retrieve's internal path — sanitized, typed `internal` so a breaker can tell them apart.
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            isError: true,
+            _meta: errorKindMeta("internal"),
+            content: [{ type: "text", text: `browse-gateway error: ${sanitizeUrlsInErrorText(message)}` }],
+          };
+        }
+      },
+    );
+  }
 
   // --- Interactive `drive` tools (Playwright-MCP-shaped), registered only when a controller is
   // injected. Every verb runs through the consumer-bound, guarded session; failures become clean

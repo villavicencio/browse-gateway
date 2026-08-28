@@ -9,6 +9,7 @@ import { Gateway, loadConfig } from "../gateway/index.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary, Allowlist } from "../policy/index.js";
 import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
 import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, parseWarmupPaths, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { buildSearch, redactedSearchFn } from "../search/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { resolveGatewayVersion } from "./version.js";
 import { GatewayDriveController } from "./drive-controller.js";
@@ -85,6 +86,11 @@ async function main(): Promise<void> {
   // Fold the suffix's provider-param fragments into the redaction set (parity with runtime.ts; R9) so a
   // driver error echoing a minted sticky password can't leak the exit geo/session/lifetime structure.
   secrets.addRedactable(stickySuffixRedactables(stickySuffix));
+  // Discovery verb (VIL-122) — mirror runtime.ts so this stdio rollback launcher doesn't silently
+  // diverge (no search here while prod has it). `undefined` unless BGW_SEARCH_ENABLED=1; enabled but
+  // misconfigured throws before the launcher ever serves.
+  const search = buildSearch(process.env, secrets);
+  if (search) log(`search: enabled (providers=[${search.providers.join(", ")}])`);
   // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
   // The interactive `drive` surface: a persistent, consumer-bound session driven via browser_* tools.
@@ -113,6 +119,8 @@ async function main(): Promise<void> {
   const server = createGatewayMcpServer({
     version: gatewayVersion.reported,
     drive,
+    // Registered only when search passed its boot guards; absent leaves the tool unregistered.
+    ...(search ? { search: redactedSearchFn(search.fn, secrets) } : {}),
     retrieve: async ({ url, forceProxy }) => {
       try {
         const forced = (forceProxy ?? false) || hostForcesProxy(new URL(url).hostname, forceProxyHosts);
@@ -133,7 +141,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 
   await server.connect(new StdioServerTransport());
-  log(`connected over stdio — consumer=${consumer.id} allow=[${consumer.allow.join(", ")}] datacenter=${onDatacenterIp} sticky=${stickySuffix !== undefined}`);
+  log(`connected over stdio — consumer=${consumer.id} allow=[${consumer.allow.join(", ")}] datacenter=${onDatacenterIp} sticky=${stickySuffix !== undefined} search=${search ? search.providers.join(",") : "off"}`);
 }
 
 main().catch((err) => {
