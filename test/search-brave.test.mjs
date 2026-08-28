@@ -282,6 +282,33 @@ test("3xx maps to provider-unavailable (a redirect means the endpoint is not the
   }
 });
 
+test("a 2xx with a bad shape reports the REAL status, not n/a", async () => {
+  // `httpStatus: null` is reserved for a request that never got an HTTP response. A 200 whose body
+  // is malformed did get one, and reporting null sends the caller hunting a transport fault.
+  for (const [body, code] of [["not json", "malformed-response"], ['{"query":{}}', "malformed-response"], ['{"web":{"results":[]}}', "empty-results"]]) {
+    const f = fakeFetch(body, { status: 200 });
+    await assert.rejects(providerWith(f).search(REQ, ctx()), (err) => {
+      assert.equal(err.code, code);
+      assert.equal(err.httpStatus, 200, `${code} lost its status`);
+      return true;
+    });
+  }
+});
+
+test("ranks are dense over the RETURNED list when entries are dropped", async () => {
+  // The first entry is unusable, so it is dropped; the survivors must be 1..N with no hole.
+  const f = fakeFetch(JSON.stringify({
+    web: { results: [
+      { title: "dropped", url: "javascript:alert(1)" },
+      { title: "first kept", url: "https://a.example.invalid/" },
+      { title: "second kept", url: "https://b.example.invalid/" },
+    ] },
+  }));
+  const results = await providerWith(f).search(REQ, ctx());
+  assert.deepEqual(results.map((r) => r.rank), [1, 2]);
+  assert.deepEqual(results.map((r) => r.title), ["first kept", "second kept"]);
+});
+
 test("status → failure-class mapping is total over the documented codes", () => {
   assert.equal(braveStatusToFailureClass(401), "authentication-failed");
   assert.equal(braveStatusToFailureClass(402), "quota-exhausted");

@@ -214,10 +214,46 @@ test("redactedSearchFn scrubs a leaked secret while preserving the typed failure
   });
 });
 
-test("redactedSearchFn passes a success through untouched", async () => {
+test("redactedSearchFn leaves an ordinary success unchanged", async () => {
   const secrets = store({ BGW_BRAVE_SEARCH_API_KEY: KEY });
   const fn = redactedSearchFn(makeSearchFn([fakeSearchProvider()], SETTINGS), secrets);
   assert.deepEqual((await fn(REQ)).results, DEFAULT_RESULTS);
+});
+
+test("a secret reflected in a SUCCESSFUL payload is redacted before the caller sees it", async () => {
+  // The endpoint is deployment-configurable and provider text is attacker-influenced, so an upstream
+  // that echoed the request's auth header into a title/snippet/URL would hand the gateway's own
+  // credential to the consumer. R9 is "a secret never reaches consumer output" — errors only is not
+  // that guarantee, and the success path renders into BOTH content text and structuredContent.
+  const secrets = store({ BGW_BRAVE_SEARCH_API_KEY: KEY });
+  const reflecting = fakeSearchProvider({
+    results: [
+      { rank: 1, title: `token ${KEY} here`, url: `https://evil.example.invalid/?k=${KEY}`, displayUrl: `evil.example.invalid/?k=${KEY}`, snippet: `echoed ${KEY}`, publishedAt: null },
+    ],
+  });
+  const res = await redactedSearchFn(makeSearchFn([reflecting], SETTINGS), secrets)(REQ);
+  const blob = JSON.stringify(res);
+  assert.ok(!blob.includes(KEY), `the key survived into the success payload: ${blob}`);
+});
+
+test("the whole MCP success surface is scrubbed, text and structuredContent alike", async () => {
+  const { createGatewayMcpServer } = await import("../dist/mcp/index.js");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+  const secrets = store({ BGW_BRAVE_SEARCH_API_KEY: KEY });
+  const reflecting = fakeSearchProvider({
+    results: [{ rank: 1, title: `t ${KEY}`, url: "https://a.example.invalid/", displayUrl: "a.example.invalid", snippet: `s ${KEY}`, publishedAt: null }],
+  });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  const server = createGatewayMcpServer({
+    retrieve: async () => ({ markdown: "x", title: "t", status: 200, blocked: false, reason: null, degraded: false, proxyUsed: false, captchaSolved: false }),
+    search: redactedSearchFn(makeSearchFn([reflecting], SETTINGS), secrets),
+  });
+  await server.connect(st);
+  const client = new Client({ name: "t", version: "1.0.0" });
+  await client.connect(ct);
+  const res = await client.callTool({ name: "search", arguments: { query: "q" } });
+  assert.ok(!JSON.stringify(res).includes(KEY), "the key reached the MCP tool result");
 });
 
 test("every search env var the code reads is forwarded by the stdio launcher", async () => {

@@ -119,8 +119,11 @@ export class BraveSearchProvider implements SearchProvider {
     // normalized `snippet` is meant to be plain prose a caller can read or feed onward, so turn it off.
     url.searchParams.set("text_decorations", "false");
 
-    const body = await this.#get(url, ctx);
-    return this.#normalize(body);
+    const { body, status } = await this.#get(url, ctx);
+    // Carry the status into normalization: a 2xx whose SHAPE is wrong still had an HTTP response,
+    // and `SearchAttempt.httpStatus` reserves null for a request that never got one. Reporting
+    // `status=n/a` for a 200 sends a caller looking for a transport problem that did not happen.
+    return this.#normalize(body, status);
   }
 
   /**
@@ -129,7 +132,7 @@ export class BraveSearchProvider implements SearchProvider {
    * way: clearing it at fetch()-resolve leaves a stalled body unbounded). Never surfaces the URL or
    * headers — the key is in a header.
    */
-  async #get(url: URL, ctx: { deadline: number; signal: AbortSignal }): Promise<unknown> {
+  async #get(url: URL, ctx: { deadline: number; signal: AbortSignal }): Promise<{ body: unknown; status: number }> {
     const remaining = ctx.deadline - this.#now();
     if (remaining <= 0) throw new SearchProviderError("timeout", "search deadline exhausted before the request started");
 
@@ -186,7 +189,7 @@ export class BraveSearchProvider implements SearchProvider {
 
       const text = await this.#readCapped(resp, controller);
       try {
-        return JSON.parse(text) as unknown;
+        return { body: JSON.parse(text) as unknown, status: resp.status };
       } catch {
         if (controller.signal.aborted) throw new SearchProviderError("timeout", "search exceeded its deadline");
         throw new SearchProviderError("malformed-response", "search provider returned a body that is not valid JSON", {
@@ -255,22 +258,22 @@ export class BraveSearchProvider implements SearchProvider {
    * would produce a field that is silently always absent — worse than an honest `null`. Resolve by
    * inspecting a live response once a key exists.
    */
-  #normalize(body: unknown): SearchResult[] {
+  #normalize(body: unknown, status: number): SearchResult[] {
     if (typeof body !== "object" || body === null) {
-      throw new SearchProviderError("malformed-response", "search provider returned a non-object body");
+      throw new SearchProviderError("malformed-response", "search provider returned a non-object body", { httpStatus: status });
     }
     const web = (body as { web?: unknown }).web;
     if (web === undefined) {
       // No `web` key at all: either a filtered response shape we did not ask for, or an error body
       // served with a 200. Either way we cannot answer the caller's question.
-      throw new SearchProviderError("malformed-response", "search provider response carried no web results section");
+      throw new SearchProviderError("malformed-response", "search provider response carried no web results section", { httpStatus: status });
     }
     if (typeof web !== "object" || web === null) {
-      throw new SearchProviderError("malformed-response", "search provider returned a malformed web results section");
+      throw new SearchProviderError("malformed-response", "search provider returned a malformed web results section", { httpStatus: status });
     }
     const raw = (web as { results?: unknown }).results;
     if (!Array.isArray(raw)) {
-      throw new SearchProviderError("malformed-response", "search provider returned a malformed web results list");
+      throw new SearchProviderError("malformed-response", "search provider returned a malformed web results list", { httpStatus: status });
     }
 
     const results: SearchResult[] = [];
@@ -296,7 +299,7 @@ export class BraveSearchProvider implements SearchProvider {
     }
 
     if (results.length === 0) {
-      throw new SearchProviderError("empty-results", "search returned no usable results");
+      throw new SearchProviderError("empty-results", "search returned no usable results", { httpStatus: status });
     }
     return results;
   }

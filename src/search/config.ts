@@ -222,7 +222,7 @@ function response(
 export function redactedSearchFn(fn: SearchFn, secrets: { redactableValues(): readonly string[] }): SearchFn {
   return async (req) => {
     try {
-      return await fn(req);
+      return redactSearchResponse(await fn(req), secrets);
     } catch (err) {
       if (err instanceof SearchAttemptsError) {
         throw new SearchAttemptsError(
@@ -235,6 +235,33 @@ export function redactedSearchFn(fn: SearchFn, secrets: { redactableValues(): re
       }
       throw new Error(redactSecrets(err instanceof Error ? err.message : String(err), secrets));
     }
+  };
+}
+
+/**
+ * Scrub every caller-visible string on a SUCCESSFUL response.
+ *
+ * The success path needs this as much as the error path: a provider payload is attacker-influenced
+ * text that the MCP layer renders into both `content` and `structuredContent`, and the endpoint is
+ * deployment-configurable — so an upstream that reflected the request's `x-subscription-token` into
+ * a title, snippet, or URL would hand the gateway's own credential to the consumer. R9 says a secret
+ * never reaches consumer output, and "errors only" is not that guarantee.
+ *
+ * Redacting a URL can corrupt it; that is the correct trade. A URL containing the API key is not a
+ * link worth preserving.
+ */
+export function redactSearchResponse(res: SearchResponse, secrets: { redactableValues(): readonly string[] }): SearchResponse {
+  return {
+    ...res,
+    query: redactSecrets(res.query, secrets),
+    provider: redactSecrets(res.provider, secrets),
+    results: res.results.map((r) => ({
+      ...r,
+      title: redactSecrets(r.title, secrets),
+      url: redactSecrets(r.url, secrets),
+      displayUrl: redactSecrets(r.displayUrl, secrets),
+      snippet: redactSecrets(r.snippet, secrets),
+    })),
   };
 }
 

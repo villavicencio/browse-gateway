@@ -33,7 +33,14 @@ export interface SearchRequest {
 /** One normalized result. `publishedAt` is `null` whenever the provider does not give a date we can
  *  trust — never a manufactured value (see `brave.ts` on the unconfirmed date field). */
 export interface SearchResult {
-  /** 1-based position in the provider's own ordering. */
+  /**
+   * 1-based position in THIS list, preserving the provider's relative order.
+   *
+   * Dense on purpose, and this is the half of the contract that was wrong before: entries the
+   * adapter cannot hand to `retrieve` (a non-http scheme, an unparseable URL) are dropped, so a
+   * rank that mirrored the provider's raw index would carry holes. A caller iterating results wants
+   * 1..N; the dropped entries were not results it could have used.
+   */
   rank: number;
   title: string;
   /** Absolute destination URL — the thing a caller hands to `retrieve`. */

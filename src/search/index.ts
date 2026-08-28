@@ -30,6 +30,7 @@ export {
   searchEndpointError,
   SearchAttemptsError,
   redactedSearchFn,
+  redactSearchResponse,
   KNOWN_SEARCH_PROVIDERS,
   DEFAULT_SEARCH_PROVIDER_TIMEOUT_MS,
   DEFAULT_SEARCH_TOTAL_TIMEOUT_MS,
