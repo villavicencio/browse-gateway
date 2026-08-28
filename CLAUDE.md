@@ -83,12 +83,25 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   works inside the image*; it proves **nothing** about the launcher prod actually runs, so an
   assertion added there gates a server the gate itself constructed. The launcher gate is
   `scripts/deploy/preswap-smoke.sh`, which boots the real `launch-http.sh` against the real env and
-  greps the boot line (`:78`). Both it and the post-swap verify probe **unauthenticated** `/mcp`
+  greps the boot line (`:96`). Both it and the post-swap verify probe **unauthenticated** `/mcp`
   expecting 401, so neither ever reaches per-connection code. Corollary: **anything that must fail a
   deploy has to be observable at boot** — resolve it beside the existing boot assertions in
   `src/mcp/http-main.ts:152-162` and emit it on the boot line at `:286-293`, never inside the
   per-connection `buildServer:` callback, where a throw is a per-session 500 that no deploy check
   sees. A plan asserted the opposite twice before anyone read the two scripts.
+- **A gate must travel with the code it gates; count the copies before trusting one.** The CD deploy
+  used to run an *inline* copy of the pre-swap smoke inside the host's `deploy-on-host.sh`. The repo
+  hardened `scripts/deploy/preswap-smoke.sh`, CI stayed green, the repo read as gated — and the new
+  assertion never executed in production for a day. Three copies existed and prod ran the stalest.
+  Since VIL-134 `deploy-on-host.sh` **extracts the smoke from the image it is deploying** and fails
+  closed if the image does not carry one, so hardening the repo copy is live on the next deploy with
+  no host sync. Two consequences that still bite: the **`obscura … --apply` path invokes an on-host
+  installed copy** via `smokeCmd` and can still drift, and **`launch-http.sh` stays host-owned** (the
+  swap runs the host's, so the smoke must too — a smoke booting the candidate with a different
+  launcher than the one that will deploy it is a false green; drift there is logged as a NOTE). More
+  generally: **an on-host copy of a repo script is stale until you have watched it run** — the host's
+  `launch-http.sh` was two months behind by the same silent mechanism. Full write-up:
+  `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`.
 - **`main` is NOT branch-protected, so nothing mechanically blocks a merge.** There are no required
   status checks (`gh api repos/<owner>/<repo>/branches/main/protection` → 404 "Branch not
   protected"). A PR with **no CI run at all** still reads mergeable, which is a strictly weaker

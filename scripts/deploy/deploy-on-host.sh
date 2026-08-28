@@ -73,17 +73,97 @@ if [ "$gate_rc" -ne 0 ]; then
 fi
 echo "deploy: gate PASS"
 
-# 4 — REAL-CONFIG PRE-SWAP SMOKE (scripts/deploy/preswap-smoke.sh — the single source of truth for
-# the smoke, shared with the `obscura keys|vault --apply` provisioning path so EVERY config mutation
-# crosses the same gate). The gate (step 3) runs validate-http with its OWN test config and NO BGW_*
+# 4 — REAL-CONFIG PRE-SWAP SMOKE, SOURCED FROM THE IMAGE BEING DEPLOYED (VIL-134).
+#
+# What it catches: the gate (step 3) runs validate-http with its OWN test config and NO BGW_*
 # overrides, so it never sees the real env file or consumers.json. The likeliest bad deploy — a
 # malformed prod env var, a consumers.json typo, or a startup cap-assertion violation (maxSessions <
 # consumers×perConsumerMax+1) — would PASS the gate, go live, fail verify, and, being config- not
 # image-specific, take the auto-rollback down with it. So boot the new image against the REAL env +
 # consumers on a throwaway container/port FIRST and abort — live container UNTOUCHED — if it can't
 # come up clean. Runs before the rollback anchor + swap, same non-bypassable posture as the gate.
+#
+# WHY IT IS EXTRACTED FROM THE IMAGE RATHER THAN RUN FROM $HERE: a gate must travel with the code it
+# gates. This step used to be an inline copy of the smoke living in this file. The repo hardened the
+# smoke (a well-formed `version=` assertion on the boot line); the host kept running its own older
+# function; the new assertion never executed in production, while CI stayed green and the repo looked
+# gated. Three copies of the smoke existed and prod ran the stalest. THIS FILE is the deploy key's
+# forced command, so it is the one piece that cannot travel with the image — which is exactly why
+# everything it can delegate to the image must be delegated. Any future hardening of
+# scripts/deploy/preswap-smoke.sh is then live on the very next deploy with no host sync at all.
+#
+# FAIL CLOSED: an image that does not carry the smoke aborts the deploy. A missing gate must never
+# read as a passing one — that is precisely the failure this change exists to end.
+#
+# Extraction uses `docker create` + `docker cp`, NOT `docker run ... cat`: create starts no process,
+# so pulling the script out of the image never executes image code, and it does not depend on the
+# image shipping a `cat`.
+SMOKE_IN_IMAGE="/app/scripts/deploy/preswap-smoke.sh"
+# A DIRECTORY, not a bare temp file. The extracted smoke is placed in it alongside a copy of the
+# host's launch-http.sh, which is what makes this safe to install ahead of the matching image:
+# a smoke predating VIL-134 does not know BGW_LAUNCH_SCRIPT and resolves "$HERE/launch-http.sh"
+# instead — "$HERE" being wherever we put it. Without a launcher beside it, deploying any older
+# image (a manual redeploy, a rollback to a pinned digest) would abort at the smoke with a
+# confusing "launcher not executable". Both old and new smokes now find the same host launcher.
+SMOKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bgw-preswap.XXXXXX")"
+SMOKE_TMP="$SMOKE_DIR/preswap-smoke.sh"
+SMOKE_ERR="$SMOKE_DIR/create.err"
+LAUNCH_TMP="$SMOKE_DIR/image-launch-http.sh"   # the IMAGE's launcher, for the drift NOTE only
+SMOKE_CID=""
+cleanup_smoke() {
+  [ -n "$SMOKE_CID" ] && docker rm -f "$SMOKE_CID" >/dev/null 2>&1 || true
+  rm -rf "$SMOKE_DIR"
+}
+trap cleanup_smoke EXIT
+
+# Capture stdout ONLY. This daemon prints warnings ("WARNING: IPv4 forwarding is disabled") to
+# stderr, and folding them into the container id with 2>&1 would hand an unusable ref to `docker cp`
+# and then to `docker rm`, leaking the staged container on every deploy.
+if ! SMOKE_CID="$(docker create "$IMAGE" 2>"$SMOKE_ERR")" || [ -z "$SMOKE_CID" ]; then
+  echo "deploy: refused — could not stage ${IMAGE} to extract the pre-swap smoke:" >&2
+  tail -3 "$SMOKE_ERR" >&2 || true
+  SMOKE_CID=""
+  exit 1
+fi
+if ! docker cp "${SMOKE_CID}:${SMOKE_IN_IMAGE}" "$SMOKE_TMP" >/dev/null 2>&1; then
+  echo "deploy: refused — image does not carry ${SMOKE_IN_IMAGE}; the pre-swap smoke cannot run." >&2
+  exit 1
+fi
+if [ ! -s "$SMOKE_TMP" ]; then
+  echo "deploy: refused — ${SMOKE_IN_IMAGE} extracted EMPTY from the image; refusing to deploy ungated." >&2
+  exit 1
+fi
+# Same staged container: pull the image's launcher too, for the drift NOTE below. Best-effort — an
+# image without it is not a reason to refuse a deploy, unlike the smoke.
+docker cp "${SMOKE_CID}:/app/scripts/deploy/launch-http.sh" "$LAUNCH_TMP" >/dev/null 2>&1 || true
+docker rm -f "$SMOKE_CID" >/dev/null 2>&1 || true
+SMOKE_CID=""
+chmod +x "$SMOKE_TMP"
+
+# The host launcher, beside the extracted smoke, under the name a pre-VIL-134 smoke looks for.
+# New smokes take it via BGW_LAUNCH_SCRIPT below; old ones find it as "$HERE/launch-http.sh".
+# Either way it is the HOST's launcher — the one step 6 will use for the real swap.
+cp "$HERE/launch-http.sh" "$SMOKE_DIR/launch-http.sh"
+chmod +x "$SMOKE_DIR/launch-http.sh"
+
+# Provenance in the deploy log, so a stale or unexpected gate is VISIBLE rather than silently absent.
+echo "deploy: pre-swap smoke sourced from image:${SMOKE_IN_IMAGE} sha256=$(sha256sum "$SMOKE_TMP" | cut -c1-16)"
+
+# Drift NOTE on the launcher. The host owns launch-http.sh — step 6's swap runs the host copy, so the
+# smoke must boot the candidate with that same launcher (see BGW_LAUNCH_SCRIPT in preswap-smoke.sh)
+# and the image's copy goes unused. A divergence is therefore not dangerous, but it does mean the repo
+# has moved on; report it rather than let it rot invisibly the way the smoke did. Not fatal: if the
+# smoke actually needs a knob the host launcher lacks, it fails closed on its own.
+if [ -s "$LAUNCH_TMP" ]; then
+  IMG_LAUNCH="$(sha256sum "$LAUNCH_TMP" | cut -d" " -f1)"
+  HOST_LAUNCH="$(sha256sum "$HERE/launch-http.sh" 2>/dev/null | cut -d" " -f1 || true)"
+  if [ -n "$HOST_LAUNCH" ] && [ "$IMG_LAUNCH" != "$HOST_LAUNCH" ]; then
+    echo "deploy: NOTE — host launch-http.sh differs from the image's copy (host $(printf %.12s "$HOST_LAUNCH") vs image $(printf %.12s "$IMG_LAUNCH")). The host copy is authoritative for the swap; the repo has moved on." >&2
+  fi
+fi
+
 echo "deploy: running real-config pre-swap smoke"
-if ! BGW_DEPLOY_IMAGE="$IMAGE" BGW_DEPLOY_CONFIG="$CONFIG" "$HERE/preswap-smoke.sh"; then
+if ! BGW_DEPLOY_IMAGE="$IMAGE" BGW_DEPLOY_CONFIG="$CONFIG" BGW_LAUNCH_SCRIPT="$HERE/launch-http.sh" "$SMOKE_TMP"; then
   echo "deploy: PRE-SWAP SMOKE FAILED — live container left running, aborting." >&2
   exit 1
 fi

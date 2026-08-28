@@ -2,6 +2,7 @@
 title: Two sha256 values are not the same fact until you confirm they are the same kind of identifier
 date: 2026-08-25
 category: docs/solutions/best-practices
+revised: 2026-08-27
 module: scripts/deploy/deploy-on-host.sh, scripts/deploy/preswap-smoke.sh, .github/workflows/deploy-http.yml, src/cli/keys.ts
 problem_type: best_practice
 component: deployment
@@ -38,7 +39,9 @@ deploy path — the highest-risk surface in this repo.
 The conclusion was wrong. The two values were never supposed to match. They are different *kinds* of
 identifier for the same image, and the mismatch is guaranteed by construction.
 
-`scripts/deploy/deploy-on-host.sh:93` captures the rollback anchor like this:
+`scripts/deploy/deploy-on-host.sh` captures the rollback anchor like this (line 173 as of
+2026-08-27 — VIL-134 inserted the image-extraction block above it, so grep the symbol rather than
+trusting the number):
 
 ```sh
 # 5 — capture the currently-running image (by ID = runnable digest) for rollback.
@@ -152,6 +155,20 @@ None of these needed anything beyond reading the cited lines. All three were ins
 stacked on the invalid comparison, which is how one bad comparison became a four-part case for
 touching the deploy path.
 
+> **Addendum 2026-08-27 — the refutations above were right, and were reached the wrong way.** Each
+> cites a line number in `scripts/deploy/*.sh` as evidence about **production** behaviour. VIL-134
+> later established that production did not run those files: the CD deploy executed an *inline* copy
+> of the smoke inside the host's own `deploy-on-host.sh`, and `--apply` executes a separate on-host
+> copy of `preswap-smoke.sh`. The repo copies were not the executing code, so citing their line
+> numbers proved nothing about prod by itself.
+>
+> The conclusions survive on re-checking the host's actual file — the digest regex and the repo/owner
+> check really are there, at the *same* lines 44 and 49, because those particular lines had not
+> drifted. That is luck, not method. The doc's own lesson applies to the doc: **trace the value
+> where it executes.** For deploy scripts that means reading the copy on the host, or confirming the
+> path sources it from the image. Since VIL-134 the CD smoke *is* sourced from the image, so a repo
+> line number is finally evidence about prod for that one file — and still is not for the others.
+
 This is the same failure family as
 [a test whose stub guarantees the assertion proves nothing](a-test-whose-stub-guarantees-the-assertion-proves-nothing.md)
 and the project rule "Measure; do not reason" (`CLAUDE.md`): a claim about system behavior was
@@ -182,7 +199,7 @@ against the artifact that would prove or disprove it.
 
 **After (confirm the identifier kind first):**
 
-> `grep -n "ROLLBACK_IMAGE=" scripts/deploy/deploy-on-host.sh` → line 93: captured via
+> `grep -n "ROLLBACK_IMAGE=" scripts/deploy/deploy-on-host.sh` → line 173: captured via
 > `docker inspect "$CONTAINER" --format '{{.Image}}'` — a **container** inspect, image ID.
 >
 > `grep -n "Manifest.Digest" .github/workflows/deploy-http.yml` → line 42: captured via

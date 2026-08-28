@@ -5,10 +5,16 @@
 # then tear it down. Exit 0 = safe to swap; non-zero = ABORT, live container UNTOUCHED.
 #
 # Single source of truth for the pre-swap smoke, shared by:
-#   - the CD deploy wrapper (deploy-on-host.sh) — passes the NEW image being deployed;
+#   - the CD deploy wrapper (deploy-on-host.sh) — passes the NEW image being deployed. Since VIL-134
+#     the deploy does NOT run an on-host copy of this file: it extracts THIS FILE FROM THE IMAGE it is
+#     deploying and runs that, so hardening added here is live on the very next deploy with no host
+#     sync. Edits to the assertions below therefore reach production by being merged and built.
 #   - the `obscura keys|vault --apply` provisioning path — passes the CURRENTLY-RUNNING image (only
 #     the env file / manifest changed), so a malformed mutation is caught before it touches the live
-#     container instead of crash-looping it (the documented `keys --apply` crash-loop vector).
+#     container instead of crash-looping it (the documented `keys --apply` crash-loop vector). That
+#     path still invokes an on-host INSTALLED copy of this script via `smokeCmd`, so an on-host copy
+#     remains and can drift from the repo. Deliberate for now, and the narrower risk: `--apply` never
+#     changes the image, and the drift is confined to one operator-run command rather than to CD.
 # Both validate the exact config the live container is about to (re)read, before the swap.
 #
 # This catches the failure class the HTTP gate cannot: a malformed prod env var, a consumers.json
@@ -27,6 +33,18 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The launcher this smoke boots the candidate with. Defaults to the sibling copy, which is correct
+# for the on-host standalone install (the `--apply` path) and for running this script from a checkout.
+#
+# The CD path overrides it (VIL-134): there, this script is extracted from the IMAGE into a temp file,
+# so "$HERE" is a scratch directory with no launcher in it. deploy-on-host.sh points BGW_LAUNCH_SCRIPT
+# at the HOST's launch-http.sh on purpose — the smoke is a pre-flight of the real swap, and the real
+# swap uses the host's launcher. Booting the candidate with a DIFFERENT launcher than the one that
+# will actually deploy it would make this gate a false green.
+LAUNCH_SCRIPT="${BGW_LAUNCH_SCRIPT:-$HERE/launch-http.sh}"
+[ -x "$LAUNCH_SCRIPT" ] || { echo "smoke: launcher not executable: $LAUNCH_SCRIPT" >&2; exit 2; }
+
 CONFIG="${BGW_DEPLOY_CONFIG:-$HOME/browse-gateway-deploy.env}"
 [ -r "$CONFIG" ] || { echo "smoke: config not readable: $CONFIG" >&2; exit 2; }
 # shellcheck disable=SC1090
@@ -66,7 +84,7 @@ preswap_smoke() {
        BGW_RESTART=no \
        BGW_CPUS="${BGW_SMOKE_CPUS:-0.5}" BGW_MEMORY="${BGW_SMOKE_MEMORY:-1g}" \
        BGW_SHM_SIZE="${BGW_SMOKE_SHM_SIZE:-256m}" \
-       BGW_PIDS_LIMIT="${BGW_SMOKE_PIDS_LIMIT:-256}" "$HERE/launch-http.sh" >/dev/null; then
+       BGW_PIDS_LIMIT="${BGW_SMOKE_PIDS_LIMIT:-256}" "$LAUNCH_SCRIPT" >/dev/null; then
     echo "smoke: image failed to launch against the real config" >&2
     return 1
   fi

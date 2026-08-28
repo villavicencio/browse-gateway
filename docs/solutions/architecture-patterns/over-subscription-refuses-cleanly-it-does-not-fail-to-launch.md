@@ -1,8 +1,9 @@
 ---
 title: Over-subscription refuses cleanly — so a reported launch failure is not a capacity story
 date: 2026-08-05
+revised: 2026-08-27
 category: docs/solutions/architecture-patterns
-module: gateway/session-manager, gateway/index, scripts/measure-pool-under-load
+module: gateway/session-manager, gateway/index, gateway/config, scripts/measure-pool-under-load
 problem_type: architecture_pattern
 component: session-pool
 severity: medium
@@ -10,6 +11,7 @@ applies_when:
   - "A consumer reports clustered failures and attributes them to pool exhaustion"
   - "You are about to change the launch deadline, the pool size, or the admission logic"
   - "You need to know what the gateway actually says when a fleet over-subscribes it"
+  - "You are setting maxSessions and want to know whether the host can honour it"
 ---
 
 ## Problem
@@ -112,6 +114,57 @@ evidence sits beside the run, not inside it.
   about deliberately; the pool-sizing comment already says the spare slot is deadlock prevention
   and explicitly *not* headroom for concurrent retrieves (`src/gateway/config.ts:104-105`).
 - **The next question is resource pressure under real workloads**, not admission control.
+
+## UPDATE 2026-08-27 — the open question now has a measured answer
+
+This doc closed on: *"the next question is **what makes Chromium fail to start under a real
+concurrent workload** — a resource question (memory, `/dev/shm`, PIDs, FDs) that this measurement
+deliberately cannot reach."* A per-session memory measurement has now reached it. See
+[measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss](../best-practices/measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss.md).
+
+**Measured on prod, 2026-08-27:** an idle floor of ~361 MiB and **~651 MiB PSS per browser session**
+against the container's 4096 MiB cap → `(4096 − 361) / 651 = 5.7` (all MiB), i.e. **about 5 concurrent
+sessions**. Production's configured `maxSessions` is **7**.
+
+### The consequence, stated plainly
+
+**The admission ceiling is set above the resource ceiling.** Everything this doc established about
+admission control still holds — it refuses cleanly, quickly, and with a message that names the
+limit. But it refuses at *7*, and the box holds about *5*. Sessions 6 and 7 are therefore **admitted
+by a correctly-functioning admission layer and then run into a memory wall**, which surfaces as a
+launch failure rather than as the clean `session limit reached (7)` refusal this doc documents.
+
+That is exactly the regime the original measurement excluded by construction: a 2-slot pool on a
+loopback fixture path with no proxy-connect and no remote render cost. The "validity limit" section
+above bounded the null result to *"not reproducible without proxy and remote cost"* — and the reason
+is now concrete rather than hypothetical. It is not that admission control is wrong. It is that
+**nothing in the tree derives a ceiling from host memory**: the only cap validation is the pool
+*floor* (`consumerCount × perConsumerMax + 1`), so `maxSessions` can be set to any number and the
+boot check will happily accept it.
+
+### What this does and does not establish
+
+- **Does:** a real, measured mechanism by which a correct admission layer over-admits into launch
+  failure, and the reason the earlier fixture run could not see it.
+- **Does not:** that this caused the specific field report. That incident's `browser core failed to
+  launch` remains unattributed; this is a mechanism with the right shape, not a confirmed diagnosis.
+  Peak observed concurrency in 44 h of prod logs was **1 session**, so on *this* deployment the wall
+  is not currently being reached.
+
+### Revised guidance
+
+- The bullet below — *"do not resize the pool on the strength of the field report"* — **still
+  stands**, and now for a second, stronger reason: 7 is already above what the host can hold, so
+  resizing *up* is the wrong direction and resizing *down* toward ~5 is a correctness argument, not
+  a capacity one. Tracked as **VIL-131** (Medium: single-operator box, peak concurrency 1).
+- **Treat `maxSessions` as a claim about the host, not a preference.** Before changing it, measure
+  PSS per session on the target box; do not infer it from `docker stats` or summed RSS, both of
+  which are wrong here and in opposite directions.
+- **A clean refusal is the good outcome.** If a fleet is hitting launch failures rather than
+  `session limit reached (N)`, suspect that `N` is set above the resource ceiling before suspecting
+  the admission logic.
+
+---
 
 ## The general lesson
 
