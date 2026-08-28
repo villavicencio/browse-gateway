@@ -1,56 +1,55 @@
 ---
-created_at: "2026-08-27T22:22:03-07:00"
+created_at: "2026-08-28T00:09:06-07:00"
 branch: "main"
-head: "279719d"
+head: "3067e9d"
+resume_focus: "Execute docs/plans/2026-08-28-0000-feat-search-epic-overnight-plan.local.md from Phase 0 — VIL-121 → VIL-122 → VIL-123, deploy VIL-121 only"
 ---
-# HANDOFF — 2026-08-27, late evening
+# HANDOFF — 2026-08-28, just past midnight
 
-Picked up the previous handoff's item 1 (VIL-135) and closed it: the host launcher was synced and the graceful stop was **watched draining real in-flight sessions in production**, ending the on-host-copy drift class that VIL-134 opened. A follow-up round then closed five loose ends from that work — including a credential this session itself leaked through a redaction filter that could not fail visibly.
+A planning-only session. No code changed and nothing was deployed: the search epic (VIL-120) was groomed and pointed, the two provider decisions were made from a live pricing survey, and a prescriptive overnight runbook was written for an unattended lower-model session to execute the whole arc. The tree is clean at the same `main` the previous handoff left.
 
-> Fleet identities are deliberately absent (public repo). Host names, consumer names, the prod env, the on-host paths, and both token fingerprints live in the private vault memory notes and on VIL-135.
+> Fleet identities, keys, and the epic's research-domain query are deliberately absent (public repo). The runbook itself is gitignored and must stay that way.
 
 ## What We Built
 
-- **VIL-135 closed — host launcher + on-host smoke synced.** No PR: this is a host-side operation, so the *only* repo trace is `d88c5ab`. Both files now hash-match the repo, joining `deploy-on-host.sh` from VIL-134 — all three deploy scripts are finally identical to source. Backups retained beside each. **The evidence is on the ticket, not in the diff**, which is the whole reason VIL-135 existed.
-- **`docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`** (`d88c5ab`) gained an outcome section: the drift NOTE's first real catch, the both-directions verification method, and the two instrument traps below. Read it before verifying any gate here — the method is the reusable part.
-- **`docs/solutions/best-practices/redacting-a-secret-needs-a-verified-redactor-not-a-regex-you-eyeballed.md`** (`279719d`) — new. The BSD/GNU regex failure, the structural `jq` alternative, and two verification checks that assert no *real* value from the file survives the filter.
-- **`CLAUDE.md`** (both commits) — the gate rule updated to reflect that the launcher is now synced, plus two new Secrets-&-hygiene bullets: never hand-roll a redaction regex, and the health-token rotation procedure (which requires a container **re-create**, not a restart).
-- **VIL-135 carries two long evidence comments** — acceptance criteria with hashes, the captured shutdown sequences, and the follow-up round. That is the durable record; this handoff is the pointer.
+- **`docs/plans/2026-08-28-0000-feat-search-epic-overnight-plan.local.md`** — the runbook. Gitignored (`*.local.md`), 614 lines. Its ground-truth section carries `file:line` anchors verified against `main` @ `3067e9d`; if a line has drifted, grep the symbol. **The kickoff prompt for the new session is in its header** and was also put on the clipboard.
+- **VIL-120 / 121 / 122 / 123 in Linear** — each carries a dated "Grooming — 2026-08-27" section appended below the original text (originals untouched), estimates 5 / 8 / 5 Fibonacci, and two grooming comments on the epic (sizing rationale; provider decision with the verbatim pricing table + fetch timestamps). VIL-113 carries a note that the `rate-limited` classifier now lands via VIL-121.
+- **VIL-121 field-evidence comment** — the automatic-path reproduction captured tonight (thin 404 → `isHardBlock` → 2 proxied exits → `timeout`, 90.3 s). It widens the ticket: 404/410 join CAPTCHA-without-solver and 429 as classes a fresh exit cannot clear.
+- **Project memory** — `linear-obscura-project-tracking.md` gained the grooming + provider-decision entries; the MEMORY.md index line was updated.
 
 ## Decisions Made
 
-- **Swapped via `applyCmd` directly rather than the `keys new`/`revoke --apply` round-trip** for the first production swap (operator choice, asked before touching prod). Reason: the CLI's only `--apply` verbs mutate the consumer manifest, and the pool floor was one slot below cap with VIL-133's pre-flight still unbuilt. The CLI wrapper was exercised separately afterwards with a throwaway consumer, so nothing was given up.
-- **Rotated the leaked credential rather than scrubbing the transcript.** Scrubbing does not un-disclose. Verified in both directions — the old token must be *refused* before the new one working means anything.
-- **The launcher stays host-owned.** Carried forward from VIL-134 and not relitigated: the smoke must boot the candidate with the same launcher the swap will use, or the gate is a false green. Drift is reported as a NOTE, never fatal.
-- **The five-consumer count is correct and deliberate** — one consumer was retired earlier the same day because it had been idle 44 hours, and revoking *lowers* the pool floor. Not drift. **Do not re-add it without a reason.**
-- **Verification of a negative needs its own control.** Before trusting "the Keychain entry is absent," the lookup was validated against entries that *do* exist — otherwise a wrong service name reads identically to a clean removal.
+- **Providers: Brave Search (VIL-122 primary), Google Custom Search JSON (VIL-123 fallback).** Both first-party, both $5/1k past free tiers that cover current volume, different indexes. Scrapers rejected (5× entry price, Google-ToS exposure). **Bing is retired** (Microsoft hub, 2025-08-11) — never propose it. Pricing was fetched 2026-08-27 ≈23:05 PDT; the table with sources is the VIL-120 comment.
+- **No API keys exist during the overnight run** (operator). Adapters are built from provider docs fetched at kickoff plus scrubbed fixtures and a deterministic fake; live verification is a filed morning ticket.
+- **Deploy scope: merge all three, deploy VIL-121 only** (operator). The `search` tool is registered only when `BGW_SEARCH_ENABLED=1`, so merging VIL-122/123 is byte-identical for prod until keys land.
+- **Mechanism correction recorded on the tickets:** the observed 90 s was *not* the automatic ladder — `shouldEscalateToProxy` fires only on CF-challenge or hard block, and the reCAPTCHA page was a 200. It was the consumer's own `forceProxy` retry re-rolling an unclearable page until `BGW_CALL_BUDGET_MS`, then #43's timeout override erasing the root class. Tonight's 404 case showed the same burn on the automatic path, so the fix goes in the shared loop.
+- **The #43 conflict is resolved by rule, not by deletion:** budget exhaustion becomes a `budgetExhausted` field; it overrides the class only when the root is non-decisive. `validate-call-budget.mjs` leg B stays green by construction (its synthetic render has no decisive root).
+- **Scope cuts:** browser-SERP fallback adapter (no owner for HTML result extraction), query cache and URL dedup (Brave's storage-rights clause) — all deferred to follow-up tickets the runbook files in Phase 4.
+- **Vocabulary spelling:** kebab-case (`rate-limited`), matching the repo's closed enums, not the tickets' snake_case.
+- **Points:** Fibonacci; children only, epic unpointed. Estimates ARE enabled on the team — the Linear MCP just cannot read the scale, so it was asked.
 
 ## What Didn't Work
 
-- **A redaction filter that silently matched nothing, leaking a token into session output.** `\s` is a GNU extension; BSD `sed` treats it as a literal `s`. The filter exited 0 and printed plausible output. This is the `a-test-whose-stub-guarantees-the-assertion-proves-nothing` family applied to a redactor: one that *cannot* match looks exactly like one with nothing to redact. Cost: a live credential rotation.
-- **The same BSD/GNU class bit twice more.** A GNU `stat` shadows BSD `stat` on the Mac, so `stat -f '%Lp'` printed filesystem info instead of permissions; and `docker events --until <UTC timestamp>` parses the value as *local* time, reads it as future, and streams forever — burned two backgrounded commands before switching to a pre-started log follower.
-- **`.HostConfig.StopTimeout` is not where `--stop-timeout` lives** (it is `.Config.StopTimeout` on Docker 29.x). Its absence was briefly recorded as evidence the old launcher created the container. The conclusion was right by luck; the key is absent on *every* container under this daemon. The sound evidence — the launcher files themselves — needed no container at all.
-- **The bare SSH host alias lands as `root`, on the rootful daemon**, where the gateway container does not exist. That reads exactly like "production is down." The admin identity is the non-root deploy user; check `id` before believing an empty `docker ps`.
-- **Shell history and repo docs were both dead ends** for explaining a fleet change made by an agent session — it runs the CLI through its tool layer, which never writes shell history, and had recorded nothing in any ticket or doc.
+- **Serper's `/pricing` page 404s and its tiers are not on any fetchable page** — recorded as "not listed" rather than guessed. Tavily's paid tier price renders as an animation placeholder on both fetch tiers; only its per-credit rate from the docs was usable.
+- **The Linear MCP exposes neither the team's estimation type nor its scale** (`get_team` returns name/timestamps only) — a decision question to the operator, not a lookup.
 
 ## What's Next
 
-1. **VIL-130 — the health surface.** Folds every fault into one `degraded` bit and cannot see the browser core. Highest-value remaining item, and this session leaned on `obscura status` repeatedly as the only end-to-end signal, which is exactly the thing that is too coarse.
-2. **VIL-133 — pre-flight the pool floor in `keys new --apply`.** `poolSizingError` is pure and exported, so the CLI can call the identical function the boot check uses. This session had to reason about the floor by hand twice; that is the ticket's whole argument.
-3. **The one gate still never watched refusing: the `--apply` wrapper aborting on a smoke failure.** It has now run green twice, but a deliberate smoke-fail was not manufactured in production. Closing it needs a staged bad config against a throwaway container — the VIL-134 RED-image method is the template.
-4. **M2 of the versioning plan (U6/U7/U5/U9) is entirely unbuilt** — optional follow-on, not an outstanding obligation of v1.0.0. U6/U9's axes are blocked on VIL-127.
-5. **Still unexplained, carried over:** two successful `retrieve` calls showed no Chrome process across ~79 samples, contradicting `src/verbs/retrieve.ts:42-50`. Do not assume `docker top` sees the whole tree until settled.
+1. **Start the overnight session** in this directory on the lower model and paste the kickoff prompt (clipboard, or the header of the runbook). It reads CLAUDE.md → the runbook → this file, then runs Phase 0 → Phase 4. Timebox ≈ 10.75 h wall-clock.
+2. **Morning, if the run completed:** verify per the runbook's "Verification" section — three squash-merges, one green `deploy-http` run, `obscura status` healthy with five consumers, a thin-404 retrieve through prod returning in < 30 s with `proxyUsed=false`, the `search` tool still absent from prod, four follow-up tickets filed.
+3. **Morning, regardless:** create the Brave Search API account and the Google Cloud project + Programmable Search Engine (set to search the whole web — verify that toggle's wording), then work the "Enable search in prod" ticket the runbook files: keys into the prod env, `BGW_SEARCH_ENABLED=1`, container **re-create** (not restart), boot line reads `search=brave,google`, one live search.
+4. **If the run stopped early:** the runbook's stop rules leave a pushed branch with a `WIP:` draft PR and a rewritten HANDOFF.md naming the exact gate it stopped on. Pick up from there, not from Phase 0.
+5. Still open from the previous handoff, unchanged: VIL-130 (health surface), VIL-133 (pool-floor pre-flight), the never-watched `--apply` smoke refusal, M2 of the versioning plan, the two `retrieve` calls with no Chrome process across ~79 samples.
 
 ## Gotchas & Watch-outs
 
-- **⚠️ The drift NOTE is now silent. If it reappears, the host drifted again** — that is its job, not a bug to suppress. All three deploy scripts currently hash-match the repo; count the copies before trusting any one of them.
-- **⚠️ `docker rm` follows `docker stop` within seconds, destroying the old container's shutdown log.** Start a `docker logs -f --tail 0` follower *before* a swap or the graceful-stop evidence is unrecoverable. Do not reach for `docker events` afterwards (see above).
-- **⚠️ A redactor is a guard — test it against a known secret before pointing it at real output.** Prefer structural `jq` redaction over regex, and assert that no actual value from the file survives. Assume BSD userland on the Mac; `\s`/`\d`/`\w`, `sed -i`, and `grep -P` all diverge silently, and coreutils on `PATH` can shadow the BSD tool you think you are calling.
-- **Rotating the health token requires a container RE-CREATE** — a `docker restart` keeps the old env. Verify the old token is *refused* before concluding the rotation took.
-- **`keys new` without `--apply` stages the manifest and env but leaves the container untouched**, so the running gateway does not see the new consumer until something re-creates it. `keys revoke` removes the macOS Keychain entry itself.
-- **When a fleet change has no explanation, grep the session transcripts before calling it accidental** — for an agent-run CLI they are the only audit trail. Cross-check against the manifest/env mtimes; an `--apply` writes both within a second and re-creates the container minutes later.
-- **`npm test` cannot be green on macOS** — 223 failures is the baseline, all `artifact-filesystem-unsupported`. Compare a delta, never the absolute number.
-- **`main` is not branch-protected** — confirm a CI run exists for the head sha before merging.
-- **A push aborts an in-flight CodeRabbit review**; land edits first, then request the round. Read the check *description*, never its state.
-- **Measurement JSON carries the egress IP**; run `validate-*`/`measure-*` only in-container. (Carried over.)
-- **The deploy id is keyed on the FULL commit sha**, is an HMAC rather than a sha prefix, and does not resolve as a git revision — `git log <deploy-id>` fails by design. (Carried over; bit again this session.)
+- **⚠️ The runbook is gitignored and must never be committed** — it names the research-domain context by reference and is operator-private by convention (`plans-stay-local-not-proof`). `git check-ignore -q docs/plans/2026-08-28-0000-*.local.md` must print nothing and exit 0.
+- **⚠️ PR bodies auto-close named Linear ids on merge.** The runbook restricts each PR body to the one ticket it completes; after every merge re-check VIL-113/121/122/123/127 states.
+- **⚠️ `main` is not branch-protected and CodeRabbit's check state is not a review verdict.** The runbook copies the exact check-description and unresolved-thread commands from CLAUDE.md; an executor that reads `mergeStateStatus: CLEAN` as reviewed will merge unreviewed code.
+- **The only sanctioned prod mutation overnight is `gh workflow run deploy-http.yml -f image_tag=latest` for VIL-121**, after CI's build-and-push on the merge commit succeeds. No host `docker`, no prod env edits, no `~/.config/obscura/config.json` changes.
+- **Brave's FAQ forbids storing results without a storage-rights plan** — one more reason the cache stays out; do not let a "small TTL cache" slip back in during review.
+- **Google CSE caps `num` at 10 and the free tier at 100/day with a 10k/day hard cap** — the adapter must clamp and must classify the daily cap as `quota-exhausted`, not retry.
+- **A `retrieve` of a thin 404 through prod currently costs ~90 s and two residential exits** — that is the pre-deploy baseline the runbook captures before the VIL-121 deploy and re-runs after; it is the watched RED→GREEN for the night.
+- **`npm test` cannot be green on macOS** (223 baseline failures, all `artifact-filesystem-unsupported`); the runbook records a baseline in Phase 0 and compares deltas only.
+- **Assume BSD userland; redact structurally with `jq` and test the redactor against a known value first.** (Carried over — it cost a token rotation last session.)
+- **The deploy id is an HMAC of the full commit sha, not a git revision.** (Carried over.)
