@@ -45,8 +45,14 @@ function sandbox({ imageSmoke, imageLauncher = null, hostSmoke = "#!/usr/bin/env
   chmodSync(join(deploy, "preswap-smoke.sh"), 0o755);
 
   // Fake launcher: the SWAP marker. Its absence is how a RED proves "live container untouched".
+  //
+  // It records the DIRECTORY IT WAS RUN FROM, which is what makes the marker specific. deploy-on-host
+  // copies this launcher next to the extracted smoke, so a pre-VIL-134 smoke invoking
+  // "$HERE/launch-http.sh" runs the copy in the scratch dir — and a bare "did LAUNCHED appear"
+  // assertion would then be satisfied by the SMOKE's launch and pass even if the real swap never
+  // happened. Only a line naming the deploy dir proves step 6 ran.
   writeFileSync(join(deploy, "launch-http.sh"),
-    `#!/usr/bin/env bash\necho "$BGW_DEPLOY_IMAGE" >> "${marks}/LAUNCHED"\nexit 0\n`);
+    `#!/usr/bin/env bash\nSELF="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"\necho "$SELF|$BGW_DEPLOY_IMAGE" >> "${marks}/LAUNCHED"\nexit 0\n`);
   chmodSync(join(deploy, "launch-http.sh"), 0o755);
 
   // What the "image" carries at /app/scripts/deploy/preswap-smoke.sh. null = absent.
@@ -112,7 +118,19 @@ function runDeploy(sb) {
   });
 }
 
-const swapped = (sb) => existsSync(join(sb.marks, "LAUNCHED"));
+/** True only when the FINAL swap ran — i.e. the launcher in the host deploy dir, not the copy the
+ *  extracted smoke boots the candidate with. See the launcher fixture above. */
+const swapped = (sb) => {
+  const f = join(sb.marks, "LAUNCHED");
+  if (!existsSync(f)) return false;
+  return readFileSync(f, "utf8").split("\n").some((l) => l.startsWith(`${sb.deploy}|`));
+};
+/** True when the extracted smoke launched the candidate from its own scratch dir. */
+const smokeLaunched = (sb) => {
+  const f = join(sb.marks, "LAUNCHED");
+  if (!existsSync(f)) return false;
+  return readFileSync(f, "utf8").split("\n").some((l) => l && !l.startsWith(`${sb.deploy}|`));
+};
 
 test("GREEN — the deploy runs the smoke that shipped in the image, not the host's copy", () => {
   const sb = sandbox({
@@ -194,5 +212,6 @@ test("a PRE-VIL-134 smoke (no BGW_LAUNCH_SCRIPT support) still finds a launcher 
   const r = runDeploy(sb);
   assert.equal(r.status, 0, `an image predating BGW_LAUNCH_SCRIPT must still deploy:\n${r.stdout}\n${r.stderr}`);
   assert.ok(existsSync(join(sb.marks, "OLD-SMOKE-FOUND-LAUNCHER")), "the old smoke must resolve a launcher beside itself");
-  assert.ok(swapped(sb), "the deploy must proceed to the swap");
+  assert.ok(smokeLaunched(sb), "the old smoke must have launched the candidate from its own scratch dir");
+  assert.ok(swapped(sb), "the deploy must still proceed to the FINAL swap, distinct from the smoke's launch");
 });

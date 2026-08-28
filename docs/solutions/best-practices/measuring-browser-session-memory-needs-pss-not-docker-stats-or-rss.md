@@ -36,7 +36,7 @@ tags:
 The gateway runs headful Chrome under Xvfb inside a resource-capped Docker container. The container
 caps are set by the deploy launcher at `scripts/deploy/launch-http.sh:86-95`:
 
-```
+```bash
 --cpus="${BGW_CPUS:-1.75}" --memory="${BGW_MEMORY:-4g}" --memory-swap="${BGW_MEMORY:-4g}" \
 --pids-limit="${BGW_PIDS_LIMIT:-512}" --shm-size="${BGW_SHM_SIZE:-1g}"
 ```
@@ -248,7 +248,7 @@ are the same concept.
 
 **Instrument 1: `docker stats --no-stream`.** Wrong on both axes.
 
-```
+```bash
 $ docker stats --no-stream <container>      # container has ZERO Chrome processes
 CPU %      MEM USAGE
 154.94%    1.068GiB
@@ -265,16 +265,18 @@ reading, because cache movement dominates the process working set.
 
 **Instrument 2: summed RSS from `docker top <container> aux`.** Over-counts ~2.4x.
 
-```
-$ docker top <container> aux | awk '/opt\/google\/chrome/{s+=$6} END{printf "%.0f MiB across %d procs\n", s/1024, NR}'
+```bash
+$ docker top <container> aux | awk '/opt\/google\/chrome/{s+=$6; n++} END{printf "%.0f MiB across %d procs\n", s/1024, n}'
 1556 MiB across 14 procs
+# n, not NR: NR counts every row docker top prints — the header, node, Xvfb — while only the
+# chrome rows are summed. NR would pair a correct MiB total with an inflated process count.
 ```
 
 Every page shared from the zygote is counted once per process.
 
 **Instrument 3: PSS from `/proc/<pid>/smaps_rollup`.** Correct.
 
-```
+```bash
 $ pids=$(docker top <container> aux | awk '/opt\/google\/chrome/{print $2}')
 $ for p in $pids; do awk '/^Pss:/{s+=$2} END{print s+0}' /proc/$p/smaps_rollup; done \
     | awk '{t+=$1} END{printf "%.0f MiB PSS across %d procs\n", t/1024, NR}'
