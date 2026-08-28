@@ -1,0 +1,22 @@
+<!doctype html>
+<!-- SHAPE: an interactive-CAPTCHA interstitial served as HTTP 200 — the case that burned 90.2s and two
+     residential exits on 2026-08-25. Two properties matter and both are load-bearing:
+       1. a visible block phrase ("unusual traffic") so the page is `blocked` despite the 200 status;
+       2. a REAL, ACTIVE widget container (class + data-sitekey) so the widget kind is attributed —
+          a bare library <script> is deliberately NOT enough, and must not be added here.
+     The block is otherwise GENERIC — it carries no protection-vendor marker — which is what lets the block
+     reason be promoted to `captcha`. Copy is written to the documented phrase list; nothing is transcribed.
+     NOTE: vendor names are banned from these files INCLUDING comments — the hint scanners read raw HTML
+     and do not strip comments, so naming one here silently re-classifies the fixture. -->
+<html lang="en">
+  <head><title>Verify you are human</title></head>
+  <body>
+    <h1>Unusual traffic detected</h1>
+    <p>Our systems have detected unusual traffic from your computer network.</p>
+    <form action="https://example.invalid/verify" method="POST">
+      <div class="g-recaptcha" data-sitekey="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"></div>
+      <button type="submit">Continue</button>
+    </form>
+    <p><a href="https://example.invalid/help">Why am I seeing this?</a></p>
+  </body>
+</html>

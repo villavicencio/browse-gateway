@@ -220,6 +220,24 @@ function renderFailure(diag: FailureDiagnostics): string {
   return `\nfailure: ${JSON.stringify(summarizeFailureDiagnostics(diag))}`;
 }
 
+/**
+ * Actionable next-step advice keyed on the surfaced `why` — the block {@link BlockReason} when the page was
+ * blocked, else the typed {@link FailureClass} from the envelope. Only the classes where the caller's next
+ * move is NON-OBVIOUS and where guessing wrong is expensive get an entry; everything else renders no hint,
+ * exactly as before.
+ *
+ * Keyed as a plain record over both vocabularies (they overlap by design — `captcha` and `rate-limited` are
+ * spelled identically in each) so one lookup serves whichever of the two produced `why`. VIL-121 added
+ * `rate-limited`, whose advice is the direct inverse of a reputation block's: a 403 wants a fresh exit, a 429
+ * wants patience, and the whole point of splitting the class is that the caller stops being told the first
+ * when the site said the second.
+ */
+const RETRIEVE_FAILURE_HINTS: Readonly<Record<string, string>> = Object.freeze({
+  captcha: " — interactive CAPTCHA, no solver configured",
+  "rate-limited":
+    " — the target is rate-limiting this client; wait and retry, do not force the proxy (a fresh exit does not clear a 429)",
+});
+
 // U1: the default is RESOLVED, never a literal. Memoized because `createGatewayMcpServer` runs
 // once per HTTP connection — the launchers pass `deps.version` explicitly (resolved at boot), so
 // this path is for tests and for `validate-http.mjs`, which builds its own server and therefore
@@ -297,7 +315,7 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           // Hint on the surfaced `why` (not just `result.reason`), so a thin-shell CAPTCHA served as a
           // 200 — surfaced as failureClass=captcha with reason=null (the #40 empty-shell follow-up) — still
           // tells the caller it needs a solver, at parity with a reason=captcha block.
-          const hint = why === "captcha" ? " — interactive CAPTCHA, no solver configured" : "";
+          const hint = RETRIEVE_FAILURE_HINTS[why] ?? "";
           const diag = result.proxyDiagnostic ? `\ndiagnostics: ${JSON.stringify(result.proxyDiagnostic)}` : "";
           // Surface the failure-evidence envelope (issue #39) — finalUrl / title / status / redirect chain /
           // console + network — so a retrieve failure is diagnosable instead of opaque. Already redacted.

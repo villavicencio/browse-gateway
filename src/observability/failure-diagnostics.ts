@@ -55,6 +55,12 @@ export type WafVendor =
  *                       (carries {@link WafVendor} when attributable).
  *   - `captcha`         an ACTIVE interactive CAPTCHA widget is the block (carries the widget-kind vendor).
  *   - `hard-block`      4xx/5xx + thin body, no vendor marker (IP/WAF reputation).
+ *   - `rate-limited`    (VIL-121) a thin-bodied HTTP **429** document — the target is asking this client to
+ *                       slow down. Split OUT of `hard-block` because the two want opposite responses: a
+ *                       reputation block wants a fresh residential exit, a rate limit wants WAITING. Never
+ *                       requests a fresh exit (see {@link import("../browser/index.js").UNCLEARABLE_STATUSES}),
+ *                       and carries NO WAF vendor — a 429 that also carries a CF/PX/DataDome marker attributes
+ *                       to that vendor first, because a managed challenge IS exit-clearable.
  *   - `empty-shell`     a 2xx/3xx page that yielded NO extractable content — the formalized `empty-content`
  *                       (an unhydrated SPA shell or a genuinely empty page). The common non-block failure.
  *   - `hydration-failed` a 2xx/3xx thin page with an SPA framework root AND a genuine (non-guard) failed
@@ -97,6 +103,7 @@ export type FailureClass =
   | "anti-bot-block"
   | "captcha"
   | "hard-block"
+  | "rate-limited"
   | "empty-shell"
   | "hydration-failed"
   | "real-zero-results"
@@ -107,6 +114,73 @@ export type FailureClass =
   | "burned-exit"
   | "timeout"
   | "ok";
+
+/**
+ * VIL-121: the classes a RETRY CANNOT CHANGE — the failure-class mirror of
+ * {@link import("../browser/index.js").UNCLEARABLE_STATUSES}. This is the one place that judgement is
+ * written down; {@link finalFailureClass} is the only consumer.
+ *
+ * The test for membership is NOT "did the site tell us something" — nearly every class carries some site
+ * signal. It is the narrower, operational question: **if the caller acts on this label by asking again,
+ * are they wrong?** For these three, yes:
+ *   - `rate-limited` — the site asked us to slow down. A retry is at best the same answer, at worst evasion.
+ *   - `captcha`      — an ACTIVE interactive widget with no solver wired. A retry re-draws the same wall.
+ *   - `policy-blocked` — our OWN nav guard refused. No exit, and no amount of waiting, reaches an
+ *                      off-allowlist target; the fix is the policy.
+ *
+ * DELIBERATELY EXCLUDED — and the two exclusions that matter are the ones a first reading wants to add:
+ *   - `hard-block` and `anti-bot-block` are the EXIT-CLEARABLE classes. A thin 403 and a Cloudflare managed
+ *     challenge are precisely what a clean residential exit fixes (F1 2026-06-01; CF clearance is
+ *     screenshot-proven) — the entire reason the escalation ladder exists. For them "we ran out of time,
+ *     try again" is not a lost verdict, it is the CORRECT and more actionable report, and #43 chose it
+ *     deliberately: across a multi-attempt re-roll the block the LAST attempt happened to land on is
+ *     incidental, while the budget overrun is the fact that describes the whole call. Promoting them here
+ *     would silently reverse #43 for the exact case it was defending, and would flip its regression test
+ *     (a CF challenge re-rolled to budget exhaustion) from `timeout` to `anti-bot-block`.
+ *     NOTE `hard-block` is also a MIXED bag under VIL-121 — a thin 404 classifies `hard-block` yet is
+ *     unclearable — which is why exit-spending is gated on the STATUS ({@link
+ *     import("../browser/index.js").isExitClearableHardBlock}) rather than on this class. Behaviour is
+ *     correct either way; only the label is coarse.
+ *   - `nav-failed` / `burned-exit` — nothing was learned about the target; the exits or the transport died.
+ *   - `empty-shell` / `hydration-failed` / `real-zero-results` / `unsupported-browser` — best-effort
+ *     sub-classifications of a 200 that yielded nothing. A call cut short mid-render reads as one of these
+ *     from a PARTIAL DOM, so treating them as decisive would let a truncated page outrank the timeout that
+ *     actually happened.
+ *   - `timeout` / `ok` — not root classes at this seam.
+ */
+export const DECISIVE_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set<FailureClass>([
+  "rate-limited",
+  "captcha",
+  "policy-blocked",
+]);
+
+/**
+ * Reconcile a per-signal ROOT class with global budget exhaustion (VIL-121, resolving the conflict with
+ * #43 by rule rather than by deleting either side).
+ *
+ * #43 established that a call which burned the whole wall-clock budget must SAY so — otherwise a 90-second
+ * failure reported the incidental block class of whatever the last attempt happened to land on, and the
+ * caller could not tell "the site blocked us" from "we ran out of time". That guarantee is KEPT: budget
+ * exhaustion is always visible, now as the orthogonal {@link FailureDiagnostics.budgetExhausted} boolean,
+ * which is set on EVERY budget-exhausted call regardless of what this returns.
+ *
+ * What changes is precedence when the site already told us something decisive. Erasing `captcha` or
+ * `rate-limited` in favour of `timeout` destroyed the only actionable half of the report — the field case
+ * that produced this ticket burned 90 s and two residential exits and surfaced `timeout`, which advises a
+ * retry, when the truth was an unsolvable CAPTCHA that a retry re-triggers. So: a decisive root SURVIVES
+ * the budget; a non-decisive one still yields to `timeout`.
+ *
+ * `undefined` root + exhausted budget → `timeout`: callers only invoke this on a call that FAILED, so an
+ * unclassified failure that spent the budget is a timeout (this is #43's original behaviour for that case).
+ */
+export function finalFailureClass(
+  root: FailureClass | undefined,
+  budgetExceeded: boolean,
+): FailureClass | undefined {
+  if (!budgetExceeded) return root;
+  if (root !== undefined && DECISIVE_FAILURE_CLASSES.has(root)) return root;
+  return "timeout";
+}
 
 /**
  * Per-stage timing on a retrieve/drive call (issue #42) — the measurement half of the "why did it take 200s"
@@ -241,6 +315,15 @@ export interface FailureDiagnostics {
    *  the annotation seam and `#failure` is not passed the requested url, so a drive FAILURE envelope never
    *  carries this — a documented scoped deferral (that rare corner's story is its block/nav class). */
   homeFallback?: boolean;
+  /** VIL-121: the call consumed its whole wall-clock budget (`BGW_CALL_BUDGET_MS`). This is #43's guarantee
+   *  — "the caller can always see the budget was spent" — moved OFF {@link failureClass} and onto its own
+   *  orthogonal boolean, so a decisive site verdict (`rate-limited` / `captcha` / a reputation block) can be
+   *  reported as the class WITHOUT hiding that the call also ran long. Set on EVERY budget-exhausted call,
+   *  including the ones whose class is still `timeout`. A boolean → {@link redactFailureDiagnostics} passes
+   *  it through untouched (the same safety basis as {@link homeFallback}). Attached at the REDACTION seam
+   *  (retrieve.ts / drive `#failure`), never via {@link buildFailureDiagnostics}. See
+   *  {@link finalFailureClass} for the precedence rule this boolean lets us relax. */
+  budgetExhausted?: true;
 }
 
 /**

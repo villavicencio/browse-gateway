@@ -366,6 +366,41 @@ export function isHardBlock(signal: Pick<PageSignal, "text">, status: number | n
   return status !== null && status >= 400 && signal.text.trim().length < MIN_CONTENT_LENGTH;
 }
 
+/**
+ * VIL-121: document statuses a FRESH EXIT CANNOT CHANGE. Rotating to a clean residential IP is the
+ * remedy for an IP/WAF *reputation* verdict — the site would serve the page to a different client.
+ * These three are not that:
+ *   - `404` / `410` — the resource is missing or gone. It is missing from every exit; re-rolling asks
+ *     the same question from a new IP and pays a full residential session for the same answer.
+ *   - `429` — the target is rate-limiting this client and telling us to slow down. A fresh exit is
+ *     either the same answer (limit keyed on account/key/fingerprint) or evasion of a limit the site
+ *     asked us to respect. Neither is a retry we should spend an exit on.
+ * DELIBERATELY NOT here: `401`/`403`/`5xx` with a thin body. Those stay exit-clearable reputation
+ * blocks — a clean IP genuinely recovers them (F1, 2026-06-01), which is the whole reason the
+ * escalation ladder exists.
+ */
+export const UNCLEARABLE_STATUSES: ReadonlySet<number> = new Set([404, 410, 429]);
+
+/** True when `status` is one {@link UNCLEARABLE_STATUSES} names. `null` (a failed nav) is NOT one —
+ *  a dead nav says nothing about the resource, and the retry path for it is unchanged. */
+export function isUnclearableStatus(status: number | null): boolean {
+  return status !== null && UNCLEARABLE_STATUSES.has(status);
+}
+
+/**
+ * {@link isHardBlock} AND the status is one a clean exit could actually clear — the ESCALATION
+ * predicate (VIL-121). The page is still a failure either way: `navFailed` / the `blocked` decision
+ * keep reading bare `isHardBlock`, so a thin 404 is reported blocked exactly as before. This narrower
+ * predicate governs only "is a residential exit worth spending here", so the two cannot drift into
+ * "not blocked" territory by accident.
+ */
+export function isExitClearableHardBlock(
+  signal: Pick<PageSignal, "text">,
+  status: number | null,
+): boolean {
+  return isHardBlock(signal, status) && !isUnclearableStatus(status);
+}
+
 /** Vendor protection scripts present in the HTML (diagnostic only). */
 export function vendorHints(signal: PageSignal): string[] {
   return VENDOR_SCRIPT_HINTS.filter((re) => re.test(signal.html)).map(String);

@@ -1,0 +1,15 @@
+<!doctype html>
+<!-- SHAPE: a thin-bodied 429. The target is asking this client to slow down; a fresh exit either does not
+     change that or evades a limit we were asked to respect. Must classify `rate-limited`, NOT `hard-block`,
+     and must never request a fresh exit (VIL-121). Carries NO protection-vendor marker of any kind: a 429
+     that DOES carry one is a different shape (a managed challenge, which IS exit-clearable) and attributes
+     to that vendor first. Body length is deliberately under MIN_CONTENT_LENGTH.
+     NOTE: vendor names are banned from these files INCLUDING comments — the hint scanners read raw HTML
+     and do not strip comments, so naming one here silently re-classifies the fixture. -->
+<html lang="en">
+  <head><title>Too Many Requests</title></head>
+  <body>
+    <h1>Too Many Requests</h1>
+    <p>Slow down and try again later.</p>
+  </body>
+</html>

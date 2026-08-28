@@ -43,6 +43,10 @@ export interface WarmFailureEvidence {
  *      R2 (#80) before this seam (surfaced as its own policy error that preserves the session), but handled
  *      DEFENSIVELY here so a warm policy-block can never be mis-advised as stale/fresh: fix the scope/policy,
  *      NOT the credential — a fresh exit can never reach it.
+ *   1b. `rate-limited` (VIL-121) — the target threw a 429. Sits directly under `policy-blocked` and ABOVE the
+ *      fresh-exit branch on purpose: branch 3 would advise "retry to draw a clean exit", which for a rate
+ *      limit is both wrong and costly (a second residential session for the same 429). The credential is fine;
+ *      the answer is to wait.
  *   2. a LIVE behavioral challenge that reached the site — the `pxHint && pxCopy` press-&-hold shape
  *      ({@link WarmFailureEvidence.behavioralChallenge}): a fresh exit will NOT clear it and a retry
  *      RE-TRIGGERS it; the stored login is fine. Gated on the LIVE-challenge signal, NOT vendor attribution
@@ -64,6 +68,13 @@ export interface WarmFailureEvidence {
 export function warmFailureAdvice(ev: WarmFailureEvidence): string {
   if (ev.failureClass === "policy-blocked") {
     return "the target or a redirect hop is off the allowlist / owner-host — fix the scope/policy, not the credential (a fresh exit cannot reach it)";
+  }
+  // VIL-121: a rate limit must be answered BEFORE the fresh-exit branch below, which would otherwise tell a
+  // fresh-exit host to "retry to draw a clean exit" — the single worst response to a 429, since it both fails
+  // and spends another residential session. Placed with `policy-blocked` because it shares that branch's
+  // shape: the site gave a decisive verdict, the stored credential is irrelevant, and no exit changes it.
+  if (ev.failureClass === "rate-limited") {
+    return "the target is rate-limiting this client (HTTP 429) — wait before retrying; the stored login is fine and a fresh exit will not clear it";
   }
   if (ev.behavioralChallenge) {
     return "a behavioral challenge (press-&-hold) reached the site — a fresh exit will not clear it and a retry re-triggers it; the stored login is fine";

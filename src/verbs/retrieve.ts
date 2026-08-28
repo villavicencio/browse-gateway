@@ -22,10 +22,17 @@ import {
   hasUnsupportedBrowserPhrase,
   hasFrameworkRoot,
   activeCaptchaKind,
+  isUnclearableStatus,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
 import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
-import { redactFailureDiagnostics, sanitizeUrlForError, assembleTiming } from "../observability/index.js";
+import {
+  redactFailureDiagnostics,
+  sanitizeUrlForError,
+  assembleTiming,
+  finalFailureClass,
+  DECISIVE_FAILURE_CLASSES,
+} from "../observability/index.js";
 import type { FailureDiagnostics, WafVendor, FailureClass, Timing } from "../observability/index.js";
 export type { WafVendor, FailureClass, Timing } from "../observability/index.js";
 import type { Gateway } from "../gateway/index.js";
@@ -113,8 +120,9 @@ export interface RetrieveOptions {
  * behavioral interstitial — classified for diagnostics, NOT solved by the token CAPTCHA tier),
  * `datadome-challenge` (a DataDome/HUMAN block — classified for diagnostics via the persistent DataDome
  * markers; behavioral, NOT solved by the token CAPTCHA tier, and NOT escalated — see escalation.ts),
- * `hard-block` (4xx/5xx + thin body — IP/WAF reputation), `blocked` (some other visible block
- * phrase). `null` when not blocked.
+ * `hard-block` (4xx/5xx + thin body — IP/WAF reputation), `rate-limited` (VIL-121: a thin 429 — the
+ * target is throttling this client, which a fresh exit does not fix and should not try to), `blocked`
+ * (some other visible block phrase). `null` when not blocked.
  */
 export type BlockReason =
   | "nav-failed"
@@ -123,6 +131,7 @@ export type BlockReason =
   | "cf-challenge"
   | "perimeterx-challenge"
   | "datadome-challenge"
+  | "rate-limited"
   | "hard-block"
   | "blocked";
 
@@ -241,6 +250,14 @@ export function classifyBlock(sig: BlockSignal): BlockReason | null {
   // (200, fat content) is never reached. Placed AFTER cf/px (which also have a visible-phrase arm) so
   // a page tripping overlapping markers attributes to the same vendor `reason` reports first.
   if (sig.ddHint === true) return "datadome-challenge";
+  // VIL-121: a THIN-bodied 429 is a rate limit, not a reputation block. Split out here — one branch, in the
+  // shared classifier, so retrieve and drive inherit it together. Placed AFTER the vendor arms deliberately:
+  // a 429 carrying a CF/PX/DataDome marker is a managed challenge that a clean residential exit DOES clear,
+  // so it must keep attributing to the vendor (and keep escalating). Placed BEFORE `hard-block` so a bare
+  // 429 stops being indistinguishable from a 403. Gated on isHardBlock (thin body) for the same reason
+  // hard-block is: a site that returns 429 while rendering a full page is serving content, not throttling us
+  // off — and the escalation ladder never fired for a fat page anyway.
+  if (sig.status === 429 && isHardBlock(sig, sig.status)) return "rate-limited";
   if (isHardBlock(sig, sig.status)) return "hard-block";
   return "blocked";
 }
@@ -528,6 +545,9 @@ export function classifyFailure(sig: FailureSignal): FailureClass {
   if (reason === "cf-challenge" || reason === "perimeterx-challenge" || reason === "datadome-challenge") {
     return "anti-bot-block";
   }
+  // VIL-121: 1:1 with the block reason — the split only means anything if it survives to the FailureClass
+  // the MCP surface and the warm-advice map read.
+  if (reason === "rate-limited") return "rate-limited";
   if (reason === "hard-block") return "hard-block";
   if (reason === "blocked") return "anti-bot-block"; // a generic visible block phrase, no attributable vendor
   // reason === null: a 2xx/3xx page, no visible block phrase, not a hard block, that still yielded no
@@ -605,6 +625,15 @@ export interface EscalationDiagnostics {
    * engaged. Pairs with the seam-level `burned-exit` FailureClass on the failure envelope.
    */
   burnedExit?: boolean;
+  /**
+   * VIL-121: the whole call consumed its wall-clock budget (`BGW_CALL_BUDGET_MS`). Mirrors
+   * {@link import("../observability/failure-diagnostics.js").FailureDiagnostics.budgetExhausted} onto the
+   * escalation diagnostic, so a caller reading only `proxyDiagnostic` — which is surfaced on the SUCCESS
+   * path too, where no failure envelope is ever built — can still see that the attempts below ran out the
+   * clock. Orthogonal EVIDENCE like {@link burnedExit}, never a behavior gate; a boolean, so secrets-free
+   * by construction.
+   */
+  budgetExhausted?: boolean;
 }
 
 /** Build {@link EscalationDiagnostics} from the escalation tally and the last failed signal. */
@@ -619,6 +648,8 @@ export function escalationDiagnostics(opts: {
   exitCheck?: EscalationDiagnostics["exitCheck"];
   /** #45: all proxied exits died without reaching the site (exit-health evidence). Omitted when false/undefined. */
   burnedExit?: boolean;
+  /** VIL-121: the call consumed its whole wall-clock budget. Omitted when false/undefined. */
+  budgetExhausted?: boolean;
 }): EscalationDiagnostics {
   return {
     proxyConfigured: opts.proxyConfigured,
@@ -628,6 +659,7 @@ export function escalationDiagnostics(opts: {
     lastStatus: opts.last?.status ?? null,
     ...(opts.attemptMs && opts.attemptMs.length ? { attemptMs: opts.attemptMs } : {}),
     ...(opts.burnedExit ? { burnedExit: true } : {}),
+    ...(opts.budgetExhausted ? { budgetExhausted: true } : {}),
     // resolveFailureReason (not bare classifyBlock/resolveBlockReason) so the escalation-diagnostics reason
     // matches the failure-envelope class/vendor on a bare-CAPTCHA failure AND on a stale-status chrome-error
     // dead nav — one EscalationError can't carry two reasons (codex #40 r3 / #41 r5). captcha-awareness rides
@@ -793,6 +825,31 @@ export function stickySuffixRedactables(suffix: string | undefined): string[] {
  */
 function hasPxChallengeCopy(render: Pick<RenderResult, "html" | "frameHtml">): boolean {
   return hasPerimeterXChallengeCopy(render.html) || hasPerimeterXChallengeCopy(render.frameHtml ?? "");
+}
+
+/**
+ * Derive the {@link BlockSignal} a render classifies as — the ONE place the HTML-derived hints
+ * (cf/px/dd/pxCopy/captchaKind) are computed for retrieve.
+ *
+ * VIL-121 needs the re-roll loop to ask the same question the final classification asks ("is this
+ * attempt terminal?"), and the failure mode of answering it twice is silent: an in-loop check built from
+ * a hand-rolled signal would agree with the final verdict on the day it was written and drift the first
+ * time a hint is added. So the loop calls THIS, and the final `FailureSignal` is built by SPREADING this
+ * plus the two retrieve-only content signals — one derivation, structurally unable to disagree.
+ */
+export function blockSignalFrom(render: RenderResult): BlockSignal {
+  return {
+    title: render.title,
+    text: render.text,
+    status: render.status,
+    cfHint: hasCloudflareHint(render.html),
+    pxHint: hasPerimeterXHint(render.html),
+    // ddHint/pxCopy/captchaKind: attribution inputs — see BlockSignal's field docs for why each is
+    // safe to carry (all persist-after-clear concerns are handled inside classifyBlock's ordering).
+    ddHint: hasDataDomeHint(render.html),
+    pxCopy: hasPxChallengeCopy(render),
+    captchaKind: activeCaptchaKind(render.html),
+  };
 }
 
 export async function retrieve(
@@ -991,6 +1048,27 @@ export async function retrieve(
         sawLiveProxiedResponse = true;
         lastLiveRender = render; // #45 (codex r8): remember it — a later dead exit must not erase this site block
       }
+      // VIL-121: this attempt failed, but on a class NO FRESH EXIT CAN CLEAR — stop, instead of paying for
+      // more exits to be told the same thing. The attempt above is fully counted (proxyAttempts, attemptMs,
+      // the live-response tracking) so the diagnostics still describe what we actually spent; only the
+      // re-roll stops. Placed at the END of the body — after the tracking, not before it — so an early exit
+      // can never leave `sawLiveProxiedResponse` stale and mislabel a site verdict as a burned exit.
+      //
+      // Field evidence for both arms: a thin 404 cost 90.3s and 2 residential exits on the AUTOMATIC path
+      // (2026-08-27); a reCAPTCHA-200 cost 90.2s and 2 exits on the FORCED path (2026-08-25). Forced and
+      // automatic share this loop, so one gate covers both.
+      const attemptSignal = blockSignalFrom(render);
+      // (a) 404/410/429 — the resource is missing/gone, or we are being throttled. Same answer from
+      //     every exit. Keyed on the status alone, NOT on the block reason, because a 404 body can be
+      //     anything (a vendor-marked branded error page still 404s from a clean IP).
+      if (isUnclearableStatus(render.status)) break;
+      // (b) an ACTIVE interactive CAPTCHA with no solver wired. `resolveBlockReason` yields `captcha` ONLY
+      //     for an otherwise-GENERIC block carrying a real widget container, so a Cloudflare managed
+      //     challenge classifies `cf-challenge` and keeps re-rolling — which is correct and load-bearing:
+      //     a clean residential exit DOES clear a CF challenge (screenshot-proven, see
+      //     captcha-cf-clearance-architecture). Without a solver a re-roll cannot change the outcome; with
+      //     one, the existing (vestigial) solve seam is left free to try.
+      if (!opts.solver && resolveBlockReason(attemptSignal) === "captcha") break;
     }
   }
 
@@ -1026,23 +1104,17 @@ export async function retrieve(
   const overBudget = (): boolean => performance.now() - t0 >= timeouts.callBudgetMs;
   if (!budgetExceeded && overBudget()) budgetExceeded = true;
   const extraction = extractMarkdown(render.html, url);
-  const cfHint = hasCloudflareHint(render.html);
-  const pxHint = hasPerimeterXHint(render.html);
-  // ddHint: a DataDome marker in the render HTML (issue #40). Attribution only — like cfHint/pxHint it
-  // persists after a clear, so it re-labels an already-blocked page's `reason` to `datadome-challenge`
-  // but is NOT a `blocked` input (a cleared DataDome page still returns content).
-  const ddHint = hasDataDomeHint(render.html);
-  // pxCopy: the press-&-hold challenge copy is in the page SOURCE but not the top-doc innerText
-  // `render.text` — the widget is in a cross-origin px-captcha-modal iframe. We look at BOTH the
-  // top-document HTML and the child-frame HTML the core captured (`render.frameHtml`), because
-  // page.content() serializes only the top frame. This is the boundary-length 200 case #24's
-  // thin-content test missed. Absent on a cleared page.
-  const pxCopy = hasPxChallengeCopy(render);
-  // The ACTIVE interactive-CAPTCHA widget kind (if any), for the block `reason` and the surfaced vendor
-  // (issue #40). Keyed on the widget CONTAINER class (activeCaptchaKind), not a loaded library or a global
-  // sitekey — so a preloaded API script can't relabel a WAF block, and a co-present unrelated library
-  // can't cross-label the kind (codex r3/r4). Carried on the classification signal.
-  const captchaKind = activeCaptchaKind(render.html);
+  // VIL-121: ONE derivation of the HTML-derived classification hints, shared with the re-roll loop's
+  // terminal check ({@link blockSignalFrom}) so the "should this attempt stop?" question and the final
+  // "what was this?" answer can never drift. Each field's rationale lives on BlockSignal / blockSignalFrom:
+  //   cfHint/pxHint/ddHint — vendor markers that PERSIST after a clear, so they re-label an already-blocked
+  //     page's reason but are never themselves a `blocked` input;
+  //   pxCopy — the press-&-hold copy that reaches the page SOURCE / a child frame but not the top-doc
+  //     innerText (the boundary-length 200 case #24's thin-content test missed);
+  //   captchaKind — the ACTIVE widget CONTAINER kind, not a merely-loaded library (codex #40 r3/r4).
+  const blockSignal = blockSignalFrom(render);
+  const pxHint = blockSignal.pxHint === true;
+  const pxCopy = blockSignal.pxCopy === true;
   // A DEAD nav: no response captured (status null) OR the render ended on a `chrome-error://` page — a reset
   // socket / unreachable host that produced no real document, which can inherit a STALE non-null status from
   // a prior in-page navigation (codex #41 r4). A chrome-error final URL is UNAMBIGUOUS (a real page never has
@@ -1076,14 +1148,9 @@ export async function retrieve(
   // diagnostics, so they can't drift (the detection-parity invariant, extended for #41 with the two
   // content signals; resolveBlockReason/classifyBlock read only the BlockSignal subset and ignore them).
   const signal: FailureSignal = {
-    title: render.title,
-    text: render.text,
-    status: render.status,
-    cfHint,
-    pxHint,
-    ddHint,
-    pxCopy,
-    captchaKind,
+    // VIL-121: SPREAD the shared block signal rather than re-listing its fields, so the loop's terminal
+    // check and this final classification read byte-identical inputs by construction.
+    ...blockSignal,
     frameworkRoot,
     networkFailed,
     // #67: the main-frame response receipt — carried so the burned-exit gate below keys off "did the exit
@@ -1122,13 +1189,51 @@ export async function retrieve(
   // — not a burn. Without reachability evidence we stay `nav-failed` (positive-signal-only, the #40 doctrine).
   const deadExit = isDeadExit(signal.responseReceived, signal.status, signal.finalUrl, signal.policyBlocked);
   const burnedExit = proxyUsed && !forced && !budgetExceeded && deadExit && !sawLiveProxiedResponse;
-  // #43 (codex r3): a budget-exhausted call is decisively a TIMEOUT — null the incidental block reason so the
+  // VIL-121: the failure CLASS is now resolved BEFORE the block `reason`, because the reason's nulling rule
+  // is derived from it — see the two blocks below. (The escalation diagnostics in between read `signal`, not
+  // either of these, so the reorder is inert for them.)
+  const failed = isRetrieveFailure({ blocked, markdown: extraction.markdown, status: render.status });
+  // Failure CLASS (issue #41) + mitigation/CAPTCHA vendor (issue #40), both a PROJECTION of the same
+  // classification (never a parallel classifier), so class and vendor can't disagree. classifyFailure
+  // layers on resolveBlockReason: the block/nav classes come off it, and its reason===null arm
+  // sub-classifies the 200-states (empty-shell / hydration-failed / real-zero-results / unsupported-browser)
+  // — formalizing the old MCP-layer `empty-content` fallback into the typed enum. Computed only on a
+  // FAILURE, so the success shape is unchanged; attached at THIS redaction seam (like wafVendor), not via
+  // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
+  //
+  // #45: an all-exits-dead escalation is a `burned-exit` (a refinement of the nav-failed the dead final
+  // render would classify as) — "our exits died", not "target unreachable". A SEAM-level loop verdict the
+  // single-page classifier can't reach, so it outranks the per-signal class.
+  const rootFailureClass: FailureClass | undefined = failed
+    ? burnedExit
+      ? "burned-exit"
+      : classifyFailure(signal)
+    : undefined;
+  // #43 + VIL-121: budget exhaustion no longer BLANKET-overrides the root class. It still wins over every
+  // non-decisive root (nav-failed, burned-exit, the 200-state content classes) — so "we ran out of time" is
+  // never dressed up as a site verdict derived from a half-rendered DOM — but a DECISIVE root (the site told
+  // us something actionable: rate-limited / captcha / hard-block / anti-bot-block / policy-blocked) now
+  // survives. #43's actual guarantee, that a caller can see the budget was spent, moves to the orthogonal
+  // `budgetExhausted` boolean below, which is set on EVERY exhausted call. See {@link finalFailureClass}.
+  // NOTE `burnedExit` is already gated on `!budgetExceeded`, and `burned-exit` is not decisive, so the two
+  // seam verdicts compose to the same precedence as before wherever the root is not decisive.
+  const failureClass: FailureClass | undefined = failed
+    ? finalFailureClass(rootFailureClass, budgetExceeded)
+    : undefined;
+  const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
+  // #43 (codex r3): a budget-exhausted call was decisively a TIMEOUT — null the incidental block reason so the
   // MCP surface (which prefers `reason` over `failureClass`) advertises `timeout`, not the cf-challenge /
   // hard-block the last attempt happened to land on. The typed `timeout` failureClass carries the detail.
   // #45 (codex r6): SAME for a burned-exit loop verdict — the surface prefers `reason`, so leaving it as the
   // incidental `nav-failed` would contradict failureClass='burned-exit'. Null it so the surface advertises the
   // burned-exit verdict (the exits died, not the target). `burned-exit` is a FailureClass, not a BlockReason.
-  const reason: BlockReason | null = budgetExceeded || burnedExit ? null : blocked ? resolveFailureReason(signal) : null;
+  // VIL-121: EXCEPT when the surviving class is decisive. The surface prefers `reason`, so nulling it there
+  // would re-hide behind `timeout` exactly the verdict finalFailureClass just preserved — the two must agree
+  // or the fix is cosmetic. Keyed off the FINAL class (not `budgetExceeded` alone) so reason and failureClass
+  // are read from one decision.
+  const decisiveVerdict = failureClass !== undefined && DECISIVE_FAILURE_CLASSES.has(failureClass);
+  const reason: BlockReason | null =
+    (budgetExceeded || burnedExit) && !decisiveVerdict ? null : blocked ? resolveFailureReason(signal) : null;
   // Surface escalation diagnostics whenever the proxy was engaged (success or failure): on a block
   // the reason says WHY; on success it shows the proxy was applied and at which attempt it landed.
   const proxyDiagnostic = proxyUsed
@@ -1140,6 +1245,7 @@ export async function retrieve(
         last: signal,
         attemptMs, // #42: per-attempt durations, 1:1 with attempts
         burnedExit, // #45: all exits died without reaching the site (exit-health evidence)
+        budgetExhausted: budgetExceeded, // VIL-121: visible even when the class stayed a decisive site verdict
       })
     : undefined;
   // Failure-evidence envelope (issue #39): surface it on ANY retrieve failure (blocked, empty-content,
@@ -1148,27 +1254,6 @@ export async function retrieve(
   // cookie/authorization stripped) before it leaves this seam. The core built the RAW envelope on
   // `render.diagnostics` (finalUrl = the post-redirect page.url(), the retrieve URL-bug fix). A successful
   // retrieve carries no envelope, so its shape is unchanged.
-  const failed = isRetrieveFailure({ blocked, markdown: extraction.markdown, status: render.status });
-  // Failure CLASS (issue #41) + mitigation/CAPTCHA vendor (issue #40), both a PROJECTION of the same
-  // classification (never a parallel classifier), so class and vendor can't disagree. classifyFailure
-  // layers on resolveBlockReason: the block/nav classes come off it, and its reason===null arm
-  // sub-classifies the 200-states (empty-shell / hydration-failed / real-zero-results / unsupported-browser)
-  // — formalizing the old MCP-layer `empty-content` fallback into the typed enum. Computed only on a
-  // FAILURE, so the success shape is unchanged; attached at THIS redaction seam (like wafVendor), not via
-  // buildFailureDiagnostics. Both are closed vocabularies → pass redactFailureDiagnostics untouched.
-  // #43: a budget-exhausted escalation is a decisive `timeout`, overriding the per-signal classification — the
-  // caller sees "bounded time ran out", not the incidental block class of whatever the last attempt landed on.
-  // #45: else an all-exits-dead escalation is a `burned-exit` (a refinement of the nav-failed the dead final
-  // render would classify as) — "our exits died", not "target unreachable". Both are SEAM-level loop verdicts
-  // (the single-page classifier can't compare attempts); precedence timeout > burned-exit > per-signal class.
-  const failureClass: FailureClass | undefined = failed
-    ? budgetExceeded
-      ? "timeout"
-      : burnedExit
-        ? "burned-exit"
-        : classifyFailure(signal)
-    : undefined;
-  const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
   // #48: a SILENT HOME-FALLBACK — the requested DEEP link (non-root path / query) silently landed on the
   // site's bare root, so the homepage was handed back instead of the requested page. A pure derivation
   // (isHomeFallback) over the requested `url` and the landed render.diagnostics.finalUrl, on the RAW urls
@@ -1228,6 +1313,10 @@ export async function retrieve(
             ...(solverEligible !== undefined ? { solverEligible } : {}),
             ...(captchaSolveReason ? { captchaSolveReason } : {}),
             ...(homeFallback ? { homeFallback } : {}), // #48: same derivation as the top-level flag
+            // VIL-121: #43's guarantee, kept as ORTHOGONAL evidence rather than as the class. Set whenever
+            // the wall-clock budget was consumed — including when the class survived as a decisive site
+            // verdict, which is exactly the case the boolean exists to keep visible.
+            ...(budgetExceeded ? { budgetExhausted: true as const } : {}),
           },
           secrets,
         )

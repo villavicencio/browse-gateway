@@ -73,6 +73,47 @@ configured to restart, an undersized configuration crash-loops, which takes down
 rather than only the one whose addition breached the floor. Adding a consumer therefore changes the
 floor, and is a capacity decision rather than a routine provisioning step.
 
+## Classifying a failed page
+
+### Exit-clearable block
+A block a **fresh residential exit could actually change** — the sole justification for spending one.
+The gateway's escalation ladder exists because an IP/WAF *reputation* verdict (a thin `401`/`403`/`5xx`)
+is a statement about the client's address: ask from a clean address and the site answers differently.
+
+Not every thin error page is that. A `404` or `410` says the resource is absent, which is true from
+every address; a `429` says this client is going too fast, which a new address either does not change
+or changes only by evading a limit the site asked us to respect. These are still *blocks* — the page
+failed, and the caller is told so — but they are outside the ladder, and re-rolling exits for one buys
+nothing at the cost of a full residential session per attempt.
+
+The distinction is a property of the **status**, not of the page body: a branded, vendor-marked error
+page still `404`s from a clean exit. The one exception runs the other way — a managed challenge
+(Cloudflare) arriving on any status is exit-clearable, because a clean address genuinely clears it.
+
+### Decisive failure class
+A failure class **a retry cannot change** — the failure-class mirror of Exit-clearable block. The test
+is not "did the site tell us something", since almost every class carries some site signal; it is
+whether a caller who acts on the label by asking again is *wrong to*. A rate limit, an interactive
+CAPTCHA with no solver, and the gateway's own policy refusal all pass that test.
+
+A reputation block and a WAF challenge deliberately do **not**, even though both are unambiguous site
+verdicts: they are exactly what a clean exit clears, so for them "we ran out of time, try again" is the
+more useful report, not a lost one. Across a multi-attempt re-roll the block the *last* attempt landed
+on is incidental, while the budget overrun describes the whole call.
+
+The distinction exists because these two kinds of verdict compete when a call also exhausts its
+wall-clock budget. Letting exhaustion win unconditionally destroys the actionable half of the report —
+a call that spent ninety seconds discovering an unsolvable CAPTCHA reported only a timeout, advising
+the one thing that cannot work. So exhaustion overrides a non-decisive class and yields to a decisive
+one, while remaining separately visible either way (see Budget exhaustion). Membership is explicit and
+lives in one place; the property is not derivable from a class's name.
+
+### Budget exhaustion
+That a call consumed its whole wall-clock budget — carried as **evidence alongside** the failure
+class, never as the class itself. Recording it separately is what lets a decisive site verdict be
+reported without hiding that the call also ran long; the two facts are orthogonal and a caller
+routinely needs both.
+
 ## Flagged ambiguities
 
 - A container's **image ID** and a registry **manifest digest** are both rendered as `sha256:` hex

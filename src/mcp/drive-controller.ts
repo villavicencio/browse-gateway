@@ -38,7 +38,15 @@ import {
   MIN_ATTEMPT_BUDGET_MS,
 } from "../verbs/index.js";
 import type { EscalationDiagnostics, EgressCheck, FailureSignal, FailureClass } from "../verbs/index.js";
-import { redactFailureDiagnostics, attachFailure, failureOf, sanitizeUrlForError, assembleTiming, warmFailureAdvice } from "../observability/index.js";
+import {
+  redactFailureDiagnostics,
+  attachFailure,
+  failureOf,
+  sanitizeUrlForError,
+  assembleTiming,
+  warmFailureAdvice,
+  finalFailureClass,
+} from "../observability/index.js";
 import type { FailureDiagnostics } from "../observability/index.js";
 import { buildWarmOverride } from "./vault-login.js";
 import type { VaultEntryStore } from "./vault-login.js";
@@ -280,14 +288,21 @@ export class GatewayDriveController implements DriveController {
     // told at the loop level, and burned-exit (no exit responded at all) can't coexist with a truncated
     // partial page as the loop's verdict. classifyFailure would read the thin-200 as a content class,
     // which is wrong for a page the deadline cut short.
+    // VIL-121: budget exhaustion is applied through {@link finalFailureClass} rather than as a blanket
+    // override, exactly as at retrieve's seam — a DECISIVE site verdict (rate-limited / captcha / a
+    // reputation or WAF block) survives it, everything else still becomes `timeout`. The reordering is
+    // behaviour-preserving for the other two loop verdicts: `burned-exit` and the deadline-truncated
+    // `timeout` are both NON-decisive, so a budget-exhausted call still reports `timeout` for them, which
+    // is what the previous precedence produced. Exhaustion itself stays visible via `budgetExhausted`.
+    const rootFailureClass: FailureClass | undefined = navFailed(snap)
+      ? opts?.burnedExit
+        ? "burned-exit"
+        : snap.deadlineTruncated
+          ? "timeout"
+          : classifyFailure(signal)
+      : undefined;
     const failureClass: FailureClass | undefined = navFailed(snap)
-      ? opts?.budgetExceeded
-        ? "timeout"
-        : opts?.burnedExit
-          ? "burned-exit"
-          : snap.deadlineTruncated
-            ? "timeout"
-            : classifyFailure(signal)
+      ? finalFailureClass(rootFailureClass, opts?.budgetExceeded === true)
       : undefined;
     const wafVendor = failureClass ? wafVendorFromFailure(failureClass, signal) : undefined;
     // #42: fold the snapshot's first-class per-stage Timing into the envelope at THIS surface seam (like
@@ -304,6 +319,9 @@ export class GatewayDriveController implements DriveController {
       // redaction passes them through untouched. Present only when the snapshot detected a CAPTCHA.
       ...(snap.solverEligible !== undefined ? { solverEligible: snap.solverEligible } : {}),
       ...(snap.captchaSolveReason ? { captchaSolveReason: snap.captchaSolveReason } : {}),
+      // VIL-121: #43's "the caller can always see the budget was spent" guarantee, as orthogonal evidence
+      // rather than as the class — set even when a decisive site verdict survived as the failureClass.
+      ...(opts?.budgetExceeded ? { budgetExhausted: true as const } : {}),
     };
     return redactFailureDiagnostics(diag, this.#secrets);
   }
