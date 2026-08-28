@@ -200,6 +200,24 @@ test("redactedSearchFn passes a success through untouched", async () => {
   assert.deepEqual((await fn(REQ)).results, DEFAULT_RESULTS);
 });
 
+test("every search env var the code reads is forwarded by the stdio launcher", async () => {
+  // The launcher's -e list is an explicit ALLOWLIST, not a pass-through: a variable missing from it
+  // is invisible inside the container whatever the operator exported, so the feature reads as
+  // disabled on that path with no error anywhere. That is exactly how the search wiring shipped
+  // unreachable on the stdio launcher until review caught it; this pins the class shut.
+  const { readFileSync } = await import("node:fs");
+  const launcher = readFileSync(new URL("../scripts/browse-gateway-mcp-launcher.sh", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../src/search/config.ts", import.meta.url), "utf8");
+  const read = [...source.matchAll(/env\.(BGW_[A-Z0-9_]+)/g)].map((m) => m[1]);
+  assert.ok(read.length >= 5, `expected to find the search env reads, found ${read.length}`);
+  const forwarded = new Set([...launcher.matchAll(/-e (BGW_[A-Z0-9_]+)/g)].map((m) => m[1]));
+  for (const name of new Set(read)) {
+    assert.ok(forwarded.has(name), `${name} is read by src/search/config.ts but not forwarded by browse-gateway-mcp-launcher.sh`);
+  }
+  // The secret is named in SECRET_KEYS rather than read via `env.` — assert it explicitly.
+  assert.ok(forwarded.has("BGW_BRAVE_SEARCH_API_KEY"), "the provider key is not forwarded by the stdio launcher");
+});
+
 test("contract: the adapter and the deterministic fake normalize to the SAME shape", async () => {
   // The point of the seam: these assertions are a contract on SearchProvider, not a description of
   // one adapter. `search-brave.test.mjs` runs the identical expectation against the real adapter.

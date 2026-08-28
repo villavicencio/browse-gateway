@@ -59,6 +59,9 @@ export function parseRetryAfterMs(raw: string | null): number | undefined {
  * `provider-unavailable` rather than pretending the query was at fault.
  */
 export function braveStatusToFailureClass(status: number): SearchProviderError["code"] {
+  // A redirect is never followed (see the fetch call), so a 3xx arrives here as a response. The
+  // configured endpoint is not the API it claims to be — a deployment fault, like a 404.
+  if (status >= 300 && status < 400) return "provider-unavailable";
   if (status === 401 || status === 403) return "authentication-failed";
   if (status === 402) return "quota-exhausted";
   if (status === 429) return "rate-limited";
@@ -152,6 +155,14 @@ export class BraveSearchProvider implements SearchProvider {
             "x-subscription-token": this.#apiKey,
           },
           signal: controller.signal,
+          // NEVER follow a redirect. Measured on Node 24: `fetch` strips `Authorization` when a
+          // redirect crosses origins but forwards a CUSTOM header verbatim — so the default
+          // `redirect: "follow"` would hand `x-subscription-token` to whatever host the endpoint
+          // points at, and would reach it WITHOUT the https-only and private-address checks that
+          // `searchEndpointError` applied to the configured URL at boot. One 302 would defeat both
+          // guarantees at once. The endpoint is deployment config naming a documented API; if it
+          // redirects, that is a misconfiguration or an attack, and both deserve a refusal.
+          redirect: "manual",
         });
       } catch (err) {
         if (controller.signal.aborted) throw new SearchProviderError("timeout", "search exceeded its deadline");
@@ -162,8 +173,11 @@ export class BraveSearchProvider implements SearchProvider {
       if (!resp.ok) {
         const code = braveStatusToFailureClass(resp.status);
         const retryAfterMs = code === "rate-limited" ? parseRetryAfterMs(resp.headers.get("retry-after")) : undefined;
-        // Drain nothing: an error body may carry an echoed query or vendor detail we have no use for
-        // and no obligation to parse. The status is the contract.
+        // Parse nothing — an error body may carry an echoed query or vendor detail we have no use
+        // for — but CANCEL it. Throwing with the body unread leaves the underlying request alive
+        // with the deadline timer already cleared, so a run of 429/5xx responses would pin
+        // connections and quietly defeat the bound this method advertises.
+        void resp.body?.cancel().catch(() => {});
         throw new SearchProviderError(code, `search provider returned HTTP ${resp.status}`, {
           httpStatus: resp.status,
           ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
@@ -182,6 +196,11 @@ export class BraveSearchProvider implements SearchProvider {
     } finally {
       clearTimeout(timer);
       ctx.signal.removeEventListener("abort", abortForDeadline);
+      // Catch-all teardown: by here the body has either been fully read, been cancelled, or is
+      // being abandoned on a throw. Aborting is a no-op in the first two cases and the thing that
+      // releases the request in the third, so no exit path — including one added later — can leave
+      // an in-flight request behind after the deadline timer is gone.
+      controller.abort();
     }
   }
 

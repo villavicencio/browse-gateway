@@ -217,6 +217,65 @@ test("over-long queries are refused locally, without spending a request", async 
   assert.equal(f.calls.length, 0);
 });
 
+test("a redirect is REFUSED, and the key never reaches the redirect target", async () => {
+  // End-to-end over REAL http servers and the REAL global fetch — not a stub. Node strips
+  // `Authorization` across a cross-origin redirect but forwards a CUSTOM header verbatim, so
+  // without `redirect: "manual"` the subscription token would be handed to whatever host the
+  // endpoint points at, bypassing the https-only + private-address checks done at boot. Delete the
+  // flag and this test fails by observing the key arrive at the second server.
+  const { createServer } = await import("node:http");
+  const seen = [];
+  const dest = createServer((req, res) => {
+    seen.push(req.headers["x-subscription-token"] ?? null);
+    res.end('{"web":{"results":[{"title":"t","url":"https://x.example.invalid/"}]}}');
+  });
+  await new Promise((r) => dest.listen(0, "127.0.0.1", r));
+  const destPort = dest.address().port;
+  const start = createServer((req, res) => {
+    res.writeHead(302, { location: `http://127.0.0.1:${destPort}/dest` });
+    res.end();
+  });
+  await new Promise((r) => start.listen(0, "127.0.0.1", r));
+  const startPort = start.address().port;
+  try {
+    const p = new BraveSearchProvider({ apiKey: KEY, apiUrl: `http://127.0.0.1:${startPort}/search` });
+    await assert.rejects(p.search(REQ, ctx()), (err) => {
+      assert.ok(err instanceof SearchProviderError);
+      // The 3xx arrives as a response instead of being followed, and reads as a bad endpoint.
+      assert.equal(err.code, "provider-unavailable");
+      assert.equal(err.httpStatus, 302);
+      return true;
+    });
+    assert.deepEqual(seen, [], "the API key was forwarded to the redirect target");
+  } finally {
+    await new Promise((r) => dest.close(r));
+    await new Promise((r) => start.close(r));
+  }
+});
+
+test("the fetch is issued with redirect:manual", async () => {
+  const f = fakeFetch(FIXTURE);
+  await providerWith(f).search(REQ, ctx());
+  assert.equal(f.calls[0].opts.redirect, "manual");
+});
+
+test("an error response body is cancelled rather than abandoned mid-flight", async () => {
+  // Throwing with the body unread leaves the request alive after the deadline timer is cleared;
+  // a run of 429/5xx would then pin connections and defeat the advertised bound.
+  let cancelled = false;
+  const body = new ReadableStream({ pull() {}, cancel() { cancelled = true; } });
+  const fn = async () => new Response(body, { status: 429 });
+  await assert.rejects(providerWith(fn).search(REQ, ctx()), (err) => err.code === "rate-limited");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(cancelled, "the error response body was never cancelled");
+});
+
+test("3xx maps to provider-unavailable (a redirect means the endpoint is not the API)", () => {
+  for (const status of [301, 302, 307, 308]) {
+    assert.equal(braveStatusToFailureClass(status), "provider-unavailable");
+  }
+});
+
 test("status → failure-class mapping is total over the documented codes", () => {
   assert.equal(braveStatusToFailureClass(401), "authentication-failed");
   assert.equal(braveStatusToFailureClass(402), "quota-exhausted");
