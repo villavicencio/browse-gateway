@@ -64,6 +64,12 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   In **zsh**, `$REPO:latest` triggers the `:l` modifier — write `"${REPO}:latest"`.
   Gates needing bind-mounts require the overlay-image approach (colima will not share
   `/private/tmp`), plus `--init`.
+  ⚠️ **Measured 2026-10-06: on an Apple-silicon Mac, Colima with Rosetta cannot start ANY current
+  image.** The entrypoint is `tini -s`, and Rosetta-translated amd64 code is refused
+  `PR_SET_CHILD_SUBREAPER` (`[FATAL tini] PR_SET_CHILD_SUBREAPER is unavailable on this platform`),
+  with or without `--init`. The same `tini -s` succeeds in an arm64 container on the same VM, so the
+  limit is Rosetta, not the kernel. A gate that "won't start" there is this, not your change. Run the
+  gate somewhere that executes amd64 natively or through QEMU instead.
 - **The runtime gate is not a formality.** It is the only stage that runs the real code against a
   real browser, and it has caught defects every unit test passed: a snapshot axis churning one
   capture pair in five while the no-churn test was green. Never accept a green unit run as evidence
