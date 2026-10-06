@@ -26,7 +26,7 @@ const IMAGE = `ghcr.io/testowner/browse-gateway@sha256:${"a".repeat(64)}`;
  * @param readyAfter the `docker logs` call number on which the boot line first appears
  * @param state      what `docker inspect` reports as Status/Running/RestartCount
  */
-function sandbox({ readyAfter, state = "running/true/0" }) {
+function sandbox({ readyAfter, state = "running/true/0", bigLogs = false, stalledProbe = false }) {
   const dir = mkdtempSync(join(tmpdir(), "bgw-verify-"));
   const bin = join(dir, "bin");
   const deploy = join(dir, "deploy");
@@ -43,6 +43,7 @@ function sandbox({ readyAfter, state = "running/true/0" }) {
   writeFileSync(join(dir, "image-smoke.sh"), "#!/usr/bin/env bash\nexit 0\n");
 
   writeFileSync(join(bin, "docker"), `#!/usr/bin/env bash
+echo "$1" >> "${marks}/docker-calls"
 case "$1" in
   pull|rm|rmi|images|run) exit 0 ;;
   create) echo "deadbeefcafe"; exit 0 ;;
@@ -52,7 +53,10 @@ case "$1" in
   logs)
     n=$(( $(cat "${marks}/logs-calls" 2>/dev/null || echo 0) + 1 )); echo "$n" > "${marks}/logs-calls"
     if [ "$n" -ge ${readyAfter} ]; then echo "gateway listening dnsRebindProtection=true version=1.0.0 mode=http"; fi
-    exit 0 ;;
+    # A log far larger than a pipe buffer, AFTER the marker: a reader that stops at the first match
+    # closes the pipe while this is still writing, exactly as the real CLI would be SIGPIPEd.
+    ${bigLogs ? `head -c 3000000 /dev/zero | tr '\\0' x; echo` : ""}
+    exit $? ;;
   inspect)
     case "$*" in
       *State.Status*) echo "${state}" ;;
@@ -62,7 +66,11 @@ case "$1" in
 esac
 exit 0
 `);
-  writeFileSync(join(bin, "curl"), "#!/usr/bin/env bash\necho 401\n");
+  // A stalled probe honours --max-time the way real curl does: it hangs for the whole allowance.
+  // Real /bin/sleep, because "sleep" on PATH is the counting shim.
+  writeFileSync(join(bin, "curl"), stalledProbe
+    ? `#!/usr/bin/env bash\nwhile [ $# -gt 0 ]; do [ "$1" = "--max-time" ] && t="$2"; shift; done\n/bin/sleep "\${t:-3}"; echo 000; exit 28\n`
+    : "#!/usr/bin/env bash\necho 401\n");
   writeFileSync(join(bin, "sha256sum"), `#!/usr/bin/env bash\nshasum -a 256 "$@" 2>/dev/null || echo "0000000000000000  $1"\n`);
   // Count sleeps instead of spending them.
   writeFileSync(join(bin, "sleep"), `#!/usr/bin/env bash\necho "$1" >> "${marks}/sleeps"\n`);
@@ -128,4 +136,37 @@ test("a container that has already restarted fails at once instead of waiting ou
   assert.equal(r.status, 1);
   assert.match(r.stdout + r.stderr, /verify: .*restarts=1/);
   assert.ok(count(sb, "sleeps") <= 2, `failed fast: ${count(sb, "sleeps")} sleeps across both verifies (bound would be 60)`);
+});
+
+test("a large container log does not make verify miss a marker it found (grep -q + pipefail SIGPIPE)", () => {
+  const sb = sandbox({ readyAfter: 1, bigLogs: true });
+  const r = runDeploy(sb, { BGW_VERIFY_TIMEOUT: "5" });
+  assert.equal(r.status, 0, `the boot line is there; verify must see it:\n${r.stdout}\n${r.stderr}`);
+  assert.equal(liveLaunches(sb).length, 1, "no rollback");
+});
+
+test("REFUSED before touching anything: a BGW_VERIFY_TIMEOUT that is not 1..600 whole seconds", () => {
+  for (const bad of ["0", "000", "abc", "-5", "2.5", "601", "99999999999999999999", ""]) {
+    const sb = sandbox({ readyAfter: 1 });
+    const r = runDeploy(sb, { BGW_VERIFY_TIMEOUT: bad });
+    if (bad === "") { assert.equal(r.status, 0, "empty means unset -> the default"); continue; }
+    assert.equal(r.status, 2, `'${bad}': ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /BGW_VERIFY_TIMEOUT/);
+    assert.equal(count(sb, "docker-calls"), 0, `'${bad}' must be refused before any docker call`);
+    assert.equal(liveLaunches(sb).length, 0);
+  }
+  const ok = runDeploy(sandbox({ readyAfter: 1 }), { BGW_VERIFY_TIMEOUT: "007" });
+  assert.equal(ok.status, 0, "leading zeros are still a whole number of seconds");
+});
+
+test("a stalled /mcp probe cannot stretch verify past its budget", () => {
+  // Booted, healthy state, but every probe hangs until --max-time. With a 1 s budget the fixed verify
+  // caps the probe at the 1 s left (~1 s per verify, ~2 s for verify + rollback-verify). An uncapped
+  // probe spends its full 3 s regardless (~6 s): that is the regression this pins.
+  const sb = sandbox({ readyAfter: 1, stalledProbe: true });
+  const t0 = Date.now();
+  const r = runDeploy(sb, { BGW_VERIFY_TIMEOUT: "1" });
+  const secs = (Date.now() - t0) / 1000;
+  assert.equal(r.status, 1, "probe never answers 401 -> verify fails -> rollback");
+  assert.ok(secs < 5, `deploy took ${secs.toFixed(1)} s; two 1 s verifies must not take ~6 s`);
 });

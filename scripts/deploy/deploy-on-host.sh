@@ -33,6 +33,21 @@ BIND_ADDR="${BGW_BIND_ADDR:-127.0.0.1}"
 HOST_PORT="${BGW_HOST_PORT:-8080}"
 GATE_LOG="${GATE_LOG:-$HOME/validate-http-deploy.log}"   # ~/ not /tmp (a root-owned /tmp log false-PASSes)
 
+# The post-swap verify budget (step 7), validated HERE — before the pull, the gate, or the swap. An
+# unusable value (0, "abc", "2.5") would make verify's loop run zero times and report failure, so the
+# deploy would roll back a healthy image and the rollback's verify would fail the same way. A typo in
+# config must be refused while the live container is still untouched. Whole seconds, 1..600; leading
+# zeros are stripped before the range check so "007" is 7 and a long digit string cannot overflow it.
+VERIFY_TIMEOUT="${BGW_VERIFY_TIMEOUT:-30}"
+case "$VERIFY_TIMEOUT" in
+  *[!0-9]*) VERIFY_TIMEOUT="" ;;
+  *) VERIFY_TIMEOUT="${VERIFY_TIMEOUT#"${VERIFY_TIMEOUT%%[!0]*}"}" ;;
+esac
+if [ -z "$VERIFY_TIMEOUT" ] || [ "${#VERIFY_TIMEOUT}" -gt 3 ] || [ "$VERIFY_TIMEOUT" -gt 600 ]; then
+  echo "deploy: refused — BGW_VERIFY_TIMEOUT must be whole seconds in 1..600, got '${BGW_VERIFY_TIMEOUT}'" >&2
+  exit 2
+fi
+
 # 1 — accept a pinned digest of THIS PROJECT'S package only (forced-command boundary). The runner
 # passes the resolved ref; the request arrives in SSH_ORIGINAL_COMMAND. Pinning the package — not
 # just "some ghcr digest" — is load-bearing: a leaked key must NOT be able to deploy an arbitrary
@@ -187,11 +202,17 @@ BGW_DEPLOY_IMAGE="$IMAGE" "$HERE/launch-http.sh"
 #
 # What does NOT get the benefit of the wait: a container that has restarted, or is not running. Those
 # will not heal by waiting, so they fail at once — the poll must not turn a fast failure into a slow one.
-VERIFY_TIMEOUT="${BGW_VERIFY_TIMEOUT:-30}"
+#
+# The budget (VERIFY_TIMEOUT, validated at the top) is ONE wall-clock deadline covering the sleeps AND
+# the /mcp probe: each probe's --max-time is capped to what is left, so a stalled probe cannot stretch
+# a 30 s verify to 4x that. The poll count is also capped, as a second bound that holds even if the
+# clock does not advance.
 verify() {
-  local i=0 state="" restarts="" code="000"
+  local i=0 start=$SECONDS left state="" restarts="" code="000" logs
   while [ "$i" -lt "$VERIFY_TIMEOUT" ]; do
     sleep 1; i=$((i + 1))
+    left=$((VERIFY_TIMEOUT - (SECONDS - start)))
+    [ "$left" -ge 1 ] || break
     state="$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
     # RestartCount is a TOP-LEVEL field ({{.RestartCount}}), NOT {{.State.RestartCount}} (which errors
     # "map has no entry"). The state line captures it as the 3rd '/'-field — reuse that.
@@ -200,8 +221,12 @@ verify() {
       running/true/0) ;;
       *) echo "verify: container not healthy (restarts=$restarts state=$state)"; return 1 ;;
     esac
-    docker logs "$CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true' || continue
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
+    # Capture, THEN match. `docker logs | grep -q` is wrong under pipefail: grep -q exits at the first
+    # match, the still-writing docker CLI dies of SIGPIPE, and the pipeline reads as FAILED on exactly
+    # the poll that found the marker — every poll, once the log outgrows a pipe buffer.
+    logs="$(docker logs "$CONTAINER" 2>&1)" || continue
+    case "$logs" in *dnsRebindProtection=true*) ;; *) continue ;; esac
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$(( left < 3 ? left : 3 ))" "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
     if [ "$code" = "401" ]; then
       echo "verify: OK after ${i}s (running, restarts=0, dnsRebind=true, /mcp=401)"
       return 0

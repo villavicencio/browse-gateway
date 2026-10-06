@@ -93,7 +93,9 @@ preswap_smoke() {
   # not-running, surfacing in 2-3s — well before the budget).
   local i=0 ready=""
   while [ "$i" -lt "$SMOKE_BOOT_TIMEOUT" ]; do
-    if docker logs "$SMOKE_CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true'; then ready=1; break; fi
+    # Capture, THEN match: `docker logs | grep -q` under pipefail SIGPIPEs the still-writing CLI and
+    # reads as failed on the very poll that found the marker (see verify() in deploy-on-host.sh).
+    case "$(docker logs "$SMOKE_CONTAINER" 2>&1 || true)" in *dnsRebindProtection=true*) ready=1; break ;; esac
     [ "$(docker inspect "$SMOKE_CONTAINER" --format '{{.State.Running}}' 2>/dev/null || echo false)" = "true" ] || break
     sleep 1; i=$((i + 1))
   done
@@ -117,7 +119,10 @@ preswap_smoke() {
   # sides against the surrounding boot line via the trailing space, so a longer token (a commit sha, a
   # digest, a branch name) cannot match a prefix and pass.
   local vsem='\(0\|[1-9][0-9]*\)\.\(0\|[1-9][0-9]*\)\.\(0\|[1-9][0-9]*\)'
-  if ! docker logs "$SMOKE_CONTAINER" 2>&1 | grep -q " version=${vsem}\(+[0-9a-f]\{12\}\)\{0,1\} "; then
+  # A here-string, not a pipe from `docker logs`, for the same SIGPIPE-under-pipefail reason as above.
+  local boot_logs
+  boot_logs="$(docker logs "$SMOKE_CONTAINER" 2>&1 || true)"
+  if ! grep -q " version=${vsem}\(+[0-9a-f]\{12\}\)\{0,1\} " <<<"$boot_logs"; then
     echo "smoke: boot line carries no well-formed version= (expected a bare semver core, optionally +12 hex)" >&2
     docker logs "$SMOKE_CONTAINER" 2>&1 | grep -o 'version=[^ ]*' | tail -1 >&2 || true
     return 1
