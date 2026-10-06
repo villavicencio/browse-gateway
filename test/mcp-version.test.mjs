@@ -32,8 +32,11 @@ test("resolves the exact version the shipped manifest carries", () => {
   assert.match(v.contractVersion, /^\d+\.\d+\.\d+$/);
 });
 
-test("R1 — the project is at 1.0.0, not 0.x", () => {
-  assert.equal(manifestVersion, "1.0.0");
+test("R1 — the project is past 0.x", () => {
+  // The invariant is the STABILITY signal, not a particular release: pinning the exact string made
+  // every additive contract change (VIL-122 was the first) edit this test for no behavioural reason.
+  const [major] = manifestVersion.split(".").map(Number);
+  assert.ok(major >= 1, `expected a 1.x-or-later contract version, got ${manifestVersion}`);
 });
 
 test("a client reads the resolved version over a real in-memory transport", async () => {

@@ -37,6 +37,10 @@ export const SECRET_KEYS = [
   "BGW_PROXY_USERNAME",
   "BGW_PROXY_PASSWORD",
   "BGW_CAPTCHA_API_KEY",
+  // Search-provider API key (VIL-122). Rides an outbound request HEADER, so it can surface in a
+  // driver/fetch error string that quotes the request — folded in here so redactSecrets scrubs it
+  // everywhere, at parity with every other BYO credential.
+  "BGW_BRAVE_SEARCH_API_KEY",
   // Raw base64 vault master key (the fallback to BGW_VAULT_KEY_FILE) — folded in so it's never
   // stringified and is auto-redacted. The FILE-path variant is not secret and stays out of this set.
   "BGW_VAULT_KEY",

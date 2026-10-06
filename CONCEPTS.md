@@ -114,6 +114,38 @@ class, never as the class itself. Recording it separately is what lets a decisiv
 reported without hiding that the call also ran long; the two facts are orthogonal and a caller
 routinely needs both.
 
+## Searching the web
+
+### Search verb
+A **discovery** operation: a caller submits a query and gets back ranked results (title, URL,
+snippet). It is deliberately not `retrieve` pointed at a search-engine URL. Those are different
+problems wearing the same shape — `retrieve` reads a page the caller already chose, so its retry
+ladder, clearance poll, and markdown extraction are all tuned for a destination. Give a SERP the
+same treatment and an engine's challenge reads as a blocked destination, sending the caller to
+rotate exits when the right move is to ask a different provider. It also makes every client own the
+engine's markup and the choice of engine, which is provider mechanics leaking into consumers.
+
+### Search provider
+An adapter behind one internal seam, mapping a vendor's wire format into the normalized result shape
+and its errors into the search failure vocabulary. Which provider answers is Obscura's decision, made
+from deployment configuration; a caller never names one and never sees vendor fields. Credentials
+and endpoints are deployment config, never client input.
+
+### Search failure class
+A **second closed vocabulary**, deliberately separate from the destination-retrieval failure classes.
+A search-host failure must never be attributed to a destination result URL: "the search API
+rate-limited us" and "the page you asked for rate-limited us" are different facts implying different
+next moves, and collapsing them into one enum is how a caller ends up retrying the wrong thing.
+Every member carries caller-facing advice, and a test asserts it — a class the caller cannot act on
+is a dead end, and a vocabulary whose members imply the same move bought nothing by splitting.
+
+### Empty result
+A provider that answered correctly and found nothing. This is a **successful search**, not a failure:
+"nothing matched" is a real answer to a discovery question, and reporting it as an error pushes an
+agent into retrying a query that already worked. It is still recorded distinctly on the attempt — as
+its own `empty` outcome rather than as a failure class — so a working provider is never read as a
+broken one while "found nothing" stays machine-readable.
+
 ## Flagged ambiguities
 
 - A container's **image ID** and a registry **manifest digest** are both rendered as `sha256:` hex

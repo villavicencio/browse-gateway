@@ -12,7 +12,11 @@
  *      refused (perConsumerMax) while its 1st is held;
  *   5. disconnect-WITHOUT-DELETE: a crashed client's session is idle-reaped and its browser released
  *      (the leak the SSE-drop path would otherwise cause — C1);
- *   6. clean teardown leaves no browser sessions.
+ *   6. clean teardown leaves no browser sessions;
+ *   7. the `search` tool is registered and answers over the real HTTP handler when the verb is wired,
+ *      and is ABSENT when it is not — the disabled-invariant, proved inside the image rather than
+ *      only in a unit test (VIL-122). The provider is the deterministic fake the unit suite uses, so
+ *      this gates the WIRING (tool -> verb -> transport), not a vendor.
  *
  * This is the kill-gate that must PASS before Atlas is cut over from stdio to HTTP (P6).
  */
@@ -28,6 +32,8 @@ import { SecretStore, redactSecrets } from "../dist/security/index.js";
 import { createHttpHandler, createGatewayMcpServer } from "../dist/mcp/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { retrieve } from "../dist/verbs/index.js";
+import { buildSearch } from "../dist/search/index.js";
+import { fakeSearchProvider, DEFAULT_RESULTS } from "../test/helpers/fake-search-provider.mjs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -60,13 +66,14 @@ const note = (label) => {
 // Built after listen() so allowedHosts can pin the actual loopback host:port — DNS-rebind protection
 // is ON for the gate, proving the legitimate Host passes and (via the unit tests) a foreign one fails.
 let handler;
-const makeHandler = (allowedHosts) =>
+const makeHandler = (allowedHosts, opts = {}) =>
   createHttpHandler({
     authenticate: (token) => policy.authenticate(token),
     buildServer: (consumer) => {
       const drive = new GatewayDriveController(gateway, secrets, consumer.token, { onDatacenterIp });
       const server = createGatewayMcpServer({
         drive,
+        ...(opts.search ? { search: opts.search } : {}),
         retrieve: async ({ url }) => {
           try {
             return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp } });
@@ -156,7 +163,58 @@ try {
   check("a crashed client's session is idle-reaped (no DELETE)", reaped.length >= 1);
   check("reaping released the browser session(s)", gateway.sessions.activeCount < beforeReap);
 
-  // 6) clean teardown.
+  // 6) search (VIL-122), on its OWN http server and handler. Isolated deliberately: the reap check
+  //    above expires every idle session on the main handler, so anything reusing a client from
+  //    before it would fail on an expired session rather than on the property under test (this gate
+  //    caught exactly that when the checks were first written inline).
+  let searchHandler;
+  const searchServer = createServer((req, res) => {
+    if (!searchHandler) {
+      res.writeHead(503);
+      res.end();
+      return;
+    }
+    searchHandler.handle(req, res).catch(() => {
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end();
+      }
+    });
+  });
+  try {
+    const sport = await new Promise((resolve) => searchServer.listen(0, "127.0.0.1", () => resolve(searchServer.address().port)));
+    const hosts = [`127.0.0.1:${sport}`, `localhost:${sport}`];
+
+    // 6a) the DISABLED invariant, proved inside the image: a handler built with no `search` dep must
+    //     not list the tool at all.
+    searchHandler = makeHandler(hosts);
+    const offConn = await connect(sport, "tok-a");
+    const toolsNoSearch = await offConn.client.listTools();
+    check("search is ABSENT from tools/list when the verb is not wired", !toolsNoSearch.tools.some((t) => t.name === "search"));
+    await offConn.client.close().catch(() => {});
+    await searchHandler.closeAll().catch(() => {});
+
+    // 6b) wired. buildSearch travels the real enablement path (BGW_SEARCH_ENABLED=1) with an
+    //     injected deterministic provider, so this proves construction + registration + transport —
+    //     the WIRING — without needing a provider key.
+    const built = buildSearch({ BGW_SEARCH_ENABLED: "1" }, secrets, { providers: [fakeSearchProvider()] });
+    check("buildSearch returns a verb when enabled with an injected provider", built !== undefined);
+    searchHandler = makeHandler(hosts, { search: built.fn });
+    const on = await connect(sport, "tok-a");
+    const listed = await on.client.listTools();
+    check("search IS listed when the verb is wired", listed.tools.some((t) => t.name === "search"));
+    const res = await on.client.callTool({ name: "search", arguments: { query: "example query", count: 3 } });
+    const text = res.isError ? "" : res.content[0].text;
+    check("search answers over the real HTTP handler with a result URL in the text", text.includes(DEFAULT_RESULTS[0].url));
+    check("search reports the provider and result count in its header", /^provider=fake results=3 /.test(text));
+    await on.client.close().catch(() => {});
+  } finally {
+    await searchHandler?.closeAll().catch(() => {});
+    await new Promise((r) => searchServer.close(r));
+    searchServer.closeAllConnections?.();
+  }
+
+  // 7) clean teardown.
   await a.client.close().catch(() => {});
   await handler.closeAll();
   check("clean teardown leaves no live MCP sessions", handler.sessionCount() === 0);

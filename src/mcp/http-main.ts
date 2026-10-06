@@ -13,6 +13,7 @@ import type { Consumer } from "../policy/index.js";
 import { redactSecrets } from "../security/index.js";
 import { retrieve, hostForcesProxy } from "../verbs/index.js";
 import { buildGatewayRuntime } from "./runtime.js";
+import { redactedSearchFn } from "../search/index.js";
 import { loadArtifactConfig, buildArtifactRuntime } from "../artifacts/runtime-builder.js";
 import type { ArtifactRuntime } from "../artifacts/index.js";
 import { createGatewayMcpServer } from "./server.js";
@@ -123,7 +124,7 @@ async function main(): Promise<void> {
   // capture is a construction-time property of every browser core the gateway is about to pool — see
   // BuildRuntimeOptions.captureEnabled.
   const artifactConfig = loadArtifactConfig(process.env);
-  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress } =
+  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress, search } =
     buildGatewayRuntime(process.env, { log, captureEnabled: artifactConfig.enabled });
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
@@ -206,6 +207,10 @@ async function main(): Promise<void> {
         // Boot-resolved above and closed over — never re-read per connection.
         version: gatewayVersion.reported,
         drive,
+        // VIL-122: present only when search passed its boot guards; absent leaves the tool
+        // unregistered. Wrapped so a provider/transport error can never carry BYO secret material
+        // to the consumer (R9), at parity with the retrieve closure below.
+        ...(search ? { search: redactedSearchFn(search.fn, secrets) } : {}),
         retrieve: async ({ url, forceProxy }) => {
           try {
             const forced = (forceProxy ?? false) || hostForcesProxy(new URL(url).hostname, forceProxyHosts);
@@ -302,6 +307,9 @@ async function main(): Promise<void> {
         `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
           `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
           `sticky=${stickySuffix !== undefined} ` +
+          // VIL-122: the enablement + provider order ride the boot line the pre-swap smoke already
+          // greps, so a search misconfiguration is visible to the deploy without a new deploy step.
+          `search=${search ? search.providers.join(",") : "off"} ` +
           // KTD13: `version=` rides the SAME boot line the pre-swap smoke already greps for
           // readiness, which makes the launcher (not just the resolver) gateable with no new deploy
           // step. `deploy=` is the opaque build stamp, or `none` on an unstamped local build.

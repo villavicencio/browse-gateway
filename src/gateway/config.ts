@@ -85,7 +85,9 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   timeouts: DEFAULT_CALL_TIMEOUTS,
 };
 
-function positiveIntOr(value: string | undefined, fallback: number): number {
+/** Strict positive-integer env parse, shared with every `BGW_*` numeric knob (search included) so
+ *  one hex/float/exponent rejection rule governs them all. */
+export function positiveIntOr(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   // Require a plain decimal integer. Bare Number() would accept hex/exponent/float
   // ("1e3" -> 1000, "0x10" -> 16) and silently blow the resource cap past its intent.

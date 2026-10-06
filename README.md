@@ -55,6 +55,11 @@ and the browser engine stays swappable.
 - **Outcome-oriented API.** `retrieve(url)` returns clean, readable markdown;
   `synthesize(url)` returns synthesized content. A low-level `drive()` escape hatch
   remains available for interactive automation the high-level verbs don't cover.
+- **Search as a verb, not a URL.** `search(query)` returns ranked results (title, URL,
+  snippet) from a sanctioned search API, so a client finds candidate URLs and then
+  `retrieve`s one — instead of manufacturing a SERP URL and inheriting an engine's markup,
+  its challenges, and the wrong retry semantics. Off unless configured; see
+  [`src/search/README.md`](src/search/README.md).
 - **Real-Chrome stealth core.** A patched/real Chrome running **headful under Xvfb**
   (a virtual display) — not `--headless` — which clears modern anti-bot challenges that
   strict-headless browsers fail.
