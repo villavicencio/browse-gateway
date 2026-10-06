@@ -30,7 +30,7 @@ const PINNED = `${REPO}@sha256:${DIGEST}`;
  * @param imageDeployOnHost contents the IMAGE carries for deploy-on-host.sh (null = same as host)
  * @param downDuringDeployMs if set, /mcp answers 000 for this long while the fake deploy "swaps"
  */
-function sandbox({ repoDigests = [PINNED], revision = SHA, deployRc = 0, imageDeployOnHost = null, downDuringDeployMs = 0 } = {}) {
+function sandbox({ repoDigests = [PINNED], revision = SHA, deployRc = 0, imageDeployOnHost = null, downDuringDeployMs = 0, downBefore = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "bgw-deploy-ref-"));
   const bin = join(dir, "bin");
   const deploy = join(dir, "deploy");
@@ -83,6 +83,8 @@ case "$1" in
 esac
 exit 0
 `);
+  // downBefore: /mcp is already unreachable when the deploy starts (a crash-looping old container).
+  if (downBefore) writeFileSync(join(marks, "DOWN"), "");
   writeFileSync(join(bin, "curl"), `#!/usr/bin/env bash\nif [ -e "${marks}/DOWN" ]; then echo 000; exit 7; fi\necho 401\n`);
   for (const f of ["docker", "curl"]) chmodSync(join(bin, f), 0o755);
 
@@ -208,4 +210,14 @@ test("the blip is measured while /mcp is actually down during the swap", () => {
   const m = r.out.match(/blip: \/mcp unavailable for ~(\d+) s \((\d+) failed probes/);
   assert.ok(m, `blip line: ${r.out}`);
   assert.ok(Number(m[1]) >= 2 && Number(m[2]) >= 3, `measured ~${m[1]} s with ${m[2]} failed probes for a 2.2 s outage`);
+});
+
+test("no invented blip: when /mcp was already down before the deploy, the report says so", () => {
+  // Measured on a real daemon: the old container was crash-looping, the smoke aborted the deploy (no
+  // swap at all), and the report still claimed "/mcp unavailable for ~32 s" as if the deploy caused it.
+  const sb = sandbox({ downBefore: true, deployRc: 1 });
+  const r = run(sb, "768af59");
+  assert.equal(r.status, 1);
+  assert.match(r.out, /blip: not measurable — \/mcp was already unavailable before the deploy/);
+  assert.doesNotMatch(r.out, /blip: \/mcp unavailable for/);
 });

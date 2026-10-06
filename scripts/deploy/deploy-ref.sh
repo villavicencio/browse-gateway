@@ -132,6 +132,10 @@ fi
 
 # 5 — time the blip: sample unauthenticated /mcp (401 = up; it is not logged by the gateway) twice a
 # second for the whole run. The gate and smoke run first and leave the live container serving.
+# Baseline first. A /mcp that is already down (a crash-looping old container) would otherwise be
+# reported as a deploy blip — measured on a real daemon: a deploy the smoke aborted, with no swap at
+# all, reported "/mcp unavailable for ~32 s".
+BASELINE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://${BIND_ADDR}:${HOST_PORT}/mcp" 2>/dev/null || true)"
 touch "$TMP/probing"
 (
   while [ -e "$TMP/probing" ]; do
@@ -154,8 +158,12 @@ PROBE_PID=""
 [ -n "$FOLLOW_PID" ] && { kill "$FOLLOW_PID" >/dev/null 2>&1 || true; FOLLOW_PID=""; }
 
 # 7 — report.
+if [ "${BASELINE:-000}" != "401" ]; then
+  BLIP="not measurable — /mcp was already unavailable before the deploy (baseline probe: ${BASELINE:-000})"
+else
 BLIP="$(awk '$2 != "401" { n++; if (!f) f = $1; l = $1 }
   END { if (n) printf "/mcp unavailable for ~%d s (%d failed probes, 0.5 s apart)", l - f + 1, n; else print "none observed (0.5 s sampling)" }' "$TMP/probe" 2>/dev/null || echo "not measured")"
+fi
 echo "deploy-ref: ---- report ----"
 echo "deploy-ref: result: exit ${rc} for ${REF} (${IMAGE})"
 echo "deploy-ref: blip: ${BLIP}"
