@@ -6,6 +6,7 @@ module: browse-gateway
 problem_type: runtime_error
 component: tooling
 severity: high
+last_updated: 2026-10-06
 symptoms:
   - "Docker container hangs indefinitely (~24 min before manual kill) with no progress"
   - "`docker logs` returns empty output despite node and Xvfb running inside the container"
@@ -34,7 +35,7 @@ A Docker container running headful Chrome under Xvfb hangs indefinitely with no 
 - `docker run … | tail -N` shows nothing at all.
 - `docker top <id>` shows `Xvfb` and `node` running, but **no `chrome` process** ever appears.
 - Inner command (the Node script, the browser launch, etc.) never produces its first log line — looks like it never started, even though the wrapper did invoke it.
-- Behavior reproduces identically on native Linux and on emulated platforms (e.g. an amd64 image on Apple Silicon via Rosetta), which initially misleads toward an emulation diagnosis.
+- This wedge reproduces identically on native Linux and on emulated platforms (e.g. an amd64 image on Apple Silicon via Rosetta), which initially misleads toward an emulation diagnosis. That holds for **this** wedge only; it is not a general rule that emulation is irrelevant. Since the image's entrypoint became `tini -s` (PR #137), an amd64 container on a Colima VM whose Rosetta has silently detached runs under QEMU user-mode and cannot start at all. See [tini -s dies on Colima when amd64 silently falls back from Rosetta to QEMU](tini-s-dies-on-colima-when-amd64-silently-falls-back-from-rosetta-to-qemu.md). When a container misbehaves only on an Apple-silicon Mac, check which amd64 handler is live (`colima ssh -- ls /proc/sys/fs/binfmt_misc/`) before ruling emulation in or out.
 
 ## What Didn't Work
 
@@ -94,6 +95,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # ENTRYPOINT runs the display bootstrap; CMD is the default app command and
 # stays overridable from `docker run … <image> <override>`.
+# (Historical: the fix as written in 2026-05. Since PR #137 the repo's image runs
+#  ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/entrypoint.sh"] — tini is
+#  baked in as PID 1 — see docker/Dockerfile.)
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["node", "scripts/your-command.mjs"]
 ```
@@ -137,4 +141,5 @@ The fix has three independent pieces, each load-bearing:
 
 ## Related
 
-- The in-repo implementation of this pattern: `docker/Dockerfile`, `docker/entrypoint.sh`, and `docker/compose.yaml`.
+- The in-repo implementation of this pattern: `docker/Dockerfile`, `docker/entrypoint.sh`, and `docker/compose.yaml`. The Dockerfile has since added `tini -s` as the image's own PID 1 (PR #137, issue #131); `entrypoint.sh` is unchanged in role.
+- [tini -s dies on Colima when amd64 silently falls back from Rosetta to QEMU](tini-s-dies-on-colima-when-amd64-silently-falls-back-from-rosetta-to-qemu.md): a later container-won't-run failure on Apple silicon where the emulation layer *was* the cause.
