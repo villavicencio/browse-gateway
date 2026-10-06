@@ -32,7 +32,9 @@ function smokeWith(bootLine) {
 
   writeFileSync(join(bin, "docker"), `#!/usr/bin/env bash
 case "$1" in
-  logs) cat "${dir}/bootline"; exit 0 ;;
+  # exit with cat's own status: the real CLI dies of SIGPIPE when its reader closes early, and a
+  # fake that always exits 0 cannot express that failure.
+  logs) cat "${dir}/bootline"; exit $? ;;
   inspect)
     case "$*" in
       *State.Status*) echo "running/true/0" ;;
@@ -100,4 +102,12 @@ test("RED — leading zeros are not a semver core", () => {
 test("RED — a non-numeric version fails the smoke", () => {
   const r = smokeWith(`${READY} version=main deploy=none mode=http`);
   assert.notEqual(r.status, 0);
+});
+
+test("PASS — a log far larger than a pipe buffer still lets the smoke find its marker (no grep -q SIGPIPE)", () => {
+  // grep -q exits at the first match; under pipefail the still-writing \`docker logs\` is SIGPIPEd and
+  // the pipeline reads as failed on the very poll that found the boot line.
+  const r = smokeWith(`${READY} version=1.0.0+ac4ec664bd8c deploy=ac4ec664bd8c mode=http\n` + "x".repeat(3_000_000));
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /smoke: OK/);
 });

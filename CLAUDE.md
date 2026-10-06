@@ -64,6 +64,19 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   In **zsh**, `$REPO:latest` triggers the `:l` modifier — write `"${REPO}:latest"`.
   Gates needing bind-mounts require the overlay-image approach (colima will not share
   `/private/tmp`), plus `--init`.
+  ⚠️ **Measured 2026-10-06: the dev Mac's Colima VM could not start ANY current image. The cause was
+  the VM's amd64 handler, not the image.** The entrypoint is `tini -s`. Rosetta had failed to attach
+  when the VM booted (`dmesg`: `binfmt_misc: register: failed to install interpreter file
+  /mnt/lima-rosetta/rosetta`), so amd64 binaries were running through QEMU user-mode (`qemu-x86_64`),
+  which refuses `PR_SET_CHILD_SUBREAPER` (`[FATAL tini] PR_SET_CHILD_SUBREAPER is unavailable on this
+  platform`), with or without `--init`. The same `tini -s` succeeds in an arm64 container on the same VM.
+  When a gate "won't start", read `docker logs`, then check which handler is live
+  (`colima ssh -- ls /proc/sys/fs/binfmt_misc/` should list `rosetta`, not only `qemu-x86_64`) before
+  suspecting your change. **Fix: `colima stop && colima start`.** Verified 2026-10-06: after the restart
+  `rosetta` was registered, `/mnt/lima-rosetta` was mounted, and the image booted. The "failed to
+  install interpreter" boot line appears even on a good boot; the later registration is what counts,
+  so check the live list, not `dmesg`. The handler can apparently drop during a long VM uptime: a gate
+  passed on this same daemon on 2026-09-30 and failed on 2026-10-06 with no VM restart in between.
 - **The runtime gate is not a formality.** It is the only stage that runs the real code against a
   real browser, and it has caught defects every unit test passed: a snapshot axis churning one
   capture pair in five while the no-churn test was green. Never accept a green unit run as evidence
@@ -110,6 +123,15 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   and `--stop-timeout` lands at `.Config.StopTimeout`, **not** `.HostConfig.StopTimeout`, whose absence
   is not evidence of anything. Full write-up:
   `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`.
+- **Since 2026-10, prod deploys are operator-run on the host, not dispatched from CI.** The prod host
+  changed, and `deploy-http.yml`'s secrets describe a host that no longer exists, so **don't dispatch it.**
+  On the host, run `scripts/deploy/deploy-ref.sh <7-hex sha | 40-hex sha | tag>`. It resolves the ref
+  to a pinned digest, refuses an image whose `org.opencontainers.image.revision` isn't that commit,
+  follows the old container's log through the swap, times the blip, and hands the digest to
+  `deploy-on-host.sh`, which keeps every gate. **The host's copies of both scripts are what run.**
+  After changing either one, sync the host and confirm deploy-ref's drift NOTE is silent. The image is
+  public on GHCR, so a pull needs no credential. Host-specific paths and the step-by-step procedure
+  stay in `CONTEXT.local.md`, never in this file.
 - **`main` is NOT branch-protected, so nothing mechanically blocks a merge.** There are no required
   status checks (`gh api repos/<owner>/<repo>/branches/main/protection` → 404 "Branch not
   protected"). A PR with **no CI run at all** still reads mergeable, which is a strictly weaker

@@ -33,6 +33,21 @@ BIND_ADDR="${BGW_BIND_ADDR:-127.0.0.1}"
 HOST_PORT="${BGW_HOST_PORT:-8080}"
 GATE_LOG="${GATE_LOG:-$HOME/validate-http-deploy.log}"   # ~/ not /tmp (a root-owned /tmp log false-PASSes)
 
+# The post-swap verify budget (step 7), validated HERE — before the pull, the gate, or the swap. An
+# unusable value (0, "abc", "2.5") would make verify's loop run zero times and report failure, so the
+# deploy would roll back a healthy image and the rollback's verify would fail the same way. A typo in
+# config must be refused while the live container is still untouched. Whole seconds, 1..600; leading
+# zeros are stripped before the range check so "007" is 7 and a long digit string cannot overflow it.
+VERIFY_TIMEOUT="${BGW_VERIFY_TIMEOUT:-30}"
+case "$VERIFY_TIMEOUT" in
+  *[!0-9]*) VERIFY_TIMEOUT="" ;;
+  *) VERIFY_TIMEOUT="${VERIFY_TIMEOUT#"${VERIFY_TIMEOUT%%[!0]*}"}" ;;
+esac
+if [ -z "$VERIFY_TIMEOUT" ] || [ "${#VERIFY_TIMEOUT}" -gt 3 ] || [ "$VERIFY_TIMEOUT" -gt 600 ]; then
+  echo "deploy: refused — BGW_VERIFY_TIMEOUT must be whole seconds in 1..600, got '${BGW_VERIFY_TIMEOUT}'" >&2
+  exit 2
+fi
+
 # 1 — accept a pinned digest of THIS PROJECT'S package only (forced-command boundary). The runner
 # passes the resolved ref; the request arrives in SSH_ORIGINAL_COMMAND. Pinning the package — not
 # just "some ghcr digest" — is load-bearing: a leaked key must NOT be able to deploy an arbitrary
@@ -177,17 +192,58 @@ echo "deploy: rollback anchor = ${ROLLBACK_IMAGE:-<none running>}"
 BGW_DEPLOY_IMAGE="$IMAGE" "$HERE/launch-http.sh"
 
 # 7 — verify; on any miss, auto-rollback to the captured digest and re-verify.
+#
+# POLL, don't take one look after a fixed sleep (VIL-291). This used to be `sleep 4` and a single
+# check, tuned on a native host. On a slower host — an amd64 image under binary translation boots
+# measurably slower — a healthy image is still starting at the 4 s mark: verify fails, the deploy rolls
+# back a good image, and the rollback's own one-shot verify can fail the same way, ending in "ROLLBACK
+# ALSO FAILED" with nothing actually wrong. The pre-swap smoke already polls (30 s); this matches it.
+# Polling costs nothing on a fast host — it returns on the first passing check.
+#
+# What does NOT get the benefit of the wait: a container that has restarted, or is not running. Those
+# will not heal by waiting, so they fail at once — the poll must not turn a fast failure into a slow one.
+#
+# The budget (VERIFY_TIMEOUT, validated at the top) is ONE wall-clock deadline covering the sleeps AND
+# the /mcp probe: each probe's --max-time is capped to what is left, so a stalled probe cannot stretch
+# a 30 s verify to 4x that. The attempt count is also capped, as a second bound that holds even if the
+# clock does not advance.
+#
+# CHECK FIRST, sleep only BETWEEN attempts. Sleeping before the first check let the smallest budget
+# (1 s) spend itself on the sleep and exit having inspected nothing — so a healthy image was rolled back
+# and the rollback's verify failed the same way. The first attempt therefore always runs, whatever the
+# budget; `continue` lands on the between-attempts bound below, never on an unbounded loop.
 verify() {
-  sleep 4
-  local state restarts code
-  state="$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
-  docker logs "$CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true' || { echo "verify: dnsRebindProtection not true ($state)"; return 1; }
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
-  # RestartCount is a TOP-LEVEL field ({{.RestartCount}}), NOT {{.State.RestartCount}} (which errors
-  # "map has no entry"). The state line already captured it as the 3rd '/'-field — reuse that.
-  restarts="${state##*/}"
-  [ "$code" = "401" ] && [ "$restarts" = "0" ] || { echo "verify: mcp=$code restarts=$restarts state=$state"; return 1; }
-  echo "verify: OK (running, restarts=0, dnsRebind=true, /mcp=401)"
+  local polls=0 start=$SECONDS left state="" restarts="" code="000" logs
+  while :; do
+    if [ "$polls" -gt 0 ]; then
+      left=$((VERIFY_TIMEOUT - (SECONDS - start)))
+      { [ "$polls" -lt "$VERIFY_TIMEOUT" ] && [ "$left" -ge 1 ]; } || break
+      sleep 1
+    fi
+    polls=$((polls + 1))
+    left=$((VERIFY_TIMEOUT - (SECONDS - start)))
+    [ "$left" -ge 1 ] || left=1   # whatever remains, an attempt's probe gets at least 1 s
+    state="$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
+    # RestartCount is a TOP-LEVEL field ({{.RestartCount}}), NOT {{.State.RestartCount}} (which errors
+    # "map has no entry"). The state line captures it as the 3rd '/'-field — reuse that.
+    restarts="${state##*/}"
+    case "$state" in
+      running/true/0) ;;
+      *) echo "verify: container not healthy (restarts=$restarts state=$state)"; return 1 ;;
+    esac
+    # Capture, THEN match. `docker logs | grep -q` is wrong under pipefail: grep -q exits at the first
+    # match, the still-writing docker CLI dies of SIGPIPE, and the pipeline reads as FAILED on exactly
+    # the poll that found the marker — every poll, once the log outgrows a pipe buffer.
+    logs="$(docker logs "$CONTAINER" 2>&1)" || continue
+    case "$logs" in *dnsRebindProtection=true*) ;; *) continue ;; esac
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$(( left < 3 ? left : 3 ))" "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
+    if [ "$code" = "401" ]; then
+      echo "verify: OK after $((SECONDS - start))s, attempt ${polls} (running, restarts=0, dnsRebind=true, /mcp=401)"
+      return 0
+    fi
+  done
+  echo "verify: timed out after ${VERIFY_TIMEOUT}s (mcp=$code restarts=$restarts state=$state)"
+  return 1
 }
 
 if verify; then
