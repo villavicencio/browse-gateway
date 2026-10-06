@@ -64,12 +64,16 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   In **zsh**, `$REPO:latest` triggers the `:l` modifier — write `"${REPO}:latest"`.
   Gates needing bind-mounts require the overlay-image approach (colima will not share
   `/private/tmp`), plus `--init`.
-  ⚠️ **Measured 2026-10-06: on an Apple-silicon Mac, Colima with Rosetta cannot start ANY current
-  image.** The entrypoint is `tini -s`, and Rosetta-translated amd64 code is refused
-  `PR_SET_CHILD_SUBREAPER` (`[FATAL tini] PR_SET_CHILD_SUBREAPER is unavailable on this platform`),
-  with or without `--init`. The same `tini -s` succeeds in an arm64 container on the same VM, so the
-  limit is Rosetta, not the kernel. A gate that "won't start" there is this, not your change. Run the
-  gate somewhere that executes amd64 natively or through QEMU instead.
+  ⚠️ **Measured 2026-10-06: the dev Mac's Colima VM could not start ANY current image, and the cause
+  was the VM's amd64 handler, not the image.** The entrypoint is `tini -s`. Rosetta had failed to attach
+  when the VM booted (`dmesg`: `binfmt_misc: register: failed to install interpreter file
+  /mnt/lima-rosetta/rosetta`), so amd64 binaries were running through QEMU user-mode (`qemu-x86_64`),
+  which refuses `PR_SET_CHILD_SUBREAPER` (`[FATAL tini] PR_SET_CHILD_SUBREAPER is unavailable on this
+  platform`), with or without `--init`. The same `tini -s` succeeds in an arm64 container on the same VM.
+  When a gate "won't start", read `docker logs`, then check which handler is live
+  (`colima ssh -- ls /proc/sys/fs/binfmt_misc/` should list `rosetta`, not only `qemu-x86_64`) before
+  suspecting your change. A Colima restart, so that Rosetta re-attaches, is the first remedy to try
+  (untested as of this writing).
 - **The runtime gate is not a formality.** It is the only stage that runs the real code against a
   real browser, and it has caught defects every unit test passed: a snapshot axis churning one
   capture pair in five while the no-churn test was green. Never accept a green unit run as evidence
