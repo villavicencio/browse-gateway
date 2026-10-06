@@ -110,6 +110,15 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   and `--stop-timeout` lands at `.Config.StopTimeout`, **not** `.HostConfig.StopTimeout`, whose absence
   is not evidence of anything. Full write-up:
   `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`.
+- **Since 2026-10, prod deploys are operator-run on the host, not dispatched from CI.** The prod host
+  changed, and `deploy-http.yml`'s secrets describe a host that no longer exists, so **don't dispatch it.**
+  On the host, run `scripts/deploy/deploy-ref.sh <7-hex sha | 40-hex sha | tag>`. It resolves the ref
+  to a pinned digest, refuses an image whose `org.opencontainers.image.revision` isn't that commit,
+  follows the old container's log through the swap, times the blip, and hands the digest to
+  `deploy-on-host.sh`, which keeps every gate. **The host's copies of both scripts are what run.**
+  After changing either one, sync the host and confirm deploy-ref's drift NOTE is silent. The image is
+  public on GHCR, so a pull needs no credential. Host-specific paths and the step-by-step procedure
+  stay in `CONTEXT.local.md`, never in this file.
 - **`main` is NOT branch-protected, so nothing mechanically blocks a merge.** There are no required
   status checks (`gh api repos/<owner>/<repo>/branches/main/protection` → 404 "Branch not
   protected"). A PR with **no CI run at all** still reads mergeable, which is a strictly weaker
