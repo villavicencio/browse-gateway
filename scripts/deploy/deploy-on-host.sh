@@ -177,17 +177,38 @@ echo "deploy: rollback anchor = ${ROLLBACK_IMAGE:-<none running>}"
 BGW_DEPLOY_IMAGE="$IMAGE" "$HERE/launch-http.sh"
 
 # 7 — verify; on any miss, auto-rollback to the captured digest and re-verify.
+#
+# POLL, don't take one look after a fixed sleep (VIL-291). This used to be `sleep 4` and a single
+# check, tuned on a native host. On a slower host — an amd64 image under binary translation boots
+# measurably slower — a healthy image is still starting at the 4 s mark: verify fails, the deploy rolls
+# back a good image, and the rollback's own one-shot verify can fail the same way, ending in "ROLLBACK
+# ALSO FAILED" with nothing actually wrong. The pre-swap smoke already polls (30 s); this matches it.
+# Polling costs nothing on a fast host — it returns on the first passing check.
+#
+# What does NOT get the benefit of the wait: a container that has restarted, or is not running. Those
+# will not heal by waiting, so they fail at once — the poll must not turn a fast failure into a slow one.
+VERIFY_TIMEOUT="${BGW_VERIFY_TIMEOUT:-30}"
 verify() {
-  sleep 4
-  local state restarts code
-  state="$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
-  docker logs "$CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true' || { echo "verify: dnsRebindProtection not true ($state)"; return 1; }
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
-  # RestartCount is a TOP-LEVEL field ({{.RestartCount}}), NOT {{.State.RestartCount}} (which errors
-  # "map has no entry"). The state line already captured it as the 3rd '/'-field — reuse that.
-  restarts="${state##*/}"
-  [ "$code" = "401" ] && [ "$restarts" = "0" ] || { echo "verify: mcp=$code restarts=$restarts state=$state"; return 1; }
-  echo "verify: OK (running, restarts=0, dnsRebind=true, /mcp=401)"
+  local i=0 state="" restarts="" code="000"
+  while [ "$i" -lt "$VERIFY_TIMEOUT" ]; do
+    sleep 1; i=$((i + 1))
+    state="$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
+    # RestartCount is a TOP-LEVEL field ({{.RestartCount}}), NOT {{.State.RestartCount}} (which errors
+    # "map has no entry"). The state line captures it as the 3rd '/'-field — reuse that.
+    restarts="${state##*/}"
+    case "$state" in
+      running/true/0) ;;
+      *) echo "verify: container not healthy (restarts=$restarts state=$state)"; return 1 ;;
+    esac
+    docker logs "$CONTAINER" 2>&1 | grep -q 'dnsRebindProtection=true' || continue
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
+    if [ "$code" = "401" ]; then
+      echo "verify: OK after ${i}s (running, restarts=0, dnsRebind=true, /mcp=401)"
+      return 0
+    fi
+  done
+  echo "verify: timed out after ${VERIFY_TIMEOUT}s (mcp=$code restarts=$restarts state=$state)"
+  return 1
 }
 
 if verify; then
