@@ -14,7 +14,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,7 +26,7 @@ const IMAGE = `ghcr.io/testowner/browse-gateway@sha256:${"a".repeat(64)}`;
  * @param readyAfter the `docker logs` call number on which the boot line first appears
  * @param state      what `docker inspect` reports as Status/Running/RestartCount
  */
-function sandbox({ readyAfter, state = "running/true/0", bigLogs = false, stalledProbe = false }) {
+function sandbox({ readyAfter, state = "running/true/0", bigLogs = false, stalledProbe = false, realSleep = false }) {
   const dir = mkdtempSync(join(tmpdir(), "bgw-verify-"));
   const bin = join(dir, "bin");
   const deploy = join(dir, "deploy");
@@ -74,7 +74,9 @@ exit 0
   writeFileSync(join(bin, "sha256sum"), `#!/usr/bin/env bash\nshasum -a 256 "$@" 2>/dev/null || echo "0000000000000000  $1"\n`);
   // Count sleeps instead of spending them.
   writeFileSync(join(bin, "sleep"), `#!/usr/bin/env bash\necho "$1" >> "${marks}/sleeps"\n`);
-  for (const f of ["docker", "curl", "sha256sum", "sleep"]) chmodSync(join(bin, f), 0o755);
+  // realSleep: drop the shim so `sleep 1` really advances the clock verify() budgets against.
+  if (realSleep) unlinkSync(join(bin, "sleep"));
+  for (const f of ["docker", "curl", "sha256sum", ...(realSleep ? [] : ["sleep"])]) chmodSync(join(bin, f), 0o755);
 
   writeFileSync(join(dir, "config.env"), [
     "BGW_EXPECTED_REPO=ghcr.io/testowner/browse-gateway",
@@ -169,4 +171,22 @@ test("a stalled /mcp probe cannot stretch verify past its budget", () => {
   const secs = (Date.now() - t0) / 1000;
   assert.equal(r.status, 1, "probe never answers 401 -> verify fails -> rollback");
   assert.ok(secs < 5, `deploy took ${secs.toFixed(1)} s; two 1 s verifies must not take ~6 s`);
+});
+
+test("a healthy container is accepted on the FIRST check, before any sleep", () => {
+  const sb = sandbox({ readyAfter: 1 });
+  const r = runDeploy(sb);
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  assert.equal(count(sb, "sleeps"), 0, "nothing to wait for: verify must check before it sleeps");
+});
+
+test("the smallest budget (1 s) still checks the container, with the clock really running", () => {
+  // With a sleep BEFORE the first check, a real 1 s sleep spent the whole budget, the loop exited
+  // without inspecting anything, the healthy image was rolled back, and the rollback's verify did the
+  // same. The sleep shim hid this: it never advanced $SECONDS.
+  const sb = sandbox({ readyAfter: 1, realSleep: true });
+  const r = runDeploy(sb, { BGW_VERIFY_TIMEOUT: "1" });
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /verify: OK/);
+  assert.equal(liveLaunches(sb).length, 1, "no rollback");
 });

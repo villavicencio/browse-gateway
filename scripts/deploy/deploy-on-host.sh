@@ -205,14 +205,24 @@ BGW_DEPLOY_IMAGE="$IMAGE" "$HERE/launch-http.sh"
 #
 # The budget (VERIFY_TIMEOUT, validated at the top) is ONE wall-clock deadline covering the sleeps AND
 # the /mcp probe: each probe's --max-time is capped to what is left, so a stalled probe cannot stretch
-# a 30 s verify to 4x that. The poll count is also capped, as a second bound that holds even if the
+# a 30 s verify to 4x that. The attempt count is also capped, as a second bound that holds even if the
 # clock does not advance.
+#
+# CHECK FIRST, sleep only BETWEEN attempts. Sleeping before the first check let the smallest budget
+# (1 s) spend itself on the sleep and exit having inspected nothing — so a healthy image was rolled back
+# and the rollback's verify failed the same way. The first attempt therefore always runs, whatever the
+# budget; `continue` lands on the between-attempts bound below, never on an unbounded loop.
 verify() {
-  local i=0 start=$SECONDS left state="" restarts="" code="000" logs
-  while [ "$i" -lt "$VERIFY_TIMEOUT" ]; do
-    sleep 1; i=$((i + 1))
+  local polls=0 start=$SECONDS left state="" restarts="" code="000" logs
+  while :; do
+    if [ "$polls" -gt 0 ]; then
+      left=$((VERIFY_TIMEOUT - (SECONDS - start)))
+      { [ "$polls" -lt "$VERIFY_TIMEOUT" ] && [ "$left" -ge 1 ]; } || break
+      sleep 1
+    fi
+    polls=$((polls + 1))
     left=$((VERIFY_TIMEOUT - (SECONDS - start)))
-    [ "$left" -ge 1 ] || break
+    [ "$left" -ge 1 ] || left=1   # whatever remains, an attempt's probe gets at least 1 s
     state="$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Running}}/{{.RestartCount}}' 2>/dev/null || echo 'missing')"
     # RestartCount is a TOP-LEVEL field ({{.RestartCount}}), NOT {{.State.RestartCount}} (which errors
     # "map has no entry"). The state line captures it as the 3rd '/'-field — reuse that.
@@ -228,7 +238,7 @@ verify() {
     case "$logs" in *dnsRebindProtection=true*) ;; *) continue ;; esac
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$(( left < 3 ? left : 3 ))" "http://${BIND_ADDR}:${HOST_PORT}/mcp" || echo 000)"
     if [ "$code" = "401" ]; then
-      echo "verify: OK after ${i}s (running, restarts=0, dnsRebind=true, /mcp=401)"
+      echo "verify: OK after $((SECONDS - start))s, attempt ${polls} (running, restarts=0, dnsRebind=true, /mcp=401)"
       return 0
     fi
   done
