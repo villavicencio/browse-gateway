@@ -28,6 +28,11 @@ tags:
   - memory-hygiene
 ---
 
+> **2026-10-07:** `.github/workflows/deploy-http.yml` has been deleted (its target host no longer exists;
+> prod deploys are operator-run via `scripts/deploy/deploy-ref.sh`). References to it below are
+> historical — read the file from git history (`git log --all -- .github/workflows/deploy-http.yml`).
+
+
 ## Context
 
 On 2026-08-25, during a routine production deploy, an agent compared the rollback anchor printed by
