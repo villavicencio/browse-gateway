@@ -6,6 +6,7 @@ module: scripts/deploy/deploy-on-host.sh, scripts/deploy/preswap-smoke.sh
 problem_type: best_practice
 component: deploy-pipeline
 severity: high
+last_updated: 2026-10-06
 applies_when:
   - "A deploy, CI, or provisioning gate is installed on a host rather than shipped with the artifact"
   - "You hardened a check in the repo and are about to assume the next deploy runs it"
@@ -93,6 +94,9 @@ Not by reading the diff. Construct the RED at the source and **watch it**:
 `test/deploy-smoke-sourcing.test.mjs` does this against a fake daemon, so the script under test is
 the real one. Every assertion in it was watched failing with the fix reverted. See
 [a-test-whose-stub-guarantees-the-assertion-proves-nothing](a-test-whose-stub-guarantees-the-assertion-proves-nothing.md).
+A fake daemon must exit with the status its writer actually got, never a hard-coded `exit 0`.
+Otherwise it cannot express a SIGPIPE death, and any pipeline assertion against it proves nothing
+([grep -q under pipefail](../runtime-errors/grep-q-under-pipefail-fails-on-the-match-it-was-looking-for.md)).
 
 ## Proving it on the real host, without a real deploy
 
@@ -108,8 +112,13 @@ extraction proves the probe works. Extract the real block out of the file that a
 # Runs the REAL step-4 block from the installed forced command against an arbitrary image.
 # It stops before step 5, so the swap cannot run and the live container is structurally safe.
 IMAGE="$1"; HERE=/path/to/deploy; CONFIG=…; . "$CONFIG"
-eval "$(sed -n '101,170p' "$HERE/deploy-on-host.sh")"
+eval "$(sed -n '/^SMOKE_IN_IMAGE=/,/^echo "deploy: smoke PASS"/p' "$HERE/deploy-on-host.sh")"
 ```
+
+Extract by **markers, not line numbers**. An earlier version of this recipe used `sed -n '101,170p'`;
+an unrelated addition near the top of the script moved the block, and those numbers began
+mid-comment. Before trusting the extraction, print it and confirm it starts at `SMOKE_IN_IMAGE=`
+and ends at `deploy: smoke PASS`.
 
 **2. Build the RED image so it cannot silently be un-broken.** Derive it from the image actually
 running, change exactly one thing, and make the build itself assert the change landed:

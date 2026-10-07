@@ -6,10 +6,12 @@ module: browser/fingerprint, test/fingerprint.test.mjs, scripts/measure-input-re
 problem_type: best_practice
 component: test-methodology
 severity: high
+last_updated: 2026-10-06
 applies_when:
   - "You are writing a unit test for browser-side code against hand-built global stubs"
   - "You are writing a guard, gate, or probe whose job is to be able to report bad news"
   - "A test is green and you are about to treat that as evidence the behaviour holds"
+  - "You are faking a CLI on PATH (docker, curl) in a shell-script test and the code under test reads its exit status"
 ---
 
 ## Problem
@@ -94,3 +96,10 @@ searching for one function name is the same failure: the check cannot see the th
 rule out. The claim is now scoped to the section it is true of, checks seven request primitives, and
 names the exception explicitly. See
 [the CDP baseline write-up](../architecture-patterns/cdp-detectability-baseline-three-way.md).
+
+A later instance outside browser code: a fake `docker` on `PATH` whose `logs` branch ended in a
+hard-coded `exit 0`. The code under test piped `docker logs` into `grep -q` under `pipefail`, where
+the real CLI dies of SIGPIPE. The fake *could not die*, so a 3 MB regression test passed against
+the broken script until the fake was changed to `exit $?`. A fake CLI must exit with the status its
+writer actually got. See
+[grep -q under pipefail fails on the match it was looking for](../runtime-errors/grep-q-under-pipefail-fails-on-the-match-it-was-looking-for.md).

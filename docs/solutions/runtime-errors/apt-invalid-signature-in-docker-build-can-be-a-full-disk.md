@@ -6,6 +6,7 @@ module: "docker/Dockerfile, scripts/validate-*.mjs, local build environment (col
 problem_type: build_error
 component: tooling
 severity: high
+last_updated: 2026-10-06
 symptoms:
   - "`docker build` fails at the `apt-get update` layer with `At least one invalid signature was encountered.`"
   - "`E: The repository ... bookworm InRelease is not signed.` for bookworm, bookworm-updates and bookworm-security alike"
@@ -222,6 +223,13 @@ docker build ... > log 2>&1; rc=$?; tail -3 log; exit $rc
   about.
 - **Read the recorded `exit=` line in the log, not the harness's task summary**, whenever a
   command was wrapped in a pipeline.
+- **Don't swap this for `set -o pipefail` without thinking.** `pipefail` fixes this direction (a
+  pipeline whose status is its last command's) and opens the opposite one. When the reader exits
+  early (`grep -q`, `head`) while the writer still has output to write, the writer gets SIGPIPE,
+  and a pipeline that found exactly what it wanted can report that 141 as failure. If the writer
+  finished first, it never sees the signal, which is why this passes on small inputs. See
+  [grep -q under pipefail fails on the match it was looking for](grep-q-under-pipefail-fails-on-the-match-it-was-looking-for.md).
+  Capturing the status explicitly, as above, avoids both.
 
 This is the exit-status face of a hazard this repo already documents in its output-visibility face:
 `docs/solutions/runtime-errors/xvfb-run-wedges-container-as-pid1.md:133` — *"Never pipe `docker run`
@@ -263,10 +271,15 @@ silently. `docker system df` is a cheap thing to glance at before starting a lon
 
 ## Related
 
-- `docs/solutions/runtime-errors/xvfb-run-wedges-container-as-pid1.md` — the other half of the
-  "your tooling is lying to you about a container" pair; covers output visibility (`docker logs`
-  empty, `| tail` swallowing a wedge) where this doc covers exit status and build-time disk.
-- **No in-repo doc covers Docker-on-Apple-Silicon setup.** That material lives *outside* the repo,
+- `docs/solutions/runtime-errors/xvfb-run-wedges-container-as-pid1.md` — another case of "your
+  tooling is lying to you about a container"; covers output visibility (`docker logs` empty, `| tail`
+  swallowing a wedge) where this doc covers exit status and build-time disk. The third case is
+  [grep -q under pipefail](grep-q-under-pipefail-fails-on-the-match-it-was-looking-for.md): a pipeline
+  that *fails* although it found its match.
+- [tini -s dies on Colima when amd64 silently falls back from Rosetta to QEMU](tini-s-dies-on-colima-when-amd64-silently-falls-back-from-rosetta-to-qemu.md)
+  — the other local-Colima failure that blocks every in-container gate while looking like something
+  else; it is the in-repo doc for the Colima VM's amd64 handler (Rosetta vs QEMU).
+- **General Docker-on-Apple-Silicon bring-up is not covered in-repo.** That material lives *outside* the repo,
   as the harness memory note `docker-headful-chrome-on-apple-silicon` (colima+Rosetta bring-up, the
   `xvfb-run` trap, `$HOME`-not-`/tmp` mount scope). That note covers **bring-up and mounts**; it
   does **not** mention disk exhaustion, build-cache growth, or apt/GPG failures — so this doc

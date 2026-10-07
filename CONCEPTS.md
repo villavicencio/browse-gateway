@@ -10,9 +10,9 @@ ce-compound-refresh process learnings; direct edits are fine. Glossary only, not
 The staged replacement of the running gateway container with one built from a newer image. The
 sequence is fixed and each stage is non-bypassable: resolve the requested tag to an immutable
 registry digest, run the Gate against that digest, run the Pre-swap smoke against the real on-host
-configuration, record the Rollback anchor, replace the container, then verify the replacement
-answers healthy. A failure before the replacement leaves the live container untouched; a failure
-after it returns the gateway to the Rollback anchor automatically.
+configuration, record the Rollback anchor, replace the container, then run the Post-swap verify.
+A failure before the replacement leaves the live container untouched; a failure after it returns the
+gateway to the Rollback anchor automatically.
 
 ### Gate
 A check that must pass before the thing it guards proceeds, and that is trusted only once it has
@@ -25,8 +25,18 @@ A boot of the exact configuration the live container is about to read — real e
 consumer manifest — on a throwaway container and port, asserting it comes up clean before anything
 touches the live container. It catches the failure class the Gate cannot: a malformed setting or a
 manifest that violates a startup assertion, which would otherwise pass an image-level check, go
-live, fail verification, and take the automatic rollback down with it. It is shared by the Deploy
+live, fail the Post-swap verify, and take the automatic rollback down with it. It is shared by the Deploy
 swap and the Apply path, which differ only in which image they hand it.
+
+### Post-swap verify
+The health check run against the replacement container right after a Deploy swap replaces it. Its
+failure is what sends the gateway back to the Rollback anchor.
+
+It waits for the replacement to come up, within a bounded polling budget, instead of taking a single look,
+because how long a healthy image takes to boot depends on the host it runs on. A replacement that has
+already restarted or stopped fails at once, because waiting cannot heal it. The same check runs again
+on the rolled-back container, so a check that cannot recognise a healthy container fails the deploy
+and its rollback together.
 
 ### Rollback anchor
 The identity of the image the gateway was running immediately before a Deploy swap, captured so an
