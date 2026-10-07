@@ -358,3 +358,33 @@ test("#48: drive browser_navigate has NO homeFallback header on a normal landing
   const nav = await client.callTool({ name: "browser_navigate", arguments: { url: "https://example.com/" } });
   assert.doesNotMatch(nav.content[0].text, /homeFallback/, "omitted when not detected");
 });
+
+// --- VIL-116: the brand is discoverable from the tool list, and only there ------------------------------
+
+test("the brand appears in the entry tools' DESCRIPTIONS, while every technical handle is unchanged", async () => {
+  const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { makeSearchFn } = await import("../dist/search/index.js");
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  const server = createGatewayMcpServer({
+    retrieve: async () => ({ markdown: "x", title: "t", status: 200, blocked: false, reason: null, degraded: false, proxyUsed: false, captchaSolved: false }),
+    search: makeSearchFn([{ name: "fake", async search() { return []; } }], { providerTimeoutMs: 1000, totalTimeoutMs: 2000 }),
+    drive: {},
+  });
+  await server.connect(st);
+  const client = new Client({ name: "brand-test", version: "1.0.0" });
+  await client.connect(ct);
+  const { tools } = await client.listTools();
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+  // An agent grepping its tool list for the brand finds it on each entry tool.
+  for (const name of ["retrieve", "search", "browser_open"]) {
+    assert.match(byName[name].description, /\bObscura\b/, `${name} description does not carry the brand`);
+  }
+  // ...and nothing that is a technical handle moved: no tool NAME carries the brand, every name keeps
+  // its established shape, and the server still identifies as browse-gateway (the mcp__browse-gateway__* prefix).
+  for (const t of tools) {
+    assert.doesNotMatch(t.name, /obscura/i, `tool name ${t.name} was branded`);
+    assert.match(t.name, /^(retrieve|search|browser_[a-z_]+)$/);
+  }
+  assert.equal(client.getServerVersion().name, "browse-gateway");
+});
