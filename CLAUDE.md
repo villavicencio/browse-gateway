@@ -77,6 +77,12 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   install interpreter" boot line appears even on a good boot; the later registration is what counts,
   so check the live list, not `dmesg`. The handler can apparently drop during a long VM uptime: a gate
   passed on this same daemon on 2026-09-30 and failed on 2026-10-06 with no VM restart in between.
+- **Running a branch's unit tests or a new gate inside an EXISTING image:** `dist/` is in
+  `.dockerignore`, so an overlay `COPY dist` builds an image without your build (and imports then fail
+  on missing exports). Stream it instead:
+  `COPYFILE_DISABLE=1 tar --no-xattrs -cf - dist test | docker run --rm -i --platform linux/amd64 <tag> sh -c 'cd /app && tar xf - && node --test --test-reporter=spec test/<x>.test.mjs'`.
+  Pass **`--test-reporter=spec`**: the image's Node defaults to TAP when stdout is not a TTY, so a grep for
+  the `ℹ pass` / `✖` lines matches nothing and reads like an empty run.
 - **The runtime gate is not a formality.** It is the only stage that runs the real code against a
   real browser, and it has caught defects every unit test passed: a snapshot axis churning one
   capture pair in five while the no-churn test was green. Never accept a green unit run as evidence
