@@ -10,6 +10,7 @@
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseConsumerManifest } from "../policy/consumer-config.js";
+import { DEFAULT_GATEWAY_CONFIG, poolSizingError, positiveIntOr } from "../gateway/config.js";
 import type { ConsumerManifestEntry } from "../policy/consumer-config.js";
 import { ok, fail, note } from "./brand.js";
 import type { Keychain } from "./keychain.js";
@@ -79,6 +80,43 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
   const envText = await readRemoteFile(deps.shell, deps.envFilePath);
   if (envText === null) throw new Error(`remote env file not found at ${deps.envFilePath}`);
   return { entries: parseConsumerManifest(manifestText), envText };
+}
+
+/**
+ * The value `key` takes when the env file is sourced (`set -a; . file`, as the launcher does): the LAST
+ * assignment wins, an optional `export ` prefix is allowed, and one layer of matching single or double
+ * quotes is stripped. Returns `undefined` when the file never assigns it.
+ */
+export function envFileValue(envText: string, key: string): string | undefined {
+  const re = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${key}=(.*)$`);
+  let value: string | undefined;
+  for (const line of envText.split("\n")) {
+    const m = re.exec(line);
+    if (!m) continue;
+    let raw = m[1]!.trim();
+    if (raw.length >= 2 && (raw[0] === "'" || raw[0] === '"') && raw[raw.length - 1] === raw[0]) raw = raw.slice(1, -1);
+    value = raw;
+  }
+  return value;
+}
+
+/**
+ * VIL-133: would the gateway BOOT with `consumerCount` consumers under this env file? Uses the boot
+ * check's own pure rule ({@link poolSizingError}) and its own defaults ({@link positiveIntOr} over
+ * {@link DEFAULT_GATEWAY_CONFIG}), so the CLI and the boot guard cannot drift. Returns a refusal naming
+ * the arithmetic AND the remedy, or null.
+ */
+export function poolFloorPreflight(consumerCount: number, envText: string): string | null {
+  const maxSessions = positiveIntOr(envFileValue(envText, "BGW_MAX_SESSIONS"), DEFAULT_GATEWAY_CONFIG.maxSessions);
+  const perConsumerMax = positiveIntOr(envFileValue(envText, "BGW_PER_CONSUMER_MAX"), DEFAULT_GATEWAY_CONFIG.perConsumerMax);
+  const err = poolSizingError(consumerCount, perConsumerMax, maxSessions);
+  if (!err) return null;
+  const required = consumerCount * perConsumerMax + 1;
+  return (
+    `refusing to add a consumer: the gateway would not boot — ${err}. Nothing was staged or changed. ` +
+    `Either raise BGW_MAX_SESSIONS to at least ${required} in the env file (if the host has the memory for ` +
+    `it), or free a slot first with \`obscura keys revoke <id> --apply\`.`
+  );
 }
 
 function manifestJson(entries: ConsumerManifestEntry[]): string {
@@ -205,6 +243,13 @@ export async function keysNew(deps: KeysDeps, id: string, opts: KeysNewOptions =
   if (tokenLineRe(envKey).test(envText)) {
     throw new Error(`env file already carries ${envKey} but "${id}" is not in the manifest — desync; resolve on the host before minting`);
   }
+
+  // VIL-133: pre-flight the pool floor BEFORE anything is written. A consumer that pushes the floor
+  // past BGW_MAX_SESSIONS does not degrade the gateway — the boot guard refuses to start it, so the next
+  // re-create crash-loops EVERY consumer. Staging alone is already the hazard (the next re-create, by
+  // --apply or by a deploy, reads these files), so this refuses whether or not --apply was passed.
+  const floorRefusal = poolFloorPreflight(entries.length + 1, envText);
+  if (floorRefusal) throw new Error(floorRefusal);
 
   const allow = opts.allow && opts.allow.length > 0 ? opts.allow : ["*"];
   const token = mintToken();

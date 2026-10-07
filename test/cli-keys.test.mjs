@@ -44,7 +44,9 @@ function fixture({ manifest, env } = {}) {
 }
 
 const BASE_MANIFEST = JSON.stringify([{ id: "consumer-1", allow: ["*"] }], null, 2);
-const BASE_ENV = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\n`;
+// A realistic cap: with no BGW_MAX_SESSIONS the boot default (2) admits ONE consumer, so a fixture that
+// adds a second would describe a config the real gateway refuses to boot (VIL-133).
+const BASE_ENV = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=8\n`;
 
 test("keys new writes manifest entry + env token, stores in keychain, prints token once", async () => {
   const { deps, lines, keychain, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
@@ -353,4 +355,52 @@ test("readRemoteFile distinguishes missing from empty", async () => {
   const { deps, envFilePath } = fixture({ env: "" });
   assert.equal(await readRemoteFile(deps.shell, envFilePath), "");
   assert.equal(await readRemoteFile(deps.shell, join(tmpdir(), "obscura-definitely-absent")), null);
+});
+
+// --- VIL-133: the pool-floor pre-flight -------------------------------------------------------------
+
+test("keys new REFUSES a consumer that would breach the pool floor, before writing anything", async () => {
+  // Genuinely AT the floor: 2 consumers × perConsumerMax 1 + 1 = 3 = BGW_MAX_SESSIONS. A third needs 4.
+  const manifest = JSON.stringify([{ id: "c1", allow: ["*"] }, { id: "c2", allow: ["*"] }], null, 2);
+  const env = `export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=1\nexport ${tokenEnvKey("c1")}=${"a".repeat(64)}\nexport ${tokenEnvKey("c2")}=${"b".repeat(64)}\n`;
+  for (const apply of [false, true]) {
+    const { deps, keychain, manifestPath, envFilePath } = fixture({ manifest, env });
+    const remote = applyShell();
+    deps.applyCmd = "~/deploy/relaunch.sh";
+    deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+    deps.shell = routeApply(deps.shell, remote);
+    await assert.rejects(
+      () => keysNew(deps, "c3", { apply }),
+      (err) => {
+        assert.match(err.message, /BGW_MAX_SESSIONS=3 is too low for 3 consumer\(s\): need >= 4/);
+        assert.match(err.message, /raise BGW_MAX_SESSIONS to at least 4/);
+        assert.match(err.message, /keys revoke <id> --apply/);
+        assert.match(err.message, /Nothing was staged/);
+        return true;
+      },
+    );
+    assert.equal(readFileSync(manifestPath, "utf8"), manifest, `manifest untouched (apply=${apply})`);
+    assert.equal(readFileSync(envFilePath, "utf8"), env, `env file untouched (apply=${apply})`);
+    assert.equal(keychain.items.size, 0, "no token minted into the keychain");
+    assert.deepEqual(remote.calls, [], "no smoke, no re-create, no probe — the live container is never touched");
+  }
+});
+
+test("keys new is allowed when the new consumer still fits — exactly at the floor", async () => {
+  const env = `export BGW_MAX_SESSIONS=3\nexport ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\n`;
+  const { deps, manifestPath } = fixture({ manifest: BASE_MANIFEST, env });
+  await keysNew(deps, "consumer-2"); // 2 × 1 + 1 = 3 ≤ 3
+  assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).length, 2);
+});
+
+test("the pre-flight reads the env file the way the launcher sources it, with the boot defaults", async () => {
+  const { envFileValue, poolFloorPreflight } = await import("../dist/cli/keys.js");
+  assert.equal(envFileValue("BGW_MAX_SESSIONS=4\nexport BGW_MAX_SESSIONS='6'\n", "BGW_MAX_SESSIONS"), "6", "last assignment wins; quotes stripped");
+  assert.equal(envFileValue('  export BGW_PER_CONSUMER_MAX="2"', "BGW_PER_CONSUMER_MAX"), "2");
+  assert.equal(envFileValue("XBGW_MAX_SESSIONS=9", "BGW_MAX_SESSIONS"), undefined, "a longer name is not a match");
+  // Unset → the boot defaults (maxSessions 2, perConsumerMax 1): one consumer fits, two do not.
+  assert.equal(poolFloorPreflight(1, ""), null);
+  assert.match(poolFloorPreflight(2, ""), /need >= 3/);
+  // perConsumerMax multiplies the floor exactly as the boot check does.
+  assert.match(poolFloorPreflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n"), /need >= 7/);
 });
