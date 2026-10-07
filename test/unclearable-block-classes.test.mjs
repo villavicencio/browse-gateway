@@ -289,8 +289,45 @@ test("shouldEscalateDrive: a 429 snapshot does not escalate; a 403 snapshot does
   assert.equal(shouldEscalateDrive(snap(429)), false, "a 429 must not");
   assert.equal(shouldEscalateDrive(snap(404)), false, "nor a 404");
   assert.equal(shouldEscalateDrive(snap(410)), false, "nor a 410");
-  // Parity with retrieve: a CF marker escalates regardless of the status it arrives on.
-  assert.equal(shouldEscalateDrive(snap(429, { cfHint: true })), true, "a CF challenge on a 429 still escalates");
+  // VIL-137 item 2: on 404/410/429 a CF marker alone is a persistent residue, not a live challenge.
+  assert.equal(shouldEscalateDrive(snap(429, { cfHint: true })), false, "a hint-only CF 429 no longer escalates");
+  assert.equal(shouldEscalateDrive(snap(404, { cfHint: true })), false, "nor a hint-only CF 404");
+  // ...but a LIVE challenge on those statuses still does, and a hint-only interstitial elsewhere still does.
+  assert.equal(shouldEscalateDrive(snap(429, { title: "Just a moment...", cfHint: true })), true, "a live CF challenge on a 429 still escalates");
+  assert.equal(shouldEscalateDrive(snap(403, { cfHint: true })), true, "a hint-only CF interstitial on a 403 still escalates");
+  assert.equal(shouldEscalateDrive(snap(503, { cfHint: true })), true, "and on a 503");
+});
+
+// --- VIL-137 item 2: retrieve's entry gate, same rule ------------------------------------------------
+
+const CF_MARKER = '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>';
+
+test("retrieve: an ordinary thin 404 from a CF-fronted origin (persistent marker, no phrase) opens ZERO proxied sessions", async () => {
+  const { gateway, calls, proxiedCalls } = makeFakeGateway([renderOf({ status: 404, title: "Not Found", text: "nope", html: `<html>${CF_MARKER}nope</html>` })]);
+  const r = await run(gateway);
+  assert.equal(r.blocked, true, "still a failure — only the exit-spending changes");
+  assert.equal(proxiedCalls().length, 0, "no paid proxied session for a 404 that merely carries the CF marker");
+  assert.equal(calls.length, 1);
+});
+
+test("CONTROL: a LIVE CF challenge on a 429 still escalates to a proxied session", async () => {
+  const { gateway, proxiedCalls } = makeFakeGateway([
+    renderOf({ status: 429, title: "Just a moment...", text: "Checking your browser", html: `<html>${CF_MARKER}</html>` }),
+    renderOf({ status: 200, title: "ok", text: FAT, html: `<html>${FAT}</html>` }),
+  ]);
+  const r = await run(gateway);
+  assert.equal(proxiedCalls().length >= 1, true, "a live challenge must still buy a clean exit");
+  assert.equal(r.proxyUsed, true);
+});
+
+test("CONTROL: a hint-only CF interstitial on a 403 (no visible phrase) still escalates", async () => {
+  const { gateway, proxiedCalls } = makeFakeGateway([
+    renderOf({ status: 403, title: "", text: "", html: `<html>${CF_MARKER}</html>` }),
+    renderOf({ status: 200, title: "ok", text: FAT, html: `<html>${FAT}</html>` }),
+  ]);
+  const r = await run(gateway);
+  assert.equal(proxiedCalls().length >= 1, true, "the documented hint-only interstitial path is kept");
+  assert.equal(r.proxyUsed, true);
 });
 
 // --- every surface over the vocabulary -------------------------------------------------------------
