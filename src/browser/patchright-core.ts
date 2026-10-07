@@ -8,7 +8,7 @@ import { buildFailureDiagnostics, assembleTiming, FAILURE_DIAGNOSTICS_CAP } from
 import { hostFromUrl, hostMatchesAnySuffix } from "../security/url.js";
 import { SecretStore, redactSecrets } from "../security/secrets.js";
 import { buildWindowsUaOverride, buildNativeUaOverride, READ_LIVE_UA_JS, type LiveUserAgent } from "./os-presentation.js";
-import { isCleared, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, hasPerimeterXChallengeCopy, hasDataDomeHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
+import { isCleared, isTerminalUnclearableRender, isVisiblyBlocked, hasCloudflareHint, hasPerimeterXHint, hasPerimeterXChallengeCopy, hasDataDomeHint, MIN_CONTENT_LENGTH, type PageSignal } from "./detect.js";
 import {
   DETECT_LIVE_CAPTCHA_JS,
   injectTokenJs,
@@ -284,6 +284,15 @@ export function resolveCoreRedactor(opts: BrowserCoreOptions): ((s: string) => s
 
 const DEFAULT_CLEARANCE_TIMEOUT_MS = 20_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
+/**
+ * VIL-136: the clearance-poll ceiling for a page that landed on a status no amount of waiting clears
+ * (`404`/`410`/`429`, {@link isTerminalUnclearableRender}) and shows NO live Cloudflare challenge.
+ * Measured on prod: a thin 404 loaded in 608 ms and then spent 20.2 s of a 22.0 s retrieve polling a
+ * document that could never clear. Shortened rather than skipped: a client-rendered app can serve its
+ * shell with a 404 and hydrate real content a moment later, and skipping outright would snapshot it at
+ * DCL and change the blocked verdict — this ticket changes how long we wait, never the verdict.
+ */
+export const UNCLEARABLE_CLEARANCE_POLL_MS = 2_000;
 /** Per-action timeout for interactive drive verbs (click/type/select/wait). */
 const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
 /**
@@ -1048,9 +1057,16 @@ export class PatchrightBrowserCore implements BrowserCore {
       // title()/evaluate() CDP calls are themselves unbounded. RESIDUAL (documented): pollSignal / snapshot /
       // extraction each still run their OWN (bounded-but-nonzero) duration past the deadline; a hard ceiling
       // that cancels an in-flight CDP call needs a top-level Promise.race / AbortSignal (the whole-op follow-up).
-      while (!isCleared(signal, opts.clearedTextLength) && waited < clearanceTimeoutMs) {
+      // VIL-136: the stage limit is re-derived from EVERY poll. A page on an unclearable status with no
+      // live challenge gets a short ceiling; the moment a visible Cloudflare phrase is on the page (a
+      // managed challenge can arrive on a 429/404 and DOES clear by waiting) the full budget applies.
+      // Keyed on the visible phrase, never on `cfHint` — CF-fronted origins serve ordinary 404s carrying
+      // persistent challenge-platform markers, and gating on the marker would restore the 20 s wait.
+      const stageLimitMs = (s: Pick<PageSignal, "title" | "text">): number =>
+        isTerminalUnclearableRender(s, status) ? Math.min(clearanceTimeoutMs, UNCLEARABLE_CLEARANCE_POLL_MS) : clearanceTimeoutMs;
+      while (!isCleared(signal, opts.clearedTextLength) && waited < stageLimitMs(signal)) {
         const budgetLeft = opts.budgetDeadlineMs !== undefined ? opts.budgetDeadlineMs - performance.now() : Infinity;
-        const sleepMs = Math.min(pollIntervalMs, clearanceTimeoutMs - waited, budgetLeft);
+        const sleepMs = Math.min(pollIntervalMs, stageLimitMs(signal) - waited, budgetLeft);
         if (sleepMs <= 0) break;
         await page.waitForTimeout(sleepMs);
         waited += sleepMs;

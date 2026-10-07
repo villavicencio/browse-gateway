@@ -37,6 +37,7 @@ export {
   deadlineBoundedTimeout,
   readProcStat,
   groupIsAllZombies,
+  UNCLEARABLE_CLEARANCE_POLL_MS,
 } from "./patchright-core.js";
 export {
   assess,
