@@ -12,12 +12,14 @@
 import type { Gateway } from "../gateway/index.js";
 import type { SecretStore } from "../security/index.js";
 import { canonicalizeHost } from "../security/index.js";
+import { isTerminalUnclearableRender } from "../browser/index.js";
 import {
   assistedLogin,
   coreLoginDriver,
   proxyOverrideFor,
   newStickyExitId,
   navFailed,
+  isDeadExit,
   shouldEscalateDrive,
   hostForcesProxy,
   PROXY_OPEN_ATTEMPTS,
@@ -124,6 +126,20 @@ export function makeGatewayLoginRunner(
               stickyExitId = id;
               promoted = true;
               break;
+            }
+            // VIL-137 (the VIL-121 re-roll rule, on its third loop): a 404/410/429 with no LIVE challenge is
+            // the same answer from every exit, so stop instead of drawing another held residential exit.
+            // Same shared predicate as retrieve's escalation loop and the drive controller's open loop, and
+            // gated on reaching the site for the same reason theirs is: a dead exit can carry a stale status,
+            // and reading that as "the login page is gone" would abandon a capture a healthy exit could land.
+            const status = proxiedSnap.status ?? null;
+            const reachedSite = !isDeadExit(proxiedSnap.responseReceived, status, proxiedSnap.url);
+            if (reachedSite && isTerminalUnclearableRender({ title: proxiedSnap.title, text: proxiedSnap.tree }, status)) {
+              throw new Error(
+                `vault login: ${recipe.loginUrl} answered HTTP ${status} on a residential exit — a fresh exit ` +
+                  `cannot change that, so the capture stopped after ${attempt} of ${PROXY_OPEN_ATTEMPTS} attempts ` +
+                  `(check the recipe's loginUrl)`,
+              );
             }
           } finally {
             // Close this exit unless it was promoted to the committed handle — so a dead/dirty exit OR
