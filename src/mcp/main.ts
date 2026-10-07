@@ -89,7 +89,7 @@ async function main(): Promise<void> {
   // Discovery verb (VIL-122) — mirror runtime.ts so this stdio rollback launcher doesn't silently
   // diverge (no search here while prod has it). `undefined` unless BGW_SEARCH_ENABLED=1; enabled but
   // misconfigured throws before the launcher ever serves.
-  const search = buildSearch(process.env, secrets);
+  const search = buildSearch(process.env, secrets, { log });
   if (search) log(`search: enabled (providers=[${search.providers.join(", ")}])`);
   // Reap idle held drive sessions so a forgotten session never pins a browser indefinitely.
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);

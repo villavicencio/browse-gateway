@@ -208,6 +208,34 @@ try {
     check("search answers over the real HTTP handler with a result URL in the text", text.includes(DEFAULT_RESULTS[0].url));
     check("search reports the provider and result count in its header", /^provider=fake results=3 /.test(text));
     await on.client.close().catch(() => {});
+    await searchHandler.closeAll().catch(() => {});
+
+    // 6c) the router (VIL-123), with REAL timers inside the image. Two chains through the real
+    //     enablement path: a primary that is rate-limited, and a primary that never settles at all
+    //     (ignores its deadline AND its abort signal). Both must fall back to the backup, and the
+    //     hung one must be abandoned at its own budget, not awaited.
+    const hung = { name: "hung", async search() { return new Promise(() => {}); } };
+    const chainEnv = { BGW_SEARCH_ENABLED: "1", BGW_SEARCH_PROVIDER_TIMEOUT_MS: "600", BGW_SEARCH_TOTAL_TIMEOUT_MS: "5000" };
+    const limited = buildSearch(chainEnv, secrets, {
+      providers: [fakeSearchProvider({ name: "primary", throwCode: "rate-limited", httpStatus: 429 }), fakeSearchProvider({ name: "backup" })],
+    });
+    const stalled = buildSearch(chainEnv, secrets, { providers: [hung, fakeSearchProvider({ name: "backup" })] });
+    for (const [label, chain] of [["rate-limited", limited], ["hung", stalled]]) {
+      searchHandler = makeHandler(hosts, { search: chain.fn });
+      const c = await connect(sport, "tok-a");
+      const t0 = Date.now();
+      const r = await c.client.callTool({ name: "search", arguments: { query: "example query", count: 3 } });
+      const elapsed = Date.now() - t0;
+      const body = r.isError ? "" : r.content[0].text;
+      check(`router: a ${label} primary falls back, and the header says fallback=true`, /^provider=backup results=3 durationMs=\d+ fallback=true\n/.test(body));
+      if (label === "hung") {
+        // Abandoned at its 600 ms budget; the bound is generous on the high side for a loaded CI box.
+        check(`router: the hung primary is abandoned at its budget (took ${elapsed} ms)`, elapsed >= 550 && elapsed < 3000);
+        check("router: the hung primary is recorded as a timeout", r.structuredContent?.attempts?.[0]?.failureClass === "timeout");
+      }
+      await c.client.close().catch(() => {});
+      await searchHandler.closeAll().catch(() => {});
+    }
   } finally {
     await searchHandler?.closeAll().catch(() => {});
     await new Promise((r) => searchServer.close(r));

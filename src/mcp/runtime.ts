@@ -216,7 +216,7 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // unknown provider, a missing key, a non-https endpoint, or an endpoint pointing at a private
   // address. It sits here — inside the shared boot builder — for the same reason every guard above
   // does: a deploy can only see a refusal that happens at boot, never one raised per connection.
-  const search = buildSearch(env, secrets);
+  const search = buildSearch(env, secrets, { log });
   if (search) log(`search: enabled (providers=[${search.providers.join(", ")}])`);
 
   return {

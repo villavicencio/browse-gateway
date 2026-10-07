@@ -13,8 +13,10 @@ import { positiveIntOr } from "../gateway/index.js";
 import { isBlockedEgressHost, redactSecrets } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import { BraveSearchProvider, BRAVE_DEFAULT_API_URL } from "./brave.js";
+import { createSearchRouter, DEFAULT_SEARCH_BREAKER_COOLDOWN_MS, DEFAULT_SEARCH_BREAKER_THRESHOLD, SearchAttemptsError } from "./router.js";
+import type { RouterClock, RouterMetrics } from "./router.js";
 import { SearchProviderError } from "./types.js";
-import type { SearchAttempt, SearchFn, SearchProvider, SearchRequest, SearchResponse, SearchResult } from "./types.js";
+import type { SearchFn, SearchProvider, SearchResponse } from "./types.js";
 
 /** Provider names this build knows how to construct. An unlisted name is a boot failure, never a
  *  silent fallback to the default — a typo in `BGW_SEARCH_PROVIDERS` must not quietly ship a
@@ -29,6 +31,10 @@ export interface SearchSettings {
   providers: string[];
   providerTimeoutMs: number;
   totalTimeoutMs: number;
+  breakerThreshold: number;
+  breakerCooldownMs: number;
+  /** Move on to the next provider when one answers "nothing matched" (default on). */
+  emptyResultsFallback: boolean;
   braveApiUrl: string;
 }
 
@@ -43,6 +49,9 @@ export function loadSearchSettings(env: NodeJS.ProcessEnv): SearchSettings {
     providers,
     providerTimeoutMs: positiveIntOr(env.BGW_SEARCH_PROVIDER_TIMEOUT_MS, DEFAULT_SEARCH_PROVIDER_TIMEOUT_MS),
     totalTimeoutMs: positiveIntOr(env.BGW_SEARCH_TOTAL_TIMEOUT_MS, DEFAULT_SEARCH_TOTAL_TIMEOUT_MS),
+    breakerThreshold: positiveIntOr(env.BGW_SEARCH_BREAKER_THRESHOLD, DEFAULT_SEARCH_BREAKER_THRESHOLD),
+    breakerCooldownMs: positiveIntOr(env.BGW_SEARCH_BREAKER_COOLDOWN_MS, DEFAULT_SEARCH_BREAKER_COOLDOWN_MS),
+    emptyResultsFallback: env.BGW_SEARCH_EMPTY_RESULTS_FALLBACK !== "0",
     braveApiUrl: env.BGW_BRAVE_SEARCH_API_URL || BRAVE_DEFAULT_API_URL,
   };
 }
@@ -90,6 +99,10 @@ export interface BuildSearchOptions {
   /** Pre-built providers, bypassing env construction. Used by the in-container HTTP gate and tests
    *  to exercise the real verb/tool wiring with a deterministic provider. */
   providers?: SearchProvider[];
+  /** Router timer seam (tests). */
+  clock?: RouterClock;
+  /** Receives one line per search (no query). */
+  log?: (line: string) => void;
 }
 
 export interface BuiltSearch {
@@ -97,6 +110,8 @@ export interface BuiltSearch {
   fn: SearchFn;
   /** Ordered provider names, for the boot line. */
   providers: string[];
+  /** Router counters (in-memory, process-local). */
+  metrics(): RouterMetrics;
 }
 
 /**
@@ -116,11 +131,14 @@ export function buildSearch(env: NodeJS.ProcessEnv, secrets: SecretStore, opts: 
 
   // An explicit provider list lets the gate/tests inject a deterministic provider without a key,
   // while production always travels the env path below.
-  if (opts.providers) {
-    return { fn: makeSearchFn(opts.providers, settings), providers: opts.providers.map((p) => p.name) };
+  if (opts.providers) return built(opts.providers, settings, opts);
+
+  if (new Set(settings.providers).size !== settings.providers.length) {
+    // Breaker state and metrics are per provider name; listing one twice is a typo, not a policy.
+    throw new Error("BGW_SEARCH_PROVIDERS names a provider more than once");
   }
 
-  const built: SearchProvider[] = [];
+  const constructed: SearchProvider[] = [];
   for (const name of settings.providers) {
     if (name === "brave") {
       const apiKey = secrets.get("BGW_BRAVE_SEARCH_API_KEY");
@@ -129,7 +147,7 @@ export function buildSearch(env: NodeJS.ProcessEnv, secrets: SecretStore, opts: 
       }
       const urlError = searchEndpointError(settings.braveApiUrl, "BGW_BRAVE_SEARCH_API_URL");
       if (urlError) throw new Error(urlError);
-      built.push(
+      constructed.push(
         new BraveSearchProvider({
           apiKey,
           apiUrl: settings.braveApiUrl,
@@ -144,79 +162,34 @@ export function buildSearch(env: NodeJS.ProcessEnv, secrets: SecretStore, opts: 
     );
   }
 
-  return { fn: makeSearchFn(built, settings), providers: built.map((p) => p.name) };
+  return built(constructed, settings, opts);
+}
+
+function built(providers: SearchProvider[], settings: SearchSettings, opts: BuildSearchOptions): BuiltSearch {
+  const router = createSearchRouter({
+    providers,
+    providerTimeoutMs: settings.providerTimeoutMs,
+    totalTimeoutMs: settings.totalTimeoutMs,
+    breakerThreshold: settings.breakerThreshold,
+    breakerCooldownMs: settings.breakerCooldownMs,
+    emptyResultsFallback: settings.emptyResultsFallback,
+    ...(opts.clock ? { clock: opts.clock } : {}),
+    ...(opts.log ? { log: opts.log } : {}),
+  });
+  return { fn: router.search, providers: providers.map((p) => p.name), metrics: router.metrics };
 }
 
 /**
- * Wrap providers into the {@link SearchFn} verb.
- *
- * VIL-122 runs exactly ONE provider — the first — and reports one attempt. Ordered fallback across
- * the rest is the sibling ticket's scope and is deliberately not implemented here: a half-built
- * fallback that silently swallows the first provider's failure class is worse than none, because
- * the caller then cannot tell which provider's verdict they are reading.
+ * Wrap providers into the {@link SearchFn} verb: a router with the default breaker and empty-result
+ * policy. One code path — a single provider is a one-provider router (VIL-123).
  */
-export function makeSearchFn(providers: SearchProvider[], settings: Pick<SearchSettings, "providerTimeoutMs" | "totalTimeoutMs">, now: () => number = Date.now): SearchFn {
-  const provider = providers[0];
-  if (!provider) throw new Error("makeSearchFn requires at least one provider");
-  // Clamp the per-attempt budget to the total deadline: a per-provider timeout larger than the
-  // total is a configuration that promises the caller a bound it would then blow through.
-  const budgetMs = Math.min(settings.providerTimeoutMs, settings.totalTimeoutMs);
-
-  return async (req: SearchRequest): Promise<SearchResponse> => {
-    const started = now();
-    const controller = new AbortController();
-    const deadline = started + budgetMs;
-    const attempt: SearchAttempt = { provider: provider.name, outcome: "ok", durationMs: 0 };
-    let results: SearchResult[] = [];
-    try {
-      results = await provider.search(req, { deadline, signal: controller.signal });
-    } catch (err) {
-      if (err instanceof SearchProviderError && err.code === "empty-results") {
-        // A provider that answered correctly and had nothing is not a broken provider. The verb
-        // reports a successful search with zero results; the attempt records that it was empty.
-        attempt.outcome = "empty";
-        attempt.httpStatus = err.httpStatus;
-        attempt.durationMs = now() - started;
-        return response(req, provider.name, [], [attempt], started, now());
-      }
-      attempt.outcome = "failed";
-      attempt.durationMs = now() - started;
-      if (err instanceof SearchProviderError) {
-        attempt.failureClass = err.code;
-        attempt.httpStatus = err.httpStatus;
-        if (err.retryAfterMs !== undefined) attempt.retryAfterMs = err.retryAfterMs;
-        throw new SearchAttemptsError(err, [attempt]);
-      }
-      // A non-typed throw from an adapter is an adapter defect, not a provider verdict. Classify it
-      // conservatively and keep the attempt record so the caller still sees what was tried. The raw
-      // message is deliberately NOT propagated: a transport error can quote the request, and the
-      // request carries the API key in a header — so only the failure SHAPE crosses this boundary
-      // (same rule the adapter applies to its own fetch/stream errors).
-      const wrapped = new SearchProviderError("network-error", `search failed (${err instanceof Error ? err.name : "unknown error"})`);
-      attempt.failureClass = wrapped.code;
-      throw new SearchAttemptsError(wrapped, [attempt]);
-    }
-    attempt.durationMs = now() - started;
-    return response(req, provider.name, results, [attempt], started, now());
-  };
-}
-
-function response(
-  req: SearchRequest,
-  provider: string,
-  results: SearchResult[],
-  attempts: SearchAttempt[],
-  started: number,
-  ended: number,
-): SearchResponse {
-  return {
-    query: req.query,
-    provider,
-    results,
-    attempts,
-    retrievedAt: new Date(ended).toISOString(),
-    durationMs: ended - started,
-  };
+export function makeSearchFn(
+  providers: SearchProvider[],
+  settings: Pick<SearchSettings, "providerTimeoutMs" | "totalTimeoutMs"> & Partial<Pick<SearchSettings, "breakerThreshold" | "breakerCooldownMs" | "emptyResultsFallback">>,
+  clock?: RouterClock,
+): SearchFn {
+  if (providers.length === 0) throw new Error("makeSearchFn requires at least one provider");
+  return createSearchRouter({ providers, ...settings, ...(clock ? { clock } : {}) }).search;
 }
 
 /**
@@ -274,17 +247,4 @@ export function redactSearchResponse(res: SearchResponse, secrets: { redactableV
   };
 }
 
-/**
- * A failed search, carrying the ordered attempt record alongside the typed cause. The MCP layer
- * renders both, so a caller sees WHICH provider failed and HOW, not just a class.
- */
-export class SearchAttemptsError extends Error {
-  readonly failure: SearchProviderError;
-  readonly attempts: SearchAttempt[];
-  constructor(failure: SearchProviderError, attempts: SearchAttempt[]) {
-    super(failure.message);
-    this.name = "SearchAttemptsError";
-    this.failure = failure;
-    this.attempts = attempts;
-  }
-}
+export { SearchAttemptsError };

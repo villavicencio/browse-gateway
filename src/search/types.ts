@@ -56,11 +56,10 @@ export interface SearchResult {
  * The closed search-failure vocabulary. Exported as an array so a test can assert every member has
  * a caller-facing hint (a class with no advice is a class the caller cannot act on).
  *
- * `captcha`, `challenge-interstitial` and `total-deadline-exhausted` are declared here but are not
- * produced by the single-provider path in this change: the first two belong to the browser-SERP
- * fallback and the third to the multi-provider router (both are the sibling ticket's scope). They
- * live in the vocabulary now so the enum is stable across that change rather than widening the
- * public contract twice.
+ * `captcha` and `challenge-interstitial` are declared but not produced: they belong to a
+ * browser-SERP fallback that was cut from VIL-123 v1. `total-deadline-exhausted` is the router's
+ * (VIL-123). All three live in the vocabulary so the enum stays stable rather than widening the
+ * public contract each time.
  */
 export const SEARCH_FAILURE_CLASSES = [
   "rate-limited",
@@ -81,8 +80,8 @@ export const SEARCH_FAILURE_CLASSES = [
 export type SearchFailureClass = (typeof SEARCH_FAILURE_CLASSES)[number];
 
 /**
- * One provider attempt, in order. The single-provider path reports exactly one; the router will
- * report the ordered fallback chain.
+ * One provider attempt, in order — the router's ordered fallback chain. A provider retried after a
+ * `Retry-After` appears twice.
  *
  * `outcome` is the PROVIDER's verdict, which is not the same as the verb's: `empty` means the
  * provider answered correctly and had nothing, which is a successful search that found nothing. It
@@ -100,12 +99,16 @@ export interface SearchAttempt {
   durationMs: number;
   /** Honoured `Retry-After`, in ms, when the provider sent a parseable one. */
   retryAfterMs?: number;
+  /** `true` when the router's circuit breaker refused the call — no request was sent. Reported as a
+   *  `provider-unavailable` failure with zero duration so the history stays complete (VIL-123). */
+  skipped?: boolean;
 }
 
 /** The normalized response. This exact key set is the public contract — a test pins it. */
 export interface SearchResponse {
   query: string;
-  /** Which provider actually fulfilled the request. */
+  /** Which provider actually fulfilled the request (for a zero-result success, the first provider
+   *  that answered "nothing matched"). */
   provider: string;
   results: SearchResult[];
   attempts: SearchAttempt[];
