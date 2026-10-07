@@ -368,6 +368,59 @@ test("breaker: the LAST available provider is never skipped (one-provider deploy
   assert.equal(res.attempts[0].skipped, undefined);
 });
 
+test("breaker: with EVERY provider open, exactly one request goes out — to the last provider only", async () => {
+  // CodeRabbit #151 r1: a per-provider "is any later provider admissible?" check called EVERY open
+  // provider in an all-open chain, because no later provider is ever admissible there.
+  const clock = new FakeClock();
+  const a = scripted("a", clock, [{ fail: "quota-exhausted", status: 402 }]);
+  const b = scripted("b", clock, [{ fail: "authentication-failed", status: 401 }]);
+  const c = scripted("c", clock, [{ fail: "authentication-failed", status: 401 }]);
+  const r = router(clock, [a, b, c]);
+  await failureOf(clock, r.search(REQ)); // all three trip at once
+  const err = await failureOf(clock, r.search(REQ));
+  assert.deepEqual(summary(err.attempts), ["a:skipped:0", "b:skipped:0", "c:authentication-failed:0"]);
+  assert.equal(a.calls.length, 1, "an open, non-last provider must not be called");
+  assert.equal(b.calls.length, 1, "an open, non-last provider must not be called");
+  assert.equal(c.calls.length, 2, "the last provider is the single last-resort request");
+});
+
+test("breaker: an open LAST provider is skipped when an earlier provider was already tried this search", async () => {
+  const clock = new FakeClock();
+  const a = scripted("a", clock, [{ fail: "network-error" }]);
+  const b = scripted("b", clock, [{ fail: "quota-exhausted", status: 402 }, { ok: true }]);
+  const r = router(clock, [a, b], { breakerThreshold: 5 });
+  await failureOf(clock, r.search(REQ)); // a fails (count 1), b trips on quota
+  const err = await failureOf(clock, r.search(REQ));
+  assert.deepEqual(summary(err.attempts), ["a:network-error:0", "b:skipped:0"]);
+  assert.equal(b.calls.length, 1);
+  assert.equal(err.failure.code, "network-error");
+});
+
+test("a SYNCHRONOUS adapter throw is classified like an async one, and cannot wedge a half-open probe", async () => {
+  // CodeRabbit #151 r1: provider.search() was called outside the try, so a non-async adapter that threw
+  // before returning a promise escaped runAttempt — and a half-open probe stayed "probing" forever.
+  const clock = new FakeClock();
+  let calls = 0;
+  const syncThrower = {
+    name: "sync",
+    search() {
+      calls++;
+      if (calls <= 2) throw new Error("sync boom");
+      return Promise.resolve(DEFAULT_RESULTS);
+    },
+  };
+  const b = scripted("b", clock, [{ ok: true }]);
+  const r = router(clock, [syncThrower, b], { breakerThreshold: 1, breakerCooldownMs: 1_000 });
+  const first = await clock.run(r.search(REQ));
+  assert.deepEqual(summary(first.attempts), ["sync:network-error:0", "b:ok:0"]);
+  await clock.advance(1_000);
+  const probe = await clock.run(r.search(REQ)); // half-open probe throws synchronously → re-opens
+  assert.deepEqual(summary(probe.attempts), ["sync:network-error:0", "b:ok:0"]);
+  await clock.advance(1_000);
+  const recovered = await clock.run(r.search(REQ)); // a fresh probe is admitted, not wedged
+  assert.equal(recovered.provider, "sync");
+});
+
 // --- Diagnostics, metrics, logging ------------------------------------------------------------------
 
 test("metrics after a scripted sequence match exactly", async () => {

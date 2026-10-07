@@ -173,10 +173,12 @@ export function createSearchRouter(opts: SearchRouterOptions): SearchRouter {
     let emptyFrom: string | undefined;
     metrics.searches++;
 
-    // The breaker never skips the LAST provider still available. Skipping it would turn a transient
-    // blip into a guaranteed failure for the whole cooldown with nothing to fall back to — on a
-    // one-provider deployment, five minutes of refusing every search after two timeouts. When every
-    // remaining provider is open, the last one is tried anyway; its result still feeds the breaker.
+    // An open breaker skips its provider — EXCEPT the last provider when nothing has been attempted yet
+    // in this search. Skipping that one would turn a transient blip into a guaranteed failure for the
+    // whole cooldown with no request sent at all: on a one-provider deployment, five minutes of refusing
+    // every search after two timeouts. So when EVERY provider is open, exactly one request goes out (to
+    // the last), and its result still feeds that breaker. Any other open provider is skipped, so an
+    // all-open chain never fans a request out to each dead provider (CodeRabbit #151 r1).
     const lastIndex = providers.length - 1;
 
     for (let i = 0; i < providers.length; i++) {
@@ -189,14 +191,14 @@ export function createSearchRouter(opts: SearchRouterOptions): SearchRouter {
         break;
       }
 
-      const anyLaterAdmissible = providers.slice(i + 1).some((p) => isAdmissible(p.name, now));
       if (!admit(provider.name, now)) {
-        if (i < lastIndex && anyLaterAdmissible) {
+        const attemptedAny = attempts.some((a) => !a.skipped);
+        if (i < lastIndex || attemptedAny) {
           pm.skipped++;
           attempts.push({ provider: provider.name, outcome: "failed", failureClass: "provider-unavailable", httpStatus: null, durationMs: 0, skipped: true });
           continue;
         }
-        // Last resort: call it even though its breaker is open.
+        // Last resort: every provider is open and nothing was sent — call the last one anyway.
       }
 
       const providerDeadline = Math.min(now + providerBudgetMs, totalDeadline);
@@ -273,8 +275,7 @@ export function createSearchRouter(opts: SearchRouterOptions): SearchRouter {
       metrics.deadlineExhausted++;
       failure = new SearchProviderError("total-deadline-exhausted", `the total search deadline of ${opts.totalTimeoutMs} ms ran out before any provider answered`);
     } else if (failures.length === 0) {
-      // Every provider was skipped by its breaker (only possible when the last one was admitted and
-      // then skipped by a concurrent probe). Nothing was sent.
+      // Defensive: unreachable while the last-resort rule above guarantees one request per search.
       failure = new SearchProviderError("provider-unavailable", "every configured search provider is cooling down after recent failures");
     } else {
       failure =
@@ -283,15 +284,6 @@ export function createSearchRouter(opts: SearchRouterOptions): SearchRouter {
     logLine(opts.log, "none", `failed:${failure.code}`, attempts, ended - started);
     throw new SearchAttemptsError(failure, attempts);
   };
-
-  /** Like {@link admit}, but without claiming the half-open probe — used only to decide whether a
-   *  later provider could take over from a skipped one. */
-  function isAdmissible(name: string, now: number): boolean {
-    const b = breakers.get(name)!;
-    if (b.state === "closed") return true;
-    if (b.state === "open") return now >= b.until;
-    return !b.probing;
-  }
 
   return {
     search,
@@ -316,7 +308,10 @@ async function runAttempt(provider: SearchProvider, req: SearchRequest, deadline
   const timedOut = new Promise<"timeout">((resolve) => {
     timer = clock.setTimeout(() => resolve("timeout"), Math.max(0, deadline - clock.now()));
   });
-  const call = provider.search(req, { deadline, signal: controller.signal });
+  // Wrapped so a SYNCHRONOUS throw from a non-async adapter becomes a rejection on the same path as an
+  // async one — otherwise it would escape before the try/finally (no attempt record, timer left armed,
+  // and a half-open probe stuck "probing" forever). CodeRabbit #151 r1.
+  const call = (async () => provider.search(req, { deadline, signal: controller.signal }))();
   // An abandoned call may still reject later; that settlement belongs to nobody.
   call.catch(() => {});
   try {

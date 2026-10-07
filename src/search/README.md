@@ -102,9 +102,10 @@ is `total-deadline-exhausted` with the full attempt list — not whichever provi
 
 **Breaker.** Per provider, in-memory. Threshold consecutive counted failures open it; while open the
 provider is recorded as `skipped: true` (no request sent); after the cooldown exactly one half-open
-probe is admitted, and its result closes or re-opens it. **The last available provider is never
-skipped**: when every remaining provider is open, the last one is called anyway. Without that rule a
-one-provider deployment would refuse every search for the whole cooldown after two timeouts.
+probe is admitted, and its result closes or re-opens it. **Last resort:** when every provider is open
+and nothing has been sent yet in this search, the LAST provider is called anyway — exactly one request,
+never one per dead provider. Without that rule a one-provider deployment would refuse every search for
+the whole cooldown after two timeouts.
 
 **Outcomes.** Any provider with results wins. Otherwise, if any provider answered "nothing matched",
 the search succeeds with zero results. Otherwise it fails with `total-deadline-exhausted` when the
