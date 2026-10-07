@@ -357,6 +357,26 @@ test("breaker: only ONE half-open probe is in flight; a concurrent search skips 
   assert.equal(probed.provider, "a");
 });
 
+test("breaker: one provider, half-open probe IN FLIGHT — an overlapping search does not send a second request", async () => {
+  // CodeRabbit #151 r2: the last-resort rule used to fire for a half-open provider too, putting a second
+  // concurrent request on the provider the single probe exists to test.
+  const clock = new FakeClock();
+  const a = scripted("a", clock, [{ fail: "network-error" }, { ok: true, delayMs: 1_000 }]);
+  const r = router(clock, [a], { breakerThreshold: 1, breakerCooldownMs: 5_000 });
+  await failureOf(clock, r.search(REQ)); // open
+  await clock.advance(5_000);
+  const probing = r.search(REQ); // takes the half-open probe; a answers after 1 s
+  await clock.flush();
+  const overlapping = await failureOf(clock, r.search(REQ));
+  assert.equal(overlapping.failure.code, "provider-unavailable");
+  assert.deepEqual(summary(overlapping.attempts), ["a:skipped:0"]);
+  assert.equal(a.calls.length, 2, "only the original failure and the ONE probe reached the provider");
+  const probed = await clock.run(probing);
+  assert.equal(probed.provider, "a", "the probe itself completes and closes the breaker");
+  const after = await clock.run(r.search(REQ));
+  assert.equal(after.provider, "a");
+});
+
 test("breaker: the LAST available provider is never skipped (one-provider deployments stay usable)", async () => {
   const clock = new FakeClock();
   const a = scripted("a", clock, [{ fail: "network-error" }, { fail: "network-error" }, { ok: true }]);

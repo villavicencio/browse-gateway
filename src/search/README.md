@@ -104,7 +104,9 @@ is `total-deadline-exhausted` with the full attempt list — not whichever provi
 provider is recorded as `skipped: true` (no request sent); after the cooldown exactly one half-open
 probe is admitted, and its result closes or re-opens it. **Last resort:** when every provider is open
 and nothing has been sent yet in this search, the LAST provider is called anyway — exactly one request,
-never one per dead provider. Without that rule a one-provider deployment would refuse every search for
+never one per dead provider. That applies to an OPEN breaker only: while a half-open probe is in flight,
+an overlapping search skips the provider and fails fast with `provider-unavailable` rather than sending a
+second concurrent request. Without that rule a one-provider deployment would refuse every search for
 the whole cooldown after two timeouts.
 
 **Outcomes.** Any provider with results wins. Otherwise, if any provider answered "nothing matched",

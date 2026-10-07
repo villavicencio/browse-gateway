@@ -174,7 +174,7 @@ export function createSearchRouter(opts: SearchRouterOptions): SearchRouter {
     metrics.searches++;
 
     // An open breaker skips its provider — EXCEPT the last provider when nothing has been attempted yet
-    // in this search. Skipping that one would turn a transient blip into a guaranteed failure for the
+    // in this search and its breaker is OPEN (not half-open with a probe already in flight). Skipping that one would turn a transient blip into a guaranteed failure for the
     // whole cooldown with no request sent at all: on a one-provider deployment, five minutes of refusing
     // every search after two timeouts. So when EVERY provider is open, exactly one request goes out (to
     // the last), and its result still feeds that breaker. Any other open provider is skipped, so an
@@ -193,7 +193,12 @@ export function createSearchRouter(opts: SearchRouterOptions): SearchRouter {
 
       if (!admit(provider.name, now)) {
         const attemptedAny = attempts.some((a) => !a.skipped);
-        if (i < lastIndex || attemptedAny) {
+        // The last resort applies to an OPEN breaker only. A HALF-OPEN provider refused here has its one
+        // probe already in flight on another search; calling it anyway would put a second concurrent
+        // request on the provider the probe exists to test, and let both outcomes race on one breaker
+        // (CodeRabbit #151 r2). That search skips it and fails fast instead.
+        const probeInFlight = breakers.get(provider.name)!.state === "half-open";
+        if (i < lastIndex || attemptedAny || probeInFlight) {
           pm.skipped++;
           attempts.push({ provider: provider.name, outcome: "failed", failureClass: "provider-unavailable", httpStatus: null, durationMs: 0, skipped: true });
           continue;
@@ -275,7 +280,8 @@ export function createSearchRouter(opts: SearchRouterOptions): SearchRouter {
       metrics.deadlineExhausted++;
       failure = new SearchProviderError("total-deadline-exhausted", `the total search deadline of ${opts.totalTimeoutMs} ms ran out before any provider answered`);
     } else if (failures.length === 0) {
-      // Defensive: unreachable while the last-resort rule above guarantees one request per search.
+      // Nothing was sent: every provider was skipped — reachable when the last one is half-open with its
+      // probe in flight on a concurrent search (the last-resort rule covers only an OPEN breaker).
       failure = new SearchProviderError("provider-unavailable", "every configured search provider is cooling down after recent failures");
     } else {
       failure =
