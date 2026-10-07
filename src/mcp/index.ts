@@ -2,7 +2,7 @@
  * MCP surface barrel (U6). The stdio entry is `main.ts`; `createGatewayMcpServer` is the
  * testable core.
  */
-export { createGatewayMcpServer, ERROR_KIND_META_KEY } from "./server.js";
+export { createGatewayMcpServer, ERROR_KIND_META_KEY, SESSION_FAILURE_META_KEY } from "./server.js";
 export { resolveGatewayVersion, isOpaqueVersion, REPORTED_VERSION } from "./version.js";
 export type { GatewayVersion } from "./version.js";
 export type { DriveController, GatewayMcpDeps, RetrieveFn, RetrieveOutcome, ErrorKind } from "./server.js";

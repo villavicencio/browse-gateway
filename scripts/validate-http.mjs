@@ -29,7 +29,7 @@ import { createServer } from "node:http";
 import { Gateway, loadConfig } from "../dist/gateway/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 import { SecretStore, redactSecrets } from "../dist/security/index.js";
-import { createHttpHandler, createGatewayMcpServer } from "../dist/mcp/index.js";
+import { createHttpHandler, createGatewayMcpServer, SESSION_FAILURE_META_KEY } from "../dist/mcp/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { retrieve } from "../dist/verbs/index.js";
 import { buildSearch } from "../dist/search/index.js";
@@ -135,6 +135,12 @@ try {
   check(
     "a consumer's 2nd concurrent drive session is refused (per-consumer cap)",
     navB2.isError === true && /per-consumer session limit/i.test(navB2.content[0].text),
+  );
+  // VIL-110: the refusal is MACHINE-readable over real HTTP, not only legible prose — the tag a consumer's
+  // breaker acts on, carried through the drive controller's redaction re-wrap and the MCP boundary.
+  check(
+    "the per-consumer refusal carries _meta session-failure=at-capacity-consumer",
+    navB2._meta?.[SESSION_FAILURE_META_KEY] === "at-capacity-consumer",
   );
   await b2.client.close().catch(() => {});
 

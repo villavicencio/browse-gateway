@@ -223,6 +223,9 @@ export type { GatewayConfig, CallTimeouts } from "./config.js";
 export {
   SessionManager,
   SessionManagerError,
+  SESSION_FAILURE_KINDS,
+  sessionFailureKindOf,
+  carrySessionFailureKind,
   MAX_INFLIGHT_MS,
   CLOSE_GRACE_MS,
   KILL_CONFIRM_MS,
@@ -235,6 +238,7 @@ export type {
   CoreFactory,
   SessionManagerOptions,
   SessionManagerErrorCode,
+  SessionFailureKind,
 } from "./session-manager.js";
 export { Session } from "./session.js";
 export type { SessionInfo, SessionState } from "./session.js";

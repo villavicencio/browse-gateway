@@ -29,6 +29,7 @@ import {
   ARTIFACT_CLOSE_TIMEOUT_MS,
 } from "./artifact-graph-lifecycle.js";
 import { describeInit } from "../gateway/init-identity.js";
+import { carrySessionFailureKind } from "../gateway/session-manager.js";
 
 const log = (msg: string): void => void process.stderr.write(`[browse-gateway-http] ${msg}\n`);
 
@@ -225,7 +226,8 @@ async function main(): Promise<void> {
             });
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            throw new Error(redactSecrets(message, secrets)); // never leak BYO secret material (R9)
+            // never leak BYO secret material (R9); keep the session-failure kind (VIL-110)
+            throw carrySessionFailureKind(new Error(redactSecrets(message, secrets)), err);
           }
         },
         // Task 2 §4.2 — the server-scoped, IMMUTABLE artifact-retrieval dependency, present only when
