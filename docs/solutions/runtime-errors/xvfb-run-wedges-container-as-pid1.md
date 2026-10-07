@@ -46,6 +46,8 @@ A Docker container running headful Chrome under Xvfb hangs indefinitely with no 
 
 ## Solution
 
+> **Process layout has changed since this was written (2026-05).** Since PR #137 the image's `ENTRYPOINT` is `/usr/bin/tini -s -- /usr/local/bin/entrypoint.sh` (`docker/Dockerfile:118`), so tini is baked in and the app runs as tini's child, not as PID 1. Under the deploy path's `--init`, Docker adds an outer `docker-init` at PID 1, giving `docker-init → tini → app`. The passages below that describe the app as PID 1 and `--init` as the only reaper record the original fix. The xvfb-run diagnosis and the entrypoint pattern are unchanged.
+
 Replace `xvfb-run` with a small entrypoint script that starts `Xvfb` in the background, waits for the X socket, then `exec`s the real command so it becomes PID 1 (or PID 1's direct child under `--init`).
 
 **`docker/entrypoint.sh`** — runs as the container's entrypoint:

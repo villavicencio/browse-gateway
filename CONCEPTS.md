@@ -32,7 +32,7 @@ swap and the Apply path, which differ only in which image they hand it.
 The health check run against the replacement container right after a Deploy swap replaces it. Its
 failure is what sends the gateway back to the Rollback anchor.
 
-It waits for the replacement to come up, within a bounded budget, instead of taking a single look,
+It waits for the replacement to come up, within a bounded polling budget, instead of taking a single look,
 because how long a healthy image takes to boot depends on the host it runs on. A replacement that has
 already restarted or stopped fails at once, because waiting cannot heal it. The same check runs again
 on the rolled-back container, so a check that cannot recognise a healthy container fails the deploy

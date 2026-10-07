@@ -225,8 +225,9 @@ docker build ... > log 2>&1; rc=$?; tail -3 log; exit $rc
   command was wrapped in a pipeline.
 - **Don't swap this for `set -o pipefail` without thinking.** `pipefail` fixes this direction (a
   pipeline whose status is its last command's) and opens the opposite one. When the reader exits
-  early (`grep -q`, `head`), a pipeline that found exactly what it wanted reports the writer's
-  SIGPIPE, 141, as failure. See
+  early (`grep -q`, `head`) while the writer still has output to write, the writer gets SIGPIPE,
+  and a pipeline that found exactly what it wanted can report that 141 as failure. If the writer
+  finished first, it never sees the signal, which is why this passes on small inputs. See
   [grep -q under pipefail fails on the match it was looking for](grep-q-under-pipefail-fails-on-the-match-it-was-looking-for.md).
   Capturing the status explicitly, as above, avoids both.
 
