@@ -199,6 +199,12 @@ export class HttpCaptchaSolver implements CaptchaSolver {
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
           signal: controller.signal,
+          // NEVER follow a redirect (VIL-139). The key rides the request BODY, and measured on Node: a
+          // 307/308 re-POSTs that body verbatim to the redirect target (301/302/303 rewrite to a bodiless
+          // GET), so following one would hand `clientKey` to whatever host the endpoint points at. The
+          // endpoint is deployment config naming a documented API; a redirect from it is a
+          // misconfiguration or an attack, and both deserve a refusal rather than a silent hop.
+          redirect: "manual",
         });
       } catch (err) {
         // Abort = we hit the deadline mid-request; otherwise a transport failure. Never surface the
@@ -209,6 +215,11 @@ export class HttpCaptchaSolver implements CaptchaSolver {
         throw new CaptchaSolveError("vendor-error", `${path}: request failed (${err instanceof Error ? err.name : "network error"})`);
       }
       if (!resp.ok) {
+        // Release the unread body so a run of error responses cannot pin connections past the deadline.
+        void resp.body?.cancel().catch(() => {});
+        if (resp.status >= 300 && resp.status < 400) {
+          throw new CaptchaSolveError("vendor-error", `${path}: HTTP ${resp.status} redirect refused — the solver endpoint must answer directly`);
+        }
         throw new CaptchaSolveError("vendor-error", `${path}: HTTP ${resp.status}`);
       }
       try {

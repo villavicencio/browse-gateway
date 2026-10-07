@@ -259,3 +259,45 @@ test("#44: isSolvableCaptchaKind agrees with the solver's TASK_TYPE for every ki
     );
   }
 });
+
+// --- VIL-139: a redirect is refused, so the key in the body never reaches the redirect target ---------
+
+for (const code of [307, 308]) {
+  test(`a ${code} redirect is REFUSED, and clientKey never reaches the redirect target`, async () => {
+    // End-to-end over REAL http servers and the REAL global fetch. Measured on Node: a 307/308 re-POSTs
+    // the body (which carries clientKey) to the target. Delete redirect: "manual" and this test fails
+    // by OBSERVING the key arrive at the second server.
+    const { createServer } = await import("node:http");
+    const seen = [];
+    const dest = createServer((req, res) => {
+      let b = "";
+      req.on("data", (c) => (b += c));
+      req.on("end", () => {
+        seen.push(b);
+        res.setHeader("content-type", "application/json");
+        res.end('{"errorId":0,"taskId":"t1"}');
+      });
+    });
+    await new Promise((r) => dest.listen(0, "127.0.0.1", r));
+    const start = createServer((req, res) => {
+      req.resume();
+      res.writeHead(code, { location: `http://127.0.0.1:${dest.address().port}/createTask` });
+      res.end();
+    });
+    await new Promise((r) => start.listen(0, "127.0.0.1", r));
+    try {
+      const solver = new HttpCaptchaSolver({ apiKey: KEY, apiUrl: `http://127.0.0.1:${start.address().port}/api`, timeoutMs: 5_000 });
+      await assert.rejects(solver.solve(recaptcha), (err) => {
+        assert.ok(err instanceof CaptchaSolveError);
+        assert.equal(err.code, "vendor-error");
+        assert.match(err.message, new RegExp(`HTTP ${code} redirect refused`));
+        assert.ok(!err.message.includes(KEY));
+        return true;
+      });
+      assert.deepEqual(seen, [], "the solver key was forwarded to the redirect target");
+    } finally {
+      await new Promise((r) => dest.close(r));
+      await new Promise((r) => start.close(r));
+    }
+  });
+}
