@@ -77,6 +77,12 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   install interpreter" boot line appears even on a good boot; the later registration is what counts,
   so check the live list, not `dmesg`. The handler can apparently drop during a long VM uptime: a gate
   passed on this same daemon on 2026-09-30 and failed on 2026-10-06 with no VM restart in between.
+- **Running a branch's unit tests or a new gate inside an EXISTING image:** `dist/` is in
+  `.dockerignore`, so an overlay `COPY dist` builds an image without your build (and imports then fail
+  on missing exports). Stream it instead:
+  `COPYFILE_DISABLE=1 tar --no-xattrs -cf - dist test | docker run --rm -i --platform linux/amd64 <tag> sh -c 'cd /app && tar xf - && node --test --test-reporter=spec test/<x>.test.mjs'`.
+  Pass **`--test-reporter=spec`**: the image's Node defaults to TAP when stdout is not a TTY, so a grep for
+  the `ℹ pass` / `✖` lines matches nothing and reads like an empty run.
 - **The runtime gate is not a formality.** It is the only stage that runs the real code against a
   real browser, and it has caught defects every unit test passed: a snapshot axis churning one
   capture pair in five while the no-churn test was green. Never accept a green unit run as evidence
@@ -122,7 +128,9 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   shutdown log seconds after `docker stop`, so start a `docker logs -f` follower **before** the swap;
   and `--stop-timeout` lands at `.Config.StopTimeout`, **not** `.HostConfig.StopTimeout`, whose absence
   is not evidence of anything. Full write-up:
-  `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`.
+  `docs/solutions/best-practices/a-gate-must-travel-with-the-code-it-gates.md`. **The dated sync and
+  backup history above is from the PREVIOUS prod host** (deleted 2026-10-05). The rule carries over
+  unchanged to the current one, where the deploy scripts were synced and hash-checked 2026-10-07.
 - **Since 2026-10, prod deploys are operator-run on the host, not dispatched from CI.** The prod host
   changed, and `deploy-http.yml`'s secrets describe a host that no longer exists, so **don't dispatch it.**
   On the host, run `scripts/deploy/deploy-ref.sh <7-hex sha | 40-hex sha | tag>`. It resolves the ref
@@ -131,7 +139,9 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   `deploy-on-host.sh`, which keeps every gate. **The host's copies of both scripts are what run.**
   After changing either one, sync the host and confirm deploy-ref's drift NOTE is silent. The image is
   public on GHCR, so a pull needs no credential. Host-specific paths and the step-by-step procedure
-  stay in `CONTEXT.local.md`, never in this file.
+  stay in `CONTEXT.local.md`, never in this file. **Watched end to end 2026-10-07:** two deploy-ref runs
+  on the current host, both `deploy: SUCCESS` with the drift NOTE silent, `verify: OK after 0s`, and a
+  measured blip of ~1–2 s (the old 10–20 s figure was the previous host's).
 - **`main` is NOT branch-protected, so nothing mechanically blocks a merge.** There are no required
   status checks (`gh api repos/<owner>/<repo>/branches/main/protection` → 404 "Branch not
   protected"). A PR with **no CI run at all** still reads mergeable, which is a strictly weaker
@@ -158,8 +168,10 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   counts page cache under cgroups v2, and its `--no-stream` CPU% is a two-sample rate — it reported
   triple-digit CPU on an idle container with zero browser processes. Summing RSS across a Chrome tree
   is wrong in the other direction: the zygote's shared pages get counted once per process (~2.4x
-  over). Use `docker top` to enumerate, and PSS from `/proc/<pid>/smaps_rollup` to measure; the pids
-  are host-visible under rootless Docker, so no `docker exec` is needed. Validate a per-session cost
+  over). Use `docker top` to enumerate, and PSS from `/proc/<pid>/smaps_rollup` to measure. On the
+  previous host the pids were host-visible under rootless Docker, so no `docker exec` was needed; that
+  has **not** been re-checked on the current host, whose runtime runs containers inside a VM — measure
+  where the pids actually live before trusting either path. Validate a per-session cost
   as a **delta that reproduces**, never as an absolute compared against a metric answering a
   different question. Full write-up, including the invalid cross-check this rule was born from:
   `docs/solutions/best-practices/measuring-browser-session-memory-needs-pss-not-docker-stats-or-rss.md`.
