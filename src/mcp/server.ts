@@ -268,14 +268,18 @@ const SEARCH_FAILURE_HINTS: Readonly<Record<SearchFailureClass, string>> = Objec
   "policy-restricted": " The query is not permitted by the configured search policy. Rephrase, or ask the operator.",
   captcha: " The search path hit an interactive challenge no solver can clear here. Do not retry in a loop.",
   "challenge-interstitial": " The search path hit an anti-bot interstitial. Do not retry in a loop.",
-  "total-deadline-exhausted": " The whole search budget ran out before any provider answered. Retry once with a simpler query.",
+  "total-deadline-exhausted": " The whole search budget ran out before any provider answered — every configured provider was slow or failing. Retry once later; the attempt list shows which providers were tried.",
 });
 
 /** Render the success body: a machine-greppable header, then one block per result. Only the `content`
  *  TEXT reliably reaches a consumer agent (measured — see the mcp-side-channels solution doc), so the
  *  results must be legible HERE and not only in `structuredContent`. */
 function formatSearchResponse(res: SearchResponse): string {
-  const header = `provider=${res.provider} results=${res.results.length} durationMs=${res.durationMs}`;
+  // `fallback=true` when the answer came from a provider other than the first one actually tried, so a
+  // caller (and an operator reading a transcript) can see the primary is struggling even on success.
+  const firstTried = res.attempts.find((a) => !a.skipped)?.provider;
+  const fallback = firstTried !== undefined && firstTried !== res.provider ? " fallback=true" : "";
+  const header = `provider=${res.provider} results=${res.results.length} durationMs=${res.durationMs}${fallback}`;
   if (res.results.length === 0) {
     return `${header}\n\nNo results.`;
   }
@@ -446,6 +450,14 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
             const { failure, attempts } = err;
             const hint = SEARCH_FAILURE_HINTS[failure.code] ?? "";
             const retry = failure.retryAfterMs !== undefined ? ` retryAfterMs=${failure.retryAfterMs}` : "";
+            // Name the provider whose verdict is being reported, not merely the last one tried: with a
+            // fallback chain the reported class (e.g. a dead credential on the primary) can come from
+            // an earlier attempt. `tried=` is the whole chain in order, breaker skips included.
+            const reported =
+              attempts.find((a) => !a.skipped && a.failureClass === failure.code)?.provider ??
+              attempts[attempts.length - 1]?.provider ??
+              "n/a";
+            const tried = attempts.map((a) => (a.skipped ? `${a.provider}(skipped)` : a.provider)).join(",");
             return {
               isError: true,
               // #47: in-band — the search provider completed a round-trip and returned a negative
@@ -456,8 +468,8 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
                 {
                   type: "text",
                   text:
-                    `Search failed (failureClass=${failure.code}, provider=${attempts[attempts.length - 1]?.provider ?? "n/a"}, ` +
-                    `status=${failure.httpStatus ?? "n/a"}, attempts=${attempts.length}${retry}).${hint}`,
+                    `Search failed (failureClass=${failure.code}, provider=${reported}, ` +
+                    `status=${failure.httpStatus ?? "n/a"}, attempts=${attempts.length} tried=${tried || "none"}${retry}).${hint}`,
                 },
               ],
               structuredContent: { attempts } as unknown as Record<string, unknown>,

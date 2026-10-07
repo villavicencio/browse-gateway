@@ -1,5 +1,5 @@
 /**
- * Search (VIL-122) — a provider-agnostic `search` verb. Discovery is its own operation with its own
+ * Search (VIL-122, VIL-123) — a provider-agnostic `search` verb behind an ordered provider router. Discovery is its own operation with its own
  * retry/timeout/failure semantics; it is not a SERP URL handed to `retrieve`.
  */
 export { SearchProviderError, SEARCH_FAILURE_CLASSES } from "./types.js";
@@ -35,4 +35,11 @@ export {
   DEFAULT_SEARCH_PROVIDER_TIMEOUT_MS,
   DEFAULT_SEARCH_TOTAL_TIMEOUT_MS,
 } from "./config.js";
+export {
+  createSearchRouter,
+  MIN_ATTEMPT_MS,
+  DEFAULT_SEARCH_BREAKER_THRESHOLD,
+  DEFAULT_SEARCH_BREAKER_COOLDOWN_MS,
+} from "./router.js";
+export type { SearchRouter, SearchRouterOptions, RouterClock, RouterMetrics, ProviderMetrics } from "./router.js";
 export type { SearchSettings, BuildSearchOptions, BuiltSearch } from "./config.js";

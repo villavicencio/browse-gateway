@@ -59,9 +59,12 @@ anything that must fail a deploy has to be observable at boot. A check inside th
 | Env | Meaning | Default |
 |---|---|---|
 | `BGW_SEARCH_ENABLED` | `1` enables the feature and registers the tool | unset (off) |
-| `BGW_SEARCH_PROVIDERS` | ordered CSV of provider names | `brave` |
-| `BGW_SEARCH_PROVIDER_TIMEOUT_MS` | per-attempt budget | `8000` |
-| `BGW_SEARCH_TOTAL_TIMEOUT_MS` | total deadline; the per-attempt budget is clamped to it | `20000` |
+| `BGW_SEARCH_PROVIDERS` | ordered CSV of provider names; tried in this order, each name at most once | `brave` |
+| `BGW_SEARCH_PROVIDER_TIMEOUT_MS` | per-provider budget (a `Retry-After` retry spends the same budget) | `8000` |
+| `BGW_SEARCH_TOTAL_TIMEOUT_MS` | total deadline across all providers; every attempt is clamped to it | `20000` |
+| `BGW_SEARCH_BREAKER_THRESHOLD` | consecutive counted failures that open a provider's breaker | `2` |
+| `BGW_SEARCH_BREAKER_COOLDOWN_MS` | how long an open breaker skips its provider before one half-open probe | `300000` |
+| `BGW_SEARCH_EMPTY_RESULTS_FALLBACK` | `0` stops at the first provider that answers "nothing matched" | on |
 | `BGW_BRAVE_SEARCH_API_URL` | endpoint base; https only, non-private | the documented endpoint |
 | `BGW_BRAVE_SEARCH_API_KEY` | **secret**, listed in `SECRET_KEYS` | — |
 
@@ -76,9 +79,51 @@ own JSON examples are `title`, `url`, `description` and `extra_snippets` — **n
 confirmed**. Rather than invent one and ship a field that is silently always absent, the adapter
 reports `null`. Resolve by inspecting one live response once a key exists.
 
+## Routing (VIL-123)
+
+`router.ts` is the only code path; a single-provider deployment is a one-provider router.
+
+**The deadline invariant.** Each attempt's deadline is `min(now + providerTimeoutMs, totalDeadline)`,
+and the router enforces it itself rather than trusting the adapter: a router-owned timer settles the
+attempt at the deadline (a provider that ignores both `ctx.deadline` and `ctx.signal` is abandoned,
+not awaited) and `ctx.signal` is aborted on every exit. No attempt starts with less than
+`MIN_ATTEMPT_MS` (500 ms) left. When the total deadline cuts an attempt or prevents one, the outcome
+is `total-deadline-exhausted` with the full attempt list — not whichever provider failed last.
+
+**Policy by failure class.**
+
+| Class | Moves to next provider | Breaker | Retried |
+|---|---|---|---|
+| `rate-limited` | yes | counts | once, only if `Retry-After` + 500 ms fits the provider's remaining budget |
+| `authentication-failed`, `quota-exhausted` | yes | **opens at once** | never |
+| `timeout`, `network-error`, `provider-unavailable`, `malformed-response` | yes | counts | no |
+| `unsupported-query` | yes (another provider may have different limits) | no — it is the query | no |
+| `empty-results` | yes, unless `BGW_SEARCH_EMPTY_RESULTS_FALLBACK=0` | no | no |
+
+**Breaker.** Per provider, in-memory. Threshold consecutive counted failures open it; while open the
+provider is recorded as `skipped: true` (no request sent); after the cooldown exactly one half-open
+probe is admitted, and its result closes or re-opens it. **Last resort:** when every provider is open
+and nothing has been sent yet in this search, the LAST provider is called anyway — exactly one request,
+never one per dead provider. That applies to an OPEN breaker only: while a half-open probe is in flight,
+an overlapping search skips the provider and fails fast with `provider-unavailable` rather than sending a
+second concurrent request. Without that rule a one-provider deployment would refuse every search for
+the whole cooldown after two timeouts.
+
+**Outcomes.** Any provider with results wins. Otherwise, if any provider answered "nothing matched",
+the search succeeds with zero results. Otherwise it fails with `total-deadline-exhausted` when the
+deadline ended it, else the first of `authentication-failed` > `quota-exhausted` > `rate-limited`
+found in the history, else the first failure. The MCP text names the provider whose class is
+reported, `tried=` lists the chain (breaker skips marked), and a success served by a later provider
+says `fallback=true`.
+
+**Observability.** One log line per search (`search: outcome=… provider=… attempts=[…]`), which
+never carries the query. `BuiltSearch.metrics()` returns per-provider counters; surfacing them on
+`/health` is VIL-130's.
+
 ## Scope
 
-One provider, one attempt, one recorded outcome. Ordered multi-provider fallback, circuit breakers,
-caching, and a browser-driven SERP fallback are the sibling ticket's scope. `SearchFailureClass`
-already declares the three classes that work needs (`captcha`, `challenge-interstitial`,
-`total-deadline-exhausted`) so the closed vocabulary does not widen twice.
+Shipped: one real provider (Brave) behind the router. **No second real provider yet**: the one
+planned (Google Custom Search JSON API) is closed to new customers and discontinued 2027-01-01
+(Google's overview page, fetched 2026-10-07), so the fallback is proven with deterministic fakes and
+a real second adapter is a follow-up. Also deferred: the query cache, canonical-URL deduplication,
+and a browser-SERP fallback (`captcha` and `challenge-interstitial` stay declared for it).

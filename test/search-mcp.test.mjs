@@ -93,7 +93,10 @@ test("zero results is a SUCCESS the agent can read, not an error", async () => {
 });
 
 test("a provider failure is an in-band tool error naming the class, provider, status and attempts", async () => {
-  const client = await connect({ search: withProvider({ throwCode: "rate-limited", httpStatus: 429, retryAfterMs: 7000 }) });
+  // A Retry-After LONGER than the provider budget: the router does not wait (no retry), and the
+  // advisory still reaches the caller. (One that fits would be honoured with a real retry — see
+  // search-router.test.mjs.)
+  const client = await connect({ search: withProvider({ throwCode: "rate-limited", httpStatus: 429, retryAfterMs: 9000 }) });
   const res = await client.callTool({ name: "search", arguments: { query: "q" } });
   assert.equal(res.isError, true);
   assert.equal(res._meta[ERROR_KIND_META_KEY], "in-band");
@@ -101,8 +104,8 @@ test("a provider failure is an in-band tool error naming the class, provider, st
   assert.match(text, /failureClass=rate-limited/);
   assert.match(text, /provider=fake/);
   assert.match(text, /status=429/);
-  assert.match(text, /attempts=1/);
-  assert.match(text, /retryAfterMs=7000/);
+  assert.match(text, /attempts=1 tried=fake/);
+  assert.match(text, /retryAfterMs=9000/);
   assert.match(text, /Wait for the retry window/);
   assert.equal(res.structuredContent.attempts[0].failureClass, "rate-limited");
 });
@@ -187,4 +190,45 @@ test("a SearchAttemptsError carrying several attempts reports the count and the 
   assert.match(res.content[0].text, /attempts=2/);
   assert.match(res.content[0].text, /provider=second/);
   assert.equal(res.structuredContent.attempts.length, 2);
+});
+
+// --- VIL-123: the router's chain is legible in the content text --------------------------------------
+
+test("a fallback success says fallback=true in the header; a primary success does not", async () => {
+  const chain = makeSearchFn(
+    [fakeSearchProvider({ name: "primary", throwCode: "rate-limited", httpStatus: 429 }), fakeSearchProvider({ name: "backup" })],
+    SETTINGS,
+  );
+  const client = await connect({ search: chain });
+  const res = await client.callTool({ name: "search", arguments: { query: "q" } });
+  assert.match(res.content[0].text, /^provider=backup results=3 durationMs=\d+ fallback=true\n/);
+  assert.deepEqual(res.structuredContent.attempts.map((a) => a.provider), ["primary", "backup"]);
+
+  const direct = await connect({ search: withProvider() });
+  const ok = await direct.callTool({ name: "search", arguments: { query: "q" } });
+  assert.doesNotMatch(ok.content[0].text, /fallback=/);
+});
+
+test("an all-failed chain names the provider whose class is reported, and the whole chain in order", async () => {
+  const chain = makeSearchFn(
+    [fakeSearchProvider({ name: "primary", throwCode: "authentication-failed", httpStatus: 401 }), fakeSearchProvider({ name: "backup", throwCode: "network-error" })],
+    SETTINGS,
+  );
+  const client = await connect({ search: chain });
+  const res = await client.callTool({ name: "search", arguments: { query: "q" } });
+  const text = res.content[0].text;
+  // The dead credential is on the PRIMARY; naming the last provider tried would point the operator
+  // at the wrong key.
+  assert.match(text, /failureClass=authentication-failed, provider=primary, status=401, attempts=2 tried=primary,backup\)/);
+});
+
+test("a breaker skip is visible in tried=", async () => {
+  const chain = makeSearchFn(
+    [fakeSearchProvider({ name: "primary", throwCode: "quota-exhausted", httpStatus: 402 }), fakeSearchProvider({ name: "backup", throwCode: "timeout" })],
+    SETTINGS,
+  );
+  const client = await connect({ search: chain });
+  await client.callTool({ name: "search", arguments: { query: "q" } }); // primary's quota trips its breaker
+  const res = await client.callTool({ name: "search", arguments: { query: "q" } });
+  assert.match(res.content[0].text, /tried=primary\(skipped\),backup/);
 });
