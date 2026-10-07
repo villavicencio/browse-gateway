@@ -248,12 +248,12 @@ verify() {
 
 if verify; then
   echo "deploy: SUCCESS → ${IMAGE}"
-  # 8 — retention: keep the newest 5 project images; never the running or rollback-anchor image.
+  # 8 — retention: keep only the running image + the rollback anchor (last known good).
   # Full (--no-trunc) IDs so they compare equal to inspect's sha256:… refs; a glob reference filter
   # to scope to the project package; explicit skips (docker also refuses to rmi an in-use image).
   local_keep="$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null || true)"
   docker images --no-trunc --filter=reference='ghcr.io/*/browse-gateway' --format '{{.ID}} {{.CreatedAt}}' \
-    | sort -rk2 | awk 'NR>5{print $1}' \
+    | sort -rk2 | awk 'NR>1{print $1}' \
     | while read -r id; do
         [ -n "$id" ] || continue
         [ "$id" = "$local_keep" ] && continue
