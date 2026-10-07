@@ -42,6 +42,23 @@ $ obscura status                 at-a-glance health: tunnel / gateway / consumer
   (^,o)  tunnel up · gateway healthy
 ```
 
+> **Current limitation (2026-10): `obscura keys` does not work against the current prod host from the
+> dev machine.** Every `keys` subcommand that touches the consumer manifest or env file (`new`, `list`,
+> `revoke`, with or without `--apply`) reaches the host over the `adminSsh` login in your Obscura config,
+> and there is no unattended SSH login from the dev machine as the account that owns those files. The host
+> itself is not closed to operators; that one route is what is missing.
+>
+> **Supported path today:** change consumer keys **on the host**, as the gateway's service account. Mint the
+> token there, add it to the env file with hidden input (`read -rs`, so the key never appears on screen, in
+> shell history, or in chat), update the consumer manifest, then run a normal gated deploy with
+> `scripts/deploy/deploy-ref.sh`, because the container only loads env changes when it is re-created.
+> Deliver the token to the consumer's machine without passing it through chat; copying a key off a screen
+> into a chat is not an acceptable workaround.
+>
+> Restoring `obscura keys … --apply` would need a dedicated, key-only SSH login for that account,
+> restricted to the dev machine's tailnet address. That is an operator decision, not a default; key
+> rotation is rare enough that the on-host path is fine.
+
 ## Why
 
 Browser automation tends to fragment: every consumer wires up its own SaaS browser
