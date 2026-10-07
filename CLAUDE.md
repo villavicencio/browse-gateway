@@ -60,7 +60,9 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
 
 - **Run `validate-*.mjs` / `measure-*.mjs` ONLY in-container** (headful Chrome under Xvfb).
   Build: `docker build --platform linux/amd64 -f docker/Dockerfile -t browse-gateway:<tag> .`
-  Run: `docker run --rm --platform linux/amd64 --shm-size=1g --init <tag> node scripts/<x>.mjs`
+  Run: `scripts/run-gate.sh <tag> <x>.mjs` — the same `docker run --rm --platform linux/amd64
+  --shm-size=1g --init <tag> node scripts/<x>.mjs`, but it first REFUSES (exit 3) when Colima's live
+  amd64 handler is not Rosetta (the QEMU-fallback trap below), instead of letting every image look broken.
   In **zsh**, `$REPO:latest` triggers the `:l` modifier — write `"${REPO}:latest"`.
   Gates needing bind-mounts require the overlay-image approach (colima will not share
   `/private/tmp`), plus `--init`.
