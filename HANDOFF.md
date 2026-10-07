@@ -99,6 +99,6 @@ waiting on the operator. Side work: per-branch handoffs so several sessions can 
     "incremental reviews are disabled". Request the next review explicitly.
 - **On the new host, image ID and registry digest are the same hash** (containerd image store), unlike the
   old rootless-Docker VPS.
-- **The Linear project "Skills" is now "Argus — Skills & Agent Infrastructure" (`P-VIL-5`).**
+- **The Linear project "Skills" was renamed.** Look it up by id `P-VIL-5`, not by the old name.
 - **Background `sleep` jobs stall while the Mac sleeps.** One scheduled review request fired about 9 hours
   late.
