@@ -1,56 +1,104 @@
 ---
-created_at: "2026-08-28T09:05:24-07:00"
+created_at: "2026-10-07T06:54:18-07:00"
 branch: "main"
-head: "1a28d69"
-resume_focus: "Phase 2 of the search epic — VIL-122, the search verb with a Brave adapter (merge-only, no deploy; no API keys exist)"
+head: "1f377f4"
+resume_focus: "Deploy 1 on the prod host (VIL-290): run the runbook in VIL-290's latest comment as the container's service account, then check the deploy-ref report lines"
 ---
-# HANDOFF — 2026-08-28, early morning
+# HANDOFF — 2026-10-07, early morning
 
-Executed Phase 0 and Phase 1 of the overnight search-epic runbook. **VIL-121 is merged and live in production** with the watched RED→GREEN captured through prod; two learnings were compounded to `docs/solutions/`. Phases 2–4 (VIL-122, VIL-123, epilogue) have not been started — this session stopped after Phase 1's tail rather than continuing, so the runbook picks up cleanly at Phase 2.
-
-> The runbook remains gitignored and uncommitted, as required. No keys, fleet identities, or research-domain queries were written anywhere.
+This session started by getting the search verb (VIL-122, PR #147) merged. Then the move to a new prod host
+(the old VPS was deleted 2026-10-05) left no working deploy path. So the session built an operator-run
+deploy (PR #148), rehearsed it against a real daemon, and wrote up what that turned up (PR #149). **Search
+is merged but not live.** Deploy 1 (new image, search off) and deploy 2 (Brave key, search on) are both
+waiting on the operator. Side work: per-branch handoffs so several sessions can run in parallel worktrees
+(villavicencio/skills#43), and briefs for the dotfiles session.
 
 ## What We Built
 
-- **PR #146 → `1471f12`, deployed** — VIL-121. The escalation ladder no longer spends residential exits on failures a fresh exit cannot change. What the PR does not tell you: `DECISIVE_FAILURE_CLASSES` ships **narrower than the runbook specified** (`{rate-limited, captcha, policy-blocked}`, not including `hard-block`/`anti-bot-block`) — see Decisions, and do not "restore" the other two.
-- **`isTerminalUnclearableRender`** (`src/browser/detect.ts`) — the one predicate both re-roll loops consult. It exists because the entry gate and the loops are *different* enforcement points; adding a rule to the gate alone leaves `forceProxy` unguarded.
-- **`docs/solutions/architecture-patterns/a-fresh-exit-cannot-clear-a-404-a-429-or-a-captcha.md`** (`b7b5ca5`) — the VIL-121 learning. Its second half is the part worth reading: three of four review findings were "the same rule applied at one of several enforcement points."
-- **`docs/solutions/runtime-errors/apt-invalid-signature-in-docker-build-can-be-a-full-disk.md`** (`1a28d69`) — the Phase 0 blocker, compounded. Contains a pre-build disk guard that is **proposed, not installed**.
-- **VIL-136 (High) and VIL-137 (Medium)** — follow-ups filed with full reproduction detail. VIL-136 came out of reading the *success* measurement, not a failure.
+- **PR #147 → `768af59`: the `search` verb with a Brave adapter.** It's off unless `BGW_SEARCH_ENABLED=1`.
+  The CodeRabbit nitpick that the abort controller is never aborted was declined and moved to VIL-123 as a
+  comment. The router rewrites `makeSearchFn` anyway.
+- **PR #148 → `a62801a`: `scripts/deploy/deploy-ref.sh <sha|tag>`, plus a `verify()` that polls.** Verify
+  checks first, sleeps only between attempts, uses one deadline covering the `/mcp` probe, and validates
+  `BGW_VERIFY_TIMEOUT` up front (1..600). **What the PR doesn't tell you:** the prod host's copies of
+  `deploy-on-host.sh`, `deploy-ref.sh` and `preswap-smoke.sh` are what actually run, and **they are not
+  synced yet.** Step 1 of the deploy-1 runbook does that and checks sha256 hashes.
+- **PR #149 → `1f377f4`: the learnings.**
+  - `docs/solutions/runtime-errors/grep-q-under-pipefail-fails-on-the-match-it-was-looking-for.md`
+  - `docs/solutions/runtime-errors/tini-s-dies-on-colima-when-amd64-silently-falls-back-from-rosetta-to-qemu.md`
+  - A refresh of four related docs, and `CONCEPTS.md` *Post-swap verify*.
+  - The fix commit merged without a second review (docs only, review slot exhausted); recorded in the PR body.
+- **Deploy-1 image:** `a62801a` → `ghcr.io/villavicencio/browse-gateway@sha256:87b39b2b1835fdfcfee22d5f1e87625986ddc069e9dd76a3a8a3efb2ad4728f8`.
+  Checked with an anonymous pull: amd64, revision label `a62801a021cb…`.
+- **Real-daemon rehearsal** on the dev Mac (Colima, amd64 under Rosetta): gate PASS, smoke OK,
+  `verify: OK after 1s`, blip about 3 s, boot 2.2 s. These are dev-Mac numbers, not prod's.
+- **The production section of `CONTEXT.local.md`** (local, gitignored) holds the deploy procedure,
+  rollback, blip notes and the VIL-290 env vars. The VPS-era sections there are marked STALE.
+- **villavicencio/skills#43 (VIL-297): handoff/pickup with a per-branch store,** for parallel worktree
+  sessions. Still open. This handoff is in the older 0.4.0 format, because the new version isn't released.
+- **Linear:**
+  - VIL-290 (turn on search; **runbook in its latest comment**), VIL-291 (deploy path), VIL-292 (datacenter
+    flag), VIL-293 (arm64 image), VIL-294 (Colima amd64 handler).
+  - In the Dotfiles project: VIL-299 (`wt` helper, workflow doc, `/ops` page), VIL-300 (agent tab status
+    over SSH), VIL-301 (the CodeRabbit watcher rule).
 
 ## Decisions Made
 
-- **`DECISIVE_FAILURE_CLASSES` excludes `hard-block` and `anti-bot-block`.** The runbook listed them as decisive *and* asserted the existing #43 budget tests stay green; both cannot hold, because one of those tests drives a CF challenge whose root is `anti-bot-block`. Narrowing was chosen over rewriting the test: those two are the *exit-clearable* classes, where "we ran out of time, try again" is correct advice. The surviving membership test is **"if the caller acts on this label by asking again, are they wrong?"**
-- **The terminal break keys on STATUS, never on the block reason.** A review suggestion to use the reason was investigated and **rejected**: `cfHint` is a persistent marker with no liveness requirement, so `classifyBlock` labels an ordinary thin 404 from *any* Cloudflare-fronted origin `cf-challenge`. Reason-gating would re-roll every exit on the most common shape the ticket exists to stop. A regression test pins this — do not relitigate.
-- **Cloudflare is the only vendor exempted from the terminal break.** PerimeterX/DataDome are behavioral: a fresh exit does not clear them and a retry re-triggers them. One attempt then stop is correct, and is now documented on the predicate.
-- **Drive's loop was fixed; the login-runner's third copy was not.** Deliberate scope call — credential-capture path with its own vault gates. Routed to VIL-137, not dropped.
-- **Fixture rule sharpened:** a string identifying a *site* is banned; a string the *classifier matches on* is required. CodeRabbit asked to remove `g-recaptcha`; the rule was the thing that was wrong, not the fixture.
-- **Deploy rode `b7b5ca5`, not the merge commit.** The docs push to `main` cancelled `1471f12`'s CI via same-branch concurrency. Same code plus docs, so this was correct — but "the merge commit's CI went green" was *false*.
+- **Deploys are operator-run on the prod host, not dispatched from CI.** `deploy-http.yml`'s secrets
+  describe the deleted host, so **don't dispatch it.** Never auto-deploy on merge.
+- **Search goes live in two deploys.** Deploy 1: image `a62801a` with search off. Deploy 2: the same digest
+  after adding `BGW_SEARCH_ENABLED=1` and `BGW_BRAVE_SEARCH_API_KEY` to the prod env file. **Brave only
+  for now.** Don't put `google` in `BGW_SEARCH_PROVIDERS` before VIL-123 ships, or boot refuses.
+- **The GHCR package is public**, so pulling needs no token. An earlier "404" was a raw manifest request
+  made without the registry's token handshake.
+- **`BGW_ALLOWED_HOSTS` is the inbound Host-header allowlist,** so the Brave endpoint doesn't belong in it.
+- **The operator says `--init` in `launch-http.sh` is load-bearing.** A refresh suggestion to call it
+  unnecessary was declined.
+- **Herdr is retired.** The operator uses plain iTerm2 with vertical tabs and tab groups.
 
 ## What Didn't Work
 
-- **The runbook's prod probe URL cannot verify anything.** `example.com/does-not-exist-vil121` has a **288-char body** — over the 200-char `MIN_CONTENT_LENGTH` — so it is not a hard block, never escalates, and returns fast-and-clean both before *and* after the fix. Used `https://api.github.com/vil121-does-not-exist` (~100 chars) instead. **Check any future probe against the threshold before trusting it.**
-- **Clock skew as the docker-build diagnosis** — reasonable (three clocks under emulation) but wrong; ruled out by measuring all three before finding the full disk.
-- **Two fixture comments named vendors while explaining the fixtures had no vendor markers**, which gave them markers — the hint scanners read raw HTML *including comments*. Three tests failed until the comments were rewritten.
-- **`callBudgetMs: 0` does not reach drive's escalation throw** — it is refused earlier at the queue boundary as a plain `Error`. A non-escalating direct failure that outruns a small budget is the reachable path.
+- **Blaming Rosetta for the Colima failure.** The VM had silently lost its Rosetta handler, and QEMU
+  user-mode was running amd64, which refuses `tini -s`. A Colima restart fixed it. An arm64-vs-amd64
+  control proves *a* translator is at fault, not *which* one. Check `binfmt_misc` before naming it.
+- **The first rehearsal crash-looped with `EISDIR`.** Its sandbox was under `/private/tmp`, which Colima
+  doesn't share, so the bind mount became an empty directory. Put rehearsal sandboxes under `$HOME`.
+- **deploy-ref first reported a ~32 s "blip"** for a deploy that never swapped, because `/mcp` was already
+  down. It now takes a baseline probe first.
+- **`verify()` first slept before checking,** so a 1 s budget never inspected anything. The tests' fake
+  `sleep` hid it, because it never advanced `$SECONDS`.
+- **A CodeRabbit watcher reported "skipped"** while the review was actually running: it read a status from
+  before the request. Only trust statuses posted after the request (VIL-301).
 
 ## What's Next
 
-1. **Phase 2 — VIL-122**, the `search` verb with a Brave adapter, per the runbook's §2. Merge-only; prod has no keys so the tool stays unregistered. Provider docs for **both** Brave and Google CSE are already fetched and saved with URLs + timestamps in this session's scratchpad under `provider-docs/` — re-fetch if that scratch is gone.
-2. **Phase 3 — VIL-123** (router + Google CSE), then **Phase 4** (epilogue: follow-up tickets, epic comment, memory, handoff). Note Phase 4's follow-up list is now partly done — VIL-136/137 are filed.
-3. **Morning, operator:** create the Brave Search API account and the Google Cloud project + Programmable Search Engine (verify the "search the whole web" toggle wording), then the enable-in-prod ticket: keys into prod env, `BGW_SEARCH_ENABLED=1`, container **re-create** (not restart), boot line reads `search=brave,google`.
-4. **`browse-gateway` MCP dropped its connection** (`ConnectionRefused` on the tunnel at `127.0.0.1:8080`) after the deploy. The deploy's own post-swap verify passed and `obscura status` was healthy immediately after, so this looks like the local tunnel/session, not the gateway. Does not block Phases 2–3; **does** block any further live prod verification.
-5. Recommended maintenance: `/ce-compound-refresh xvfb-run-wedges-container-as-pid1` — its `| tail` rule covers only EOF-buffering and is now incomplete (the same pipe also masks *exit status*).
-6. Still open, unchanged: VIL-130 (health surface), VIL-131 (pool floor, Medium), VIL-133 (pool-floor pre-flight), the never-watched `--apply` smoke refusal, M2 of the versioning plan.
+1. **Deploy 1 (operator).** Use the runbook in VIL-290's latest comment. Run it as the container's service
+   account, not the admin login. Expect `deploy: SUCCESS`, no drift NOTE, `verify: OK after Ns` (the first
+   real boot time on prod) and `boot line: search=off`.
+2. **Deploy 2.** Back up the prod env file, add the two variables, then rerun the same `deploy-ref.sh`
+   command with the same sha. Expect `search=brave`, then make one real query.
+3. **villavicencio/skills#43.** A re-review was requested 2026-10-07 13:49Z and was in flight at handoff
+   time. Merge it if clean, then the `release(dv): 0.5.0` PR, then
+   `claude plugin marketplace update villavicencio-skills && claude plugin update dv@villavicencio-skills`.
+4. **VIL-123:** the search router plus Google CSE. It includes the abort-signal fix declined on #147.
+5. **VIL-291 leftovers.** Decide what happens to `deploy-http.yml`. `CLAUDE.md`'s deploy-gate section still
+   describes the VPS host-sync world beyond the note added in #148.
+6. **Later:** VIL-292, VIL-294's guard, VIL-293.
 
 ## Gotchas & Watch-outs
 
-- **⚠️ The clearance poll is now the dominant cost on a thin 404** — 20.2 s of the post-fix 22.0 s. That is VIL-136, and it means a "still slow" report after VIL-121 is expected, not a regression.
-- **⚠️ Do not re-add `hard-block`/`anti-bot-block` to `DECISIVE_FAILURE_CLASSES`,** and do not switch the terminal break to the block reason. Both look like obvious cleanups and both are wrong; each has a test pinning it and a rationale in the PR body.
-- **⚠️ Pushing to `main` right after a merge cancels the merge commit's CI run.** Confirm *which* run actually produced the image before deploying — "the PR was green" is not the same claim.
-- **The proposed disk guard in the new solutions doc is NOT installed.** If you install it, watch it RED *and* GREEN — the terser `&&`-chain form returns exit 1 on the healthy path.
-- **A host `df` is not evidence for Docker disk pressure** — the Mac showed 28G free while the colima VM's `/var/lib/docker` had zero. Use `colima ssh -- df -h /var/lib/docker`.
-- **`validate-call-budget` leg B silently self-skips without `BGW_PROXY_*`.** It ran this session by mapping the local spike creds by *name* (no proxy request is made). A "PASS with 1 note" there means the leg did not run.
-- **`npm test` baseline on `main` is now 1529 / 1306 / 223** (fail count unchanged from the documented 223). Compare the failing set **by name**, not by count.
-- **PR bodies auto-close named Linear ids on merge** — VIL-121 went to Done automatically. Re-check VIL-113/122/123/127 after every merge; they were verified untouched this session.
-- Carried over: assume BSD userland and redact structurally with `jq`, testing the redactor against a known value first; the deploy id is an HMAC of the full commit sha, not a git revision.
+- **No shell state carries over between tool calls,** so every block in a skill or runbook must stand on
+  its own.
+- **Local gates:** before trusting or blaming one, check that `colima ssh -- ls /proc/sys/fs/binfmt_misc/`
+  lists `rosetta`. The "failed to install interpreter" line in `dmesg` appears even on a good boot.
+- **`npm test` on macOS:** compare the failing set by test name against `main`. Today: no branch-only
+  failures, and one timing-flaky artifact test that failed on `main` only.
+- **CodeRabbit:**
+  - It allows one review per hour across every repo and session.
+  - In the skills repo, automatic re-reviews are off, so a push after a completed review shows
+    "incremental reviews are disabled". Request the next review explicitly.
+- **On the new host, image ID and registry digest are the same hash** (containerd image store), unlike the
+  old rootless-Docker VPS.
+- **The Linear project "Skills" was renamed.** Look it up by id `P-VIL-5`, not by the old name.
+- **Background `sleep` jobs stall while the Mac sleeps.** One scheduled review request fired about 9 hours
+  late.
