@@ -17,6 +17,11 @@ related_components:
 tags: [linear, deploy-verification, stale-ticket, urgency, triage, gh-run-list]
 ---
 
+> **2026-10-07:** `.github/workflows/deploy-http.yml` has been deleted (its target host no longer exists;
+> prod deploys are operator-run via `scripts/deploy/deploy-ref.sh`). References to it below are
+> historical — read the file from git history (`git log --all -- .github/workflows/deploy-http.yml`).
+
+
 ## Problem
 
 Tickets that carry a deployment-status banner — `MERGED BUT NOT DEPLOYED`, `the last production

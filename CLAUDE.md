@@ -132,7 +132,8 @@ unit breakdown is in the private plan (see `CONTEXT.local.md`).
   backup history above is from the PREVIOUS prod host** (deleted 2026-10-05). The rule carries over
   unchanged to the current one, where the deploy scripts were synced and hash-checked 2026-10-07.
 - **Since 2026-10, prod deploys are operator-run on the host, not dispatched from CI.** The prod host
-  changed, and `deploy-http.yml`'s secrets describe a host that no longer exists, so **don't dispatch it.**
+  changed, and the CI deploy workflow (`deploy-http.yml`) targeted the deleted host, so it was **deleted
+  2026-10-07** (recover it from git history if a CI-driven deploy is ever wanted again).
   On the host, run `scripts/deploy/deploy-ref.sh <7-hex sha | 40-hex sha | tag>`. It resolves the ref
   to a pinned digest, refuses an image whose `org.opencontainers.image.revision` isn't that commit,
   follows the old container's log through the swap, times the blip, and hands the digest to
