@@ -404,3 +404,42 @@ test("the pre-flight reads the env file the way the launcher sources it, with th
   // perConsumerMax multiplies the floor exactly as the boot check does.
   assert.match(poolFloorPreflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n"), /need >= 7/);
 });
+
+// --- CodeRabbit #157: the pre-flight must see the value the gateway actually receives --------------------
+
+test("an inline comment is dropped as bash drops it — the exact understated-floor scenario is refused", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  // bash gives the gateway perConsumerMax=2, so 2 consumers need 2×2+1 = 5 sessions, not the 3 a
+  // comment-blind reader (falling back to perConsumerMax 1) would compute.
+  const env = "export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=2 # capacity\n";
+  assert.match(poolFloorPreflight(2, env), /need >= 5/);
+});
+
+test("quoted values with a trailing comment are read exactly", async () => {
+  const { envFileAssignment } = await import("../dist/cli/keys.js");
+  assert.deepEqual(envFileAssignment('BGW_MAX_SESSIONS="6" # six', "BGW_MAX_SESSIONS"), { value: "6" });
+  assert.deepEqual(envFileAssignment("export BGW_MAX_SESSIONS='7'", "BGW_MAX_SESSIONS"), { value: "7" });
+  assert.deepEqual(envFileAssignment("BGW_MAX_SESSIONS=8\t# tab comment", "BGW_MAX_SESSIONS"), { value: "8" });
+  assert.deepEqual(envFileAssignment("OTHER=1", "BGW_MAX_SESSIONS"), {});
+});
+
+for (const [label, line] of [
+  ["a variable expansion", "BGW_MAX_SESSIONS=$CAP"],
+  ["command substitution", "BGW_MAX_SESSIONS=$(nproc)"],
+  ["a non-integer", "BGW_MAX_SESSIONS=lots"],
+  ["a hash with no space (bash keeps it literal)", "BGW_MAX_SESSIONS=8#c"],
+  ["a zero", "BGW_PER_CONSUMER_MAX=0"],
+]) {
+  test(`the pre-flight REFUSES rather than guesses on ${label}`, async () => {
+    const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+    assert.match(poolFloorPreflight(1, `${line}\n`), /cannot evaluate BGW_[A-Z_]+ in the env file safely/);
+  });
+}
+
+test("keys new refuses to stage when a sizing variable cannot be evaluated, writing nothing", async () => {
+  const env = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=$CAP\n`;
+  const { deps, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env });
+  await assert.rejects(() => keysNew(deps, "consumer-2"), /cannot evaluate BGW_MAX_SESSIONS/);
+  assert.equal(readFileSync(manifestPath, "utf8"), BASE_MANIFEST);
+  assert.equal(readFileSync(envFilePath, "utf8"), env);
+});

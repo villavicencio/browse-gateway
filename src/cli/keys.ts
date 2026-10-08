@@ -83,21 +83,34 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
 }
 
 /**
- * The value `key` takes when the env file is sourced (`set -a; . file`, as the launcher does): the LAST
- * assignment wins, an optional `export ` prefix is allowed, and one layer of matching single or double
- * quotes is stripped. Returns `undefined` when the file never assigns it.
+ * The value `key` takes when the env file is sourced (`set -a; . file`, as the launcher does), for the
+ * SIMPLE assignment shapes the pre-flight can evaluate exactly: the LAST assignment wins, an optional
+ * `export ` prefix is allowed, a trailing ` # comment` (whitespace before `#`) is dropped as bash drops
+ * it, and one layer of matching single or double quotes is stripped. Returns `{ value }`, `{}` when the
+ * file never assigns the key, or `{ unsupported: raw }` when the last assignment uses syntax this reader
+ * does not model (expansions, command substitution, escapes, unbalanced quotes, ...): evaluating that by
+ * guesswork could disagree with what the gateway actually receives (CodeRabbit #157).
  */
-export function envFileValue(envText: string, key: string): string | undefined {
+export function envFileAssignment(envText: string, key: string): { value?: string; unsupported?: string } {
   const re = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${key}=(.*)$`);
-  let value: string | undefined;
+  let last: string | undefined;
   for (const line of envText.split("\n")) {
     const m = re.exec(line);
-    if (!m) continue;
-    let raw = m[1]!.trim();
-    if (raw.length >= 2 && (raw[0] === "'" || raw[0] === '"') && raw[raw.length - 1] === raw[0]) raw = raw.slice(1, -1);
-    value = raw;
+    if (m) last = m[1]!;
   }
-  return value;
+  if (last === undefined) return {};
+  const raw = last;
+  // One quoted word, or one bare word, optionally followed by whitespace + a comment.
+  const quoted = /^(['"])([^'"\\$`]*)\1(?:[ \t]+#.*)?[ \t]*$/.exec(raw);
+  if (quoted) return { value: quoted[2]! };
+  const bare = /^([^ \t'"\\$`#;&|<>(){}]*)(?:[ \t]+#.*)?[ \t]*$/.exec(raw);
+  if (bare) return { value: bare[1]! };
+  return { unsupported: raw.trim() };
+}
+
+/** {@link envFileAssignment}'s value, for callers that only need the plain case. */
+export function envFileValue(envText: string, key: string): string | undefined {
+  return envFileAssignment(envText, key).value;
 }
 
 /**
@@ -105,10 +118,29 @@ export function envFileValue(envText: string, key: string): string | undefined {
  * check's own pure rule ({@link poolSizingError}) and its own defaults ({@link positiveIntOr} over
  * {@link DEFAULT_GATEWAY_CONFIG}), so the CLI and the boot guard cannot drift. Returns a refusal naming
  * the arithmetic AND the remedy, or null.
+ *
+ * FAIL-CLOSED on what it cannot read: a sizing variable whose assignment uses unsupported syntax, or whose
+ * value is not a plain positive integer, refuses rather than falling back to a default — a default the
+ * gateway may not be using is exactly how the floor gets understated (CodeRabbit #157).
  */
 export function poolFloorPreflight(consumerCount: number, envText: string): string | null {
-  const maxSessions = positiveIntOr(envFileValue(envText, "BGW_MAX_SESSIONS"), DEFAULT_GATEWAY_CONFIG.maxSessions);
-  const perConsumerMax = positiveIntOr(envFileValue(envText, "BGW_PER_CONSUMER_MAX"), DEFAULT_GATEWAY_CONFIG.perConsumerMax);
+  const sizing: Record<string, number> = {};
+  for (const [key, fallback] of [
+    ["BGW_MAX_SESSIONS", DEFAULT_GATEWAY_CONFIG.maxSessions],
+    ["BGW_PER_CONSUMER_MAX", DEFAULT_GATEWAY_CONFIG.perConsumerMax],
+  ] as const) {
+    const a = envFileAssignment(envText, key);
+    if (a.unsupported !== undefined || (a.value !== undefined && !/^[1-9][0-9]*$/.test(a.value))) {
+      return (
+        `refusing to add a consumer: cannot evaluate ${key} in the env file safely (its assignment is not a ` +
+        `plain positive integer), so the pool floor cannot be checked. Nothing was staged or changed. Write it ` +
+        `as \`${key}=<n>\` (an optional trailing \` # comment\` is fine) and re-run.`
+      );
+    }
+    sizing[key] = a.value === undefined ? fallback : positiveIntOr(a.value, fallback);
+  }
+  const maxSessions = sizing.BGW_MAX_SESSIONS!;
+  const perConsumerMax = sizing.BGW_PER_CONSUMER_MAX!;
   const err = poolSizingError(consumerCount, perConsumerMax, maxSessions);
   if (!err) return null;
   const required = consumerCount * perConsumerMax + 1;
