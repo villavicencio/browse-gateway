@@ -83,116 +83,75 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
 }
 
 /**
- * The value `key` takes when the env file is sourced (`set -a; . file`, as the launcher does), for the
- * SIMPLE assignment shapes the pre-flight can evaluate exactly: the LAST assignment wins, an optional
- * `export ` prefix is allowed, a trailing ` # comment` (whitespace before `#`) is dropped as bash drops
- * it, and one layer of matching single or double quotes is stripped. Returns `{ value }`, `{}` when the
- * file never assigns the key, or `{ unsupported: raw }` when the last assignment uses syntax this reader
- * does not model (expansions, command substitution, escapes, unbalanced quotes, ...): evaluating that by
- * guesswork could disagree with what the gateway actually receives (CodeRabbit #157).
- */
-export function envFileAssignment(envText: string, key: string): { value?: string; unsupported?: string } {
-  const re = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${key}=(.*)$`);
-  let last: string | undefined;
-  for (const line of envText.split("\n")) {
-    const m = re.exec(line);
-    if (m) last = m[1]!;
-  }
-  if (last === undefined) return {};
-  const raw = last;
-  // One quoted word, or one bare word, optionally followed by whitespace + a comment.
-  const quoted = /^(['"])([^'"\\$`]*)\1(?:[ \t]+#.*)?[ \t]*$/.exec(raw);
-  if (quoted) return { value: quoted[2]! };
-  const bare = /^([^ \t'"\\$`#;&|<>(){}]*)(?:[ \t]+#.*)?[ \t]*$/.exec(raw);
-  if (bare) return { value: bare[1]! };
-  return { unsupported: raw.trim() };
-}
-
-/** {@link envFileAssignment}'s value, for callers that only need the plain case. */
-export function envFileValue(envText: string, key: string): string | undefined {
-  return envFileAssignment(envText, key).value;
-}
-
-/**
- * Split one env-file line into its shell CODE and whether it ends inside an open quote. A `#` starts a
- * comment only when it is outside quotes and at the line start or after whitespace, exactly as in bash;
- * a `#` inside '...' or "..." is data (MergeWren on #157). Backslash escapes are honoured outside single
- * quotes. A line that ends inside a quote continues onto the next line, which a line-by-line reader cannot
- * follow, so the caller refuses the whole file in that case.
- */
-export function envLineCode(line: string): { code: string; openQuote: boolean } {
-  let quote: "'" | '"' | null = null;
-  // Whether the previous character is UNESCAPED whitespace outside quotes: only then can a `#` start a
-  // comment. An escaped space (`A=x\\ #y`) is part of the word, so the `#` after it is data
-  // (MergeWren on #157).
-  let atWordStart = true;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!;
-    if (quote === "'") {
-      if (c === "'") quote = null;
-      continue;
-    }
-    if (c === "\\") {
-      i++;
-      atWordStart = false;
-      continue;
-    }
-    if (quote === '"') {
-      if (c === '"') quote = null;
-      continue;
-    }
-    if (c === "#" && atWordStart) return { code: line.slice(0, i), openQuote: false };
-    if (c === "'" || c === '"') quote = c;
-    atWordStart = c === " " || c === "\t";
-  }
-  return { code: line, openQuote: quote !== null };
-}
-
-/** Lines that can change ANY variable in ways a line-by-line reader cannot follow. */
-const OPAQUE_ENV_LINE = /^[ \t]*(?:\.|source|eval|set)(?:[ \t]|$)/;
-
-/**
- * VIL-133: would the gateway BOOT with `consumerCount` consumers under this env file? Uses the boot
- * check's own pure rule ({@link poolSizingError}) and its own number parser ({@link positiveIntOr}), so
- * the CLI and the boot guard cannot drift. Returns a refusal naming the arithmetic AND the remedy, or null.
+ * VIL-133: the two pool-sizing values EXACTLY as the launcher will see them, by letting bash evaluate the
+ * env file the way `launch-http.sh` does: `set -euo pipefail`, then `set -a; . file`. It runs in a clean
+ * `env -i` subshell, so the caller's own environment cannot leak in, over the same shell the CLI already
+ * uses to read and write that file.
  *
- * FAIL-CLOSED wherever the file alone cannot tell us what the gateway will receive (MergeWren / CodeRabbit
- * on #157). The launcher sources this file LAST, just before forwarding every `BGW_*` by name, so an
- * explicit plain assignment here is authoritative, and anything else is refused rather than guessed:
- *  - a sizing variable that is NOT assigned here: the launcher would forward whatever its own
- *    environment exported, which this CLI cannot see, so a default would be a guess;
- *  - any other line that mentions it (`unset`, `+=`, `readonly`, an expansion, ...), or a line that can
- *    change anything (`.`/`source`, `eval`, `set`): the last plain assignment may not be the final value;
- *  - a value the boot parser would reject and replace with its default.
+ * Why bash and not a parser: every hand-written reader of this file missed some bash rule (inline
+ * comments, quoted `#`, escaped spaces, `;#`, conditionals, `unset`, `+=`, ...), and each miss was a way
+ * to UNDERSTATE the floor and stage a crash-loop (CodeRabbit and MergeWren on #157). Bash cannot disagree
+ * with itself. The launcher already executes this file on every deploy as the same account, so evaluating
+ * it here adds no trust the deploy path does not already extend.
+ *
+ * The launcher forwards every shell variable named `BGW_*` (`compgen -v`, exported or not), so a plain
+ * shell variable is exactly what it sends. Returns each value as bash leaves it (`null` when the file
+ * leaves it unset), or `{ error }` when sourcing fails: under the launcher's `set -eu` that same file
+ * would abort the launch.
  */
-export function poolFloorPreflight(consumerCount: number, envText: string): string | null {
+export async function resolveEnvSizing(
+  shell: Pick<RemoteShell, "run">,
+  envFilePath: string,
+): Promise<{ maxSessions: string | null; perConsumerMax: string | null } | { error: string }> {
+  const unset = "__bgw_unset__";
+  const body =
+    `set -euo pipefail; set -a; . "$1" >/dev/null 2>&1; ` +
+    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${unset}}" "\${BGW_PER_CONSUMER_MAX-${unset}}"`;
+  const r = await shell.run(`env -i HOME="$HOME" PATH="$PATH" bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`);
+  if (r.code !== 0) return { error: `sourcing it the way the launcher does fails (exit ${r.code}), so the launch would abort too` };
+  const out = r.stdout.split("\n");
+  // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
+  // holds a newline).
+  if (out.length !== 3 || out[2] !== "") return { error: "the values could not be read back after sourcing it" };
+  const value = (v: string): string | null => (v === unset ? null : v);
+  return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
+}
+
+/**
+ * VIL-133: would the gateway BOOT with `consumerCount` consumers, given the sizing values the launcher will
+ * see ({@link resolveEnvSizing})? Uses the boot check's own pure rule ({@link poolSizingError}) and number
+ * parser ({@link positiveIntOr}), so the CLI and the boot guard cannot drift. Returns a refusal naming the
+ * arithmetic AND the remedy, or null.
+ *
+ * A value the file leaves UNSET refuses rather than assuming the boot default: the launcher forwards every
+ * `BGW_*` from its own environment too, which this CLI cannot see, so an absent value is not known to be
+ * the default (MergeWren on #157). A value boot would reject (and replace with its default) refuses too.
+ */
+export function poolFloorPreflight(
+  consumerCount: number,
+  sizing: { maxSessions: string | null; perConsumerMax: string | null } | { error: string },
+): string | null {
   const refuse = (key: string, why: string): string =>
     `refusing to add a consumer: cannot evaluate ${key} from the env file safely (${why}), so the pool ` +
-    `floor cannot be checked. Nothing was staged or changed. Set it explicitly as \`${key}=<n>\` (an optional ` +
-    `trailing \` # comment\` is fine), with no other line changing it, and re-run.`;
-  const parsed = envText.split("\n").map(envLineCode);
-  if (parsed.some((p) => p.openQuote)) {
-    return refuse("BGW_MAX_SESSIONS", "a quoted value spans lines, which this check does not model");
+    `floor cannot be checked. Nothing was staged or changed. Set it explicitly in the env file as ` +
+    `\`${key}=<n>\` and re-run.`;
+  if ("error" in sizing) {
+    // The file's own output is discarded, never echoed: the env file holds every consumer's token.
+    return (
+      `refusing to add a consumer: cannot evaluate the env file safely (${sizing.error}), so the pool ` +
+      `floor cannot be checked. Nothing was staged or changed. Fix the env file so it sources cleanly ` +
+      `under \`set -euo pipefail\`, as the launcher sources it, and re-run.`
+    );
   }
-  const lines = parsed.map((p) => p.code);
-  const opaque = lines.find((l) => OPAQUE_ENV_LINE.test(l));
-  const sizing: Record<string, number> = {};
-  for (const key of ["BGW_MAX_SESSIONS", "BGW_PER_CONSUMER_MAX"] as const) {
-    if (opaque !== undefined) return refuse(key, "the file sources, evals or sets other state");
-    const plain = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${key}=`);
-    const mentions = new RegExp(`(^|[^A-Za-z0-9_])${key}([^A-Za-z0-9_]|$)`);
-    // `lines` holds each line's shell CODE (comments removed by a quote-aware scan), so a comment that
-    // mentions the name is ignored while a command after a quoted `#` is still seen (MergeWren on #157).
-    if (lines.some((l) => mentions.test(l) && !plain.test(l))) return refuse(key, "another line changes or reads it");
-    const a = envFileAssignment(envText, key);
-    if (a.value === undefined && a.unsupported === undefined) return refuse(key, "it is not set in the file");
-    if (a.unsupported !== undefined) return refuse(key, "its assignment uses syntax this check does not model");
-    const n = positiveIntOr(a.value, Number.NaN);
+  const parsed: Record<string, number> = {};
+  for (const [key, raw] of [["BGW_MAX_SESSIONS", sizing.maxSessions], ["BGW_PER_CONSUMER_MAX", sizing.perConsumerMax]] as const) {
+    if (raw === null) return refuse(key, "it is not set in the file");
+    const n = positiveIntOr(raw, Number.NaN);
     if (Number.isNaN(n)) return refuse(key, "the gateway would reject this value and use its default");
-    sizing[key] = n;
+    parsed[key] = n;
   }
-  const maxSessions = sizing.BGW_MAX_SESSIONS!;
-  const perConsumerMax = sizing.BGW_PER_CONSUMER_MAX!;
+  const maxSessions = parsed.BGW_MAX_SESSIONS!;
+  const perConsumerMax = parsed.BGW_PER_CONSUMER_MAX!;
   const err = poolSizingError(consumerCount, perConsumerMax, maxSessions);
   if (!err) return null;
   const required = consumerCount * perConsumerMax + 1;
@@ -332,7 +291,7 @@ export async function keysNew(deps: KeysDeps, id: string, opts: KeysNewOptions =
   // past BGW_MAX_SESSIONS does not degrade the gateway — the boot guard refuses to start it, so the next
   // re-create crash-loops EVERY consumer. Staging alone is already the hazard (the next re-create, by
   // --apply or by a deploy, reads these files), so this refuses whether or not --apply was passed.
-  const floorRefusal = poolFloorPreflight(entries.length + 1, envText);
+  const floorRefusal = poolFloorPreflight(entries.length + 1, await resolveEnvSizing(deps.shell, deps.envFilePath));
   if (floorRefusal) throw new Error(floorRefusal);
 
   const allow = opts.allow && opts.allow.length > 0 ? opts.allow : ["*"];

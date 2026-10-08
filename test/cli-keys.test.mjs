@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -393,132 +393,98 @@ test("keys new is allowed when the new consumer still fits — exactly at the fl
   assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).length, 2);
 });
 
-test("the pre-flight reads the env file the way the launcher sources it, with the boot defaults", async () => {
-  const { envFileValue, poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.equal(envFileValue("BGW_MAX_SESSIONS=4\nexport BGW_MAX_SESSIONS='6'\n", "BGW_MAX_SESSIONS"), "6", "last assignment wins; quotes stripped");
-  assert.equal(envFileValue('  export BGW_PER_CONSUMER_MAX="2"', "BGW_PER_CONSUMER_MAX"), "2");
-  assert.equal(envFileValue("XBGW_MAX_SESSIONS=9", "BGW_MAX_SESSIONS"), undefined, "a longer name is not a match");
-  // Not set in the file → refused: the launcher would forward whatever its own environment exported.
-  assert.match(poolFloorPreflight(1, ""), /it is not set in the file/);
-  // perConsumerMax multiplies the floor exactly as the boot check does.
-  assert.match(poolFloorPreflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n"), /need >= 7/);
-});
-
-// --- CodeRabbit #157: the pre-flight must see the value the gateway actually receives --------------------
-
-test("an inline comment is dropped as bash drops it — the exact understated-floor scenario is refused", async () => {
+/** The sizing values bash gives the launcher for `envText`, through the real resolver over a real shell. */
+async function sizingOf(envText) {
+  const { resolveEnvSizing } = await import("../dist/cli/keys.js");
+  const dir = mkdtempSync(join(tmpdir(), "obscura-sizing-"));
+  const path = join(dir, "prod.env");
+  writeFileSync(path, envText);
+  try {
+    return await resolveEnvSizing(localShell(), path);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+async function preflight(consumers, envText) {
   const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  // bash gives the gateway perConsumerMax=2, so 2 consumers need 2×2+1 = 5 sessions, not the 3 a
-  // comment-blind reader (falling back to perConsumerMax 1) would compute.
-  const env = "export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=2 # capacity\n";
-  assert.match(poolFloorPreflight(2, env), /need >= 5/);
-});
-
-test("quoted values with a trailing comment are read exactly", async () => {
-  const { envFileAssignment } = await import("../dist/cli/keys.js");
-  assert.deepEqual(envFileAssignment('BGW_MAX_SESSIONS="6" # six', "BGW_MAX_SESSIONS"), { value: "6" });
-  assert.deepEqual(envFileAssignment("export BGW_MAX_SESSIONS='7'", "BGW_MAX_SESSIONS"), { value: "7" });
-  assert.deepEqual(envFileAssignment("BGW_MAX_SESSIONS=8\t# tab comment", "BGW_MAX_SESSIONS"), { value: "8" });
-  assert.deepEqual(envFileAssignment("OTHER=1", "BGW_MAX_SESSIONS"), {});
-});
-
-for (const [label, line] of [
-  ["a variable expansion", "BGW_MAX_SESSIONS=$CAP"],
-  ["command substitution", "BGW_MAX_SESSIONS=$(nproc)"],
-  ["a non-integer", "BGW_MAX_SESSIONS=lots"],
-  ["a hash with no space (bash keeps it literal)", "BGW_MAX_SESSIONS=8#c"],
-  ["a zero", "BGW_PER_CONSUMER_MAX=0"],
-]) {
-  test(`the pre-flight REFUSES rather than guesses on ${label}`, async () => {
-    const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-    const other = line.startsWith("BGW_MAX") ? "BGW_PER_CONSUMER_MAX=1" : "BGW_MAX_SESSIONS=8";
-    assert.match(poolFloorPreflight(1, `${line}\n${other}\n`), /cannot evaluate BGW_[A-Z_]+ from the env file safely/);
-  });
+  return poolFloorPreflight(consumers, await sizingOf(envText));
 }
 
-test("keys new refuses to stage when a sizing variable cannot be evaluated, writing nothing", async () => {
-  const env = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=$CAP\nexport BGW_PER_CONSUMER_MAX=1\n`;
-  const { deps, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env });
-  await assert.rejects(() => keysNew(deps, "consumer-2"), /cannot evaluate BGW_MAX_SESSIONS/);
-  assert.equal(readFileSync(manifestPath, "utf8"), BASE_MANIFEST);
-  assert.equal(readFileSync(envFilePath, "utf8"), env);
+test("the pre-flight sees what bash gives the launcher: last assignment wins, quotes and export are bash's", async () => {
+  assert.deepEqual(await sizingOf("BGW_MAX_SESSIONS=4\nexport BGW_MAX_SESSIONS='6'\nBGW_PER_CONSUMER_MAX=\"2\"\n"), { maxSessions: "6", perConsumerMax: "2" });
+  assert.deepEqual(await sizingOf("XBGW_MAX_SESSIONS=9\n"), { maxSessions: null, perConsumerMax: null }, "a longer name is not a match");
+  // perConsumerMax multiplies the floor exactly as the boot check does.
+  assert.match(await preflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n"), /need >= 7/);
 });
 
-// --- MergeWren #157: refuse whatever the file alone cannot settle ------------------------------------
+test("the caller's own environment does not leak into the evaluation", async () => {
+  process.env.BGW_MAX_SESSIONS = "99";
+  try {
+    assert.deepEqual(await sizingOf("BGW_PER_CONSUMER_MAX=1\n"), { maxSessions: null, perConsumerMax: "1" });
+  } finally {
+    delete process.env.BGW_MAX_SESSIONS;
+  }
+});
+
+// --- CodeRabbit + MergeWren #157: every bash rule a hand-written reader missed, now settled by bash ------
+
+test("an inline comment is dropped as bash drops it — the exact understated-floor scenario is refused", async () => {
+  // bash gives the gateway perConsumerMax=2, so 2 consumers need 2×2+1 = 5 sessions, not the 3 a
+  // comment-blind reader (falling back to perConsumerMax 1) would compute.
+  assert.match(await preflight(2, "export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=2 # capacity\n"), /need >= 5/);
+});
 
 const BOTH = "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=1\n";
 
-test("a later line that changes a sizing variable (unset, +=, readonly) is refused, not ignored", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  for (const extra of ["unset BGW_MAX_SESSIONS", "BGW_MAX_SESSIONS+=0", "readonly BGW_PER_CONSUMER_MAX", "export -n BGW_MAX_SESSIONS"]) {
-    assert.match(poolFloorPreflight(1, `${BOTH}${extra}\n`), /another line changes or reads it/, extra);
-  }
-});
+for (const [label, env, expected] of [
+  ["a quoted # is not a comment; the unset after it runs", `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`, { maxSessions: null, perConsumerMax: "1" }],
+  ["an escaped space keeps the # in the word; the unset after it runs", `${BOTH}X=a\\ #b; unset BGW_MAX_SESSIONS\n`, { maxSessions: null, perConsumerMax: "1" }],
+  ["a ; separator starts a comment, so a mention after ;# is not a command", `${BOTH}X=1;# unset BGW_MAX_SESSIONS\n`, { maxSessions: "8", perConsumerMax: "1" }],
+  ["an assignment in a branch that never runs does not count", `${BOTH}if false; then BGW_MAX_SESSIONS=99; fi\n`, { maxSessions: "8", perConsumerMax: "1" }],
+  ["+= appends, as bash does", `${BOTH}BGW_MAX_SESSIONS+=0\n`, { maxSessions: "80", perConsumerMax: "1" }],
+  ["a quoted value spanning lines is followed", `${BOTH}X="a\n# "; unset BGW_MAX_SESSIONS\n`, { maxSessions: null, perConsumerMax: "1" }],
+  ["a trailing comment naming a sizing variable is only a comment", `${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX\n`, { maxSessions: "8", perConsumerMax: "1" }],
+  ["command substitution is evaluated as the launcher would", "BGW_MAX_SESSIONS=$(echo 5)\nBGW_PER_CONSUMER_MAX=1\n", { maxSessions: "5", perConsumerMax: "1" }],
+  ["export -n still leaves a shell variable, which the launcher forwards", `${BOTH}export -n BGW_MAX_SESSIONS\n`, { maxSessions: "8", perConsumerMax: "1" }],
+]) {
+  test(`bash semantics: ${label}`, async () => {
+    assert.deepEqual(await sizingOf(env), expected);
+  });
+}
 
-test("a file that sources, evals or sets other state is refused", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  for (const extra of [". /etc/extra.env", "source ./more.env", "eval \"$X\"", "set -a"]) {
-    assert.match(poolFloorPreflight(1, `${BOTH}${extra}\n`), /sources, evals or sets other state/, extra);
-  }
-});
+for (const [label, env, why] of [
+  ["an unset expansion (set -u aborts the launch too)", "BGW_MAX_SESSIONS=$CAP\nBGW_PER_CONSUMER_MAX=1\n", /sourcing it the way the launcher does fails/],
+  ["a sourced file that does not exist", `${BOTH}. /nonexistent/extra.env\n`, /sourcing it the way the launcher does fails/],
+  ["a file that exits early", `${BOTH}exit 0\n`, /could not be read back/],
+  ["a non-integer", "BGW_MAX_SESSIONS=lots\nBGW_PER_CONSUMER_MAX=1\n", /would reject this value/],
+  ["a hash with no space (bash keeps it literal)", "BGW_MAX_SESSIONS=8#c\nBGW_PER_CONSUMER_MAX=1\n", /would reject this value/],
+  ["a zero", "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=0\n", /would reject this value/],
+  ["an unset sizing variable", `${BOTH}unset BGW_PER_CONSUMER_MAX\n`, /BGW_PER_CONSUMER_MAX.*it is not set in the file/],
+]) {
+  test(`the pre-flight REFUSES rather than guesses on ${label}`, async () => {
+    const r = await preflight(1, env);
+    assert.match(r, /cannot evaluate (BGW_[A-Z_]+ from )?the env file safely/);
+    assert.match(r, /Nothing was staged/);
+    assert.match(r, why);
+  });
+}
 
 test("a sizing variable missing from the file is refused (the launcher could forward an inherited value)", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.match(poolFloorPreflight(1, "BGW_MAX_SESSIONS=8\n"), /BGW_PER_CONSUMER_MAX.*it is not set in the file/);
-  assert.match(poolFloorPreflight(1, "BGW_PER_CONSUMER_MAX=1\n"), /BGW_MAX_SESSIONS.*it is not set in the file/);
+  // MergeWren on #157 suggested assuming the boot default; declined: launch-http.sh forwards every BGW_*
+  // in ITS environment too (compgen -v), which this CLI cannot see.
+  assert.match(await preflight(1, "BGW_MAX_SESSIONS=8\n"), /BGW_PER_CONSUMER_MAX.*it is not set in the file/);
+  assert.match(await preflight(1, "BGW_PER_CONSUMER_MAX=1\n"), /BGW_MAX_SESSIONS.*it is not set in the file/);
 });
 
 test("values the boot parser accepts are accepted (leading zeros), exactly at the floor", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.equal(poolFloorPreflight(2, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n"), null);
-  assert.match(poolFloorPreflight(3, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n"), /need >= 4/);
+  assert.equal(await preflight(2, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n"), null);
+  assert.match(await preflight(3, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n"), /need >= 4/);
 });
 
-test("a similarly-named variable is not mistaken for a sizing variable", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.equal(poolFloorPreflight(1, `${BOTH}BGW_MAX_SESSIONS_NOTE=hello\nunset XBGW_MAX_SESSIONS\n`), null);
-});
-
-test("a whole-line comment that mentions a sizing variable is not a command", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.equal(poolFloorPreflight(1, `# BGW_MAX_SESSIONS is sized for two consumers\n  # and BGW_PER_CONSUMER_MAX too\n${BOTH}`), null);
-  assert.match(poolFloorPreflight(1, `${BOTH}unset BGW_MAX_SESSIONS # cleanup\n`), /another line changes or reads it/);
-});
-
-test("a quoted # is not a comment: a command later on the same line is still caught", async () => {
-  // MergeWren on #157: stripping at any whitespace-preceded # would turn this into `X="a ` and hide the unset.
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.match(poolFloorPreflight(1, `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`), /another line changes or reads it/);
-  assert.match(poolFloorPreflight(1, `${BOTH}Y='it''s # here'; unset BGW_PER_CONSUMER_MAX\n`), /another line changes or reads it/);
-});
-
-test("a real trailing comment that mentions a sizing variable is just a comment", async () => {
-  // MergeWren on #157 (medium): a valid trailing comment must not block keys new.
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.equal(poolFloorPreflight(1, `${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX\nTOKEN="x" # BGW_MAX_SESSIONS too\n`), null);
-});
-
-test("a quoted value that spans lines refuses the whole file (a line-by-line reader cannot follow it)", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  // Line 2 LOOKS like a comment, but bash is still inside the quote from line 1 and then runs the unset.
-  const env = `${BOTH}X="a\n# "; unset BGW_MAX_SESSIONS\n`;
-  assert.match(poolFloorPreflight(1, env), /a quoted value spans lines/);
-});
-
-test("envLineCode follows bash's comment rules", async () => {
-  const { envLineCode } = await import("../dist/cli/keys.js");
-  assert.deepEqual(envLineCode("A=1 # c"), { code: "A=1 ", openQuote: false });
-  assert.deepEqual(envLineCode('A="x # y" # c'), { code: 'A="x # y" ', openQuote: false });
-  assert.deepEqual(envLineCode("A=x#y"), { code: "A=x#y", openQuote: false });
-  assert.deepEqual(envLineCode("# whole"), { code: "", openQuote: false });
-  assert.deepEqual(envLineCode('A="open'), { code: 'A="open', openQuote: true });
-  assert.deepEqual(envLineCode("A=\\# not a comment"), { code: "A=\\# not a comment", openQuote: false });
-  // An escaped space is part of the word, so the # after it is data, not a comment (MergeWren on #157).
-  assert.deepEqual(envLineCode("A=x\\ #y; unset B"), { code: "A=x\\ #y; unset B", openQuote: false });
-  assert.deepEqual(envLineCode("A=x \\#y"), { code: "A=x \\#y", openQuote: false });
-});
-
-test("an escaped space before # does not start a comment, so a later command is still caught", async () => {
-  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  assert.match(poolFloorPreflight(1, `${BOTH}X=a\\ #b; unset BGW_MAX_SESSIONS\n`), /another line changes or reads it/);
+test("keys new refuses to stage when the env file cannot be evaluated, writing nothing", async () => {
+  const env = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=$CAP\nexport BGW_PER_CONSUMER_MAX=1\n`;
+  const { deps, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env });
+  await assert.rejects(() => keysNew(deps, "consumer-2"), /cannot evaluate the env file safely/);
+  assert.equal(readFileSync(manifestPath, "utf8"), BASE_MANIFEST);
+  assert.equal(readFileSync(envFilePath, "utf8"), env);
 });
