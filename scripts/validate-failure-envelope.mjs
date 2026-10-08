@@ -94,6 +94,9 @@ try {
     check("VIL-313: envelope names the session open/close and the page setup (all non-negative numbers)",
       ["sessionAcquireMs", "sessionReleaseMs", "pageSetupMs"].every((k) => typeof t[k] === "number" && t[k] >= 0));
     check("VIL-313: the named stages fit inside the whole-call totalMs", sum <= t.totalMs + named.length);
+    // And from below (MergeWren on #166): a missing or zeroed stage leaves its time unnamed. A healthy run
+    // leaves ~0.2 s unnamed; without pageSetupMs it was ~1.2 s. 750 ms keeps ~4x headroom over the healthy run.
+    check("VIL-313: at most 750 ms of the call is unnamed (the stages account for it)", t.totalMs - sum <= 750);
     check("envelope is secret-free (no cookie/authorization value leaked)",
       !/set-cookie:\s*\S/i.test(JSON.stringify(r.diagnostics)) && !/authorization:\s*\S/i.test(JSON.stringify(r.diagnostics)));
   }
