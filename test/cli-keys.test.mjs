@@ -478,3 +478,11 @@ test("a similarly-named variable is not mistaken for a sizing variable", async (
   const { poolFloorPreflight } = await import("../dist/cli/keys.js");
   assert.equal(poolFloorPreflight(1, `${BOTH}BGW_MAX_SESSIONS_NOTE=hello\nunset XBGW_MAX_SESSIONS\n`), null);
 });
+
+test("comments that mention a sizing variable are not commands (whole-line and trailing)", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  const env = `# BGW_MAX_SESSIONS is sized for two consumers\n${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX above\n`;
+  assert.equal(poolFloorPreflight(1, env), null);
+  // ...but a command after the comment marker's line start is still caught.
+  assert.match(poolFloorPreflight(1, `${BOTH}unset BGW_MAX_SESSIONS # cleanup\n`), /another line changes or reads it/);
+});
