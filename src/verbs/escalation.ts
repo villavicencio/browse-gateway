@@ -5,7 +5,7 @@
  * `isHardBlock`). It is NOT engaged for soft targets or DataDome (the spike showed those pass
  * direct from the datacenter). Pure logic.
  */
-import { assess, isExitClearableHardBlock, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
+import { assess, isExitClearableHardBlock, isTerminalUnclearableRender, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
 import { parseHostSuffixList, hostMatchesAnySuffix } from "../security/index.js";
 
@@ -37,9 +37,15 @@ export interface EscalationContext {
  *
  * VIL-121: the hard-block arm is {@link isExitClearableHardBlock}, not bare `isHardBlock` — a thin
  * 404/410/429 is still a hard block (still reported blocked, still a failure) but a fresh exit
- * cannot change it, so spending a residential session on one is pure burn. The CF arm is untouched:
- * a managed challenge IS cleared by a clean exit (screenshot-proven), so it keeps escalating even
- * when it arrives on one of those statuses.
+ * cannot change it, so spending a residential session on one is pure burn.
+ *
+ * VIL-137 item 2: the CF arm now uses the SAME liveness rule the re-roll loop does, but only where the two
+ * disagreed. A CF marker (`challenge-platform` etc.) PERSISTS on ordinary pages, so a thin 404 from any
+ * Cloudflare-fronted origin used to open one paid proxied session that the re-roll rule then stopped.
+ * Now: on a 404/410/429 the CF arm needs a VISIBLE challenge phrase (a live managed challenge on such a
+ * status still escalates — screenshot-proven to clear); on every other status a hint-only CF page still
+ * escalates exactly as before, so the hint-only interstitial path (403/503 + marker, no phrase) is kept.
+ * Full unification (phrase required everywhere) was rejected for that reason.
  */
 export function shouldEscalateToProxy(
   signal: PageSignal,
@@ -47,7 +53,7 @@ export function shouldEscalateToProxy(
   ctx: EscalationContext,
 ): boolean {
   if (!ctx.onDatacenterIp || !ctx.proxyAvailable) return false;
-  return isCloudflareBlock(signal) || isExitClearableHardBlock(signal, status);
+  return (isCloudflareBlock(signal) && !isTerminalUnclearableRender(signal, status)) || isExitClearableHardBlock(signal, status);
 }
 
 /**

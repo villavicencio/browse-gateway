@@ -8,7 +8,7 @@
  * failure is surfaced as a restart-the-session error rather than swapping exits live (which would
  * lose page state). Pure helpers — no I/O.
  */
-import { isHardBlock, isExitClearableHardBlock, isVisiblyBlocked, isCloudflareVisible } from "../browser/index.js";
+import { isHardBlock, isExitClearableHardBlock, isUnclearableStatus, isVisiblyBlocked, isCloudflareVisible } from "../browser/index.js";
 import type { BrowserCoreOptions, PageSnapshot } from "../browser/index.js";
 import type { SecretStore } from "../security/index.js";
 import {
@@ -170,7 +170,10 @@ export function shouldEscalateDrive(snap: PageSnapshot): boolean {
   const status = snap.status ?? null;
   return (
     isCloudflareVisible({ title: snap.title, text: snap.tree }) ||
-    snap.cfHint === true ||
+    // VIL-137 item 2 (parity with retrieve's shouldEscalateToProxy): a hint-only CF page escalates on
+    // any status EXCEPT 404/410/429, where the marker is a persistent residue on an ordinary page, not
+    // a live challenge — the visible-phrase arm above still escalates a live challenge on those.
+    (snap.cfHint === true && !isUnclearableStatus(status)) ||
     isExitClearableHardBlock({ text: snap.tree }, status)
   );
 }
