@@ -10,7 +10,7 @@
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseConsumerManifest } from "../policy/consumer-config.js";
-import { DEFAULT_GATEWAY_CONFIG, poolSizingError, positiveIntOr } from "../gateway/config.js";
+import { poolSizingError, positiveIntOr } from "../gateway/config.js";
 import type { ConsumerManifestEntry } from "../policy/consumer-config.js";
 import { ok, fail, note } from "./brand.js";
 import type { Keychain } from "./keychain.js";
@@ -113,31 +113,42 @@ export function envFileValue(envText: string, key: string): string | undefined {
   return envFileAssignment(envText, key).value;
 }
 
+/** Lines that can change ANY variable in ways a line-by-line reader cannot follow. */
+const OPAQUE_ENV_LINE = /^[ \t]*(?:\.|source|eval|set)(?:[ \t]|$)/;
+
 /**
  * VIL-133: would the gateway BOOT with `consumerCount` consumers under this env file? Uses the boot
- * check's own pure rule ({@link poolSizingError}) and its own defaults ({@link positiveIntOr} over
- * {@link DEFAULT_GATEWAY_CONFIG}), so the CLI and the boot guard cannot drift. Returns a refusal naming
- * the arithmetic AND the remedy, or null.
+ * check's own pure rule ({@link poolSizingError}) and its own number parser ({@link positiveIntOr}), so
+ * the CLI and the boot guard cannot drift. Returns a refusal naming the arithmetic AND the remedy, or null.
  *
- * FAIL-CLOSED on what it cannot read: a sizing variable whose assignment uses unsupported syntax, or whose
- * value is not a plain positive integer, refuses rather than falling back to a default — a default the
- * gateway may not be using is exactly how the floor gets understated (CodeRabbit #157).
+ * FAIL-CLOSED wherever the file alone cannot tell us what the gateway will receive (MergeWren / CodeRabbit
+ * on #157). The launcher sources this file LAST, just before forwarding every `BGW_*` by name, so an
+ * explicit plain assignment here is authoritative, and anything else is refused rather than guessed:
+ *  - a sizing variable that is NOT assigned here: the launcher would forward whatever its own
+ *    environment exported, which this CLI cannot see, so a default would be a guess;
+ *  - any other line that mentions it (`unset`, `+=`, `readonly`, an expansion, ...), or a line that can
+ *    change anything (`.`/`source`, `eval`, `set`): the last plain assignment may not be the final value;
+ *  - a value the boot parser would reject and replace with its default.
  */
 export function poolFloorPreflight(consumerCount: number, envText: string): string | null {
+  const refuse = (key: string, why: string): string =>
+    `refusing to add a consumer: cannot evaluate ${key} from the env file safely (${why}), so the pool ` +
+    `floor cannot be checked. Nothing was staged or changed. Set it explicitly as \`${key}=<n>\` (an optional ` +
+    `trailing \` # comment\` is fine), with no other line changing it, and re-run.`;
+  const lines = envText.split("\n");
+  const opaque = lines.find((l) => OPAQUE_ENV_LINE.test(l));
   const sizing: Record<string, number> = {};
-  for (const [key, fallback] of [
-    ["BGW_MAX_SESSIONS", DEFAULT_GATEWAY_CONFIG.maxSessions],
-    ["BGW_PER_CONSUMER_MAX", DEFAULT_GATEWAY_CONFIG.perConsumerMax],
-  ] as const) {
+  for (const key of ["BGW_MAX_SESSIONS", "BGW_PER_CONSUMER_MAX"] as const) {
+    if (opaque !== undefined) return refuse(key, "the file sources, evals or sets other state");
+    const plain = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${key}=`);
+    const mentions = new RegExp(`(^|[^A-Za-z0-9_])${key}([^A-Za-z0-9_]|$)`);
+    if (lines.some((l) => mentions.test(l) && !plain.test(l))) return refuse(key, "another line changes or reads it");
     const a = envFileAssignment(envText, key);
-    if (a.unsupported !== undefined || (a.value !== undefined && !/^[1-9][0-9]*$/.test(a.value))) {
-      return (
-        `refusing to add a consumer: cannot evaluate ${key} in the env file safely (its assignment is not a ` +
-        `plain positive integer), so the pool floor cannot be checked. Nothing was staged or changed. Write it ` +
-        `as \`${key}=<n>\` (an optional trailing \` # comment\` is fine) and re-run.`
-      );
-    }
-    sizing[key] = a.value === undefined ? fallback : positiveIntOr(a.value, fallback);
+    if (a.value === undefined && a.unsupported === undefined) return refuse(key, "it is not set in the file");
+    if (a.unsupported !== undefined) return refuse(key, "its assignment uses syntax this check does not model");
+    const n = positiveIntOr(a.value, Number.NaN);
+    if (Number.isNaN(n)) return refuse(key, "the gateway would reject this value and use its default");
+    sizing[key] = n;
   }
   const maxSessions = sizing.BGW_MAX_SESSIONS!;
   const perConsumerMax = sizing.BGW_PER_CONSUMER_MAX!;

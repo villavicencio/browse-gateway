@@ -46,7 +46,7 @@ function fixture({ manifest, env } = {}) {
 const BASE_MANIFEST = JSON.stringify([{ id: "consumer-1", allow: ["*"] }], null, 2);
 // A realistic cap: with no BGW_MAX_SESSIONS the boot default (2) admits ONE consumer, so a fixture that
 // adds a second would describe a config the real gateway refuses to boot (VIL-133).
-const BASE_ENV = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=8\n`;
+const BASE_ENV = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=8\nexport BGW_PER_CONSUMER_MAX=1\n`;
 
 test("keys new writes manifest entry + env token, stores in keychain, prints token once", async () => {
   const { deps, lines, keychain, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
@@ -387,7 +387,7 @@ test("keys new REFUSES a consumer that would breach the pool floor, before writi
 });
 
 test("keys new is allowed when the new consumer still fits — exactly at the floor", async () => {
-  const env = `export BGW_MAX_SESSIONS=3\nexport ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\n`;
+  const env = `export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=1\nexport ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\n`;
   const { deps, manifestPath } = fixture({ manifest: BASE_MANIFEST, env });
   await keysNew(deps, "consumer-2"); // 2 × 1 + 1 = 3 ≤ 3
   assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).length, 2);
@@ -398,9 +398,8 @@ test("the pre-flight reads the env file the way the launcher sources it, with th
   assert.equal(envFileValue("BGW_MAX_SESSIONS=4\nexport BGW_MAX_SESSIONS='6'\n", "BGW_MAX_SESSIONS"), "6", "last assignment wins; quotes stripped");
   assert.equal(envFileValue('  export BGW_PER_CONSUMER_MAX="2"', "BGW_PER_CONSUMER_MAX"), "2");
   assert.equal(envFileValue("XBGW_MAX_SESSIONS=9", "BGW_MAX_SESSIONS"), undefined, "a longer name is not a match");
-  // Unset → the boot defaults (maxSessions 2, perConsumerMax 1): one consumer fits, two do not.
-  assert.equal(poolFloorPreflight(1, ""), null);
-  assert.match(poolFloorPreflight(2, ""), /need >= 3/);
+  // Not set in the file → refused: the launcher would forward whatever its own environment exported.
+  assert.match(poolFloorPreflight(1, ""), /it is not set in the file/);
   // perConsumerMax multiplies the floor exactly as the boot check does.
   assert.match(poolFloorPreflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n"), /need >= 7/);
 });
@@ -432,14 +431,50 @@ for (const [label, line] of [
 ]) {
   test(`the pre-flight REFUSES rather than guesses on ${label}`, async () => {
     const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-    assert.match(poolFloorPreflight(1, `${line}\n`), /cannot evaluate BGW_[A-Z_]+ in the env file safely/);
+    const other = line.startsWith("BGW_MAX") ? "BGW_PER_CONSUMER_MAX=1" : "BGW_MAX_SESSIONS=8";
+    assert.match(poolFloorPreflight(1, `${line}\n${other}\n`), /cannot evaluate BGW_[A-Z_]+ from the env file safely/);
   });
 }
 
 test("keys new refuses to stage when a sizing variable cannot be evaluated, writing nothing", async () => {
-  const env = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=$CAP\n`;
+  const env = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=$CAP\nexport BGW_PER_CONSUMER_MAX=1\n`;
   const { deps, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env });
   await assert.rejects(() => keysNew(deps, "consumer-2"), /cannot evaluate BGW_MAX_SESSIONS/);
   assert.equal(readFileSync(manifestPath, "utf8"), BASE_MANIFEST);
   assert.equal(readFileSync(envFilePath, "utf8"), env);
+});
+
+// --- MergeWren #157: refuse whatever the file alone cannot settle ------------------------------------
+
+const BOTH = "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=1\n";
+
+test("a later line that changes a sizing variable (unset, +=, readonly) is refused, not ignored", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  for (const extra of ["unset BGW_MAX_SESSIONS", "BGW_MAX_SESSIONS+=0", "readonly BGW_PER_CONSUMER_MAX", "export -n BGW_MAX_SESSIONS"]) {
+    assert.match(poolFloorPreflight(1, `${BOTH}${extra}\n`), /another line changes or reads it/, extra);
+  }
+});
+
+test("a file that sources, evals or sets other state is refused", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  for (const extra of [". /etc/extra.env", "source ./more.env", "eval \"$X\"", "set -a"]) {
+    assert.match(poolFloorPreflight(1, `${BOTH}${extra}\n`), /sources, evals or sets other state/, extra);
+  }
+});
+
+test("a sizing variable missing from the file is refused (the launcher could forward an inherited value)", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  assert.match(poolFloorPreflight(1, "BGW_MAX_SESSIONS=8\n"), /BGW_PER_CONSUMER_MAX.*it is not set in the file/);
+  assert.match(poolFloorPreflight(1, "BGW_PER_CONSUMER_MAX=1\n"), /BGW_MAX_SESSIONS.*it is not set in the file/);
+});
+
+test("values the boot parser accepts are accepted (leading zeros), exactly at the floor", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  assert.equal(poolFloorPreflight(2, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n"), null);
+  assert.match(poolFloorPreflight(3, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n"), /need >= 4/);
+});
+
+test("a similarly-named variable is not mistaken for a sizing variable", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  assert.equal(poolFloorPreflight(1, `${BOTH}BGW_MAX_SESSIONS_NOTE=hello\nunset XBGW_MAX_SESSIONS\n`), null);
 });
