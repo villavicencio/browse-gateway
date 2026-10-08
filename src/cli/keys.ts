@@ -107,14 +107,41 @@ export async function resolveEnvSizing(
   const body =
     `set -euo pipefail; set -a; . "$1" >/dev/null 2>&1; ` +
     `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${unset}}" "\${BGW_PER_CONSUMER_MAX-${unset}}"`;
-  const r = await shell.run(`env -i HOME="$HOME" PATH="$PATH" bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`);
-  if (r.code !== 0) return { error: `sourcing it the way the launcher does fails (exit ${r.code}), so the launch would abort too` };
-  const out = r.stdout.split("\n");
-  // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
-  // holds a newline).
-  if (out.length !== 3 || out[2] !== "") return { error: "the values could not be read back after sourcing it" };
-  const value = (v: string): string | null => (v === unset ? null : v);
-  return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
+  const evaluate = async (envPrefix: string) => {
+    const r = await shell.run(`${envPrefix} bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`);
+    if (r.code !== 0) return { code: r.code };
+    const out = r.stdout.split("\n");
+    // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
+    // holds a newline).
+    if (out.length !== 3 || out[2] !== "") return { code: 0, unreadable: true };
+    const value = (v: string): string | null => (v === unset ? null : v);
+    return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
+  };
+
+  // 1. The file on its own, in a clean environment: what it sets.
+  const clean = await evaluate(`env -i HOME="$HOME" PATH="$PATH"`);
+  if ("code" in clean) {
+    return {
+      error:
+        "unreadable" in clean
+          ? "the values could not be read back after sourcing it"
+          : `sourcing it the way the launcher does fails (exit ${clean.code}), so the launch would abort too`,
+    };
+  }
+  if (clean.maxSessions === null || clean.perConsumerMax === null) return clean;
+
+  // 2. The launcher does NOT run clean: it inherits its caller's environment before sourcing the file
+  // (MergeWren on #157), so `BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:-7}` or `${CAP:-7}` would give the
+  // gateway a value step 1 never saw. Evaluate again with this shell's own environment plus sentinel
+  // values for both sizing variables; any difference means the result depends on an environment this
+  // check cannot see, so refuse. Limit: a variable set only in the deploy's environment, and in neither
+  // of these, is not detected.
+  const sentinel = "__bgw_inherited__";
+  const inherited = await evaluate(`BGW_MAX_SESSIONS=${sentinel} BGW_PER_CONSUMER_MAX=${sentinel}`);
+  if ("code" in inherited || inherited.maxSessions !== clean.maxSessions || inherited.perConsumerMax !== clean.perConsumerMax) {
+    return { error: "its sizing values depend on the environment the launcher inherits, which this check cannot see" };
+  }
+  return clean;
 }
 
 /**

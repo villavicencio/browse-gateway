@@ -393,6 +393,8 @@ test("keys new is allowed when the new consumer still fits — exactly at the fl
   assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).length, 2);
 });
 
+const BOTH = "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=1\n";
+
 /** The sizing values bash gives the launcher for `envText`, through the real resolver over a real shell. */
 async function sizingOf(envText) {
   const { resolveEnvSizing } = await import("../dist/cli/keys.js");
@@ -417,13 +419,41 @@ test("the pre-flight sees what bash gives the launcher: last assignment wins, qu
   assert.match(await preflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n"), /need >= 7/);
 });
 
-test("the caller's own environment does not leak into the evaluation", async () => {
-  process.env.BGW_MAX_SESSIONS = "99";
+/** Run `fn` with `vars` set in this process's environment, restoring every prior value (or absence) after
+ *  (MergeWren on #157: the old cleanup deleted a variable that was set before the test). */
+async function withEnv(vars, fn) {
+  const prior = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
   try {
-    assert.deepEqual(await sizingOf("BGW_PER_CONSUMER_MAX=1\n"), { maxSessions: null, perConsumerMax: "1" });
+    return await fn();
   } finally {
-    delete process.env.BGW_MAX_SESSIONS;
+    for (const [k, v] of Object.entries(prior)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
+}
+
+test("an inherited sizing value does not count as the file setting it", async () => {
+  await withEnv({ BGW_MAX_SESSIONS: "99" }, async () => {
+    assert.deepEqual(await sizingOf("BGW_PER_CONSUMER_MAX=1\n"), { maxSessions: null, perConsumerMax: "1" });
+  });
+});
+
+test("a file whose sizing depends on the inherited environment is refused (the launcher inherits it)", async () => {
+  // MergeWren on #157: a clean evaluation alone would read 7 here, while a launcher started with
+  // BGW_MAX_SESSIONS=3 in its environment would send 3.
+  for (const env of ["BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:-7}\nBGW_PER_CONSUMER_MAX=1\n", "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=${BGW_PER_CONSUMER_MAX:-1}\n"]) {
+    assert.match(await preflight(1, env), /depend on the environment the launcher inherits/, env);
+  }
+  // Another variable the shell's environment sets is caught the same way.
+  await withEnv({ BGW_TEST_CAP: "3" }, async () => {
+    assert.match(await preflight(1, "BGW_MAX_SESSIONS=${BGW_TEST_CAP:-7}\nBGW_PER_CONSUMER_MAX=1\n"), /depend on the environment/);
+  });
+  // A plain value is unaffected by whatever the environment holds.
+  await withEnv({ BGW_MAX_SESSIONS: "3" }, async () => {
+    assert.equal(await preflight(1, BOTH), null);
+  });
 });
 
 // --- CodeRabbit + MergeWren #157: every bash rule a hand-written reader missed, now settled by bash ------
@@ -433,8 +463,6 @@ test("an inline comment is dropped as bash drops it — the exact understated-fl
   // comment-blind reader (falling back to perConsumerMax 1) would compute.
   assert.match(await preflight(2, "export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=2 # capacity\n"), /need >= 5/);
 });
-
-const BOTH = "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=1\n";
 
 for (const [label, env, expected] of [
   ["a quoted # is not a comment; the unset after it runs", `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`, { maxSessions: null, perConsumerMax: "1" }],
