@@ -25,6 +25,9 @@ const PROXY_SECRETS = () => new SecretStore(() => ({ BGW_PROXY_URL: "http://p:1"
 const clean = (url = "https://ex.com/login") => ({ url, title: "t", tree: "AUTHENTICATED " + "x".repeat(200), status: 200 });
 const blockedCF = (url = "https://ex.com/login") => ({ url, title: "Just a moment...", tree: "", status: 403, cfHint: true });
 const dead = (url = "https://ex.com/login") => ({ url, title: "", tree: "", status: null });
+// VIL-137: a thin page on a status no fresh exit can change, and a LIVE CF challenge served on one.
+const thinStatus = (status) => (url = "https://ex.com/login") => ({ url, title: "Not Found", tree: "nope", status, responseReceived: true });
+const liveCF429 = (url = "https://ex.com/login") => ({ url, title: "Just a moment...", tree: "", status: 429, cfHint: true, responseReceived: true });
 
 /** A fake core: navigate() pops scripted snapshots (then falls back to `defaultNav`); the
  *  assisted-login surface always succeeds. */
@@ -192,4 +195,54 @@ test("the assisted-login / vault-login surface is NEVER wired into the MCP serve
   for (const ref of ["vault-login", "vaultLogin", "captureLogin", "assistedLogin", "gateway-login-runner"]) {
     assert.ok(!server.includes(ref), `dist/mcp/server.js must not reference "${ref}"`);
   }
+});
+
+// --- VIL-137: the unclearable-status rule reaches the login runner's proxied loop ----------------------
+
+for (const status of [404, 410, 429]) {
+  test(`forced host whose login URL answers a thin ${status}: ONE exit, then a clear stop (not ${PROXY_OPEN_ATTEMPTS} exits)`, async () => {
+    const { gateway, opened, closed } = fakeGateway(fakeCore({ defaultNav: thinStatus(status) }));
+    const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["ex.com"] });
+    await assert.rejects(
+      () => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }),
+      new RegExp(`answered HTTP ${status} on a residential exit .* stopped after 1 of ${PROXY_OPEN_ATTEMPTS} attempts`),
+    );
+    assert.equal(opened.length, 1, "a fresh exit cannot change this status, so only one was drawn");
+    assert.deepEqual(closed, ["h1"], "the one proxied session is closed, not leaked");
+  });
+}
+
+test("escalated capture whose proxied exit lands a thin 404: stops after that exit", async () => {
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [blockedCF()], defaultNav: thinStatus(404) }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}" });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /answered HTTP 404/);
+  assert.equal(opened.length, 2, "direct + exactly one proxied exit");
+});
+
+test("a LIVE Cloudflare challenge on a 429 keeps its full exit budget (a clean exit can clear it)", async () => {
+  const { gateway, opened } = fakeGateway(fakeCore({ defaultNav: liveCF429 }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["ex.com"] });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), new RegExp(`after ${PROXY_OPEN_ATTEMPTS} attempts`));
+  assert.equal(opened.length, PROXY_OPEN_ATTEMPTS);
+});
+
+test("DECIDED POLICY: a hint-only CF page (marker, no visible phrase) on a 429 stops after one exit", async () => {
+  // On 404/410/429 a Cloudflare marker without the visible challenge phrase is treated as a persistent
+  // residue, not a live challenge — the same rule the entry gates use (VIL-137 item 2, operator decision
+  // 2026-10-07, PR #163) and the shared re-roll predicate isTerminalUnclearableRender. A live challenge
+  // on those statuses (visible phrase) keeps its full exit budget; see the liveCF429 test above.
+  const hintOnly429 = (url = "https://ex.com/login") => ({ url, title: "Too Many Requests", tree: "slow down", status: 429, cfHint: true, responseReceived: true });
+  const { gateway, opened } = fakeGateway(fakeCore({ defaultNav: hintOnly429 }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["ex.com"] });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /answered HTTP 429/);
+  assert.equal(opened.length, 1);
+});
+
+test("a DEAD exit carrying a stale 404 is not read as the site's answer — the next exit is still tried", async () => {
+  const staleDead = (url = "https://ex.com/login") => ({ url, title: "", tree: "", status: 404, responseReceived: false });
+  const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [staleDead(), clean()] }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["ex.com"] });
+  const res = await runner({ host: "ex.com", recipe: RECIPE, creds: CREDS });
+  assert.equal(opened.length, 2);
+  assert.ok(opened[1].proxy.password.endsWith(res.stickyExitId));
 });
