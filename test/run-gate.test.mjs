@@ -119,3 +119,13 @@ test("both observed forms of tini's fatal line get the QEMU diagnosis (with and 
     assert.match(r.stderr, /amd64 refuses PR_SET_CHILD_SUBREAPER here/, line);
   }
 });
+
+test("extra args may not override the platform: --platform in either form refuses before any container", () => {
+  for (const extra of [["--platform", "linux/arm64"], ["--platform=linux/arm64"]]) {
+    const s = stubs({ probeOk: true });
+    const r = run(s, ["img:tag", "validate-http.mjs", ...extra]);
+    assert.equal(r.status, 2, extra.join(" "));
+    assert.match(r.stderr, /may not set --platform/);
+    assert.deepEqual(runs(s.calls()), [], "neither the probe nor the gate starts");
+  }
+});

@@ -25,6 +25,16 @@ image=$1
 gate=$2
 shift 2
 
+# The gate is promised to run as linux/amd64, the platform the probe just checked. An extra
+# `--platform` would override that (MergeWren on #158), so refuse it rather than reorder and hope.
+for arg in "$@"; do
+  case "$arg" in
+    --platform|--platform=*)
+      echo "run-gate: REFUSING — extra args may not set --platform; gates always run as linux/amd64." >&2
+      exit 2 ;;
+  esac
+done
+
 if ! probe=$(docker run --rm --platform linux/amd64 --entrypoint /usr/bin/tini "$image" -s -- true 2>&1); then
   {
     echo "run-gate: REFUSING — the start-up probe (the image's own \`tini -s\` as linux/amd64) failed."
