@@ -351,8 +351,13 @@ test("sweep: an EACCES on the STAT read (cmdline readable) is skipped, never sig
   writeProc(root, 313, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 313 });
   const { kill, kills } = makeKillFake(root);
   const readFile = await failingReader(313, "EACCES", "stat");
-  await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() });
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() });
   assert.deepEqual(kills, [], "an unreadable stat means no generation stamp, so no signal");
+  // The documented EACCES posture, asserted on the result (MergeWren on #153): EACCES means "not ours to
+  // inspect" (another uid / hidepid), so the entry is skipped like a vanished one, and with nothing else
+  // stamped the sweep confirms — the same verdict as the cmdline-EACCES test above. A same-uid Chrome
+  // cannot produce this shape (its cmdline and stat are equally readable), so this is not a live orphan.
+  assert.equal(r.result, "confirmed", "EACCES on stat = foreign, skipped; same verdict as EACCES on cmdline");
   rmSync(root, { recursive: true, force: true });
 });
 
