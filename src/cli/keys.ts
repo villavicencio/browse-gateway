@@ -99,9 +99,10 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
  * sentinel. Any dependence on what is inherited (`${BGW_MAX_SESSIONS:-7}`, `${BGW_MAX_SESSIONS:+9}`,
  * `${CAP:-7}` with CAP set here) shows up as a disagreement and is refused (MergeWren on #157: a single
  * evaluation, cleared or inherited, cannot tell). Remaining limit: a variable set ONLY in the deploy's
- * environment, in neither of these two. The boot check (src/mcp/runtime.ts) still refuses that case
- * inside the pre-swap smoke, which boots the real launcher against the real env file before any swap, so
- * a misread here is a later refusal, never a crash-loop.
+ * environment, in neither of these two. When a pre-swap smoke runs (every deploy, and `keys new --apply`
+ * with `smokeCmd` configured), the boot check (src/mcp/runtime.ts) refuses that case before any swap. An
+ * `--apply` WITHOUT `smokeCmd` has no such backstop: it warns and re-creates the live container, so there
+ * this pre-flight is the only floor check (MergeWren on #157).
  *
  * Two evaluations source the file twice. A deploy already does too (the pre-swap smoke, then the swap),
  * and the file is the launcher's own config, so this adds nothing a deploy does not already do.
