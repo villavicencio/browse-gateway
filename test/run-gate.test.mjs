@@ -92,3 +92,19 @@ test("a probe that fails for another reason (missing image) refuses WITHOUT the 
   assert.doesNotMatch(r.stderr, /QEMU|colima stop/, "no translator advice for an unrelated failure");
   assert.ok(!s.calls().includes(gateCall));
 });
+
+test("the QEMU diagnosis needs tini's own fatal line, not the word anywhere in Docker's output", () => {
+  const s = stubs({ probeOk: false, probeError: "Error response from daemon: container references PR_SET_CHILD_SUBREAPER in its name" });
+  const r = run(s);
+  assert.equal(r.status, 3, "still fail closed");
+  assert.match(r.stderr, /could not run at all/);
+  assert.doesNotMatch(r.stderr, /QEMU|colima stop/);
+});
+
+test("both observed forms of tini's fatal line get the QEMU diagnosis (with and without the pid)", () => {
+  for (const line of ["[FATAL tini (1)] PR_SET_CHILD_SUBREAPER is unavailable on this platform. Are you using Linux >= 3.4?", "[FATAL tini] PR_SET_CHILD_SUBREAPER is unavailable on this platform"]) {
+    const r = run(stubs({ probeOk: false, probeError: line }));
+    assert.equal(r.status, 3);
+    assert.match(r.stderr, /refuses PR_SET_CHILD_SUBREAPER \(QEMU user-mode\)/, line);
+  }
+});

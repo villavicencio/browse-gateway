@@ -31,8 +31,9 @@ if ! probe=$(docker run --rm --platform linux/amd64 --entrypoint /usr/bin/tini "
     echo "run-gate: probe output: ${probe:-<none>}"
     # Diagnose only what the output proves (MergeWren on #158): the QEMU-fallback advice is for tini's own
     # PR_SET_CHILD_SUBREAPER refusal, not for a missing image, a stopped daemon or any other failure.
+    # tini's own fatal line, not a bare substring anywhere in Docker's output (MergeWren on #158).
     case "$probe" in
-      *PR_SET_CHILD_SUBREAPER*)
+      *"[FATAL tini"*"] PR_SET_CHILD_SUBREAPER is unavailable"*)
         echo "run-gate: amd64 is running through a translator that refuses PR_SET_CHILD_SUBREAPER (QEMU user-mode),"
         echo "run-gate: so every gate would die at startup and look like a broken image."
         if [ "$(docker context show 2>/dev/null || true)" = "colima" ]; then
