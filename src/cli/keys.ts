@@ -142,11 +142,11 @@ export function poolFloorPreflight(consumerCount: number, envText: string): stri
     if (opaque !== undefined) return refuse(key, "the file sources, evals or sets other state");
     const plain = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${key}=`);
     const mentions = new RegExp(`(^|[^A-Za-z0-9_])${key}([^A-Za-z0-9_]|$)`);
-    // Comments are not commands (MergeWren on #157): drop a whole-line comment and a trailing ` # ...`
-    // before looking for the name. Stripping at any whitespace-preceded `#` can over-strip inside quotes;
-    // that only ever makes the check stricter elsewhere, never hides a real command at the line start.
-    const code = (l: string): string => l.replace(/(^|[ \t])#.*$/, "$1");
-    if (lines.some((l) => mentions.test(code(l)) && !plain.test(l))) return refuse(key, "another line changes or reads it");
+    // Only WHOLE-LINE comments are skipped (MergeWren on #157). A trailing ` # ...` is NOT stripped: a `#`
+    // inside quotes is not a comment, so stripping there could hide a command later on the same line. A
+    // trailing comment that mentions the name therefore refuses, which errs in the safe direction.
+    const isComment = (l: string): boolean => /^[ \t]*#/.test(l);
+    if (lines.some((l) => !isComment(l) && mentions.test(l) && !plain.test(l))) return refuse(key, "another line changes or reads it");
     const a = envFileAssignment(envText, key);
     if (a.value === undefined && a.unsupported === undefined) return refuse(key, "it is not set in the file");
     if (a.unsupported !== undefined) return refuse(key, "its assignment uses syntax this check does not model");

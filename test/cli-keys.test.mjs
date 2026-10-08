@@ -479,10 +479,16 @@ test("a similarly-named variable is not mistaken for a sizing variable", async (
   assert.equal(poolFloorPreflight(1, `${BOTH}BGW_MAX_SESSIONS_NOTE=hello\nunset XBGW_MAX_SESSIONS\n`), null);
 });
 
-test("comments that mention a sizing variable are not commands (whole-line and trailing)", async () => {
+test("a whole-line comment that mentions a sizing variable is not a command", async () => {
   const { poolFloorPreflight } = await import("../dist/cli/keys.js");
-  const env = `# BGW_MAX_SESSIONS is sized for two consumers\n${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX above\n`;
-  assert.equal(poolFloorPreflight(1, env), null);
-  // ...but a command after the comment marker's line start is still caught.
+  assert.equal(poolFloorPreflight(1, `# BGW_MAX_SESSIONS is sized for two consumers\n  # and BGW_PER_CONSUMER_MAX too\n${BOTH}`), null);
   assert.match(poolFloorPreflight(1, `${BOTH}unset BGW_MAX_SESSIONS # cleanup\n`), /another line changes or reads it/);
+});
+
+test("a quoted # is not a comment: a command later on the same line is still caught", async () => {
+  // MergeWren on #157: stripping at any whitespace-preceded # would turn this into `X="a ` and hide the unset.
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  assert.match(poolFloorPreflight(1, `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`), /another line changes or reads it/);
+  // A trailing comment that mentions the name refuses too: the safe direction, by design.
+  assert.match(poolFloorPreflight(1, `${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX\n`), /another line changes or reads it/);
 });
