@@ -489,6 +489,28 @@ test("a quoted # is not a comment: a command later on the same line is still cau
   // MergeWren on #157: stripping at any whitespace-preceded # would turn this into `X="a ` and hide the unset.
   const { poolFloorPreflight } = await import("../dist/cli/keys.js");
   assert.match(poolFloorPreflight(1, `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`), /another line changes or reads it/);
-  // A trailing comment that mentions the name refuses too: the safe direction, by design.
-  assert.match(poolFloorPreflight(1, `${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX\n`), /another line changes or reads it/);
+  assert.match(poolFloorPreflight(1, `${BOTH}Y='it''s # here'; unset BGW_PER_CONSUMER_MAX\n`), /another line changes or reads it/);
+});
+
+test("a real trailing comment that mentions a sizing variable is just a comment", async () => {
+  // MergeWren on #157 (medium): a valid trailing comment must not block keys new.
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  assert.equal(poolFloorPreflight(1, `${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX\nTOKEN="x" # BGW_MAX_SESSIONS too\n`), null);
+});
+
+test("a quoted value that spans lines refuses the whole file (a line-by-line reader cannot follow it)", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  // Line 2 LOOKS like a comment, but bash is still inside the quote from line 1 and then runs the unset.
+  const env = `${BOTH}X="a\n# "; unset BGW_MAX_SESSIONS\n`;
+  assert.match(poolFloorPreflight(1, env), /a quoted value spans lines/);
+});
+
+test("envLineCode follows bash's comment rules", async () => {
+  const { envLineCode } = await import("../dist/cli/keys.js");
+  assert.deepEqual(envLineCode("A=1 # c"), { code: "A=1 ", openQuote: false });
+  assert.deepEqual(envLineCode('A="x # y" # c'), { code: 'A="x # y" ', openQuote: false });
+  assert.deepEqual(envLineCode("A=x#y"), { code: "A=x#y", openQuote: false });
+  assert.deepEqual(envLineCode("# whole"), { code: "", openQuote: false });
+  assert.deepEqual(envLineCode('A="open'), { code: 'A="open', openQuote: true });
+  assert.deepEqual(envLineCode("A=\\# not a comment"), { code: "A=\\# not a comment", openQuote: false });
 });

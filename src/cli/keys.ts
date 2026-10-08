@@ -113,6 +113,35 @@ export function envFileValue(envText: string, key: string): string | undefined {
   return envFileAssignment(envText, key).value;
 }
 
+/**
+ * Split one env-file line into its shell CODE and whether it ends inside an open quote. A `#` starts a
+ * comment only when it is outside quotes and at the line start or after whitespace, exactly as in bash;
+ * a `#` inside '...' or "..." is data (MergeWren on #157). Backslash escapes are honoured outside single
+ * quotes. A line that ends inside a quote continues onto the next line, which a line-by-line reader cannot
+ * follow, so the caller refuses the whole file in that case.
+ */
+export function envLineCode(line: string): { code: string; openQuote: boolean } {
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (quote === "'") {
+      if (c === "'") quote = null;
+      continue;
+    }
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (quote === '"') {
+      if (c === '"') quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') quote = c;
+    else if (c === "#" && (i === 0 || line[i - 1] === " " || line[i - 1] === "\t")) return { code: line.slice(0, i), openQuote: false };
+  }
+  return { code: line, openQuote: quote !== null };
+}
+
 /** Lines that can change ANY variable in ways a line-by-line reader cannot follow. */
 const OPAQUE_ENV_LINE = /^[ \t]*(?:\.|source|eval|set)(?:[ \t]|$)/;
 
@@ -135,18 +164,20 @@ export function poolFloorPreflight(consumerCount: number, envText: string): stri
     `refusing to add a consumer: cannot evaluate ${key} from the env file safely (${why}), so the pool ` +
     `floor cannot be checked. Nothing was staged or changed. Set it explicitly as \`${key}=<n>\` (an optional ` +
     `trailing \` # comment\` is fine), with no other line changing it, and re-run.`;
-  const lines = envText.split("\n");
+  const parsed = envText.split("\n").map(envLineCode);
+  if (parsed.some((p) => p.openQuote)) {
+    return refuse("BGW_MAX_SESSIONS", "a quoted value spans lines, which this check does not model");
+  }
+  const lines = parsed.map((p) => p.code);
   const opaque = lines.find((l) => OPAQUE_ENV_LINE.test(l));
   const sizing: Record<string, number> = {};
   for (const key of ["BGW_MAX_SESSIONS", "BGW_PER_CONSUMER_MAX"] as const) {
     if (opaque !== undefined) return refuse(key, "the file sources, evals or sets other state");
     const plain = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${key}=`);
     const mentions = new RegExp(`(^|[^A-Za-z0-9_])${key}([^A-Za-z0-9_]|$)`);
-    // Only WHOLE-LINE comments are skipped (MergeWren on #157). A trailing ` # ...` is NOT stripped: a `#`
-    // inside quotes is not a comment, so stripping there could hide a command later on the same line. A
-    // trailing comment that mentions the name therefore refuses, which errs in the safe direction.
-    const isComment = (l: string): boolean => /^[ \t]*#/.test(l);
-    if (lines.some((l) => !isComment(l) && mentions.test(l) && !plain.test(l))) return refuse(key, "another line changes or reads it");
+    // `lines` holds each line's shell CODE (comments removed by a quote-aware scan), so a comment that
+    // mentions the name is ignored while a command after a quoted `#` is still seen (MergeWren on #157).
+    if (lines.some((l) => mentions.test(l) && !plain.test(l))) return refuse(key, "another line changes or reads it");
     const a = envFileAssignment(envText, key);
     if (a.value === undefined && a.unsupported === undefined) return refuse(key, "it is not set in the file");
     if (a.unsupported !== undefined) return refuse(key, "its assignment uses syntax this check does not model");
