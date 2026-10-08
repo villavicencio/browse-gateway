@@ -226,6 +226,18 @@ test("a LIVE Cloudflare challenge on a 429 keeps its full exit budget (a clean e
   assert.equal(opened.length, PROXY_OPEN_ATTEMPTS);
 });
 
+test("DECIDED POLICY: a hint-only CF page (marker, no visible phrase) on a 429 stops after one exit", async () => {
+  // On 404/410/429 a Cloudflare marker without the visible challenge phrase is treated as a persistent
+  // residue, not a live challenge — the same rule the entry gates use (VIL-137 item 2, operator decision
+  // 2026-10-07, PR #163) and the shared re-roll predicate isTerminalUnclearableRender. A live challenge
+  // on those statuses (visible phrase) keeps its full exit budget; see the liveCF429 test above.
+  const hintOnly429 = (url = "https://ex.com/login") => ({ url, title: "Too Many Requests", tree: "slow down", status: 429, cfHint: true, responseReceived: true });
+  const { gateway, opened } = fakeGateway(fakeCore({ defaultNav: hintOnly429 }));
+  const runner = makeGatewayLoginRunner(gateway, PROXY_SECRETS(), "tok", { onDatacenterIp: true, stickySuffix: "_s-{id}", forceProxyHosts: ["ex.com"] });
+  await assert.rejects(() => runner({ host: "ex.com", recipe: RECIPE, creds: CREDS }), /answered HTTP 429/);
+  assert.equal(opened.length, 1);
+});
+
 test("a DEAD exit carrying a stale 404 is not read as the site's answer — the next exit is still tried", async () => {
   const staleDead = (url = "https://ex.com/login") => ({ url, title: "", tree: "", status: 404, responseReceived: false });
   const { gateway, opened } = fakeGateway(fakeCore({ navQueue: [staleDead(), clean()] }));
