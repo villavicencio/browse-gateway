@@ -212,6 +212,16 @@ export interface Timing {
   captchaSolveMs?: number;
   /** Snapshot / aria-tree extraction ms — includes the opt-in failure-screenshot capture when it is enabled. */
   snapshotMs?: number;
+  /** VIL-313: a render's per-call page setup before the goto: the fresh page, its evidence and download
+   *  listeners, the capture generation, and the OS-presentation override. Measured at ~1.2 s on hal and
+   *  previously unnamed. Render path only. */
+  pageSetupMs?: number;
+  /** VIL-313: opening the surfaced render's session: consumer auth, the browser launch, and the allowlist
+   *  guard install. Measured at ~3 s per call on hal. Retrieve only (a drive verb reuses an open session). */
+  sessionAcquireMs?: number;
+  /** VIL-313: closing the surfaced render's session after the render returned (the browser teardown).
+   *  Retrieve only. */
+  sessionReleaseMs?: number;
 }
 
 /**
@@ -227,6 +237,9 @@ export function assembleTiming(measured: {
   clearancePollMs?: number;
   captchaSolveMs?: number;
   snapshotMs?: number;
+  pageSetupMs?: number;
+  sessionAcquireMs?: number;
+  sessionReleaseMs?: number;
 }): Timing {
   const clamp = (n: number): number => Math.max(0, Math.round(n));
   const out: Timing = { totalMs: clamp(measured.totalMs) };
@@ -234,6 +247,9 @@ export function assembleTiming(measured: {
   if (measured.clearancePollMs !== undefined) out.clearancePollMs = clamp(measured.clearancePollMs);
   if (measured.captchaSolveMs !== undefined) out.captchaSolveMs = clamp(measured.captchaSolveMs);
   if (measured.snapshotMs !== undefined) out.snapshotMs = clamp(measured.snapshotMs);
+  if (measured.pageSetupMs !== undefined) out.pageSetupMs = clamp(measured.pageSetupMs);
+  if (measured.sessionAcquireMs !== undefined) out.sessionAcquireMs = clamp(measured.sessionAcquireMs);
+  if (measured.sessionReleaseMs !== undefined) out.sessionReleaseMs = clamp(measured.sessionReleaseMs);
   return out;
 }
 

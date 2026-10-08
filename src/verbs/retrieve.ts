@@ -25,7 +25,7 @@ import {
   isTerminalUnclearableRender,
   MIN_CONTENT_LENGTH,
 } from "../browser/index.js";
-import type { ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
+import type { BrowserCoreOptions, ProxyConfig, RenderOptions, RenderResult } from "../browser/index.js";
 import {
   redactFailureDiagnostics,
   sanitizeUrlForError,
@@ -35,7 +35,7 @@ import {
 } from "../observability/index.js";
 import type { FailureDiagnostics, WafVendor, FailureClass, Timing } from "../observability/index.js";
 export type { WafVendor, FailureClass, Timing } from "../observability/index.js";
-import type { Gateway } from "../gateway/index.js";
+import type { Gateway, Session } from "../gateway/index.js";
 import { DEFAULT_CALL_TIMEOUTS, type CallTimeouts } from "../gateway/config.js";
 import { isHttpUrl, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
@@ -852,6 +852,45 @@ export function blockSignalFrom(render: RenderResult): BlockSignal {
   };
 }
 
+/** VIL-313: the session lifecycle cost of one render — open (auth, browser launch, guard install) and close. */
+interface SessionTiming {
+  acquireMs: number;
+  releaseMs: number;
+}
+
+/**
+ * VIL-313: run one render in a consumer session and record how long the session took to OPEN (until the
+ * callback starts) and to CLOSE (after the callback finished). Every retrieve render opens and closes its
+ * own browser, and on hal that lifecycle was ~3 s per call with no field naming it. The timing is keyed by
+ * the render it produced, because the surfaced render is not always the last one (a mixed proxied
+ * exhaustion surfaces an earlier live attempt). A synthetic render has no entry, so its fields are omitted.
+ */
+async function renderInSession(
+  gateway: Gateway,
+  token: string,
+  render: (session: Session) => Promise<RenderResult>,
+  sessionTimings: WeakMap<RenderResult, SessionTiming>,
+  coreOverrides?: BrowserCoreOptions,
+): Promise<RenderResult> {
+  const called = performance.now();
+  let started = called;
+  let finished = called;
+  const result = await gateway.withConsumerSession(
+    token,
+    async (s) => {
+      started = performance.now();
+      try {
+        return await render(s);
+      } finally {
+        finished = performance.now();
+      }
+    },
+    coreOverrides,
+  );
+  sessionTimings.set(result, { acquireMs: started - called, releaseMs: performance.now() - finished });
+  return result;
+}
+
 export async function retrieve(
   gateway: Gateway,
   secrets: SecretStore,
@@ -861,6 +900,8 @@ export async function retrieve(
   // #42 per-stage timing: t0 bounds the WHOLE retrieve call (every render attempt + extraction). The
   // surfaced core stages come from the final render; attemptMs breaks down the proxied retry loop.
   const t0 = performance.now();
+  // VIL-313: each render's session open/close time, keyed by the render (see renderInSession).
+  const sessionTimings = new WeakMap<RenderResult, SessionTiming>();
   // Scheme allowlist (R14-adjacent): only http(s). Rejects file:/data:/blob:/ftp:/view-source:
   // before any navigation, so a non-http target can't read local files or bypass the
   // host-based guard (whose host is empty for those schemes).
@@ -946,7 +987,7 @@ export async function retrieve(
   // 1) Direct render through an authenticated, allowlist-guarded session — skipped when forcing proxy.
   let render: RenderResult | undefined;
   if (!forced) {
-    render = await gateway.withConsumerSession(token, (s) => s.core.render(url, { ...renderOpts, artifactOperation: beginCapture() }));
+    render = await renderInSession(gateway, token, (s) => s.core.render(url, { ...renderOpts, artifactOperation: beginCapture() }), sessionTimings);
   }
 
   // 2) CAPTCHA hook (retrieve path) — detect a widget for the block-reason diagnostic. Full
@@ -1012,9 +1053,11 @@ export async function retrieve(
       proxyAttempts = attempt;
       // #42: wall-clock this whole attempt (fresh proxied session-open + render) so a re-roll is legible.
       const attempt0 = performance.now();
-      render = await gateway.withConsumerSession(
+      render = await renderInSession(
+        gateway,
         token,
         (s) => s.core.render(url, { ...proxiedRenderOpts, artifactOperation: beginCapture() }),
+        sessionTimings,
         { proxy: mintStickyProxy(proxy, opts.stickySuffix), navigationTimeoutMs: timeouts.proxyNavTimeoutMs },
       );
       attemptMs.push(performance.now() - attempt0);
@@ -1098,7 +1141,7 @@ export async function retrieve(
       // and budgetExceeded → failureClass=timeout.
       render = { url, status: null, title: "", text: "", html: "", clearanceWaitedMs: 0, diagnostics: { finalUrl: url, status: null } };
     } else {
-      render = await gateway.withConsumerSession(token, (s) => s.core.render(url, { ...renderOpts, artifactOperation: beginCapture() }));
+      render = await renderInSession(gateway, token, (s) => s.core.render(url, { ...renderOpts, artifactOperation: beginCapture() }), sessionTimings);
     }
   }
   // #45 (codex r8): on a MIXED proxied exhaustion — an earlier attempt REACHED the site (a live block) but the
@@ -1317,7 +1360,16 @@ export async function retrieve(
   // attemptMs holds only the proxied attempts — so a slow DIRECT attempt's stage breakdown isn't surfaced
   // separately. Its duration is still accounted (totalMs − sum(attemptMs) − extraction); a per-attempt
   // direct/proxied stage split is a follow-up (it would break attemptMs's clean 1:1-with-`attempts` shape).
-  const timing: Timing = assembleTiming({ ...(render.timing ?? {}), totalMs: performance.now() - t0 });
+  // VIL-313: plus the surfaced render's session open/close, so the stages add up to totalMs (absent on a
+  // synthetic render, which had no session).
+  const surfacedSession = sessionTimings.get(render);
+  const timing: Timing = assembleTiming({
+    ...(render.timing ?? {}),
+    ...(surfacedSession !== undefined
+      ? { sessionAcquireMs: surfacedSession.acquireMs, sessionReleaseMs: surfacedSession.releaseMs }
+      : {}),
+    totalMs: performance.now() - t0,
+  });
   const diagnostics =
     failed && render.diagnostics
       ? redactFailureDiagnostics(

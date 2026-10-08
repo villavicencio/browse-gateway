@@ -1022,6 +1022,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       // domContentLoadedMs = goto wall-clock (waitUntil:"domcontentloaded" resolves AT DCL). Measured around
       // the try so a goto that THROWS (timeout / challenge abort) still records its time-to-abort.
       const goto0 = performance.now();
+      // VIL-313: everything from t0 to here is per-call page setup (fresh page, listeners, generation,
+      // OS presentation). It was the largest unnamed slice of a render on hal.
+      const pageSetupMs = goto0 - t0;
       // #43 (codex r5): when a shared per-call deadline is passed, clamp the goto timeout to what remains of
       // it, so navigation + the clearance poll below share ONE budget instead of each independently consuming
       // the full `remaining` (which let a 20s allowance run ~40s). Gated on the option, so unbudgeted renders
@@ -1104,6 +1107,7 @@ export class PatchrightBrowserCore implements BrowserCore {
       // BrowserCore.render() caller reading this intermediate value sees the body-only total.
       const timing = assembleTiming({
         totalMs: performance.now() - t0,
+        pageSetupMs,
         domContentLoadedMs,
         clearancePollMs,
         snapshotMs,
