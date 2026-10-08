@@ -294,6 +294,16 @@ function formatSearchResponse(res: SearchResponse): string {
 let memoizedVersion: string | undefined;
 const resolvedDefaultVersion = (): string => (memoizedVersion ??= resolveGatewayVersion().reported);
 
+/**
+ * VIL-116: the brand, in the one surface a consumer agent actually sees — tool DESCRIPTIONS. An agent
+ * told to "use Obscura" greps its tool list for the brand; the README, CLI and boot banner that carry
+ * the brand↔handle mapping are all invisible to it. Tool NAMES, the server name (the
+ * `mcp__browse-gateway__*` prefix), env vars, ports and the image stay the technical handle — the
+ * http-main boundary scopes the brand exclusion to "env/ports/tool names", and a description is none
+ * of those. Prefixed on the three entry tools a consumer reaches for first.
+ */
+const BRAND = "Obscura (this browse-gateway server)";
+
 export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
   const server = new McpServer({
     name: deps.name ?? "browse-gateway",
@@ -309,7 +319,7 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
     {
       title: "Retrieve readable content",
       description:
-        "Read any web page as clean, readable markdown. Preferred for fetching page content: it " +
+        `${BRAND}: read any web page as clean, readable markdown. Preferred for fetching page content: it ` +
         "runs a stealth browser that clears Cloudflare / anti-bot / CAPTCHA and rotates a clean " +
         "residential IP on hard blocks, so it succeeds where an ordinary browser is blocked or " +
         'returns "Forbidden". Prefer this over a generic browser for reading a URL; use the ' +
@@ -417,7 +427,7 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
       {
         title: "Search the web",
         description:
-          "Search the web and get ranked results (title, URL, snippet) from a sanctioned search " +
+          `${BRAND}: search the web and get ranked results (title, URL, snippet) from a sanctioned search ` +
           "API. Use this to FIND candidate URLs, then `retrieve` to read one. Never build a " +
           "search-engine URL and hand it to `retrieve` — that gives discovery the wrong retry, " +
           "timeout and extraction semantics, and breaks when the engine challenges the request.",
@@ -534,7 +544,7 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
       {
         title: "Open a drive session",
         description:
-          "Open a stateful stealth browser session for interactive work (clicks, forms, multi-step flows). " +
+          `${BRAND}: open a stateful stealth browser session for interactive work (clicks, forms, multi-step flows). ` +
           "Drive it with the other browser_* tools; call browser_close when done. To simply read a page, prefer `retrieve`.",
         inputSchema: {},
       },
