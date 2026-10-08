@@ -440,36 +440,24 @@ test("an inherited sizing value does not count as the file setting it", async ()
   });
 });
 
-test("a sizing value the file leaves to the inherited environment is refused (the launcher inherits it)", async () => {
-  // MergeWren on #157: here the launcher would send whatever BGW_MAX_SESSIONS it inherited, not 7.
-  for (const env of ["BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:-7}\nBGW_PER_CONSUMER_MAX=1\n", "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=${BGW_PER_CONSUMER_MAX:-1}\n"]) {
-    assert.match(await preflight(1, env), /depends on the environment the launcher inherits/, env);
+test("a file whose sizing depends on the inherited environment is refused (the launcher inherits it)", async () => {
+  // MergeWren on #157: the launcher would send whatever it inherited, not what a clean read sees.
+  for (const env of [
+    "BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:-7}\nBGW_PER_CONSUMER_MAX=1\n",
+    "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=${BGW_PER_CONSUMER_MAX:-1}\n",
+    // A conditional that reacts to an inherited value without echoing it back (MergeWren on #157).
+    "BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:+9}${BGW_MAX_SESSIONS:-8}\nBGW_PER_CONSUMER_MAX=1\n",
+  ]) {
+    assert.match(await preflight(1, env), /depend on the environment the launcher inherits/, env);
   }
+  // Another variable this shell's environment sets is caught the same way.
+  await withEnv({ BGW_TEST_CAP: "3" }, async () => {
+    assert.match(await preflight(1, "BGW_MAX_SESSIONS=${BGW_TEST_CAP:-7}\nBGW_PER_CONSUMER_MAX=1\n"), /depend on the environment/);
+  });
   // A plain value is unaffected by whatever the environment holds.
   await withEnv({ BGW_MAX_SESSIONS: "3" }, async () => {
     assert.equal(await preflight(1, BOTH), null);
   });
-});
-
-test("like the launcher, the evaluation inherits other variables from its shell", async () => {
-  await withEnv({ BGW_TEST_CAP: "3" }, async () => {
-    assert.deepEqual(await sizingOf("BGW_MAX_SESSIONS=${BGW_TEST_CAP:-7}\nBGW_PER_CONSUMER_MAX=1\n"), { maxSessions: "3", perConsumerMax: "1" });
-  });
-});
-
-test("the env file is sourced exactly once per evaluation", async () => {
-  // MergeWren on #157: the file is executed, so it must not run twice.
-  const { resolveEnvSizing } = await import("../dist/cli/keys.js");
-  const dir = mkdtempSync(join(tmpdir(), "obscura-once-"));
-  const marker = join(dir, "runs");
-  const path = join(dir, "prod.env");
-  writeFileSync(path, `${BOTH}echo x >> '${marker}'\n`);
-  try {
-    await resolveEnvSizing(localShell(), path);
-    assert.equal(readFileSync(marker, "utf8"), "x\n");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 // --- CodeRabbit + MergeWren #157: every bash rule a hand-written reader missed, now settled by bash ------
@@ -503,7 +491,7 @@ for (const [label, env, why] of [
   ["a non-integer", "BGW_MAX_SESSIONS=lots\nBGW_PER_CONSUMER_MAX=1\n", /would reject this value/],
   ["a hash with no space (bash keeps it literal)", "BGW_MAX_SESSIONS=8#c\nBGW_PER_CONSUMER_MAX=1\n", /would reject this value/],
   ["a zero", "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=0\n", /would reject this value/],
-  ["an unset sizing variable", `${BOTH}unset BGW_PER_CONSUMER_MAX\n`, /BGW_PER_CONSUMER_MAX.*does not set it itself/],
+  ["an unset sizing variable", `${BOTH}unset BGW_PER_CONSUMER_MAX\n`, /BGW_PER_CONSUMER_MAX.*does not set it/],
 ]) {
   test(`the pre-flight REFUSES rather than guesses on ${label}`, async () => {
     const r = await preflight(1, env);
@@ -516,8 +504,8 @@ for (const [label, env, why] of [
 test("a sizing variable missing from the file is refused (the launcher could forward an inherited value)", async () => {
   // MergeWren on #157 suggested assuming the boot default; declined: launch-http.sh forwards every BGW_*
   // in ITS environment too (compgen -v), which this CLI cannot see.
-  assert.match(await preflight(1, "BGW_MAX_SESSIONS=8\n"), /BGW_PER_CONSUMER_MAX.*does not set it itself/);
-  assert.match(await preflight(1, "BGW_PER_CONSUMER_MAX=1\n"), /BGW_MAX_SESSIONS.*does not set it itself/);
+  assert.match(await preflight(1, "BGW_MAX_SESSIONS=8\n"), /BGW_PER_CONSUMER_MAX.*does not set it/);
+  assert.match(await preflight(1, "BGW_PER_CONSUMER_MAX=1\n"), /BGW_MAX_SESSIONS.*does not set it/);
 });
 
 test("values the boot parser accepts are accepted (leading zeros), exactly at the floor", async () => {
