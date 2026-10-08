@@ -115,7 +115,7 @@ export type SessionManagerErrorCode = "SESSION_LIMIT" | "CORE_LAUNCH";
 /**
  * VIL-110: WHY a session could not be had, as a closed machine-readable vocabulary. `code` stays the
  * coarse two-value split it always was; `kind` is the distinction a consumer's next move depends on:
- *  - `launch-failed`        — the core factory threw, or the browser exited during startup. Investigate.
+ *  - `launch-failed`        — the core factory threw synchronously, or its launch promise rejected. Investigate.
  *                             (Not sub-classified: both mean "the browser did not come up", and the
  *                             human message distinguishes them for an operator.)
  *  - `launch-timeout`       — the launch ran past its deadline. Likely contention.
@@ -471,7 +471,7 @@ export class SessionManager {
       if (ownedDir !== undefined) {
         this.#enqueueOrphan({ dir: ownedDir, settled: true, ...(meta?.consumerId ? { consumerId: meta.consumerId } : {}) });
       }
-      throw new SessionManagerError("CORE_LAUNCH", "launch-failed", "browser core failed to launch (the browser exited during startup)", { cause: outcome.cause });
+      throw new SessionManagerError("CORE_LAUNCH", "launch-failed", "browser core failed to launch (the launch was rejected)", { cause: outcome.cause });
     }
     if (outcome.kind === "timeout") {
       // The deadline won and the reserved slot is released (acquire's `finally`). The launch becomes a

@@ -66,13 +66,17 @@ async function forced(site) {
     case "global-cap": {
       const mgr = new SessionManager({ maxSessions: 1, coreFactory: async () => fakeCore() });
       await mgr.acquire();
-      return mgr.acquire().catch((e) => e);
+      const err = await mgr.acquire().catch((e) => e);
+      await mgr.shutdown(); // release the held session and its profile dir (MergeWren #161)
+      return err;
     }
     case "consumer-cap": {
       const policy = new PolicyEngine({ registry: new ConsumerRegistry([{ id: "a", token: "tok-a", allow: ["example.com"] }]) });
       const gw = Gateway.create({ maxSessions: 5, core: {} }, async () => fakeCore(), policy);
-      await gw.openConsumerSession("tok-a");
-      return gw.openConsumerSession("tok-a").catch((e) => e);
+      const held = await gw.openConsumerSession("tok-a");
+      const err = await gw.openConsumerSession("tok-a").catch((e) => e);
+      await gw.closeConsumerSession("tok-a", held); // release it (MergeWren #161)
+      return err;
     }
     case "shutdown-before": {
       const mgr = new SessionManager({ maxSessions: 2, coreFactory: async () => fakeCore() });
