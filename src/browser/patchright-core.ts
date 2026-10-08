@@ -119,11 +119,13 @@ export function computeForceKillAvailable(
 export function readProcStat(
   pid: number,
   procRoot = "/proc",
+  readFile: (path: string) => string = (path) => readFileSync(path, "utf8"),
 ): { pgrp: number; startTime: string; state: string } | undefined {
   // Exported for the #54 Part 2 orphan sweep (same generation discipline keyed off a SCANNED pid);
-  // `procRoot` is injectable there so the parse is unit-testable against a fake proc tree.
+  // `procRoot` is injectable there so the parse is unit-testable against a fake proc tree, and so is
+  // `readFile`, so the sweep's errno triage covers the stat read too (VIL-119 review).
   try {
-    const stat = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
+    const stat = readFile(`${procRoot}/${pid}/stat`);
     const after = stat.slice(stat.lastIndexOf(")") + 2).split(" "); // [state, ppid, pgrp, ... starttime@idx19]
     const state = after[0];
     const pgrp = after[2];

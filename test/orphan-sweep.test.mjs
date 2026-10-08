@@ -284,22 +284,80 @@ test("sweep: a group forked while an owed group still blocks is stamped+killed o
   rmSync(root, { recursive: true, force: true });
 });
 
-test("sweep: a gateway-side read failure (not ENOENT/EACCES) REJECTS instead of reading as 'exited' (codex r9)", async () => {
+/** A proc-file reader that raises `code` for one pid's files and reads the fake proc tree otherwise.
+ *  Injected rather than staged with chmod (VIL-119): root ignores permission bits, so `chmod 000`
+ *  cannot raise EACCES in the image (uid 0), and EMFILE cannot be staged on a filesystem at all. */
+async function failingReader(failPid, code, onlyFile) {
+  const { readFileSync } = await import("node:fs");
+  return (path) => {
+    if (path.includes(`/${failPid}/`) && (onlyFile === undefined || path.endsWith(`/${onlyFile}`))) {
+      const err = new Error(`${code}: simulated`);
+      err.code = code;
+      throw err;
+    }
+    return readFileSync(path, "utf8");
+  };
+}
+
+test("sweep: an EACCES proc read is FOREIGN — skipped, the sweep confirms (on any uid) (codex r9, VIL-119)", async () => {
   const root = makeProcRoot();
   const dir = "/tmp/bgw-eacces";
   writeProc(root, 310, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 310 });
-  // Make the cmdline unreadable in a way that is NOT a vanish: chmod 000 → EACCES. EACCES is triaged as
-  // FOREIGN (another uid's entry can't be our same-uid Chrome) → skipped, scan finds nothing, and with
-  // no other evidence the sweep confirms — that is the documented EACCES posture. The FAIL-CLOSED path
-  // (EMFILE/EIO propagate) can't be simulated via the fs; assert it structurally instead: a synthetic
-  // error with code EMFILE thrown through the triage helper must NOT be swallowed.
-  const { chmodSync } = await import("node:fs");
-  chmodSync(join(root, "310", "cmdline"), 0o000);
+  // EACCES is triaged as FOREIGN (another uid's entry can't be our same-uid Chrome) → skipped, the scan
+  // finds nothing, and with no other evidence the sweep confirms — the documented EACCES posture.
   const { kill, kills } = makeKillFake(root);
-  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, ...fakeClock() });
+  const readFile = await failingReader(310, "EACCES");
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() });
   assert.equal(r.result, "confirmed", "EACCES = foreign (not our same-uid chrome) — skipped, not fail-closed");
   assert.deepEqual(kills, [], "nothing signaled off an unreadable entry");
-  chmodSync(join(root, "310", "cmdline"), 0o644);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: a gateway-side read failure (EMFILE) REJECTS instead of reading as 'exited' (codex r9, VIL-119)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-emfile";
+  writeProc(root, 311, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 311 });
+  // fd exhaustion IN THE GATEWAY is our failure to scan, not evidence the process exited. Swallowing it
+  // would let a resource-exhausted sweep false-confirm over a live Chrome, so it must propagate.
+  const { kill, kills } = makeKillFake(root);
+  const readFile = await failingReader(311, "EMFILE");
+  await assert.rejects(
+    sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() }),
+    (err) => err.code === "EMFILE",
+  );
+  assert.deepEqual(kills, [], "nothing signaled off a failed scan");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: an EMFILE on the STAT read (cmdline readable) also REJECTS — the stat goes through the injected reader (VIL-119 review)", async () => {
+  // CodeRabbit on #153: readProcStat read `stat` with readFileSync directly, so only the cmdline read went
+  // through SweepEnv.readFile and a stat-side gateway failure was never exercised.
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-stat-emfile";
+  writeProc(root, 312, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 312 });
+  const { kill, kills } = makeKillFake(root);
+  const readFile = await failingReader(312, "EMFILE", "stat");
+  await assert.rejects(
+    sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() }),
+    (err) => err.code === "EMFILE",
+  );
+  assert.deepEqual(kills, [], "nothing signaled when the generation stamp could not be read");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: an EACCES on the STAT read (cmdline readable) is skipped, never signaled (VIL-119 review)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-stat-eacces";
+  writeProc(root, 313, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 313 });
+  const { kill, kills } = makeKillFake(root);
+  const readFile = await failingReader(313, "EACCES", "stat");
+  const r = await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() });
+  assert.deepEqual(kills, [], "an unreadable stat means no generation stamp, so no signal");
+  // The documented EACCES posture, asserted on the result (MergeWren on #153): EACCES means "not ours to
+  // inspect" (another uid / hidepid), so the entry is skipped like a vanished one, and with nothing else
+  // stamped the sweep confirms — the same verdict as the cmdline-EACCES test above. A same-uid Chrome
+  // cannot produce this shape (its cmdline and stat are equally readable), so this is not a live orphan.
+  assert.equal(r.result, "confirmed", "EACCES on stat = foreign, skipped; same verdict as EACCES on cmdline");
   rmSync(root, { recursive: true, force: true });
 });
 

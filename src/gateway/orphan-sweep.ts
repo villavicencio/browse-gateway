@@ -59,7 +59,15 @@ export interface SweepEnv {
   now?: () => number;
   /** The sweeping process's own pid, excluded from the dir-reference discovery scan. Injectable. */
   selfPid?: number;
+  /**
+   * Per-pid proc FILE reader (cmdline, stat), utf8. Injectable so the errno triage can be exercised
+   * on any uid (VIL-119): staging EACCES with `chmod 000` cannot work as root — root ignores
+   * permission bits, and the image runs as uid 0 — and EMFILE cannot be staged on a filesystem at all.
+   */
+  readFile?: (path: string) => string;
 }
+
+const readUtf8 = (path: string): string => readFileSync(path, "utf8");
 
 const SWEEP_POLL_MS = 100;
 
@@ -80,14 +88,14 @@ function vanishedOrForeign(err: unknown): boolean {
   return code === "ENOENT" || code === "ESRCH" || code === "EACCES";
 }
 
-export function findPidsByUserDataDir(dir: string, procRoot = "/proc"): number[] {
+export function findPidsByUserDataDir(dir: string, procRoot = "/proc", readFile: (path: string) => string = readUtf8): number[] {
   const marker = `--user-data-dir=${dir}`;
   const out: number[] = [];
   const names = readdirSync(procRoot); // throws on an unreadable root — the sweep maps it to "unsupported"
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
     try {
-      const cmdline = readFileSync(join(procRoot, name, "cmdline"), "utf8");
+      const cmdline = readFile(join(procRoot, name, "cmdline"));
       if (cmdline.split("\0").includes(marker)) out.push(Number(name));
     } catch (err) {
       if (!vanishedOrForeign(err)) throw err; // codex r9: fail closed on a scan-side failure
@@ -120,6 +128,7 @@ export async function sweepOrphanProcesses(
   const kill = env.kill ?? ((pid: number, sig: NodeJS.Signals | 0) => process.kill(pid, sig));
   const sleep = env.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = env.now ?? (() => Date.now());
+  const readFile = env.readFile ?? readUtf8;
   // Codex r2: a Linux host whose proc root is absent/unreadable (a misconfigured mount) must report
   // UNSUPPORTED — never "confirmed" off a scan that scanned nothing. One up-front probe. Codex r10:
   // triage the failure — only a GENUINELY-absent root (ENOENT/ENOTDIR: no proc mount) degrades to
@@ -137,7 +146,7 @@ export async function sweepOrphanProcesses(
   const selfPid = env.selfPid ?? process.pid;
   const carriesMarker = (pid: number): boolean => {
     try {
-      return readFileSync(join(procRoot, String(pid), "cmdline"), "utf8").split("\0").includes(marker);
+      return readFile(join(procRoot, String(pid), "cmdline")).split("\0").includes(marker);
     } catch (err) {
       if (!vanishedOrForeign(err)) throw err; // codex r9: our own scan failure must not read as "exited"
       return false; // exited/foreign — no marker, nothing to signal
@@ -188,7 +197,7 @@ export async function sweepOrphanProcesses(
    *  holders (codex r5 P1). Bounded by the container's pid space; the fd scan runs only while a sweep
    *  is active (an orphan exists), never on the hot path. */
   const findLaunchPids = (): number[] => {
-    const out = new Set<number>(findPidsByUserDataDir(dir, procRoot));
+    const out = new Set<number>(findPidsByUserDataDir(dir, procRoot, readFile));
     for (const name of readdirSync(procRoot)) {
       if (!/^\d+$/.test(name)) continue;
       const pid = Number(name);
@@ -217,10 +226,10 @@ export async function sweepOrphanProcesses(
    *  confirm-side reads (leader upgrade, revalidation, recycle check) stay LENIENT — a failure there
    *  skips a signal or keeps a group owed, both fail-safe. */
   const statOf = (pid: number): { pgrp: number; startTime: string } | undefined => {
-    const stat = readProcStat(pid, procRoot);
+    const stat = readProcStat(pid, procRoot, readFile);
     if (stat) return stat;
     try {
-      readFileSync(join(procRoot, String(pid), "stat"), "utf8");
+      readFile(join(procRoot, String(pid), "stat"));
     } catch (err) {
       if (!vanishedOrForeign(err)) throw err;
       return undefined; // genuinely gone / not ours to read
@@ -264,9 +273,9 @@ export async function sweepOrphanProcesses(
     // compare against the adopted (old-leader) stamp.
     for (const [pgrp, rep] of observed) {
       if (rep.pid === pgrp) continue;
-      const leader = readProcStat(pgrp, procRoot);
+      const leader = readProcStat(pgrp, procRoot, readFile);
       if (!leader || leader.pgrp !== pgrp) continue;
-      const member = readProcStat(rep.pid, procRoot);
+      const member = readProcStat(rep.pid, procRoot, readFile);
       if (!member || member.startTime !== rep.startTime || member.pgrp !== pgrp) continue;
       const up = { pid: pgrp, startTime: leader.startTime };
       observed.set(pgrp, up);
@@ -281,7 +290,7 @@ export async function sweepOrphanProcesses(
     // This narrows the race back to the irreducible microsecond TOCTOU documented on phase 1. ESRCH =
     // already gone — swallowed.
     for (const [pgrp, rep] of observed) {
-      const s = readProcStat(rep.pid, procRoot);
+      const s = readProcStat(rep.pid, procRoot, readFile);
       if (!s || s.startTime !== rep.startTime || s.pgrp !== pgrp) continue; // not provably ours anymore
       try {
         kill(-pgrp, "SIGKILL");
@@ -317,7 +326,7 @@ export async function sweepOrphanProcesses(
       return code === "ESRCH" || code === "EPERM";
     }
     if (rep.pid === pgrp) {
-      const stat = readProcStat(pgrp, procRoot);
+      const stat = readProcStat(pgrp, procRoot, readFile);
       if (stat && stat.pgrp === pgrp && stat.startTime !== rep.startTime) return true; // recycled group
     }
     // #131: signal 0 cannot tell a zombie from a live process, and a group of nothing but zombies has
