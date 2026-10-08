@@ -1,8 +1,9 @@
 /**
- * scripts/run-gate.sh (VIL-294) — the amd64-handler guard, exercised for real: the script runs under
- * bash with stub `docker` and `colima` binaries first on PATH, so both the refusal and the pass-through
- * are observed rather than asserted structurally. The stubs record every call, which is how the tests
- * prove the refusal happens BEFORE any container is started.
+ * scripts/run-gate.sh (VIL-294) — the amd64 start-up guard, exercised for real: the script runs under
+ * bash with a stub `docker` first on PATH, so both the refusal and the pass-through are observed rather
+ * than asserted structurally. The stub records every call, which is how the tests prove the refusal
+ * happens BEFORE the gate container is started, and lets each test decide whether the image's
+ * `tini -s` probe succeeds (Rosetta) or fails (QEMU's PR_SET_CHILD_SUBREAPER refusal).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -10,22 +11,28 @@ import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const SCRIPT = new URL("../scripts/run-gate.sh", import.meta.url).pathname;
+// fileURLToPath, not URL#pathname: pathname keeps percent-encoding, so a checkout path with a space
+// would hand bash a nonexistent script (MergeWren on #158).
+const SCRIPT = fileURLToPath(new URL("../scripts/run-gate.sh", import.meta.url));
 
-function stubs({ context, handlers, colimaFails = false }) {
+function stubs({ context = "colima", probeOk = true }) {
   const dir = mkdtempSync(join(tmpdir(), "run-gate-"));
   const log = join(dir, "calls.log");
   writeFileSync(
     join(dir, "docker"),
-    `#!/bin/sh\necho "docker $*" >> "${log}"\nif [ "$1 $2" = "context show" ]; then echo "${context}"; fi\nexit 0\n`,
-  );
-  writeFileSync(
-    join(dir, "colima"),
-    `#!/bin/sh\necho "colima $*" >> "${log}"\n${colimaFails ? "exit 1" : `printf '%s\\n' ${handlers.map((h) => `'${h}'`).join(" ")}`}\n`,
+    `#!/bin/sh
+echo "docker $*" >> "${log}"
+if [ "$1 $2" = "context show" ]; then echo "${context}"; exit 0; fi
+case "$*" in
+  *"--entrypoint /usr/bin/tini"*)
+    ${probeOk ? "exit 0" : `echo "[FATAL tini (1)] PR_SET_CHILD_SUBREAPER is unavailable on this platform." >&2; exit 1`} ;;
+esac
+exit 0
+`,
   );
   chmodSync(join(dir, "docker"), 0o755);
-  chmodSync(join(dir, "colima"), 0o755);
   return { dir, calls: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : []) };
 }
 
@@ -33,55 +40,45 @@ function run(stub, args = ["browse-gateway:dev", "validate-http.mjs"]) {
   return spawnSync("bash", [SCRIPT, ...args], { env: { ...process.env, PATH: `${stub.dir}:/usr/bin:/bin` }, encoding: "utf8" });
 }
 
-const ranGate = (calls) => calls.some((c) => c.startsWith("docker run"));
+const probeCall = "docker run --rm --platform linux/amd64 --entrypoint /usr/bin/tini browse-gateway:dev -s -- true";
+const gateCall = "docker run --rm --platform linux/amd64 --shm-size=1g --init browse-gateway:dev node scripts/validate-http.mjs";
 
-test("Colima WITHOUT the rosetta handler (QEMU fallback): refuses with exit 3 and never starts a container", () => {
-  const s = stubs({ context: "colima", handlers: ["python3.12", "qemu-i386", "qemu-x86_64", "register", "status"] });
+test("the image's tini -s cannot start as amd64 (QEMU fallback): refuses with exit 3 and never starts the gate", () => {
+  const s = stubs({ probeOk: false });
   const r = run(s);
   assert.equal(r.status, 3);
-  assert.match(r.stderr, /REFUSING — Colima has no 'rosetta' binfmt handler/);
-  assert.match(r.stderr, /colima stop && colima start/);
-  assert.ok(!ranGate(s.calls()), "no container may start on a QEMU-only handler");
+  assert.match(r.stderr, /REFUSING — the image's own `tini -s` cannot start as linux\/amd64/);
+  assert.match(r.stderr, /PR_SET_CHILD_SUBREAPER/, "the probe's own output is shown");
+  assert.match(r.stderr, /colima stop && colima start/, "on Colima, the fix is named");
+  assert.ok(s.calls().includes(probeCall), "the probe ran");
+  assert.ok(!s.calls().includes(gateCall), "the gate container must never start");
 });
 
-test("Colima WITH rosetta: runs the gate with the documented flags", () => {
-  const s = stubs({ context: "colima", handlers: ["python3.12", "qemu-x86_64", "register", "rosetta", "status"] });
+test("the probe succeeds: the gate runs with the documented flags, after the probe", () => {
+  const s = stubs({ probeOk: true });
   const r = run(s);
   assert.equal(r.status, 0, r.stderr);
-  assert.ok(
-    s.calls().includes("docker run --rm --platform linux/amd64 --shm-size=1g --init browse-gateway:dev node scripts/validate-http.mjs"),
-    s.calls().join("\n"),
-  );
+  const calls = s.calls();
+  assert.ok(calls.indexOf(probeCall) !== -1 && calls.indexOf(gateCall) > calls.indexOf(probeCall), calls.join("\n"));
 });
 
-test("the match is EXACT: a handler merely containing the word does not count", () => {
-  const s = stubs({ context: "colima", handlers: ["qemu-x86_64", "rosetta-old", "not-rosetta"] });
-  assert.equal(run(s).status, 3);
-});
-
-test("an unreadable handler list (colima ssh failing) refuses rather than guessing", () => {
-  const s = stubs({ context: "colima", handlers: [], colimaFails: true });
-  assert.equal(run(s).status, 3);
-  assert.ok(!ranGate(s.calls()));
-});
-
-test("a non-Colima runtime is not checked: no colima call, the gate runs", () => {
-  const s = stubs({ context: "orbstack", handlers: [] });
+test("the guard does not depend on the runtime: a failing probe refuses on a non-Colima context too", () => {
+  const s = stubs({ context: "orbstack", probeOk: false });
   const r = run(s);
-  assert.equal(r.status, 0, r.stderr);
-  assert.ok(!s.calls().some((c) => c.startsWith("colima")));
-  assert.ok(ranGate(s.calls()));
+  assert.equal(r.status, 3);
+  assert.doesNotMatch(r.stderr, /colima stop/, "the Colima-specific hint only appears on Colima");
+  assert.ok(!s.calls().includes(gateCall));
 });
 
-test("extra docker args are passed through before the image", () => {
-  const s = stubs({ context: "orbstack", handlers: [] });
+test("extra docker args are passed through to the gate, before the image", () => {
+  const s = stubs({ probeOk: true });
   run(s, ["img:tag", "validate-teardown.mjs", "-e", "BGW_X=1"]);
   assert.ok(s.calls().includes("docker run --rm --platform linux/amd64 --shm-size=1g --init -e BGW_X=1 img:tag node scripts/validate-teardown.mjs"));
 });
 
 test("missing arguments print usage and exit 2", () => {
-  const s = stubs({ context: "orbstack", handlers: [] });
-  const r = run(s, ["only-a-tag"]);
+  const s = stubs({});
+  const r = run(s, ["only-an-image"]);
   assert.equal(r.status, 2);
   assert.match(r.stderr, /usage/);
 });
