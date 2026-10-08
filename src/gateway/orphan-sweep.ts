@@ -226,7 +226,7 @@ export async function sweepOrphanProcesses(
    *  confirm-side reads (leader upgrade, revalidation, recycle check) stay LENIENT — a failure there
    *  skips a signal or keeps a group owed, both fail-safe. */
   const statOf = (pid: number): { pgrp: number; startTime: string } | undefined => {
-    const stat = readProcStat(pid, procRoot);
+    const stat = readProcStat(pid, procRoot, readFile);
     if (stat) return stat;
     try {
       readFile(join(procRoot, String(pid), "stat"));
@@ -273,9 +273,9 @@ export async function sweepOrphanProcesses(
     // compare against the adopted (old-leader) stamp.
     for (const [pgrp, rep] of observed) {
       if (rep.pid === pgrp) continue;
-      const leader = readProcStat(pgrp, procRoot);
+      const leader = readProcStat(pgrp, procRoot, readFile);
       if (!leader || leader.pgrp !== pgrp) continue;
-      const member = readProcStat(rep.pid, procRoot);
+      const member = readProcStat(rep.pid, procRoot, readFile);
       if (!member || member.startTime !== rep.startTime || member.pgrp !== pgrp) continue;
       const up = { pid: pgrp, startTime: leader.startTime };
       observed.set(pgrp, up);
@@ -290,7 +290,7 @@ export async function sweepOrphanProcesses(
     // This narrows the race back to the irreducible microsecond TOCTOU documented on phase 1. ESRCH =
     // already gone — swallowed.
     for (const [pgrp, rep] of observed) {
-      const s = readProcStat(rep.pid, procRoot);
+      const s = readProcStat(rep.pid, procRoot, readFile);
       if (!s || s.startTime !== rep.startTime || s.pgrp !== pgrp) continue; // not provably ours anymore
       try {
         kill(-pgrp, "SIGKILL");
@@ -326,7 +326,7 @@ export async function sweepOrphanProcesses(
       return code === "ESRCH" || code === "EPERM";
     }
     if (rep.pid === pgrp) {
-      const stat = readProcStat(pgrp, procRoot);
+      const stat = readProcStat(pgrp, procRoot, readFile);
       if (stat && stat.pgrp === pgrp && stat.startTime !== rep.startTime) return true; // recycled group
     }
     // #131: signal 0 cannot tell a zombie from a live process, and a group of nothing but zombies has

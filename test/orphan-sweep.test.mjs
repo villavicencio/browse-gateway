@@ -287,10 +287,10 @@ test("sweep: a group forked while an owed group still blocks is stamped+killed o
 /** A proc-file reader that raises `code` for one pid's files and reads the fake proc tree otherwise.
  *  Injected rather than staged with chmod (VIL-119): root ignores permission bits, so `chmod 000`
  *  cannot raise EACCES in the image (uid 0), and EMFILE cannot be staged on a filesystem at all. */
-async function failingReader(failPid, code) {
+async function failingReader(failPid, code, onlyFile) {
   const { readFileSync } = await import("node:fs");
   return (path) => {
-    if (path.includes(`/${failPid}/`)) {
+    if (path.includes(`/${failPid}/`) && (onlyFile === undefined || path.endsWith(`/${onlyFile}`))) {
       const err = new Error(`${code}: simulated`);
       err.code = code;
       throw err;
@@ -326,6 +326,33 @@ test("sweep: a gateway-side read failure (EMFILE) REJECTS instead of reading as 
     (err) => err.code === "EMFILE",
   );
   assert.deepEqual(kills, [], "nothing signaled off a failed scan");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: an EMFILE on the STAT read (cmdline readable) also REJECTS — the stat goes through the injected reader (VIL-119 review)", async () => {
+  // CodeRabbit on #153: readProcStat read `stat` with readFileSync directly, so only the cmdline read went
+  // through SweepEnv.readFile and a stat-side gateway failure was never exercised.
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-stat-emfile";
+  writeProc(root, 312, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 312 });
+  const { kill, kills } = makeKillFake(root);
+  const readFile = await failingReader(312, "EMFILE", "stat");
+  await assert.rejects(
+    sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() }),
+    (err) => err.code === "EMFILE",
+  );
+  assert.deepEqual(kills, [], "nothing signaled when the generation stamp could not be read");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sweep: an EACCES on the STAT read (cmdline readable) is skipped, never signaled (VIL-119 review)", async () => {
+  const root = makeProcRoot();
+  const dir = "/tmp/bgw-stat-eacces";
+  writeProc(root, 313, { args: ["chrome", `--user-data-dir=${dir}`], pgrp: 313 });
+  const { kill, kills } = makeKillFake(root);
+  const readFile = await failingReader(313, "EACCES", "stat");
+  await sweepOrphanProcesses(dir, 500, { platform: "linux", procRoot: root, kill, selfPid: 1, readFile, ...fakeClock() });
+  assert.deepEqual(kills, [], "an unreadable stat means no generation stamp, so no signal");
   rmSync(root, { recursive: true, force: true });
 });
 
