@@ -97,14 +97,17 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
  * here adds no trust the deploy path does not already extend. The file's own output is discarded, never
  * echoed: it holds every consumer's token.
  *
- * Both sizing variables enter preset to a sentinel. A value that comes back containing it was NOT settled
- * by the file (unset, or built from whatever the launcher inherits, like `${BGW_MAX_SESSIONS:-7}`), and
- * this shell cannot know what the deploy will inherit, so it is reported as `inherited` and never drives a
- * refusal (MergeWren on #157). Other inherited variables (`${CAP:-7}`) resolve from this shell; where the
- * deploy's differ, the boot check in the pre-swap smoke decides.
+ * The file runs UNMODIFIED, exactly as the launcher runs it when no sizing variable is inherited. A
+ * pre-flight that presets either variable changes how a file that branches on them runs (MergeWren on
+ * #157), so instead: when this shell's own environment already sets BGW_MAX_SESSIONS or
+ * BGW_PER_CONSUMER_MAX, the launcher could inherit a value this check cannot vouch for, and the result is
+ * `{ error }` (unchecked). A sizing variable the file leaves unset is reported as {@link INHERITED}: its
+ * value then depends on the deploy's environment, so it never drives a refusal. Other inherited
+ * variables (`${CAP:-7}`) resolve from this shell; where the deploy's differ, the boot check in the
+ * pre-swap smoke decides.
  *
- * Returns each raw value (`inherited` when the file did not settle it), or `{ error }` when the file cannot
- * be evaluated here.
+ * Returns each raw value ({@link INHERITED} when the file leaves it unset), or `{ error }` when the file
+ * cannot be evaluated here.
  */
 /** A sizing value as the env file settles it, or {@link INHERITED} when the file leaves it to the environment. */
 export const INHERITED = Symbol("inherited");
@@ -114,21 +117,27 @@ export async function resolveEnvSizing(
   shell: Pick<RemoteShell, "run">,
   envFilePath: string,
 ): Promise<{ maxSessions: SizingValue; perConsumerMax: SizingValue } | { error: string }> {
-  const sentinel = "__bgw_inherited__";
+  const unset = "__bgw_unset__";
+  const envHas = "__bgw_env_sets:";
   const body =
+    `if [ -n "\${BGW_MAX_SESSIONS+x}\${BGW_PER_CONSUMER_MAX+x}" ]; then ` +
+    `builtin printf "%s%s\\n" "${envHas}" "\${BGW_MAX_SESSIONS+ BGW_MAX_SESSIONS}\${BGW_PER_CONSUMER_MAX+ BGW_PER_CONSUMER_MAX}"; exit 0; fi; ` +
     `set -euo pipefail; set -a; . "$1" >/dev/null 2>&1; ` +
-    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${sentinel}}" "\${BGW_PER_CONSUMER_MAX-${sentinel}}"`;
-  const r = await shell.run(
-    `BGW_MAX_SESSIONS=${sentinel} BGW_PER_CONSUMER_MAX=${sentinel} bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`,
-  );
+    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${unset}}" "\${BGW_PER_CONSUMER_MAX-${unset}}"`;
+  const r = await shell.run(`bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`);
   if (r.code !== 0) return { error: `sourcing it the way the launcher does failed here (exit ${r.code})` };
+  if (r.stdout.startsWith(envHas)) {
+    const names = r.stdout.slice(envHas.length).trim().split(/\s+/).join(" and ");
+    return { error: `this shell's own environment already sets ${names}, so the value the launcher inherits cannot be vouched for` };
+  }
   const out = r.stdout.split("\n");
   // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
   // holds a newline).
   if (out.length !== 3 || out[2] !== "") return { error: "the values could not be read back after sourcing it" };
-  const value = (v: string): SizingValue => (v.includes(sentinel) ? INHERITED : v);
+  const value = (v: string): SizingValue => (v === unset ? INHERITED : v);
   return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
 }
+
 
 /** The pool-floor pre-flight's verdict: proceed, refuse (a certain breach), or unchecked (warn, proceed). */
 export type PoolFloorCheck = { kind: "ok" } | { kind: "refuse"; message: string } | { kind: "unchecked"; message: string };

@@ -430,18 +430,36 @@ test("the pre-flight sees what bash gives the launcher: last assignment wins, qu
   assert.match(r.message, /need >= 7/);
 });
 
-test("like the launcher, the evaluation inherits its shell's environment, but a sizing value it supplies is not the file's", async () => {
-  // MergeWren on #157: a cleared environment disagrees with launch-http.sh, which inherits its caller's;
-  // and a sizing value taken from the environment is not certain for the later launch.
-  await withEnv({ BGW_TEST_CAP: "3", BGW_MAX_SESSIONS: "5" }, async () => {
-    assert.deepEqual(await sizingOf("BGW_PER_CONSUMER_MAX=${BGW_TEST_CAP:-7}\n"), { maxSessions: INHERITED, perConsumerMax: "3" });
+test("like the launcher, the evaluation inherits its shell's environment", async () => {
+  // MergeWren on #157: a cleared environment disagrees with launch-http.sh, which inherits its caller's.
+  await withEnv({ BGW_TEST_CAP: "3" }, async () => {
+    assert.deepEqual(await sizingOf("BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=${BGW_TEST_CAP:-7}\n"), { maxSessions: "8", perConsumerMax: "3" });
   });
 });
 
-test("a sizing value the file leaves to the environment never drives a refusal: unchecked, named", async () => {
+test("the file runs unmodified: one that branches on a sizing variable takes the launcher's branch", async () => {
+  // MergeWren on #157: presetting the variables made this take the `2` branch and falsely refuse.
+  const env = '[ -n "${BGW_MAX_SESSIONS+x}" ] && BGW_MAX_SESSIONS=2 || BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=${BGW_PER_CONSUMER_MAX:-1}\n';
+  assert.deepEqual(await sizingOf(env), { maxSessions: "8", perConsumerMax: "1" });
+  assert.deepEqual(await preflight(2, env), { kind: "ok" });
+});
+
+test("a sizing variable already in this shell's environment makes the check unchecked, named, never a refusal", async () => {
+  await withEnv({ BGW_MAX_SESSIONS: "3" }, async () => {
+    const r = await preflight(9, BOTH);
+    assert.equal(r.kind, "unchecked");
+    assert.match(r.message, /environment already sets BGW_MAX_SESSIONS,/);
+    assert.match(r.message, /boot check decides/);
+  });
+  await withEnv({ BGW_MAX_SESSIONS: "3", BGW_PER_CONSUMER_MAX: "1" }, async () => {
+    assert.match((await preflight(9, BOTH)).message, /sets BGW_MAX_SESSIONS and BGW_PER_CONSUMER_MAX,/);
+  });
+});
+
+test("a sizing variable the file leaves unset never drives a refusal: unchecked, named", async () => {
   for (const [env, names] of [
     ["", /BGW_MAX_SESSIONS and BGW_PER_CONSUMER_MAX/],
-    ["BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:-2}\nBGW_PER_CONSUMER_MAX=1\n", /leaves BGW_MAX_SESSIONS to the environment/],
+    ["BGW_PER_CONSUMER_MAX=1\n", /leaves BGW_MAX_SESSIONS to the environment/],
     [`${BOTH}unset BGW_PER_CONSUMER_MAX\n`, /leaves BGW_PER_CONSUMER_MAX to the environment/],
   ]) {
     const r = await preflight(9, env);
