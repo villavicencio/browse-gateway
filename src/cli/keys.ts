@@ -97,23 +97,36 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
  * here adds no trust the deploy path does not already extend. The file's own output is discarded, never
  * echoed: it holds every consumer's token.
  *
- * Returns each raw value (`null` when unset), or `{ error }` when the file cannot be evaluated here.
+ * Both sizing variables enter preset to a sentinel. A value that comes back containing it was NOT settled
+ * by the file (unset, or built from whatever the launcher inherits, like `${BGW_MAX_SESSIONS:-7}`), and
+ * this shell cannot know what the deploy will inherit, so it is reported as `inherited` and never drives a
+ * refusal (MergeWren on #157). Other inherited variables (`${CAP:-7}`) resolve from this shell; where the
+ * deploy's differ, the boot check in the pre-swap smoke decides.
+ *
+ * Returns each raw value (`inherited` when the file did not settle it), or `{ error }` when the file cannot
+ * be evaluated here.
  */
+/** A sizing value as the env file settles it, or {@link INHERITED} when the file leaves it to the environment. */
+export const INHERITED = Symbol("inherited");
+export type SizingValue = string | typeof INHERITED;
+
 export async function resolveEnvSizing(
   shell: Pick<RemoteShell, "run">,
   envFilePath: string,
-): Promise<{ maxSessions: string | null; perConsumerMax: string | null } | { error: string }> {
-  const unset = "__bgw_unset__";
+): Promise<{ maxSessions: SizingValue; perConsumerMax: SizingValue } | { error: string }> {
+  const sentinel = "__bgw_inherited__";
   const body =
     `set -euo pipefail; set -a; . "$1" >/dev/null 2>&1; ` +
-    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${unset}}" "\${BGW_PER_CONSUMER_MAX-${unset}}"`;
-  const r = await shell.run(`bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`);
+    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${sentinel}}" "\${BGW_PER_CONSUMER_MAX-${sentinel}}"`;
+  const r = await shell.run(
+    `BGW_MAX_SESSIONS=${sentinel} BGW_PER_CONSUMER_MAX=${sentinel} bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`,
+  );
   if (r.code !== 0) return { error: `sourcing it the way the launcher does failed here (exit ${r.code})` };
   const out = r.stdout.split("\n");
   // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
   // holds a newline).
   if (out.length !== 3 || out[2] !== "") return { error: "the values could not be read back after sourcing it" };
-  const value = (v: string): string | null => (v === unset ? null : v);
+  const value = (v: string): SizingValue => (v.includes(sentinel) ? INHERITED : v);
   return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
 }
 
@@ -128,12 +141,13 @@ export type PoolFloorCheck = { kind: "ok" } | { kind: "refuse"; message: string 
  * refuses only a breach it can compute, and otherwise says it could not check and leaves the decision to
  * that boot check, rather than refusing on doubt (the trade-off settled on #157).
  *
- * It mirrors boot exactly: the same parser ({@link positiveIntOr}), the same defaults for an unset or
- * invalid value ({@link DEFAULT_GATEWAY_CONFIG}), the same rule ({@link poolSizingError}).
+ * For values the file settles, it mirrors boot exactly: the same parser ({@link positiveIntOr}), the same
+ * default for an invalid value ({@link DEFAULT_GATEWAY_CONFIG}), the same rule ({@link poolSizingError}).
+ * A value the file leaves to the environment is not certain, so it never drives a refusal.
  */
 export function poolFloorPreflight(
   consumerCount: number,
-  sizing: { maxSessions: string | null; perConsumerMax: string | null } | { error: string },
+  sizing: { maxSessions: SizingValue; perConsumerMax: SizingValue } | { error: string },
 ): PoolFloorCheck {
   if ("error" in sizing) {
     return {
@@ -143,8 +157,21 @@ export function poolFloorPreflight(
         `decides at the next pre-swap smoke (\`keys --apply\`, or a deploy)`,
     };
   }
-  const maxSessions = positiveIntOr(sizing.maxSessions ?? undefined, DEFAULT_GATEWAY_CONFIG.maxSessions);
-  const perConsumerMax = positiveIntOr(sizing.perConsumerMax ?? undefined, DEFAULT_GATEWAY_CONFIG.perConsumerMax);
+  const inherited = (["BGW_MAX_SESSIONS", "BGW_PER_CONSUMER_MAX"] as const).filter(
+    (_, i) => [sizing.maxSessions, sizing.perConsumerMax][i] === INHERITED,
+  );
+  if (inherited.length > 0) {
+    return {
+      kind: "unchecked",
+      message:
+        `could not check the pool floor: the env file leaves ${inherited.join(" and ")} to the environment the ` +
+        `launcher inherits, which this check cannot see; the gateway's boot check decides at the next ` +
+        `pre-swap smoke (\`keys --apply\`, or a deploy)`,
+    };
+  }
+  // Settled by the file; an invalid value takes boot's default, exactly as boot does.
+  const maxSessions = positiveIntOr(sizing.maxSessions as string, DEFAULT_GATEWAY_CONFIG.maxSessions);
+  const perConsumerMax = positiveIntOr(sizing.perConsumerMax as string, DEFAULT_GATEWAY_CONFIG.perConsumerMax);
   const err = poolSizingError(consumerCount, perConsumerMax, maxSessions);
   if (!err) return { kind: "ok" };
   const required = consumerCount * perConsumerMax + 1;
@@ -164,7 +191,7 @@ function manifestJson(entries: ConsumerManifestEntry[]): string {
 function restartInstruction(deps: KeysDeps): string {
   return (
     "staged only — the gateway loads consumers when the container is RE-CREATED " +
-    "(a plain `docker restart` keeps the old env); re-run with --apply once `applyCmd` is configured, " +
+    "(a plain `docker restart` keeps the old env); re-run with --apply once `applyCmd` and `smokeCmd` are configured, " +
     "or re-create via your launch script on the host"
   );
 }

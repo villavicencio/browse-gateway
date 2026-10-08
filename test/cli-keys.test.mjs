@@ -387,6 +387,7 @@ test("keys new is allowed when the new consumer still fits — exactly at the fl
 });
 
 const BOTH = "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=1\n";
+const { INHERITED } = await import("../dist/cli/keys.js");
 
 /** The raw sizing values bash gives the launcher for `envText`, through the real resolver over a real shell. */
 async function sizingOf(envText) {
@@ -422,18 +423,32 @@ async function withEnv(vars, fn) {
 
 test("the pre-flight sees what bash gives the launcher: last assignment wins, quotes and export are bash's", async () => {
   assert.deepEqual(await sizingOf("BGW_MAX_SESSIONS=4\nexport BGW_MAX_SESSIONS='6'\nBGW_PER_CONSUMER_MAX=\"2\"\n"), { maxSessions: "6", perConsumerMax: "2" });
-  assert.deepEqual(await sizingOf("XBGW_MAX_SESSIONS=9\n"), { maxSessions: null, perConsumerMax: null }, "a longer name is not a match");
+  assert.deepEqual(await sizingOf("XBGW_MAX_SESSIONS=9\n"), { maxSessions: INHERITED, perConsumerMax: INHERITED }, "a longer name is not a match");
   // perConsumerMax multiplies the floor exactly as the boot check does.
   const r = await preflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n");
   assert.equal(r.kind, "refuse");
   assert.match(r.message, /need >= 7/);
 });
 
-test("like the launcher, the evaluation inherits its shell's environment", async () => {
-  // MergeWren on #157: a cleared environment disagrees with launch-http.sh, which inherits its caller's.
+test("like the launcher, the evaluation inherits its shell's environment, but a sizing value it supplies is not the file's", async () => {
+  // MergeWren on #157: a cleared environment disagrees with launch-http.sh, which inherits its caller's;
+  // and a sizing value taken from the environment is not certain for the later launch.
   await withEnv({ BGW_TEST_CAP: "3", BGW_MAX_SESSIONS: "5" }, async () => {
-    assert.deepEqual(await sizingOf("BGW_PER_CONSUMER_MAX=${BGW_TEST_CAP:-7}\n"), { maxSessions: "5", perConsumerMax: "3" });
+    assert.deepEqual(await sizingOf("BGW_PER_CONSUMER_MAX=${BGW_TEST_CAP:-7}\n"), { maxSessions: INHERITED, perConsumerMax: "3" });
   });
+});
+
+test("a sizing value the file leaves to the environment never drives a refusal: unchecked, named", async () => {
+  for (const [env, names] of [
+    ["", /BGW_MAX_SESSIONS and BGW_PER_CONSUMER_MAX/],
+    ["BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:-2}\nBGW_PER_CONSUMER_MAX=1\n", /leaves BGW_MAX_SESSIONS to the environment/],
+    [`${BOTH}unset BGW_PER_CONSUMER_MAX\n`, /leaves BGW_PER_CONSUMER_MAX to the environment/],
+  ]) {
+    const r = await preflight(9, env);
+    assert.equal(r.kind, "unchecked", env);
+    assert.match(r.message, names, env);
+    assert.match(r.message, /boot check decides/, env);
+  }
 });
 
 test("the env file is sourced exactly once per pre-flight", async () => {
@@ -462,12 +477,12 @@ test("an inline comment is dropped as bash drops it — the exact understated-fl
 });
 
 for (const [label, env, expected] of [
-  ["a quoted # is not a comment; the unset after it runs", `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`, { maxSessions: null, perConsumerMax: "1" }],
-  ["an escaped space keeps the # in the word; the unset after it runs", `${BOTH}X=a\\ #b; unset BGW_MAX_SESSIONS\n`, { maxSessions: null, perConsumerMax: "1" }],
+  ["a quoted # is not a comment; the unset after it runs", `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`, { maxSessions: INHERITED, perConsumerMax: "1" }],
+  ["an escaped space keeps the # in the word; the unset after it runs", `${BOTH}X=a\\ #b; unset BGW_MAX_SESSIONS\n`, { maxSessions: INHERITED, perConsumerMax: "1" }],
   ["a ; separator starts a comment, so a mention after ;# is not a command", `${BOTH}X=1;# unset BGW_MAX_SESSIONS\n`, { maxSessions: "8", perConsumerMax: "1" }],
   ["an assignment in a branch that never runs does not count", `${BOTH}if false; then BGW_MAX_SESSIONS=99; fi\n`, { maxSessions: "8", perConsumerMax: "1" }],
   ["+= appends, as bash does", `${BOTH}BGW_MAX_SESSIONS+=0\n`, { maxSessions: "80", perConsumerMax: "1" }],
-  ["a quoted value spanning lines is followed", `${BOTH}X="a\n# "; unset BGW_MAX_SESSIONS\n`, { maxSessions: null, perConsumerMax: "1" }],
+  ["a quoted value spanning lines is followed", `${BOTH}X="a\n# "; unset BGW_MAX_SESSIONS\n`, { maxSessions: INHERITED, perConsumerMax: "1" }],
   ["a trailing comment naming a sizing variable is only a comment", `${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX\n`, { maxSessions: "8", perConsumerMax: "1" }],
   ["command substitution is evaluated as the launcher would", "BGW_MAX_SESSIONS=$(echo 5)\nBGW_PER_CONSUMER_MAX=1\n", { maxSessions: "5", perConsumerMax: "1" }],
   ["export -n still leaves a shell variable, which the launcher forwards", `${BOTH}export -n BGW_MAX_SESSIONS\n`, { maxSessions: "8", perConsumerMax: "1" }],
@@ -477,10 +492,10 @@ for (const [label, env, expected] of [
   });
 }
 
-test("an unset or invalid value takes the boot default, exactly as boot does", async () => {
-  // MergeWren on #157 (f7c3ac5#2): mirror boot's defaults instead of refusing an absent value.
-  assert.deepEqual(await preflight(1, ""), { kind: "ok" }, "defaults 2/1 fit one consumer");
-  for (const env of ["", "BGW_MAX_SESSIONS=lots\n", "BGW_MAX_SESSIONS=8#c\n", "BGW_MAX_SESSIONS=0\n", `${BOTH}unset BGW_MAX_SESSIONS\n`]) {
+test("an invalid value the file sets takes the boot default, exactly as boot does", async () => {
+  // MergeWren on #157 (f7c3ac5#2): mirror boot's defaults rather than refusing on the value alone.
+  for (const env of ["BGW_MAX_SESSIONS=lots\nBGW_PER_CONSUMER_MAX=1\n", "BGW_MAX_SESSIONS=8#c\nBGW_PER_CONSUMER_MAX=1\n", "BGW_MAX_SESSIONS=0\nBGW_PER_CONSUMER_MAX=1\n"]) {
+    assert.deepEqual(await preflight(1, env), { kind: "ok" }, `default 2 fits one consumer: ${env}`);
     const r = await preflight(2, env);
     assert.equal(r.kind, "refuse", env);
     assert.match(r.message, /BGW_MAX_SESSIONS=2 is too low for 2 consumer\(s\): need >= 3/, env);

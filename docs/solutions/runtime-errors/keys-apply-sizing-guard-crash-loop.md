@@ -69,12 +69,14 @@ and the 2026-08-27 update in
 ## Prevention
 - ✅ **DONE — `keys new` pre-flights the floor before staging anything** (VIL-133, PR #157). It has bash
   source the env file the way `launch-http.sh` does, then applies boot's own parser, defaults and rule
-  (`positiveIntOr`, `DEFAULT_GATEWAY_CONFIG`, `poolSizingError`). A breach it can compute is refused with
-  nothing written. A file it cannot evaluate gets a warning and is left to the boot check (below). It is
-  advisory by design: seven review rounds showed that predicting another process's environment from here
-  never fully converges, so the boot check stays the one authority.
+  (`positiveIntOr`, `DEFAULT_GATEWAY_CONFIG`, `poolSizingError`). A breach computed from values the file
+  itself settles is refused with nothing written. A value the file leaves to the environment (unset, or
+  `${BGW_MAX_SESSIONS:-…}`), or a file it cannot evaluate, gets a warning and is left to the boot check
+  (below). Other inherited variables resolve from the operator's shell, which can differ from the deploy's.
+  It is advisory by design: seven review rounds showed that predicting another process's environment from
+  here never fully converges, so the boot check stays the one authority.
 - ✅ **DONE — `keys --apply` runs a pre-swap smoke** (PR #26, merged 2026-06-23). `preswapSmoke()`
-  runs before the re-create — `src/cli/keys.ts:148`, inside `applyRecreate`. A malformed env or
+  (in `src/cli/keys.ts`, called from `applyRecreate`) runs before the re-create. A malformed env or
   manifest, including an undersized `BGW_MAX_SESSIONS` floor, aborts the apply with the live
   container untouched.
   ~~Caveat 1 — the smoke is conditional on `smokeCmd` being configured.~~ **Closed by VIL-133 (PR #157):**
