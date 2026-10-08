@@ -15,7 +15,8 @@ import { randomBytes } from "node:crypto";
 import { isHttpUrl, redactSecrets, canonicalizeHost } from "../security/index.js";
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
-import { DEFAULT_CALL_TIMEOUTS, carrySessionFailureKind } from "../gateway/index.js";
+import { DEFAULT_CALL_TIMEOUTS } from "../gateway/index.js";
+import { rewrapRedacted } from "./redact-rewrap.js";
 import type { CallTimeouts } from "../gateway/index.js";
 import { DIAGNOSTICS_EGRESS_HOSTS } from "../policy/index.js";
 import type { BrowserCoreOptions, DriveTarget, PageSnapshot, RenderOptions, WaitCondition } from "../browser/index.js";
@@ -772,8 +773,7 @@ export class GatewayDriveController implements DriveController {
     try {
       return await this.#gateway.openConsumerSession(this.#token, override);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw carrySessionFailureKind(new Error(redactSecrets(message, this.#secrets)), err);
+      throw rewrapRedacted(err, this.#secrets);
     }
   }
 
@@ -1287,12 +1287,11 @@ export class GatewayDriveController implements DriveController {
     } catch (err) {
       // Session reaped/closed out from under us -> reset so the next navigate transparently reopens.
       if (!this.#gateway.sessions.get(handle)) this.#handle = undefined;
-      const message = err instanceof Error ? err.message : String(err);
       // Preserve a failure envelope (issue #39) across the redaction re-wrap: an action that landed on a
       // blocked page throws `attachFailure(...)` INSIDE this #run turn (see #actAndSnap), and the fresh
       // Error below would otherwise drop the non-enumerable `.failure`. The envelope was already redacted
       // at #failure(), so re-attaching it is secret-safe.
-      throw carrySessionFailureKind(attachFailure(new Error(redactSecrets(message, this.#secrets)), failureOf(err)), err);
+      throw attachFailure(rewrapRedacted(err, this.#secrets), failureOf(err));
     }
   }
 }

@@ -68,7 +68,11 @@ The claim that all three raise sites emit identical text is **false**. Two do:
 - `session-manager.ts:401` — the factory threw synchronously
 - `session-manager.ts:420` — the launch promise rejected (Chromium exited)
 
-Both emit `browser core failed to launch`. But the deadline branch has always had its own message:
+Both emitted `browser core failed to launch`, byte-identical, when this was written. **Since VIL-110
+(2026-10-08)** they share only that prefix: the synchronous throw says `… (the core factory threw)` and
+the rejection says `… (the launch was rejected)`. Both also carry `kind: "launch-failed"`, which MCP
+results now expose as `_meta["browse-gateway/session-failure"]`. The deadline branch has always had its
+own message:
 
 - `session-manager.ts:459-462` — `` `browser core launch exceeded ${this.#launchDeadlineMs}ms deadline` ``
 

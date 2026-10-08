@@ -5,7 +5,8 @@
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { assertStdioArtifactUnsupported } from "../artifacts/runtime-builder.js";
-import { Gateway, loadConfig, carrySessionFailureKind } from "../gateway/index.js";
+import { Gateway, loadConfig } from "../gateway/index.js";
+import { rewrapRedacted } from "./redact-rewrap.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary, Allowlist } from "../policy/index.js";
 import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
 import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, parseWarmupPaths, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
@@ -127,9 +128,8 @@ async function main(): Promise<void> {
         return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix, forceProxy: forced, timeouts: config.timeouts });
       } catch (err) {
         // Never let a proxy/browser error message carry BYO secret material to the consumer (R9).
-        const message = err instanceof Error ? err.message : String(err);
-        // VIL-110: keep the session-failure kind across the redaction re-wrap (the MCP layer reads it).
-        throw carrySessionFailureKind(new Error(redactSecrets(message, secrets)), err);
+        // VIL-110: the shared re-wrap keeps the session-failure kind (the MCP layer reads it).
+        throw rewrapRedacted(err, secrets);
       }
     },
   });

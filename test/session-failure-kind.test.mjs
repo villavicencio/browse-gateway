@@ -21,8 +21,14 @@ import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
 import { SecretStore } from "../dist/security/index.js";
 import { GatewayDriveController } from "../dist/mcp/drive-controller.js";
 import { createGatewayMcpServer, ERROR_KIND_META_KEY, SESSION_FAILURE_META_KEY } from "../dist/mcp/index.js";
+import { rewrapRedacted } from "../dist/mcp/redact-rewrap.js";
+import { readFileSync } from "node:fs";
 
 const tick = () => new Promise((r) => setTimeout(r, 5));
+
+/** No real profile directories: a never-settling launch would otherwise leave its mkdtemp dir behind
+ *  (MergeWren on #161). */
+const NO_DIRS = { make: async () => "/nonexistent/bgw-test-profile", sweep: async () => ({ result: "confirmed" }), remove: async () => {} };
 
 /** A minimal healthy fake core. */
 function fakeCore() {
@@ -52,19 +58,19 @@ async function forced(site) {
   switch (site) {
     case "sync-throw": {
       // A NON-async factory that throws before returning a promise.
-      const mgr = new SessionManager({ maxSessions: 2, coreFactory: () => { throw new Error("boom"); } });
+      const mgr = new SessionManager({ orphanDirOps: NO_DIRS, maxSessions: 2, coreFactory: () => { throw new Error("boom"); } });
       return mgr.acquire().catch((e) => e);
     }
     case "rejection": {
-      const mgr = new SessionManager({ maxSessions: 2, coreFactory: async () => { throw new Error("chrome exited"); } });
+      const mgr = new SessionManager({ orphanDirOps: NO_DIRS, maxSessions: 2, coreFactory: async () => { throw new Error("chrome exited"); } });
       return mgr.acquire().catch((e) => e);
     }
     case "deadline": {
-      const mgr = new SessionManager({ maxSessions: 2, coreFactory: () => new Promise(() => {}), launchDeadlineMs: 20, closeGraceMs: 20, killConfirmMs: 20 });
+      const mgr = new SessionManager({ orphanDirOps: NO_DIRS, maxSessions: 2, coreFactory: () => new Promise(() => {}), launchDeadlineMs: 20, closeGraceMs: 20, killConfirmMs: 20 });
       return mgr.acquire().catch((e) => e);
     }
     case "global-cap": {
-      const mgr = new SessionManager({ maxSessions: 1, coreFactory: async () => fakeCore() });
+      const mgr = new SessionManager({ orphanDirOps: NO_DIRS, maxSessions: 1, coreFactory: async () => fakeCore() });
       await mgr.acquire();
       const err = await mgr.acquire().catch((e) => e);
       await mgr.shutdown(); // release the held session and its profile dir (MergeWren #161)
@@ -79,7 +85,7 @@ async function forced(site) {
       return err;
     }
     case "shutdown-before": {
-      const mgr = new SessionManager({ maxSessions: 2, coreFactory: async () => fakeCore() });
+      const mgr = new SessionManager({ orphanDirOps: NO_DIRS, maxSessions: 2, coreFactory: async () => fakeCore() });
       await mgr.shutdown();
       return mgr.acquire().catch((e) => e);
     }
@@ -87,7 +93,7 @@ async function forced(site) {
       // Shutdown begins WHILE a launch is in flight; the launch then lands and must not register.
       let release;
       const gate = new Promise((r) => { release = r; });
-      const mgr = new SessionManager({ maxSessions: 2, coreFactory: async () => { await gate; return fakeCore(); }, closeGraceMs: 20, killConfirmMs: 20 });
+      const mgr = new SessionManager({ orphanDirOps: NO_DIRS, maxSessions: 2, coreFactory: async () => { await gate; return fakeCore(); }, closeGraceMs: 20, killConfirmMs: 20 });
       const p = mgr.acquire().catch((e) => e);
       await tick();
       const down = mgr.shutdown();
@@ -160,8 +166,8 @@ async function connect(deps) {
 test("retrieve path: a refused session reaches _meta as its kind, beside the unchanged error-kind", async () => {
   for (const site of ["global-cap", "deadline", "shutdown-before"]) {
     const err = await forced(site);
-    // The launchers re-wrap retrieve errors for redaction exactly like this.
-    const client = await connect({ retrieve: async () => { throw carrySessionFailureKind(new Error(err.message), err); } });
+    // The PRODUCTION re-wrap both launchers use (the source test below pins that they do).
+    const client = await connect({ retrieve: async () => { throw rewrapRedacted(err, new SecretStore(() => ({}))); } });
     const res = await client.callTool({ name: "retrieve", arguments: { url: "https://example.com/" } });
     assert.equal(res.isError, true);
     assert.equal(res._meta[ERROR_KIND_META_KEY], "internal", "the coarse two-value kind is unchanged (additive wire shape)");
@@ -191,4 +197,33 @@ test("an error that is NOT a session failure carries no session-failure key", as
   const client = await connect({ retrieve: async () => { throw new Error("some other failure"); } });
   const res = await client.callTool({ name: "retrieve", arguments: { url: "https://example.com/" } });
   assert.equal(res._meta[SESSION_FAILURE_META_KEY], undefined);
+});
+
+// --- MergeWren #161 ------------------------------------------------------------------------------------
+
+test("every entrypoint re-wraps through rewrapRedacted (removing it from any one fails here)", () => {
+  const src = (f) => readFileSync(new URL(`../src/mcp/${f}`, import.meta.url), "utf8");
+  for (const [file, uses] of [["main.ts", 1], ["http-main.ts", 1], ["drive-controller.ts", 2]]) {
+    const text = src(file);
+    assert.equal((text.match(/rewrapRedacted\(err, /g) ?? []).length, uses, `${file} must re-wrap through rewrapRedacted ${uses}x`);
+    assert.doesNotMatch(text, /new Error\(redactSecrets\(/, `${file} hand-rolls a re-wrap that would drop the kind`);
+  }
+});
+
+test("rewrapRedacted redacts a secret AND keeps the session-failure kind", async () => {
+  const secrets = new SecretStore(() => ({ BGW_PROXY_PASSWORD: "hunter2-secret-value" }));
+  const original = new SessionManagerError("SESSION_LIMIT", "limit hit while using hunter2-secret-value", { kind: "at-capacity-global" });
+  const wrapped = rewrapRedacted(original, secrets);
+  assert.ok(!wrapped.message.includes("hunter2-secret-value"), wrapped.message);
+  assert.equal(sessionFailureKindOf(wrapped), "at-capacity-global");
+});
+
+test("the exported constructor keeps its original (code, message, options?) signature", () => {
+  const cause = new Error("root");
+  const e = new SessionManagerError("CORE_LAUNCH", "legacy caller", { cause });
+  assert.equal(e.message, "legacy caller");
+  assert.equal(e.code, "CORE_LAUNCH");
+  assert.equal(e.cause, cause);
+  assert.equal(e.kind, undefined, "a legacy caller gets no kind, not a corrupted one");
+  assert.equal(sessionFailureKindOf(e), undefined);
 });
