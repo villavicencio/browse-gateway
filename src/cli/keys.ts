@@ -10,6 +10,7 @@
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseConsumerManifest } from "../policy/consumer-config.js";
+import { DEFAULT_GATEWAY_CONFIG, poolSizingError, positiveIntOr } from "../gateway/config.js";
 import type { ConsumerManifestEntry } from "../policy/consumer-config.js";
 import { ok, fail, note } from "./brand.js";
 import type { Keychain } from "./keychain.js";
@@ -41,7 +42,9 @@ export interface KeysDeps {
    * up clean — typically `~/deploy/preswap-smoke.sh` directly (it defaults the smoked image to the
    * running container's, so no image plumbing is needed here). Run first so a malformed env or an
    * undersized `BGW_MAX_SESSIONS` floor aborts the apply with the LIVE container untouched, instead
-   * of crash-looping it (the documented `keys --apply` crash-loop). Absent → apply proceeds, warned.
+   * of crash-looping it (the documented `keys --apply` crash-loop). REQUIRED for `--apply` (VIL-133):
+   * the boot check it runs is the one authority on whether the staged config boots, so absent →
+   * `--apply` refuses before anything is written.
    */
   smokeCmd?: string;
   out: (line: string) => void;
@@ -81,6 +84,115 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
   return { entries: parseConsumerManifest(manifestText), envText };
 }
 
+/**
+ * VIL-133: the two raw pool-sizing values the launcher would forward, by letting bash source the env file
+ * the way `launch-http.sh` does (`set -euo pipefail`, then `set -a; . file`), once, over the same shell
+ * the CLI already uses to read and write that file, and inheriting that shell's environment as the
+ * launcher inherits its caller's. The launcher forwards every shell variable named `BGW_*` (`compgen -v`,
+ * exported or not), so these are what the gateway's boot check would see, as far as this shell can tell.
+ *
+ * Why bash and not a parser: every hand-written reader of this file missed some bash rule (inline
+ * comments, quoted `#`, escaped spaces, `;#`, dead branches, `unset`, `+=`, ...), CodeRabbit and MergeWren
+ * on #157. The launcher already executes this file on every deploy as the same account, so evaluating it
+ * here adds no trust the deploy path does not already extend. The file's own output is discarded, never
+ * echoed: it holds every consumer's token.
+ *
+ * The file runs UNMODIFIED, exactly as the launcher runs it when no sizing variable is inherited. A
+ * pre-flight that presets either variable changes how a file that branches on them runs (MergeWren on
+ * #157), so instead: when this shell's own environment already sets BGW_MAX_SESSIONS or
+ * BGW_PER_CONSUMER_MAX, the launcher could inherit a value this check cannot vouch for, and the result is
+ * `{ error }` (unchecked). A sizing variable the file leaves unset is reported as {@link INHERITED}: its
+ * value then depends on the deploy's environment, so it never drives a refusal. Other inherited
+ * variables (`${CAP:-7}`) resolve from this shell; where the deploy's differ, the boot check in the
+ * pre-swap smoke decides.
+ *
+ * Returns each raw value ({@link INHERITED} when the file leaves it unset), or `{ error }` when the file
+ * cannot be evaluated here.
+ */
+/** A sizing value as the env file settles it, or {@link INHERITED} when the file leaves it to the environment. */
+export const INHERITED = Symbol("inherited");
+export type SizingValue = string | typeof INHERITED;
+
+export async function resolveEnvSizing(
+  shell: Pick<RemoteShell, "run">,
+  envFilePath: string,
+): Promise<{ maxSessions: SizingValue; perConsumerMax: SizingValue } | { error: string }> {
+  const unset = "__bgw_unset__";
+  const envHas = "__bgw_env_sets:";
+  const body =
+    `if [ -n "\${BGW_MAX_SESSIONS+x}\${BGW_PER_CONSUMER_MAX+x}" ]; then ` +
+    `builtin printf "%s%s\\n" "${envHas}" "\${BGW_MAX_SESSIONS+ BGW_MAX_SESSIONS}\${BGW_PER_CONSUMER_MAX+ BGW_PER_CONSUMER_MAX}"; exit 0; fi; ` +
+    `set -euo pipefail; set -a; . "$1" >/dev/null 2>&1; ` +
+    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${unset}}" "\${BGW_PER_CONSUMER_MAX-${unset}}"`;
+  const r = await shell.run(`bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`);
+  if (r.code !== 0) return { error: `sourcing it the way the launcher does failed here (exit ${r.code})` };
+  if (r.stdout.startsWith(envHas)) {
+    const names = r.stdout.slice(envHas.length).trim().split(/\s+/).join(" and ");
+    return { error: `this shell's own environment already sets ${names}, so the value the launcher inherits cannot be vouched for` };
+  }
+  const out = r.stdout.split("\n");
+  // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
+  // holds a newline).
+  if (out.length !== 3 || out[2] !== "") return { error: "the values could not be read back after sourcing it" };
+  const value = (v: string): SizingValue => (v === unset ? INHERITED : v);
+  return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
+}
+
+
+/** The pool-floor pre-flight's verdict: proceed, refuse (a certain breach), or unchecked (warn, proceed). */
+export type PoolFloorCheck = { kind: "ok" } | { kind: "refuse"; message: string } | { kind: "unchecked"; message: string };
+
+/**
+ * VIL-133: would the gateway BOOT with `consumerCount` consumers, given the sizing values the launcher
+ * would forward ({@link resolveEnvSizing})? An EARLY, advisory check. The authority is the gateway's own
+ * boot check (src/mcp/runtime.ts), which the pre-swap smoke runs against the real launcher and env file
+ * before any swap: on every deploy, and on every `keys --apply` (which requires `smokeCmd`). So this
+ * refuses only a breach it can compute, and otherwise says it could not check and leaves the decision to
+ * that boot check, rather than refusing on doubt (the trade-off settled on #157).
+ *
+ * For values the file settles, it mirrors boot exactly: the same parser ({@link positiveIntOr}), the same
+ * default for an invalid value ({@link DEFAULT_GATEWAY_CONFIG}), the same rule ({@link poolSizingError}).
+ * A value the file leaves to the environment is not certain, so it never drives a refusal.
+ */
+export function poolFloorPreflight(
+  consumerCount: number,
+  sizing: { maxSessions: SizingValue; perConsumerMax: SizingValue } | { error: string },
+): PoolFloorCheck {
+  if ("error" in sizing) {
+    return {
+      kind: "unchecked",
+      message:
+        `could not check the pool floor from the env file (${sizing.error}); the gateway's boot check ` +
+        `decides at the next pre-swap smoke (\`keys --apply\`, or a deploy)`,
+    };
+  }
+  const inherited = (["BGW_MAX_SESSIONS", "BGW_PER_CONSUMER_MAX"] as const).filter(
+    (_, i) => [sizing.maxSessions, sizing.perConsumerMax][i] === INHERITED,
+  );
+  if (inherited.length > 0) {
+    return {
+      kind: "unchecked",
+      message:
+        `could not check the pool floor: the env file leaves ${inherited.join(" and ")} to the environment the ` +
+        `launcher inherits, which this check cannot see; the gateway's boot check decides at the next ` +
+        `pre-swap smoke (\`keys --apply\`, or a deploy)`,
+    };
+  }
+  // Settled by the file; an invalid value takes boot's default, exactly as boot does.
+  const maxSessions = positiveIntOr(sizing.maxSessions as string, DEFAULT_GATEWAY_CONFIG.maxSessions);
+  const perConsumerMax = positiveIntOr(sizing.perConsumerMax as string, DEFAULT_GATEWAY_CONFIG.perConsumerMax);
+  const err = poolSizingError(consumerCount, perConsumerMax, maxSessions);
+  if (!err) return { kind: "ok" };
+  const required = consumerCount * perConsumerMax + 1;
+  return {
+    kind: "refuse",
+    message:
+      `refusing to add a consumer: the gateway would not boot — ${err}. Nothing was staged or changed. ` +
+      `Either raise BGW_MAX_SESSIONS to at least ${required} in the env file (if the host has the memory for ` +
+      `it), or free a slot first with \`obscura keys revoke <id> --apply\`.`,
+  };
+}
+
 function manifestJson(entries: ConsumerManifestEntry[]): string {
   return `${JSON.stringify(entries, null, 2)}\n`;
 }
@@ -88,30 +200,40 @@ function manifestJson(entries: ConsumerManifestEntry[]): string {
 function restartInstruction(deps: KeysDeps): string {
   return (
     "staged only — the gateway loads consumers when the container is RE-CREATED " +
-    "(a plain `docker restart` keeps the old env); re-run with --apply once `applyCmd` is configured, " +
+    "(a plain `docker restart` keeps the old env); re-run with --apply once `applyCmd` and `smokeCmd` are configured, " +
     "or re-create via your launch script on the host"
   );
 }
 
 /**
- * Pre-swap smoke (when `smokeCmd` is configured): boot the current image against the just-staged env
+ * `--apply` needs both on-host commands, checked BEFORE anything is staged. `applyCmd` re-creates the
+ * container; `smokeCmd` boots the staged config on a throwaway port first, and its boot check is the one
+ * authority on whether that config boots (VIL-133), so an apply without it could crash-loop every consumer.
+ */
+const APPLY_GATES_MISSING = (key: "applyCmd" | "smokeCmd"): string =>
+  key === "applyCmd"
+    ? "--apply needs the `applyCmd` config key (or OBSCURA_APPLY_CMD): the on-host command that re-creates " +
+      "the gateway container re-reading env + manifest (e.g. your launch-http.sh wrapper). " +
+      "A plain `docker restart` cannot activate env changes, so obscura refuses to fake it. Nothing was staged."
+    : "--apply needs the `smokeCmd` config key (or OBSCURA_SMOKE_CMD): the on-host pre-swap smoke that boots " +
+      "the staged config on a throwaway port before the live re-create. Its boot check is what refuses a " +
+      "config that would crash-loop the gateway, so obscura will not re-create without it. Nothing was staged.";
+
+function requireApplyGates(deps: KeysDeps): void {
+  if (!deps.applyCmd) throw new Error(APPLY_GATES_MISSING("applyCmd"));
+  if (!deps.smokeCmd) throw new Error(APPLY_GATES_MISSING("smokeCmd"));
+}
+
+/**
+ * Pre-swap smoke (`smokeCmd`, required for `--apply`): boot the current image against the just-staged env
  * + manifest on a throwaway port and ABORT the apply — live container untouched — if it can't come up
  * clean. This is the guard for the documented `keys --apply` crash-loop: an undersized
  * `BGW_MAX_SESSIONS` floor (or any malformed config) is caught here instead of after the live
- * re-create. Absent `smokeCmd` → warn loudly and proceed (backward-compatible; the change is still
- * staged on disk regardless).
+ * re-create.
  */
 async function preswapSmoke(deps: KeysDeps): Promise<void> {
-  if (!deps.smokeCmd) {
-    deps.out(
-      note(
-        "applying WITHOUT a pre-swap smoke — a malformed env/manifest (e.g. BGW_MAX_SESSIONS below the " +
-          "floor) can crash-loop the gateway and take every consumer down. Configure `smokeCmd` " +
-          "(OBSCURA_SMOKE_CMD) to gate the apply on a throwaway-port boot of the staged config.",
-      ),
-    );
-    return;
-  }
+  // requireApplyGates refuses this before anything is written; kept so no path can re-create unsmoked.
+  if (!deps.smokeCmd) throw new Error("internal: --apply reached the re-create without smokeCmd; nothing was re-created");
   deps.out(note("pre-swap smoke — booting the current image against the staged config on a throwaway port"));
   const smoke = await deps.shell.run(
     `set -e; export DOCKER_HOST="\${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"; ${deps.smokeCmd}`,
@@ -195,6 +317,7 @@ export async function keysNew(deps: KeysDeps, id: string, opts: KeysNewOptions =
   if (!CONSUMER_ID_RE.test(id)) {
     throw new Error(`invalid consumer id "${id}" (letters, digits, ".", "_", "-"; must start alphanumeric)`);
   }
+  if (opts.apply) requireApplyGates(deps);
   const { entries, envText } = await readProdFiles(deps);
   if (entries.some((e) => e.id === id)) throw new Error(`consumer "${id}" already exists in the manifest`);
   const collision = envKeyCollision(id, entries.map((e) => e.id));
@@ -205,6 +328,14 @@ export async function keysNew(deps: KeysDeps, id: string, opts: KeysNewOptions =
   if (tokenLineRe(envKey).test(envText)) {
     throw new Error(`env file already carries ${envKey} but "${id}" is not in the manifest — desync; resolve on the host before minting`);
   }
+
+  // VIL-133: pre-flight the pool floor BEFORE anything is written. A consumer that pushes the floor past
+  // BGW_MAX_SESSIONS does not degrade the gateway: the boot guard refuses to start it. A breach this can
+  // compute is refused here, with or without --apply. Anything it cannot check is left to that boot guard,
+  // which the pre-swap smoke runs before any re-create (--apply requires smokeCmd; a deploy always smokes).
+  const floor = poolFloorPreflight(entries.length + 1, await resolveEnvSizing(deps.shell, deps.envFilePath));
+  if (floor.kind === "refuse") throw new Error(floor.message);
+  if (floor.kind === "unchecked") deps.out(note(floor.message));
 
   const allow = opts.allow && opts.allow.length > 0 ? opts.allow : ["*"];
   const token = mintToken();
@@ -282,6 +413,7 @@ export interface KeysRevokeOptions {
  * reported explicitly and then fully cleaned, never silently half-removed.
  */
 export async function keysRevoke(deps: KeysDeps, id: string, opts: KeysRevokeOptions = {}): Promise<void> {
+  if (opts.apply) requireApplyGates(deps);
   const { entries, envText } = await readProdFiles(deps);
   const envKey = tokenEnvKey(id);
   const inManifest = entries.some((e) => e.id === id);

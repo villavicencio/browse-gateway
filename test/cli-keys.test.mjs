@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -44,7 +44,9 @@ function fixture({ manifest, env } = {}) {
 }
 
 const BASE_MANIFEST = JSON.stringify([{ id: "consumer-1", allow: ["*"] }], null, 2);
-const BASE_ENV = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\n`;
+// A realistic cap: with no BGW_MAX_SESSIONS the boot default (2) admits ONE consumer, so a fixture that
+// adds a second would describe a config the real gateway refuses to boot (VIL-133).
+const BASE_ENV = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=8\nexport BGW_PER_CONSUMER_MAX=1\n`;
 
 test("keys new writes manifest entry + env token, stores in keychain, prints token once", async () => {
   const { deps, lines, keychain, manifestPath, envFilePath } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
@@ -268,17 +270,20 @@ test("keys --apply runs the smoke BEFORE the re-create when it passes", async ()
   assert.ok(smokeIdx < recreateIdx, "smoke precedes the re-create");
 });
 
-test("keys --apply without smokeCmd warns about the missing gate but still applies", async () => {
-  const { deps, lines } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
-  const fileShell = deps.shell;
-  const remote = applyShell({ curlCodes: ["401"], envKeyPresent: true });
-  deps.applyCmd = "~/deploy/relaunch.sh"; // no smokeCmd
-  deps.shell = routeApply(fileShell, remote);
+test("keys --apply refuses without smokeCmd BEFORE anything is staged (new and revoke)", async () => {
+  // VIL-133: the smoke's boot check is the one authority on whether the staged config boots.
+  const newer = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  newer.deps.applyCmd = "~/deploy/relaunch.sh"; // no smokeCmd
+  await assert.rejects(() => keysNew(newer.deps, "consumer-2", { apply: true }), /needs the `smokeCmd` config key.*Nothing was staged/s);
+  assert.equal(readFileSync(newer.manifestPath, "utf8"), BASE_MANIFEST, "manifest untouched");
+  assert.equal(readFileSync(newer.envFilePath, "utf8"), BASE_ENV, "env file untouched");
+  assert.equal(newer.keychain.items.size, 0, "no token minted");
 
-  await keysNew(deps, "consumer-2", { apply: true });
-  assert.ok(lines.some((l) => l.includes("WITHOUT a pre-swap smoke")), "warns about the missing smoke gate");
-  assert.ok(!remote.calls.some((c) => c.script.includes("preswap-smoke")), "no smoke attempted when unconfigured");
-  assert.ok(remote.calls.some((c) => c.script.includes("relaunch.sh")), "still re-creates");
+  const rev = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
+  rev.deps.applyCmd = "~/deploy/relaunch.sh";
+  await assert.rejects(() => keysRevoke(rev.deps, "consumer-1", { apply: true }), /needs the `smokeCmd` config key/);
+  assert.equal(readFileSync(rev.manifestPath, "utf8"), BASE_MANIFEST, "revoke staged nothing either");
+  assert.equal(readFileSync(rev.envFilePath, "utf8"), BASE_ENV);
 });
 
 test("keys new --apply runs applyCmd, waits for 401, and confirms the token is ACTIVE in the container", async () => {
@@ -286,12 +291,8 @@ test("keys new --apply runs applyCmd, waits for 401, and confirms the token is A
   const fileShell = deps.shell; // keep real file ops for the staged writes
   const remote = applyShell({ curlCodes: ["000", "000", "401"], envKeyPresent: true });
   deps.applyCmd = "~/deploy/relaunch.sh";
-  deps.shell = {
-    run: (script, input, opts) =>
-      script.includes("curl") || script.includes("printenv") || script.includes("relaunch.sh")
-        ? remote.run(script, input, opts)
-        : fileShell.run(script, input, opts),
-  };
+  deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+  deps.shell = routeApply(fileShell, remote);
   await keysNew(deps, "consumer-2", { apply: true });
 
   const applyCall = remote.calls.find((c) => c.script.includes("relaunch.sh"));
@@ -301,11 +302,11 @@ test("keys new --apply runs applyCmd, waits for 401, and confirms the token is A
   assert.ok(lines.some((l) => l.includes("healthy after re-create") && l.includes("active")));
 });
 
-test("keys --apply refuses without applyCmd (docker restart cannot activate env changes)", async () => {
+test("keys --apply refuses without applyCmd (docker restart cannot activate env changes), before staging", async () => {
   const { deps, manifestPath } = fixture({ manifest: BASE_MANIFEST, env: BASE_ENV });
-  await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /applyCmd.*OBSCURA_APPLY_CMD.*docker restart/s);
-  // The mutation itself still landed (staged) — only the apply step refused.
-  assert.ok(JSON.parse(readFileSync(manifestPath, "utf8")).some((e) => e.id === "consumer-2"), "change staged");
+  deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+  await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /applyCmd.*OBSCURA_APPLY_CMD.*docker restart.*Nothing was staged/s);
+  assert.equal(readFileSync(manifestPath, "utf8"), BASE_MANIFEST, "nothing staged");
 });
 
 test("keys new --apply fails loudly when the re-created container lacks the new token", async () => {
@@ -313,12 +314,8 @@ test("keys new --apply fails loudly when the re-created container lacks the new 
   const fileShell = deps.shell;
   const remote = applyShell({ curlCodes: ["401"], envKeyPresent: false });
   deps.applyCmd = "~/deploy/relaunch.sh";
-  deps.shell = {
-    run: (script, input, opts) =>
-      script.includes("curl") || script.includes("printenv") || script.includes("relaunch.sh")
-        ? remote.run(script, input, opts)
-        : fileShell.run(script, input, opts),
-  };
+  deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+  deps.shell = routeApply(fileShell, remote);
   await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /NOT in the container env.*did not re-read/s);
 });
 
@@ -327,11 +324,9 @@ test("keys --apply times out when the gateway never answers 401 after the re-cre
   const fileShell = deps.shell;
   const remote = applyShell({ curlCodes: ["000"] });
   deps.applyCmd = "~/deploy/relaunch.sh";
+  deps.smokeCmd = "~/deploy/preswap-smoke.sh";
   deps.applyTimeoutMs = 20;
-  deps.shell = {
-    run: (script, input, opts) =>
-      script.includes("curl") || script.includes("relaunch.sh") ? remote.run(script, input, opts) : fileShell.run(script, input, opts),
-  };
+  deps.shell = routeApply(fileShell, remote);
   await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /did not come back healthy/);
 });
 
@@ -353,4 +348,213 @@ test("readRemoteFile distinguishes missing from empty", async () => {
   const { deps, envFilePath } = fixture({ env: "" });
   assert.equal(await readRemoteFile(deps.shell, envFilePath), "");
   assert.equal(await readRemoteFile(deps.shell, join(tmpdir(), "obscura-definitely-absent")), null);
+});
+
+// --- VIL-133: the pool-floor pre-flight -------------------------------------------------------------
+
+test("keys new REFUSES a consumer that would breach the pool floor, before writing anything", async () => {
+  // Genuinely AT the floor: 2 consumers × perConsumerMax 1 + 1 = 3 = BGW_MAX_SESSIONS. A third needs 4.
+  const manifest = JSON.stringify([{ id: "c1", allow: ["*"] }, { id: "c2", allow: ["*"] }], null, 2);
+  const env = `export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=1\nexport ${tokenEnvKey("c1")}=${"a".repeat(64)}\nexport ${tokenEnvKey("c2")}=${"b".repeat(64)}\n`;
+  for (const apply of [false, true]) {
+    const { deps, keychain, manifestPath, envFilePath } = fixture({ manifest, env });
+    const remote = applyShell();
+    deps.applyCmd = "~/deploy/relaunch.sh";
+    deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+    deps.shell = routeApply(deps.shell, remote);
+    await assert.rejects(
+      () => keysNew(deps, "c3", { apply }),
+      (err) => {
+        assert.match(err.message, /BGW_MAX_SESSIONS=3 is too low for 3 consumer\(s\): need >= 4/);
+        assert.match(err.message, /raise BGW_MAX_SESSIONS to at least 4/);
+        assert.match(err.message, /keys revoke <id> --apply/);
+        assert.match(err.message, /Nothing was staged/);
+        return true;
+      },
+    );
+    assert.equal(readFileSync(manifestPath, "utf8"), manifest, `manifest untouched (apply=${apply})`);
+    assert.equal(readFileSync(envFilePath, "utf8"), env, `env file untouched (apply=${apply})`);
+    assert.equal(keychain.items.size, 0, "no token minted into the keychain");
+    assert.deepEqual(remote.calls, [], "no smoke, no re-create, no probe — the live container is never touched");
+  }
+});
+
+test("keys new is allowed when the new consumer still fits — exactly at the floor", async () => {
+  const env = `export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=1\nexport ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\n`;
+  const { deps, manifestPath } = fixture({ manifest: BASE_MANIFEST, env });
+  await keysNew(deps, "consumer-2"); // 2 × 1 + 1 = 3 ≤ 3
+  assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).length, 2);
+});
+
+const BOTH = "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=1\n";
+const { INHERITED } = await import("../dist/cli/keys.js");
+
+/** The raw sizing values bash gives the launcher for `envText`, through the real resolver over a real shell. */
+async function sizingOf(envText) {
+  const { resolveEnvSizing } = await import("../dist/cli/keys.js");
+  const dir = mkdtempSync(join(tmpdir(), "obscura-sizing-"));
+  const path = join(dir, "prod.env");
+  writeFileSync(path, envText);
+  try {
+    return await resolveEnvSizing(localShell(), path);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+async function preflight(consumers, envText) {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  return poolFloorPreflight(consumers, await sizingOf(envText));
+}
+
+/** Run `fn` with `vars` set in this process's environment, restoring every prior value (or absence) after
+ *  (MergeWren on #157: the old cleanup deleted a variable that was set before the test). */
+async function withEnv(vars, fn) {
+  const prior = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(prior)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("the pre-flight sees what bash gives the launcher: last assignment wins, quotes and export are bash's", async () => {
+  assert.deepEqual(await sizingOf("BGW_MAX_SESSIONS=4\nexport BGW_MAX_SESSIONS='6'\nBGW_PER_CONSUMER_MAX=\"2\"\n"), { maxSessions: "6", perConsumerMax: "2" });
+  assert.deepEqual(await sizingOf("XBGW_MAX_SESSIONS=9\n"), { maxSessions: INHERITED, perConsumerMax: INHERITED }, "a longer name is not a match");
+  // perConsumerMax multiplies the floor exactly as the boot check does.
+  const r = await preflight(3, "BGW_MAX_SESSIONS=6\nBGW_PER_CONSUMER_MAX=2\n");
+  assert.equal(r.kind, "refuse");
+  assert.match(r.message, /need >= 7/);
+});
+
+test("like the launcher, the evaluation inherits its shell's environment", async () => {
+  // MergeWren on #157: a cleared environment disagrees with launch-http.sh, which inherits its caller's.
+  await withEnv({ BGW_TEST_CAP: "3" }, async () => {
+    assert.deepEqual(await sizingOf("BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=${BGW_TEST_CAP:-7}\n"), { maxSessions: "8", perConsumerMax: "3" });
+  });
+});
+
+test("the file runs unmodified: one that branches on a sizing variable takes the launcher's branch", async () => {
+  // MergeWren on #157: presetting the variables made this take the `2` branch and falsely refuse.
+  const env = '[ -n "${BGW_MAX_SESSIONS+x}" ] && BGW_MAX_SESSIONS=2 || BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=${BGW_PER_CONSUMER_MAX:-1}\n';
+  assert.deepEqual(await sizingOf(env), { maxSessions: "8", perConsumerMax: "1" });
+  assert.deepEqual(await preflight(2, env), { kind: "ok" });
+});
+
+test("a sizing variable already in this shell's environment makes the check unchecked, named, never a refusal", async () => {
+  await withEnv({ BGW_MAX_SESSIONS: "3" }, async () => {
+    const r = await preflight(9, BOTH);
+    assert.equal(r.kind, "unchecked");
+    assert.match(r.message, /environment already sets BGW_MAX_SESSIONS,/);
+    assert.match(r.message, /boot check decides/);
+  });
+  await withEnv({ BGW_MAX_SESSIONS: "3", BGW_PER_CONSUMER_MAX: "1" }, async () => {
+    assert.match((await preflight(9, BOTH)).message, /sets BGW_MAX_SESSIONS and BGW_PER_CONSUMER_MAX,/);
+  });
+});
+
+test("a sizing variable the file leaves unset never drives a refusal: unchecked, named", async () => {
+  for (const [env, names] of [
+    ["", /BGW_MAX_SESSIONS and BGW_PER_CONSUMER_MAX/],
+    ["BGW_PER_CONSUMER_MAX=1\n", /leaves BGW_MAX_SESSIONS to the environment/],
+    [`${BOTH}unset BGW_PER_CONSUMER_MAX\n`, /leaves BGW_PER_CONSUMER_MAX to the environment/],
+  ]) {
+    const r = await preflight(9, env);
+    assert.equal(r.kind, "unchecked", env);
+    assert.match(r.message, names, env);
+    assert.match(r.message, /boot check decides/, env);
+  }
+});
+
+test("the env file is sourced exactly once per pre-flight", async () => {
+  // MergeWren on #157: the file is executed, so it must not run twice.
+  const { resolveEnvSizing } = await import("../dist/cli/keys.js");
+  const dir = mkdtempSync(join(tmpdir(), "obscura-once-"));
+  const marker = join(dir, "runs");
+  const path = join(dir, "prod.env");
+  writeFileSync(path, `${BOTH}echo x >> '${marker}'\n`);
+  try {
+    await resolveEnvSizing(localShell(), path);
+    assert.equal(readFileSync(marker, "utf8"), "x\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- CodeRabbit + MergeWren #157: every bash rule a hand-written reader missed, now settled by bash ------
+
+test("an inline comment is dropped as bash drops it — the exact understated-floor scenario is refused", async () => {
+  // bash gives the gateway perConsumerMax=2, so 2 consumers need 2×2+1 = 5 sessions, not the 3 a
+  // comment-blind reader (falling back to perConsumerMax 1) would compute.
+  const r = await preflight(2, "export BGW_MAX_SESSIONS=3\nexport BGW_PER_CONSUMER_MAX=2 # capacity\n");
+  assert.equal(r.kind, "refuse");
+  assert.match(r.message, /need >= 5/);
+});
+
+for (const [label, env, expected] of [
+  ["a quoted # is not a comment; the unset after it runs", `${BOTH}X="a # b"; unset BGW_MAX_SESSIONS\n`, { maxSessions: INHERITED, perConsumerMax: "1" }],
+  ["an escaped space keeps the # in the word; the unset after it runs", `${BOTH}X=a\\ #b; unset BGW_MAX_SESSIONS\n`, { maxSessions: INHERITED, perConsumerMax: "1" }],
+  ["a ; separator starts a comment, so a mention after ;# is not a command", `${BOTH}X=1;# unset BGW_MAX_SESSIONS\n`, { maxSessions: "8", perConsumerMax: "1" }],
+  ["an assignment in a branch that never runs does not count", `${BOTH}if false; then BGW_MAX_SESSIONS=99; fi\n`, { maxSessions: "8", perConsumerMax: "1" }],
+  ["+= appends, as bash does", `${BOTH}BGW_MAX_SESSIONS+=0\n`, { maxSessions: "80", perConsumerMax: "1" }],
+  ["a quoted value spanning lines is followed", `${BOTH}X="a\n# "; unset BGW_MAX_SESSIONS\n`, { maxSessions: INHERITED, perConsumerMax: "1" }],
+  ["a trailing comment naming a sizing variable is only a comment", `${BOTH}OTHER=1 # see BGW_PER_CONSUMER_MAX\n`, { maxSessions: "8", perConsumerMax: "1" }],
+  ["command substitution is evaluated as the launcher would", "BGW_MAX_SESSIONS=$(echo 5)\nBGW_PER_CONSUMER_MAX=1\n", { maxSessions: "5", perConsumerMax: "1" }],
+  ["export -n still leaves a shell variable, which the launcher forwards", `${BOTH}export -n BGW_MAX_SESSIONS\n`, { maxSessions: "8", perConsumerMax: "1" }],
+]) {
+  test(`bash semantics: ${label}`, async () => {
+    assert.deepEqual(await sizingOf(env), expected);
+  });
+}
+
+test("an invalid value the file sets takes the boot default, exactly as boot does", async () => {
+  // MergeWren on #157 (f7c3ac5#2): mirror boot's defaults rather than refusing on the value alone.
+  for (const env of ["BGW_MAX_SESSIONS=lots\nBGW_PER_CONSUMER_MAX=1\n", "BGW_MAX_SESSIONS=8#c\nBGW_PER_CONSUMER_MAX=1\n", "BGW_MAX_SESSIONS=0\nBGW_PER_CONSUMER_MAX=1\n"]) {
+    assert.deepEqual(await preflight(1, env), { kind: "ok" }, `default 2 fits one consumer: ${env}`);
+    const r = await preflight(2, env);
+    assert.equal(r.kind, "refuse", env);
+    assert.match(r.message, /BGW_MAX_SESSIONS=2 is too low for 2 consumer\(s\): need >= 3/, env);
+  }
+  // An invalid perConsumerMax falls back to 1, as boot does.
+  assert.deepEqual(await preflight(7, "BGW_MAX_SESSIONS=8\nBGW_PER_CONSUMER_MAX=0\n"), { kind: "ok" });
+});
+
+test("values the boot parser accepts are accepted (leading zeros), exactly at the floor", async () => {
+  assert.deepEqual(await preflight(2, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n"), { kind: "ok" });
+  assert.match((await preflight(3, "BGW_MAX_SESSIONS=03\nBGW_PER_CONSUMER_MAX=01\n")).message, /need >= 4/);
+});
+
+for (const [label, env] of [
+  ["an unset expansion (set -u)", "BGW_MAX_SESSIONS=$BGW_TEST_UNDEFINED_CAP\nBGW_PER_CONSUMER_MAX=1\n"],
+  ["a sourced file that does not exist", `${BOTH}. /nonexistent/extra.env\n`],
+  ["a file that exits early", `${BOTH}exit 0\n`],
+]) {
+  test(`a file the pre-flight cannot evaluate is left to the boot check, not refused: ${label}`, async () => {
+    const r = await preflight(1, env);
+    assert.equal(r.kind, "unchecked");
+    assert.match(r.message, /could not check the pool floor/);
+    assert.match(r.message, /boot check decides at the next pre-swap smoke/);
+  });
+}
+
+test("keys new stages with a warning when the env file cannot be evaluated (no --apply)", async () => {
+  const env = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=$BGW_TEST_UNDEFINED_CAP\n`;
+  const { deps, manifestPath, lines } = fixture({ manifest: BASE_MANIFEST, env });
+  await keysNew(deps, "consumer-2");
+  assert.ok(lines.some((l) => l.includes("could not check the pool floor")), "the operator is told");
+  assert.ok(JSON.parse(readFileSync(manifestPath, "utf8")).some((e) => e.id === "consumer-2"), "staged");
+});
+
+test("keys new --apply with an unevaluable env file still smokes before any re-create, and the smoke decides", async () => {
+  const env = `export ${tokenEnvKey("consumer-1")}=${"a".repeat(64)}\nexport BGW_MAX_SESSIONS=$BGW_TEST_UNDEFINED_CAP\n`;
+  const { deps } = fixture({ manifest: BASE_MANIFEST, env });
+  const remote = applyShell({ smokeCode: 1 });
+  deps.applyCmd = "~/deploy/relaunch.sh";
+  deps.smokeCmd = "~/deploy/preswap-smoke.sh";
+  deps.shell = routeApply(deps.shell, remote);
+  await assert.rejects(() => keysNew(deps, "consumer-2", { apply: true }), /pre-swap smoke FAILED/);
+  assert.ok(!remote.calls.some((c) => c.script.includes("relaunch.sh")), "the live container was never re-created");
 });

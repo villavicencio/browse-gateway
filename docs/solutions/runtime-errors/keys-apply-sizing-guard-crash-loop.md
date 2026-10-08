@@ -67,17 +67,23 @@ and the 2026-08-27 update in
 `docs/solutions/architecture-patterns/over-subscription-refuses-cleanly-it-does-not-fail-to-launch.md`.
 
 ## Prevention
-- **Pre-flight the floor before any `keys new --apply`.** The new consumer count and `perConsumerMax`
-  are known; read `BGW_MAX_SESSIONS` from the env file and refuse (or warn loudly) when the mint
-  would push the count past `(MAX_SESSIONS − 1) / perConsumerMax`. This is the real product gap —
-  `keysNew` should not be able to stage a config that the boot guard will reject.
+- ✅ **DONE — `keys new` pre-flights the floor before staging anything** (VIL-133, PR #157). It has bash
+  source the env file the way `launch-http.sh` does, then applies boot's own parser, defaults and rule
+  (`positiveIntOr`, `DEFAULT_GATEWAY_CONFIG`, `poolSizingError`). The file runs unmodified, exactly as the
+  launcher runs it when no sizing variable is inherited; if the operator's shell already sets one, the
+  check reports "unchecked" instead of guessing. A breach computed from that run is refused with nothing
+  written. A sizing variable the file leaves unset, or a file it cannot evaluate, gets a warning and is
+  left to the boot check (below). Other inherited variables resolve from the operator's shell, which can
+  differ from the deploy's; the boot check covers that difference too.
+  It is advisory by design: seven review rounds showed that predicting another process's environment from
+  here never fully converges, so the boot check stays the one authority.
 - ✅ **DONE — `keys --apply` runs a pre-swap smoke** (PR #26, merged 2026-06-23). `preswapSmoke()`
-  runs before the re-create — `src/cli/keys.ts:148`, inside `applyRecreate`. A malformed env or
+  (in `src/cli/keys.ts`, called from `applyRecreate`) runs before the re-create. A malformed env or
   manifest, including an undersized `BGW_MAX_SESSIONS` floor, aborts the apply with the live
   container untouched.
-  **Caveat 1 — the smoke is conditional on `smokeCmd` being configured.** With it unset the apply
-  warns loudly and proceeds unsmoked (`src/cli/keys.ts:105-109`), which is the pre-#26 behaviour. An
-  operator config without `smokeCmd` still carries the exposure this doc describes.
+  ~~Caveat 1 — the smoke is conditional on `smokeCmd` being configured.~~ **Closed by VIL-133 (PR #157):**
+  `--apply` (for `keys new` and `keys revoke`) now refuses before anything is staged unless both `applyCmd`
+  and `smokeCmd` are configured, so every apply-driven re-create runs the boot check first.
   ⚠️ **Caveat 2 — CORRECTION 2026-08-27. This doc used to call `scripts/deploy/preswap-smoke.sh`
   "the single source of truth … shared by the CD wrapper and `--apply`". That was never true in
   production.** The CD deploy ran an *inline* copy of the smoke inside the host's `deploy-on-host.sh`
