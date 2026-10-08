@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 // would hand bash a nonexistent script (MergeWren on #158).
 const SCRIPT = fileURLToPath(new URL("../scripts/run-gate.sh", import.meta.url));
 
-function stubs({ context = "colima", probeOk = true }) {
+function stubs({ context = "colima", probeOk = true, probeError = "[FATAL tini (1)] PR_SET_CHILD_SUBREAPER is unavailable on this platform." }) {
   const dir = mkdtempSync(join(tmpdir(), "run-gate-"));
   const log = join(dir, "calls.log");
   writeFileSync(
@@ -27,7 +27,7 @@ echo "docker $*" >> "${log}"
 if [ "$1 $2" = "context show" ]; then echo "${context}"; exit 0; fi
 case "$*" in
   *"--entrypoint /usr/bin/tini"*)
-    ${probeOk ? "exit 0" : `echo "[FATAL tini (1)] PR_SET_CHILD_SUBREAPER is unavailable on this platform." >&2; exit 1`} ;;
+    ${probeOk ? "exit 0" : `echo "${probeError}" >&2; exit 1`} ;;
 esac
 exit 0
 `,
@@ -47,7 +47,8 @@ test("the image's tini -s cannot start as amd64 (QEMU fallback): refuses with ex
   const s = stubs({ probeOk: false });
   const r = run(s);
   assert.equal(r.status, 3);
-  assert.match(r.stderr, /REFUSING — the image's own `tini -s` cannot start as linux\/amd64/);
+  assert.match(r.stderr, /REFUSING — the start-up probe/);
+  assert.match(r.stderr, /refuses PR_SET_CHILD_SUBREAPER \(QEMU user-mode\)/);
   assert.match(r.stderr, /PR_SET_CHILD_SUBREAPER/, "the probe's own output is shown");
   assert.match(r.stderr, /colima stop && colima start/, "on Colima, the fix is named");
   assert.ok(s.calls().includes(probeCall), "the probe ran");
@@ -81,4 +82,13 @@ test("missing arguments print usage and exit 2", () => {
   const r = run(s, ["only-an-image"]);
   assert.equal(r.status, 2);
   assert.match(r.stderr, /usage/);
+});
+
+test("a probe that fails for another reason (missing image) refuses WITHOUT the QEMU/Colima diagnosis", () => {
+  const s = stubs({ probeOk: false, probeError: "Unable to find image 'browse-gateway:dev' locally" });
+  const r = run(s);
+  assert.equal(r.status, 3, "still fail closed");
+  assert.match(r.stderr, /could not run at all/);
+  assert.doesNotMatch(r.stderr, /QEMU|colima stop/, "no translator advice for an unrelated failure");
+  assert.ok(!s.calls().includes(gateCall));
 });

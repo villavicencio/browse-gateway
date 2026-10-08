@@ -27,13 +27,21 @@ shift 2
 
 if ! probe=$(docker run --rm --platform linux/amd64 --entrypoint /usr/bin/tini "$image" -s -- true 2>&1); then
   {
-    echo "run-gate: REFUSING — the image's own \`tini -s\` cannot start as linux/amd64 on this machine,"
-    echo "run-gate: so every gate would die at startup and look like a broken image."
+    echo "run-gate: REFUSING — the start-up probe (the image's own \`tini -s\` as linux/amd64) failed."
     echo "run-gate: probe output: ${probe:-<none>}"
-    if [ "$(docker context show 2>/dev/null || true)" = "colima" ]; then
-      echo "run-gate: Colima: amd64 is probably running through QEMU, not Rosetta. Fix: colima stop && colima start"
-      echo "run-gate: then check: colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta   (expect: enabled)"
-    fi
+    # Diagnose only what the output proves (MergeWren on #158): the QEMU-fallback advice is for tini's own
+    # PR_SET_CHILD_SUBREAPER refusal, not for a missing image, a stopped daemon or any other failure.
+    case "$probe" in
+      *PR_SET_CHILD_SUBREAPER*)
+        echo "run-gate: amd64 is running through a translator that refuses PR_SET_CHILD_SUBREAPER (QEMU user-mode),"
+        echo "run-gate: so every gate would die at startup and look like a broken image."
+        if [ "$(docker context show 2>/dev/null || true)" = "colima" ]; then
+          echo "run-gate: Colima: Rosetta is probably not attached. Fix: colima stop && colima start"
+          echo "run-gate: then check: colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta   (expect: enabled)"
+        fi ;;
+      *)
+        echo "run-gate: the probe could not run at all (is the image built and the docker daemon up?)." ;;
+    esac
   } >&2
   exit 3
 fi
