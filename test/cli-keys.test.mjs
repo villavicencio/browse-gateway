@@ -513,4 +513,12 @@ test("envLineCode follows bash's comment rules", async () => {
   assert.deepEqual(envLineCode("# whole"), { code: "", openQuote: false });
   assert.deepEqual(envLineCode('A="open'), { code: 'A="open', openQuote: true });
   assert.deepEqual(envLineCode("A=\\# not a comment"), { code: "A=\\# not a comment", openQuote: false });
+  // An escaped space is part of the word, so the # after it is data, not a comment (MergeWren on #157).
+  assert.deepEqual(envLineCode("A=x\\ #y; unset B"), { code: "A=x\\ #y; unset B", openQuote: false });
+  assert.deepEqual(envLineCode("A=x \\#y"), { code: "A=x \\#y", openQuote: false });
+});
+
+test("an escaped space before # does not start a comment, so a later command is still caught", async () => {
+  const { poolFloorPreflight } = await import("../dist/cli/keys.js");
+  assert.match(poolFloorPreflight(1, `${BOTH}X=a\\ #b; unset BGW_MAX_SESSIONS\n`), /another line changes or reads it/);
 });

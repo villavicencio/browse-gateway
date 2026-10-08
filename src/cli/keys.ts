@@ -122,6 +122,10 @@ export function envFileValue(envText: string, key: string): string | undefined {
  */
 export function envLineCode(line: string): { code: string; openQuote: boolean } {
   let quote: "'" | '"' | null = null;
+  // Whether the previous character is UNESCAPED whitespace outside quotes: only then can a `#` start a
+  // comment. An escaped space (`A=x\\ #y`) is part of the word, so the `#` after it is data
+  // (MergeWren on #157).
+  let atWordStart = true;
   for (let i = 0; i < line.length; i++) {
     const c = line[i]!;
     if (quote === "'") {
@@ -130,14 +134,16 @@ export function envLineCode(line: string): { code: string; openQuote: boolean } 
     }
     if (c === "\\") {
       i++;
+      atWordStart = false;
       continue;
     }
     if (quote === '"') {
       if (c === '"') quote = null;
       continue;
     }
+    if (c === "#" && atWordStart) return { code: line.slice(0, i), openQuote: false };
     if (c === "'" || c === '"') quote = c;
-    else if (c === "#" && (i === 0 || line[i - 1] === " " || line[i - 1] === "\t")) return { code: line.slice(0, i), openQuote: false };
+    atWordStart = c === " " || c === "\t";
   }
   return { code: line, openQuote: quote !== null };
 }
