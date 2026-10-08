@@ -112,13 +112,65 @@ export const MAX_WATCHED_LAUNCHES = 32;
 
 export type SessionManagerErrorCode = "SESSION_LIMIT" | "CORE_LAUNCH";
 
+/**
+ * VIL-110: WHY a session could not be had, as a closed machine-readable vocabulary. `code` stays the
+ * coarse two-value split it always was; `kind` is the distinction a consumer's next move depends on:
+ *  - `launch-failed`        — the core factory threw synchronously, or its launch promise rejected. Investigate.
+ *                             (Not sub-classified: both mean "the browser did not come up", and the
+ *                             human message distinguishes them for an operator.)
+ *  - `launch-timeout`       — the launch ran past its deadline. Likely contention.
+ *  - `at-capacity-global`   — the global pool is full. Back off.
+ *  - `at-capacity-consumer` — this consumer is at its per-consumer cap (drive path only: retrieve supplies
+ *                             no consumer id, so it can never see this kind). Back off.
+ *  - `shutting-down`        — this instance is draining. Do NOT retry against it.
+ * Exported as an array so a test can enumerate it from `dist/`.
+ */
+export const SESSION_FAILURE_KINDS = [
+  "launch-failed",
+  "launch-timeout",
+  "at-capacity-global",
+  "at-capacity-consumer",
+  "shutting-down",
+] as const;
+export type SessionFailureKind = (typeof SESSION_FAILURE_KINDS)[number];
+
 export class SessionManagerError extends Error {
   readonly code: SessionManagerErrorCode;
-  constructor(code: SessionManagerErrorCode, message: string, options?: ErrorOptions) {
+  /** VIL-110. Optional and carried in `options`, so the exported `(code, message, options?)` constructor
+   *  keeps its original signature (MergeWren on #161); every raise site in this module sets it. */
+  readonly kind: SessionFailureKind | undefined;
+  constructor(code: SessionManagerErrorCode, message: string, options?: ErrorOptions & { kind?: SessionFailureKind }) {
     super(message, options);
     this.name = "SessionManagerError";
     this.code = code;
+    this.kind = options?.kind;
   }
+}
+
+const SESSION_FAILURE_KIND = "sessionFailureKind";
+
+/**
+ * The {@link SessionFailureKind} an error carries — directly (a {@link SessionManagerError}) or across a
+ * re-wrap ({@link carrySessionFailureKind}). Never recovered from message text: the whole point of the
+ * field is that nothing downstream has to parse prose to tell "you asked for too much" from "the browser
+ * died".
+ */
+export function sessionFailureKindOf(err: unknown): SessionFailureKind | undefined {
+  if (err instanceof SessionManagerError && err.kind !== undefined) return err.kind;
+  if (typeof err !== "object" || err === null) return undefined;
+  const k = (err as Record<string, unknown>)[SESSION_FAILURE_KIND];
+  return typeof k === "string" && (SESSION_FAILURE_KINDS as readonly string[]).includes(k) ? (k as SessionFailureKind) : undefined;
+}
+
+/**
+ * Carry `from`'s session-failure kind onto `to` (a fresh, redacted re-wrap). Non-enumerable, like
+ * `attachFailure`'s envelope, so it never leaks into a JSON dump of the error. A no-op when `from`
+ * carries no kind. Returns `to` so a call site can `throw carrySessionFailureKind(new Error(…), err)`.
+ */
+export function carrySessionFailureKind<E extends Error>(to: E, from: unknown): E {
+  const kind = sessionFailureKindOf(from);
+  if (kind !== undefined) Object.defineProperty(to, SESSION_FAILURE_KIND, { value: kind, enumerable: false });
+  return to;
 }
 
 export interface SessionManagerOptions {
@@ -302,23 +354,17 @@ export class SessionManager {
     // Refuse once shutdown has begun, so a replacement can't be admitted while shutdown() drains in-flight
     // teardowns/launches (issue #50). Reuses SESSION_LIMIT — a shutdown is a "can't acquire now".
     if (this.#shuttingDown) {
-      throw new SessionManagerError("SESSION_LIMIT", "session manager is shutting down");
+      throw new SessionManagerError("SESSION_LIMIT", "session manager is shutting down", { kind: "shutting-down" });
     }
     // #54 Part 2: gate on activeCount (registered + live orphans), not #sessions alone — a wedged/late
     // orphan holds real RSS/pids, so admitting a replacement on top of it would let live browsers exceed
     // the cap the resource control exists for. Truthful back-pressure: the orphan drains (bounded sweep /
     // teardown), then capacity frees.
     if (this.activeCount + this.#reserved >= this.#maxSessions) {
-      throw new SessionManagerError(
-        "SESSION_LIMIT",
-        `session limit reached (${this.#maxSessions})`,
-      );
+      throw new SessionManagerError("SESSION_LIMIT", `session limit reached (${this.#maxSessions})`, { kind: "at-capacity-global" });
     }
     if (meta?.consumerId && this.#countForConsumer(meta.consumerId) >= this.#perConsumerMax) {
-      throw new SessionManagerError(
-        "SESSION_LIMIT",
-        `per-consumer session limit reached (${this.#perConsumerMax})`,
-      );
+      throw new SessionManagerError("SESSION_LIMIT", `per-consumer session limit reached (${this.#perConsumerMax})`, { kind: "at-capacity-consumer" });
     }
     this.#reserved++;
     if (meta?.consumerId) {
@@ -398,7 +444,9 @@ export class SessionManager {
       if (ownedDir !== undefined) {
         this.#enqueueOrphan({ dir: ownedDir, settled: true, ...(meta?.consumerId ? { consumerId: meta.consumerId } : {}) });
       }
-      throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause });
+      // VIL-110: distinct prose from the rejection path below (they used to be byte-identical); the
+      // shared prefix is kept because measurement scripts classify on it.
+      throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch (the core factory threw)", { cause, kind: "launch-failed" });
     }
     const deadline = deadlineTimer(this.#launchDeadlineMs);
     const outcome = await Promise.race([
@@ -417,7 +465,7 @@ export class SessionManager {
       if (ownedDir !== undefined) {
         this.#enqueueOrphan({ dir: ownedDir, settled: true, ...(meta?.consumerId ? { consumerId: meta.consumerId } : {}) });
       }
-      throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch", { cause: outcome.cause });
+      throw new SessionManagerError("CORE_LAUNCH", "browser core failed to launch (the launch was rejected)", { cause: outcome.cause, kind: "launch-failed" });
     }
     if (outcome.kind === "timeout") {
       // The deadline won and the reserved slot is released (acquire's `finally`). The launch becomes a
@@ -456,10 +504,7 @@ export class SessionManager {
           void this.#sweepOrphan(rec);
         },
       );
-      throw new SessionManagerError(
-        "CORE_LAUNCH",
-        `browser core launch exceeded ${this.#launchDeadlineMs}ms deadline`,
-      );
+      throw new SessionManagerError("CORE_LAUNCH", `browser core launch exceeded ${this.#launchDeadlineMs}ms deadline`, { kind: "launch-timeout" });
     }
     const core = outcome.core;
     if (this.#shuttingDown) {
@@ -476,7 +521,7 @@ export class SessionManager {
       } catch {
         this.#unconfirmed.add(orphan); // rec stays counted; the reconfirm drain finalizes it
       }
-      throw new SessionManagerError("SESSION_LIMIT", "session manager is shutting down");
+      throw new SessionManagerError("SESSION_LIMIT", "session manager is shutting down", { kind: "shutting-down" });
     }
     const session = new Session(core, meta?.consumerId ? { consumerId: meta.consumerId } : {});
     if (ownedDir !== undefined) this.#ownedDirs.set(session, ownedDir);

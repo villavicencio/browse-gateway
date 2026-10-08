@@ -16,6 +16,7 @@ import { isHttpUrl, redactSecrets, canonicalizeHost } from "../security/index.js
 import type { SecretStore } from "../security/index.js";
 import type { Gateway, Session } from "../gateway/index.js";
 import { DEFAULT_CALL_TIMEOUTS } from "../gateway/index.js";
+import { rewrapRedacted } from "./redact-rewrap.js";
 import type { CallTimeouts } from "../gateway/index.js";
 import { DIAGNOSTICS_EGRESS_HOSTS } from "../policy/index.js";
 import type { BrowserCoreOptions, DriveTarget, PageSnapshot, RenderOptions, WaitCondition } from "../browser/index.js";
@@ -762,17 +763,17 @@ export class GatewayDriveController implements DriveController {
    * propagates — the open-path analogue of {@link #run} (which already redacts the drive/use path). The
    * open path (browser launch + warm-cookie restore + proxy connect) can surface a secret in a raw
    * throw; redacting HERE means coverage no longer hangs on the session-manager's static CORE_LAUNCH
-   * re-wrap holding (audit #2). A plain re-wrap matches #run — no caller branches on the open error's
-   * type/code (SessionManagerError is only produced, never inspected; EscalationError is thrown at the
-   * navigate/escalation layer, never by openConsumerSession). The `#verifyEgress` probe opens directly:
+   * re-wrap holding (audit #2). The re-wrap carries the session-failure KIND across (VIL-110): the MCP
+   * layer reads it to tell a capacity refusal from a launch failure from a shutdown, so flattening to a
+   * plain Error here would erase exactly that (EscalationError is thrown at the navigate/escalation
+   * layer, never by openConsumerSession). The `#verifyEgress` probe opens directly:
    * it already swallows every error to `{ kind: "unknown" }`, so it has no surface to redact.
    */
   async #openConsumerSession(override: BrowserCoreOptions | undefined): Promise<string> {
     try {
       return await this.#gateway.openConsumerSession(this.#token, override);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(redactSecrets(message, this.#secrets));
+      throw rewrapRedacted(err, this.#secrets);
     }
   }
 
@@ -1286,12 +1287,11 @@ export class GatewayDriveController implements DriveController {
     } catch (err) {
       // Session reaped/closed out from under us -> reset so the next navigate transparently reopens.
       if (!this.#gateway.sessions.get(handle)) this.#handle = undefined;
-      const message = err instanceof Error ? err.message : String(err);
       // Preserve a failure envelope (issue #39) across the redaction re-wrap: an action that landed on a
       // blocked page throws `attachFailure(...)` INSIDE this #run turn (see #actAndSnap), and the fresh
       // Error below would otherwise drop the non-enumerable `.failure`. The envelope was already redacted
       // at #failure(), so re-attaching it is secret-safe.
-      throw attachFailure(new Error(redactSecrets(message, this.#secrets)), failureOf(err));
+      throw attachFailure(rewrapRedacted(err, this.#secrets), failureOf(err));
     }
   }
 }

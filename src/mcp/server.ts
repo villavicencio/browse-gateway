@@ -14,6 +14,7 @@ import type { FailureDiagnostics, Timing } from "../observability/index.js";
 import type { ArtifactOutcome, ArtifactResponseLease } from "../artifacts/index.js";
 import type { SearchFn, SearchFailureClass, SearchResponse } from "../search/index.js";
 import { SearchAttemptsError } from "../search/index.js";
+import { sessionFailureKindOf } from "../gateway/session-manager.js";
 import { getArtifactLeaseTracker } from "./http-request-context.js";
 import { ARTIFACT_TOOL_NAME } from "./http-response-lease.js";
 import { resolveGatewayVersion } from "./version.js";
@@ -26,6 +27,19 @@ import { resolveGatewayVersion } from "./version.js";
  * the client verbatim.
  */
 export const ERROR_KIND_META_KEY = "browse-gateway/error-kind";
+/**
+ * VIL-110: the session-acquisition cause, as its OWN additive `_meta` key beside {@link ERROR_KIND_META_KEY}
+ * — set only when a session could not be had, to one of `SESSION_FAILURE_KINDS` (`launch-failed`,
+ * `launch-timeout`, `at-capacity-global`, `at-capacity-consumer`, `shutting-down`).
+ *
+ * WIRE-SHAPE DECISION: an ADDITIVE key, not a third {@link ErrorKind} value. A client that switches
+ * exhaustively on the two existing kinds (the out-of-repo circuit breaker described above is one) keeps
+ * working unchanged; these errors still read `internal` there. The cost is that "healthy but full" is
+ * still labelled `internal` on the coarse key — a third `ErrorKind` value (e.g. `at-capacity`) would
+ * fix that, but it is a breaking change and needs the breaker updated in the same window, which is an
+ * operator decision, not one this key makes.
+ */
+export const SESSION_FAILURE_META_KEY = "browse-gateway/session-failure";
 
 /**
  * The kind tag on a tool error (issue #47), keyed by {@link ERROR_KIND_META_KEY}:
@@ -47,6 +61,12 @@ export const ERROR_KIND_META_KEY = "browse-gateway/error-kind";
 export type ErrorKind = "in-band" | "internal";
 
 const errorKindMeta = (kind: ErrorKind) => ({ [ERROR_KIND_META_KEY]: kind });
+
+/** `errorKindMeta` plus the session-failure kind when `err` carries one (VIL-110). */
+const errorMeta = (kind: ErrorKind, err: unknown) => {
+  const sessionFailure = sessionFailureKindOf(err);
+  return sessionFailure ? { ...errorKindMeta(kind), [SESSION_FAILURE_META_KEY]: sessionFailure } : errorKindMeta(kind);
+};
 
 /**
  * Task 2 §3.5 — the ONE external shape every `browser_get_artifact` denial collapses to before a
@@ -410,7 +430,8 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
           isError: true,
           // #47: the retrieve call threw — the gateway responded but a sub-op errored (alive, not a
           // transport failure). Typed `internal` so a breaker can distinguish it from an in-band block.
-          _meta: errorKindMeta("internal"),
+          // VIL-110: plus the session-failure kind when the throw was a refused/failed session.
+          _meta: errorMeta("internal", err),
           content: [{ type: "text", text: `browse-gateway error: ${sanitizeUrlsInErrorText(message)}` }],
         };
       }
@@ -521,7 +542,7 @@ export function createGatewayMcpServer(deps: GatewayMcpDeps): McpServer {
       // action error (locator timeout, enveloped but unclassified) OR a config EscalationError (force-proxy
       // with no proxy available, thrown with no envelope) correctly stays `internal`.
       const kind: ErrorKind = failure?.failureClass ? "in-band" : "internal";
-      return { isError: true as const, _meta: errorKindMeta(kind), content: [{ type: "text" as const, text }] };
+      return { isError: true as const, _meta: errorMeta(kind, err), content: [{ type: "text" as const, text }] };
     };
     const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
     const snap = async (run: () => Promise<PageSnapshot>) => {
