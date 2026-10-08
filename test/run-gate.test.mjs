@@ -49,8 +49,9 @@ function run(stub, args = ["browse-gateway:dev", "validate-http.mjs"]) {
 
 const probeCall = "docker run --rm --platform linux/amd64 --entrypoint /usr/bin/tini browse-gateway:dev -s -- true";
 const gateCall = "docker run --rm --platform linux/amd64 --shm-size=1g --init browse-gateway:dev node scripts/validate-http.mjs";
-/** Any `docker run` other than the probe: a refusal must start NO such container, whatever its args. */
-const nonProbeRuns = (calls) => calls.filter((c) => c.startsWith("docker run") && !c.includes("--entrypoint /usr/bin/tini"));
+/** Every `docker run` the script made. A refusal must have made exactly one: the probe itself, nothing else,
+ *  with no substring filter that a probe-like extra run could slip through (MergeWren on #158). */
+const runs = (calls) => calls.filter((c) => c.startsWith("docker run"));
 
 test("the image's tini -s cannot start as amd64 (QEMU fallback): refuses with exit 3 and never starts the gate", () => {
   const s = stubs({ probeOk: false });
@@ -58,11 +59,11 @@ test("the image's tini -s cannot start as amd64 (QEMU fallback): refuses with ex
   assert.equal(r.status, 3);
   assert.match(r.stderr, /REFUSING — the start-up probe/);
   assert.match(r.stderr, /amd64 refuses PR_SET_CHILD_SUBREAPER here/);
-  assert.match(r.stderr, /known cause is amd64 running through QEMU user-mode/, "named as the likely cause, not asserted");
+  assert.match(r.stderr, /One known cause \(not established by this probe\)/, "named as a possible cause, not asserted");
   assert.match(r.stderr, /PR_SET_CHILD_SUBREAPER/, "the probe's own output is shown");
   assert.match(r.stderr, /Likely fix: colima stop && colima start/, "on Colima, the likely fix is named");
   assert.ok(s.calls().includes(probeCall), "the probe ran");
-  assert.deepEqual(nonProbeRuns(s.calls()), [], "no container other than the probe may start");
+  assert.deepEqual(runs(s.calls()), [probeCall], "the probe is the only container started");
 });
 
 test("the probe succeeds: the gate runs with the documented flags, after the probe", () => {
@@ -78,7 +79,7 @@ test("the guard does not depend on the runtime: a failing probe refuses on a non
   const r = run(s);
   assert.equal(r.status, 3);
   assert.doesNotMatch(r.stderr, /colima stop/, "the Colima-specific hint only appears on Colima");
-  assert.deepEqual(nonProbeRuns(s.calls()), []);
+  assert.deepEqual(runs(s.calls()), [probeCall]);
 });
 
 test("extra docker args are passed through to the gate, before the image", () => {
@@ -100,7 +101,7 @@ test("a probe that fails for another reason (missing image) refuses WITHOUT the 
   assert.equal(r.status, 3, "still fail closed");
   assert.match(r.stderr, /could not run at all/);
   assert.doesNotMatch(r.stderr, /QEMU|colima stop/, "no translator advice for an unrelated failure");
-  assert.deepEqual(nonProbeRuns(s.calls()), []);
+  assert.deepEqual(runs(s.calls()), [probeCall]);
 });
 
 test("the QEMU diagnosis needs tini's own fatal line, not the word anywhere in Docker's output", () => {
