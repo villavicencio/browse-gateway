@@ -83,65 +83,48 @@ async function readProdFiles(deps: ProdFilesDeps): Promise<ProdFiles> {
 }
 
 /**
- * VIL-133: the two pool-sizing values EXACTLY as the launcher will see them, by letting bash evaluate the
- * env file the way `launch-http.sh` does: `set -euo pipefail`, then `set -a; . file`. It runs in a clean
- * `env -i` subshell, so the caller's own environment cannot leak in, over the same shell the CLI already
- * uses to read and write that file.
+ * VIL-133: the two pool-sizing values as the launcher will see them, by letting bash evaluate the env file
+ * the way `launch-http.sh` does: `set -euo pipefail`, then `set -a; . file`, ONCE, over the same shell the
+ * CLI already uses to read and write that file.
  *
  * Why bash and not a parser: every hand-written reader of this file missed some bash rule (inline
- * comments, quoted `#`, escaped spaces, `;#`, conditionals, `unset`, `+=`, ...), and each miss was a way
- * to UNDERSTATE the floor and stage a crash-loop (CodeRabbit and MergeWren on #157). Bash cannot disagree
- * with itself. The launcher already executes this file on every deploy as the same account, so evaluating
- * it here adds no trust the deploy path does not already extend.
+ * comments, quoted `#`, escaped spaces, `;#`, dead branches, `unset`, `+=`, ...), and each miss was a way
+ * to UNDERSTATE the floor (CodeRabbit and MergeWren on #157). Bash cannot disagree with itself. The
+ * launcher already executes this file on every deploy as the same account, so evaluating it here adds no
+ * trust the deploy path does not already extend.
+ *
+ * Like the launcher, the evaluation INHERITS its shell's environment (MergeWren on #157: a cleared
+ * environment disagrees with it), except that both sizing variables enter as sentinels. A sentinel that
+ * survives sourcing means the FILE did not settle the value (unset, or `${BGW_MAX_SESSIONS:-7}`-style
+ * defaulting to whatever the launcher inherits), which this check cannot see, so the pre-flight refuses.
+ * Other inherited variables (`${CAP:-7}`) are read from this shell, the operator's session on the host;
+ * where that differs from the deploy's own environment, the boot check in the pre-swap smoke (real
+ * launcher, real env file) still refuses before any swap, so a misread here is a later refusal, never a
+ * crash-loop.
  *
  * The launcher forwards every shell variable named `BGW_*` (`compgen -v`, exported or not), so a plain
- * shell variable is exactly what it sends. Returns each value as bash leaves it (`null` when the file
- * leaves it unset), or `{ error }` when sourcing fails: under the launcher's `set -eu` that same file
- * would abort the launch.
+ * shell variable is exactly what it sends. The file's own output is discarded, never echoed: it holds
+ * every consumer's token. Returns each value (`null` when the file leaves it to the environment), or
+ * `{ error }` when sourcing fails, as it would abort the launch under `set -eu`.
  */
 export async function resolveEnvSizing(
   shell: Pick<RemoteShell, "run">,
   envFilePath: string,
 ): Promise<{ maxSessions: string | null; perConsumerMax: string | null } | { error: string }> {
-  const unset = "__bgw_unset__";
+  const sentinel = "__bgw_inherited__";
   const body =
     `set -euo pipefail; set -a; . "$1" >/dev/null 2>&1; ` +
-    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${unset}}" "\${BGW_PER_CONSUMER_MAX-${unset}}"`;
-  const evaluate = async (envPrefix: string) => {
-    const r = await shell.run(`${envPrefix} bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`);
-    if (r.code !== 0) return { code: r.code };
-    const out = r.stdout.split("\n");
-    // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
-    // holds a newline).
-    if (out.length !== 3 || out[2] !== "") return { code: 0, unreadable: true };
-    const value = (v: string): string | null => (v === unset ? null : v);
-    return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
-  };
-
-  // 1. The file on its own, in a clean environment: what it sets.
-  const clean = await evaluate(`env -i HOME="$HOME" PATH="$PATH"`);
-  if ("code" in clean) {
-    return {
-      error:
-        "unreadable" in clean
-          ? "the values could not be read back after sourcing it"
-          : `sourcing it the way the launcher does fails (exit ${clean.code}), so the launch would abort too`,
-    };
-  }
-  if (clean.maxSessions === null || clean.perConsumerMax === null) return clean;
-
-  // 2. The launcher does NOT run clean: it inherits its caller's environment before sourcing the file
-  // (MergeWren on #157), so `BGW_MAX_SESSIONS=${BGW_MAX_SESSIONS:-7}` or `${CAP:-7}` would give the
-  // gateway a value step 1 never saw. Evaluate again with this shell's own environment plus sentinel
-  // values for both sizing variables; any difference means the result depends on an environment this
-  // check cannot see, so refuse. Limit: a variable set only in the deploy's environment, and in neither
-  // of these, is not detected.
-  const sentinel = "__bgw_inherited__";
-  const inherited = await evaluate(`BGW_MAX_SESSIONS=${sentinel} BGW_PER_CONSUMER_MAX=${sentinel}`);
-  if ("code" in inherited || inherited.maxSessions !== clean.maxSessions || inherited.perConsumerMax !== clean.perConsumerMax) {
-    return { error: "its sizing values depend on the environment the launcher inherits, which this check cannot see" };
-  }
-  return clean;
+    `builtin printf "%s\\n%s\\n" "\${BGW_MAX_SESSIONS-${sentinel}}" "\${BGW_PER_CONSUMER_MAX-${sentinel}}"`;
+  const r = await shell.run(
+    `BGW_MAX_SESSIONS=${sentinel} BGW_PER_CONSUMER_MAX=${sentinel} bash -c ${shQuote(body)} _ ${shQuote(envFilePath)}`,
+  );
+  if (r.code !== 0) return { error: `sourcing it the way the launcher does fails (exit ${r.code}), so the launch would abort too` };
+  const out = r.stdout.split("\n");
+  // Exactly two lines back, or the file did something this read cannot trust (exited early, or a value
+  // holds a newline).
+  if (out.length !== 3 || out[2] !== "") return { error: "the values could not be read back after sourcing it" };
+  const value = (v: string): string | null => (v.includes(sentinel) ? null : v);
+  return { maxSessions: value(out[0]!), perConsumerMax: value(out[1]!) };
 }
 
 /**
@@ -172,7 +155,7 @@ export function poolFloorPreflight(
   }
   const parsed: Record<string, number> = {};
   for (const [key, raw] of [["BGW_MAX_SESSIONS", sizing.maxSessions], ["BGW_PER_CONSUMER_MAX", sizing.perConsumerMax]] as const) {
-    if (raw === null) return refuse(key, "it is not set in the file");
+    if (raw === null) return refuse(key, "the file does not set it itself, so its value depends on the environment the launcher inherits");
     const n = positiveIntOr(raw, Number.NaN);
     if (Number.isNaN(n)) return refuse(key, "the gateway would reject this value and use its default");
     parsed[key] = n;
