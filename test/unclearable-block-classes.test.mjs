@@ -294,8 +294,9 @@ test("shouldEscalateDrive: a 429 snapshot does not escalate; a 403 snapshot does
   assert.equal(shouldEscalateDrive(snap(404, { cfHint: true })), false, "nor a hint-only CF 404");
   // ...but a LIVE challenge on those statuses still does, and a hint-only interstitial elsewhere still does.
   assert.equal(shouldEscalateDrive(snap(429, { title: "Just a moment...", cfHint: true })), true, "a live CF challenge on a 429 still escalates");
-  assert.equal(shouldEscalateDrive(snap(403, { cfHint: true })), true, "a hint-only CF interstitial on a 403 still escalates");
-  assert.equal(shouldEscalateDrive(snap(503, { cfHint: true })), true, "and on a 503");
+  // Isolate the CF arm: a 200 is outside the hard-block arm, so only the hint can escalate it (MergeWren #163).
+  assert.equal(shouldEscalateDrive(snap(200, { cfHint: true })), true, "a hint-only CF interstitial on a 200 still escalates");
+  assert.equal(shouldEscalateDrive(snap(200)), false, "and without the hint it does not — the hint is what escalates it");
 });
 
 // --- VIL-137 item 2: retrieve's entry gate, same rule ------------------------------------------------
@@ -320,14 +321,23 @@ test("CONTROL: a LIVE CF challenge on a 429 still escalates to a proxied session
   assert.equal(r.proxyUsed, true);
 });
 
-test("CONTROL: a hint-only CF interstitial on a 403 (no visible phrase) still escalates", async () => {
+test("CONTROL: a hint-only CF interstitial (no visible phrase) on a non-error status still escalates — via the CF arm alone", async () => {
+  // MergeWren on #163: a thin 403 escalates through the HARD-BLOCK arm whatever the marker says, so a 403
+  // control could not show the CF arm survived. A 200 is outside the hard-block arm (it needs >= 400), so
+  // only the CF hint can make this escalate.
   const { gateway, proxiedCalls } = makeFakeGateway([
-    renderOf({ status: 403, title: "", text: "", html: `<html>${CF_MARKER}</html>` }),
+    renderOf({ status: 200, title: "", text: "", html: `<html>${CF_MARKER}</html>` }),
     renderOf({ status: 200, title: "ok", text: FAT, html: `<html>${FAT}</html>` }),
   ]);
   const r = await run(gateway);
   assert.equal(proxiedCalls().length >= 1, true, "the documented hint-only interstitial path is kept");
   assert.equal(r.proxyUsed, true);
+});
+
+test("CONTROL: the same CF-hinted 200 WITHOUT the marker does not escalate (the hint is what does it)", async () => {
+  const { gateway, proxiedCalls } = makeFakeGateway([renderOf({ status: 200, title: "", text: "", html: "<html></html>" })]);
+  await run(gateway);
+  assert.equal(proxiedCalls().length, 0);
 });
 
 // --- every surface over the vocabulary -------------------------------------------------------------
