@@ -948,7 +948,10 @@ test("kill(): raises its closing fence before invalidation can re-enter with a s
 test("closeActivePage(): raises a page fence before invalidation can re-enter on that page", async () => {
   const context = fakeContext({ duringGoto: (emit) => emit("download", disposableDownload()) });
   const sink = operationFactory({ stage: () => new Promise(() => {}) });
-  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 100 });
+  // VIL-140: the settle bound must NOT elapse before closeActivePage() runs — if it does, navigate's own
+  // settle invalidates the operation outside the page fence and the re-entry sees a different error.
+  // 100 ms of real clock lost that race under the full parallel suite; nothing here waits on the bound.
+  const core = coreWith(context, { captureEnabled: true, captureSettleTimeoutMs: 10_000 });
   const current = sink.make();
   const successor = sink.make();
   let reentry;
@@ -2291,7 +2294,11 @@ test("a hung cancel() does not prevent delete(), and the disposal reaches a BOUN
     cancel() { attempted.push("cancel"); return new Promise(() => {}); },   // never settles
     async delete() { attempted.push("delete"); },
   };
-  const { context, sink, core } = coreWithLateEvent(late, { captureSettleTimeoutMs: 25 });
+  // VIL-140: the bound is real-clock by design (see `sleep` above), so it must be wide enough that the
+  // "still pending" phase below always completes inside it. 25 ms lost that race under the full parallel
+  // suite (observed: the successor saw "core is dirty" instead of "disposal pending"). 400 ms is a 16x
+  // margin over the old value; the sleep that follows waits it out.
+  const { context, sink, core } = coreWithLateEvent(late, { captureSettleTimeoutMs: 400 });
 
   await core.navigate("https://origin.test/doc", { artifactOperation: sink.make() });
   await drain();
@@ -2310,7 +2317,7 @@ test("a hung cancel() does not prevent delete(), and the disposal reaches a BOUN
   // And that pending state is BOUNDED. Once the core's own settle bound elapses the disposal is
   // unconfirmed — so the core turns dirty and stops retaining the promise and the driver object,
   // rather than staying pending forever behind a call that will never answer.
-  await sleep(120);
+  await sleep(500);
   const before = context.calls.length;
   await assert.rejects(
     core.navigate("https://origin.test/after", { artifactOperation: sink.make() }),
