@@ -34,10 +34,12 @@ if ! probe=$(docker run --rm --platform linux/amd64 --entrypoint /usr/bin/tini "
     # tini's own fatal line, not a bare substring anywhere in Docker's output (MergeWren on #158).
     case "$probe" in
       *"[FATAL tini"*"] PR_SET_CHILD_SUBREAPER is unavailable"*)
-        echo "run-gate: amd64 is running through a translator that refuses PR_SET_CHILD_SUBREAPER (QEMU user-mode),"
-        echo "run-gate: so every gate would die at startup and look like a broken image."
+        # The fatal line proves the prctl failed, not WHY (MergeWren on #158): name the known cause as a
+        # likely one, and say how to check it, rather than asserting it.
+        echo "run-gate: amd64 refuses PR_SET_CHILD_SUBREAPER here, so every gate would die at startup and look"
+        echo "run-gate: like a broken image. The known cause is amd64 running through QEMU user-mode instead of Rosetta."
         if [ "$(docker context show 2>/dev/null || true)" = "colima" ]; then
-          echo "run-gate: Colima: Rosetta is probably not attached. Fix: colima stop && colima start"
+          echo "run-gate: Colima: Rosetta may not be attached. Likely fix: colima stop && colima start"
           echo "run-gate: then check: colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta   (expect: enabled)"
         fi ;;
       *)

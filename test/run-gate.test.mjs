@@ -5,9 +5,9 @@
  * happens BEFORE the gate container is started, and lets each test decide whether the image's
  * `tini -s` probe succeeds (Rosetta) or fails (QEMU's PR_SET_CHILD_SUBREAPER refusal).
  */
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -17,8 +17,15 @@ import { fileURLToPath } from "node:url";
 // would hand bash a nonexistent script (MergeWren on #158).
 const SCRIPT = fileURLToPath(new URL("../scripts/run-gate.sh", import.meta.url));
 
+// Every stub directory is removed when the file finishes (MergeWren on #158).
+const stubDirs = [];
+after(() => {
+  for (const d of stubDirs) rmSync(d, { recursive: true, force: true });
+});
+
 function stubs({ context = "colima", probeOk = true, probeError = "[FATAL tini (1)] PR_SET_CHILD_SUBREAPER is unavailable on this platform." }) {
   const dir = mkdtempSync(join(tmpdir(), "run-gate-"));
+  stubDirs.push(dir);
   const log = join(dir, "calls.log");
   writeFileSync(
     join(dir, "docker"),
@@ -42,17 +49,20 @@ function run(stub, args = ["browse-gateway:dev", "validate-http.mjs"]) {
 
 const probeCall = "docker run --rm --platform linux/amd64 --entrypoint /usr/bin/tini browse-gateway:dev -s -- true";
 const gateCall = "docker run --rm --platform linux/amd64 --shm-size=1g --init browse-gateway:dev node scripts/validate-http.mjs";
+/** Any `docker run` other than the probe: a refusal must start NO such container, whatever its args. */
+const nonProbeRuns = (calls) => calls.filter((c) => c.startsWith("docker run") && !c.includes("--entrypoint /usr/bin/tini"));
 
 test("the image's tini -s cannot start as amd64 (QEMU fallback): refuses with exit 3 and never starts the gate", () => {
   const s = stubs({ probeOk: false });
   const r = run(s);
   assert.equal(r.status, 3);
   assert.match(r.stderr, /REFUSING — the start-up probe/);
-  assert.match(r.stderr, /refuses PR_SET_CHILD_SUBREAPER \(QEMU user-mode\)/);
+  assert.match(r.stderr, /amd64 refuses PR_SET_CHILD_SUBREAPER here/);
+  assert.match(r.stderr, /known cause is amd64 running through QEMU user-mode/, "named as the likely cause, not asserted");
   assert.match(r.stderr, /PR_SET_CHILD_SUBREAPER/, "the probe's own output is shown");
-  assert.match(r.stderr, /colima stop && colima start/, "on Colima, the fix is named");
+  assert.match(r.stderr, /Likely fix: colima stop && colima start/, "on Colima, the likely fix is named");
   assert.ok(s.calls().includes(probeCall), "the probe ran");
-  assert.ok(!s.calls().includes(gateCall), "the gate container must never start");
+  assert.deepEqual(nonProbeRuns(s.calls()), [], "no container other than the probe may start");
 });
 
 test("the probe succeeds: the gate runs with the documented flags, after the probe", () => {
@@ -68,7 +78,7 @@ test("the guard does not depend on the runtime: a failing probe refuses on a non
   const r = run(s);
   assert.equal(r.status, 3);
   assert.doesNotMatch(r.stderr, /colima stop/, "the Colima-specific hint only appears on Colima");
-  assert.ok(!s.calls().includes(gateCall));
+  assert.deepEqual(nonProbeRuns(s.calls()), []);
 });
 
 test("extra docker args are passed through to the gate, before the image", () => {
@@ -90,7 +100,7 @@ test("a probe that fails for another reason (missing image) refuses WITHOUT the 
   assert.equal(r.status, 3, "still fail closed");
   assert.match(r.stderr, /could not run at all/);
   assert.doesNotMatch(r.stderr, /QEMU|colima stop/, "no translator advice for an unrelated failure");
-  assert.ok(!s.calls().includes(gateCall));
+  assert.deepEqual(nonProbeRuns(s.calls()), []);
 });
 
 test("the QEMU diagnosis needs tini's own fatal line, not the word anywhere in Docker's output", () => {
@@ -105,6 +115,6 @@ test("both observed forms of tini's fatal line get the QEMU diagnosis (with and 
   for (const line of ["[FATAL tini (1)] PR_SET_CHILD_SUBREAPER is unavailable on this platform. Are you using Linux >= 3.4?", "[FATAL tini] PR_SET_CHILD_SUBREAPER is unavailable on this platform"]) {
     const r = run(stubs({ probeOk: false, probeError: line }));
     assert.equal(r.status, 3);
-    assert.match(r.stderr, /refuses PR_SET_CHILD_SUBREAPER \(QEMU user-mode\)/, line);
+    assert.match(r.stderr, /amd64 refuses PR_SET_CHILD_SUBREAPER here/, line);
   }
 });
