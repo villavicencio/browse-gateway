@@ -286,3 +286,80 @@ test("MCP drive: formatSnapshot surfaces a compact total line on a success snaps
   assert.equal(res.isError ?? false, false);
   assert.match(res.content[0].text, /total: 1234ms/, "the compact total line is rendered on success");
 });
+
+// --- (e) VIL-313: session open/close and page setup are named, so the stages add up -------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A fake gateway whose Nth session takes `delays[N].open` ms to open (before the callback runs) and
+ *  `delays[N].close` ms to close (after it returns), like a real launch and teardown. */
+function makeTimedGateway(results, delays) {
+  let idx = 0;
+  const gateway = {
+    async withConsumerSession(_token, fn) {
+      const i = Math.min(idx, results.length - 1);
+      idx++;
+      const { open = 0, close = 0 } = delays[Math.min(i, delays.length - 1)];
+      await sleep(open);
+      const session = {
+        core: {
+          kind: "fake",
+          async render() {
+            return renderOf(results[i]);
+          },
+          async setNavigationGuard() {},
+          async close() {},
+        },
+      };
+      const value = await fn(session, { id: "agent-1" });
+      await sleep(close);
+      return value;
+    },
+  };
+  return { gateway };
+}
+
+test("assembleTiming: the VIL-313 fields are rounded, clamped and omitted like every other stage", () => {
+  const t = assembleTiming({ totalMs: 5000.4, pageSetupMs: 1199.6, sessionAcquireMs: 3044.5, sessionReleaseMs: -1 });
+  assert.equal(t.pageSetupMs, 1200);
+  assert.equal(t.sessionAcquireMs, 3045);
+  assert.equal(t.sessionReleaseMs, 0, "a negative clock read clamps to 0");
+  assert.deepEqual(Object.keys(assembleTiming({ totalMs: 1 })), ["totalMs"], "absent VIL-313 fields are omitted, not 0");
+});
+
+test("retrieve: the session's open and close time are named, and the render's page setup carries through", async () => {
+  const { gateway } = makeTimedGateway(
+    [{ text: "x".repeat(1000), html: articleHtml, timing: { totalMs: 5, pageSetupMs: 7, domContentLoadedMs: 3 } }],
+    [{ open: 80, close: 60 }],
+  );
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://soft.example/" });
+  assert.ok(r.timing.sessionAcquireMs >= 75, `open time measured (${r.timing.sessionAcquireMs})`);
+  assert.ok(r.timing.sessionReleaseMs >= 55, `close time measured (${r.timing.sessionReleaseMs})`);
+  assert.ok(r.timing.totalMs >= r.timing.sessionAcquireMs + r.timing.sessionReleaseMs, "both fall inside the whole-call total");
+  assert.equal(r.timing.pageSetupMs, 7, "the surfaced render's page setup carries through");
+});
+
+test("retrieve: a failure's envelope carries the same session timing (single derivation)", async () => {
+  const { gateway } = makeTimedGateway([{ ...cfBlock, diagnostics: { finalUrl: "https://hard.example/", status: 403 } }], [{ open: 30, close: 20 }]);
+  const r = await retrieve(gateway, new SecretStore(() => ({})), { token: "t", url: "https://hard.example/" });
+  assert.equal(r.blocked, true);
+  assert.ok(r.timing.sessionAcquireMs >= 25);
+  assert.deepEqual(r.diagnostics.timing, r.timing, "envelope.timing IS result.timing");
+});
+
+test("retrieve: the session timing belongs to the SURFACED render, even when it is not the last one", async () => {
+  // Direct blocked → proxied attempt 1 reaches the site (live 403, slow session) → attempts 2-3 are dead
+  // exits (fast sessions). #45 surfaces attempt 1, so its slow open/close must be the ones reported.
+  const dead = { status: null, title: "", text: "", html: "", diagnostics: { finalUrl: "chrome-error://chromewebdata/", status: null } };
+  const live = { ...cfBlock, responseReceived: true, diagnostics: { finalUrl: "https://hard.example/", status: 403 } };
+  const { gateway } = makeTimedGateway(
+    [cfBlock, live, dead, dead],
+    [{ open: 0, close: 0 }, { open: 120, close: 90 }, { open: 0, close: 0 }, { open: 0, close: 0 }],
+  );
+  const secrets = new SecretStore(() => ({ BGW_PROXY_URL: "http://proxy:8080", BGW_PROXY_PASSWORD: "pwd" }));
+  const r = await retrieve(gateway, secrets, { token: "t", url: "https://hard.example/", escalation: { onDatacenterIp: true } });
+  assert.equal(r.proxyUsed, true);
+  assert.equal(r.diagnostics?.status, 403, "the live attempt was surfaced (#45)");
+  assert.ok(r.timing.sessionAcquireMs >= 110, `the surfaced attempt's open time, not the last dead one's (${r.timing.sessionAcquireMs})`);
+  assert.ok(r.timing.sessionReleaseMs >= 80, `the surfaced attempt's close time (${r.timing.sessionReleaseMs})`);
+});

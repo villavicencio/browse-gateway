@@ -23,6 +23,8 @@
  *      wafVendor='cloudflare' (best-effort — degrades to a note when the challenge clears).
  *   7. per-stage timing (issue #42) — a failed retrieve's envelope carries a populated, non-negative
  *      `timing.totalMs` (the whole-call wall-clock), proving the timing folds into the live envelope.
+ *      VIL-313: it also names the session open/close and the render's page setup, and the named stages fit
+ *      inside totalMs, so the breakdown accounts for the call on a real browser.
  */
 import { Gateway, loadConfig } from "../dist/gateway/index.js";
 import { PolicyEngine, ConsumerRegistry } from "../dist/policy/index.js";
@@ -83,6 +85,18 @@ try {
       r.diagnostics.failureClass === "policy-blocked" && r.diagnostics.wafVendor === undefined);
     check("envelope carries #42 timing with a non-negative totalMs (the wall-clock breakdown)",
       !!r.diagnostics.timing && typeof r.diagnostics.timing.totalMs === "number" && r.diagnostics.timing.totalMs >= 0);
+    // VIL-313: the session's open/close and the render's page setup are named on a REAL browser, so the
+    // breakdown accounts for the call. Each named stage is rounded separately, hence the small tolerance.
+    const t = r.diagnostics.timing ?? {};
+    const named = ["sessionAcquireMs", "pageSetupMs", "domContentLoadedMs", "clearancePollMs", "snapshotMs", "sessionReleaseMs"];
+    const sum = named.reduce((acc, k) => acc + (t[k] ?? 0), 0);
+    console.log(`  timing: ${named.map((k) => `${k}=${t[k]}`).join(" ")} totalMs=${t.totalMs} unnamed=${t.totalMs - sum}`);
+    check("VIL-313: envelope names the session open/close and the page setup (all non-negative numbers)",
+      ["sessionAcquireMs", "sessionReleaseMs", "pageSetupMs"].every((k) => typeof t[k] === "number" && t[k] >= 0));
+    check("VIL-313: the named stages fit inside the whole-call totalMs", sum <= t.totalMs + named.length);
+    // And from below (MergeWren on #166): a missing or zeroed stage leaves its time unnamed. A healthy run
+    // leaves ~0.2 s unnamed; without pageSetupMs it was ~1.2 s. 750 ms keeps ~4x headroom over the healthy run.
+    check("VIL-313: at most 750 ms of the call is unnamed (the stages account for it)", t.totalMs - sum <= 750);
     check("envelope is secret-free (no cookie/authorization value leaked)",
       !/set-cookie:\s*\S/i.test(JSON.stringify(r.diagnostics)) && !/authorization:\s*\S/i.test(JSON.stringify(r.diagnostics)));
   }
