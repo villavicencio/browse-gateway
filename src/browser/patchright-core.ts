@@ -295,6 +295,29 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
  * DCL and change the blocked verdict — this ticket changes how long we wait, never the verdict.
  */
 export const UNCLEARABLE_CLEARANCE_POLL_MS = 2_000;
+
+/**
+ * How long a render's clearance poll may wait, re-derived on every poll round.
+ *
+ * - VIL-314: a navigation the gateway's OWN guard refused (`selfBlocked`) can never clear, so the poll
+ *   gets no time at all. The guard records that during the goto, so a block a consumer asked for by
+ *   requesting an off-allowlist URL used to wait out the whole budget (~20 s in prod) before reporting a
+ *   verdict the gateway already had. Re-derived per round, so a block event that lands after the goto
+ *   still stops the poll at the next check.
+ * - VIL-136: a 404/410/429 with no live challenge gets a short ceiling ({@link UNCLEARABLE_CLEARANCE_POLL_MS}).
+ * - Anything else gets the full budget.
+ *
+ * Pure, so the decision is unit-testable without a browser.
+ */
+export function clearancePollLimitMs(
+  signal: Pick<PageSignal, "title" | "text">,
+  status: number | null,
+  clearanceTimeoutMs: number,
+  selfBlocked: boolean,
+): number {
+  if (selfBlocked) return 0;
+  return isTerminalUnclearableRender(signal, status) ? Math.min(clearanceTimeoutMs, UNCLEARABLE_CLEARANCE_POLL_MS) : clearanceTimeoutMs;
+}
 /** Per-action timeout for interactive drive verbs (click/type/select/wait). */
 const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
 /**
@@ -1067,8 +1090,9 @@ export class PatchrightBrowserCore implements BrowserCore {
       // managed challenge can arrive on a 429/404 and DOES clear by waiting) the full budget applies.
       // Keyed on the visible phrase, never on `cfHint` — CF-fronted origins serve ordinary 404s carrying
       // persistent challenge-platform markers, and gating on the marker would restore the 20 s wait.
+      // VIL-314: and a navigation the gateway's own guard refused gets no poll at all (re-checked each round).
       const stageLimitMs = (s: Pick<PageSignal, "title" | "text">): number =>
-        isTerminalUnclearableRender(s, status) ? Math.min(clearanceTimeoutMs, UNCLEARABLE_CLEARANCE_POLL_MS) : clearanceTimeoutMs;
+        clearancePollLimitMs(s, status, clearanceTimeoutMs, this.#policyBlockedNav !== undefined);
       while (!isCleared(signal, opts.clearedTextLength) && waited < stageLimitMs(signal)) {
         const budgetLeft = opts.budgetDeadlineMs !== undefined ? opts.budgetDeadlineMs - performance.now() : Infinity;
         const sleepMs = Math.min(pollIntervalMs, stageLimitMs(signal) - waited, budgetLeft);

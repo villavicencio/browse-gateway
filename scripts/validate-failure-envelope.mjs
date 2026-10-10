@@ -97,6 +97,11 @@ try {
     // And from below (MergeWren on #166): a missing or zeroed stage leaves its time unnamed. A healthy run
     // leaves ~0.2 s unnamed; without pageSetupMs it was ~1.2 s. 750 ms keeps ~4x headroom over the healthy run.
     check("VIL-313: at most 750 ms of the call is unnamed (the stages account for it)", t.totalMs - sum <= 750);
+    // VIL-314: the gateway's own guard refused this nav, so it can never clear and the poll runs no rounds
+    // (it waited out the whole 8 s budget before, ~9.3 s). What remains is the poll's single opening read of
+    // Chrome's error page, ~1.2 s in-container. Skipping that read only moves the same ~1.2 s into
+    // snapshotMs (measured), so it stays. 3 s cleanly separates fixed (~1.2 s) from broken (>= 8 s).
+    check("VIL-314: a self-blocked nav runs no clearance-poll rounds (clearancePollMs <= 3000, budget 8000)", (t.clearancePollMs ?? 0) <= 3_000);
     check("envelope is secret-free (no cookie/authorization value leaked)",
       !/set-cookie:\s*\S/i.test(JSON.stringify(r.diagnostics)) && !/authorization:\s*\S/i.test(JSON.stringify(r.diagnostics)));
   }
