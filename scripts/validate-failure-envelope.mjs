@@ -101,10 +101,20 @@ try {
     // (it waited out the whole 8 s budget before, ~9.3 s). What remains is the poll's single opening read of
     // Chrome's error page, ~1.2 s in-container. Skipping that read only moves the same ~1.2 s into
     // snapshotMs (measured), so it stays. 3 s cleanly separates fixed (~1.2 s) from broken (>= 8 s).
-    check("VIL-314: a self-blocked nav runs no clearance-poll rounds (clearancePollMs <= 3000, budget 8000)", (t.clearancePollMs ?? 0) <= 3_000);
+    check("VIL-314: the envelope records the poll, and a self-blocked nav's stays far under the 8 s budget (<= 3000)",
+      typeof t.clearancePollMs === "number" && t.clearancePollMs <= 3_000);
     check("envelope is secret-free (no cookie/authorization value leaked)",
       !/set-cookie:\s*\S/i.test(JSON.stringify(r.diagnostics)) && !/authorization:\s*\S/i.test(JSON.stringify(r.diagnostics)));
   }
+
+  // VIL-314, the exact claim (MergeWren on #167): through the same consumer-session path retrieve uses (so the
+  // real allowlist guard refuses the nav), the core records the policy block and its clearance poll SLEPT 0 ms.
+  // clearanceWaitedMs is the poll's sleep counter, so this is "no poll rounds" with no timing threshold.
+  // Without the fix it equals the whole 8 s budget.
+  const core = await gateway.withConsumerSession(TOKEN, (s) => s.core.render(OFF_ALLOWLIST, { clearanceTimeoutMs: 8_000 }));
+  console.log(`  core.render(off-allowlist): policyBlocked=${core.policyBlocked?.host} clearanceWaitedMs=${core.clearanceWaitedMs}`);
+  check("VIL-314: the core records the self-block and its clearance poll slept 0 ms (no rounds)",
+    core.policyBlocked !== undefined && core.clearanceWaitedMs === 0);
 
   let driveEnv;
   try {
