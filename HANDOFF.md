@@ -1,104 +1,85 @@
 ---
-created_at: "2026-10-07T06:54:18-07:00"
+created_at: "2026-10-10T14:47:18-07:00"
 branch: "main"
-head: "1f377f4"
-resume_focus: "Deploy 1 on the prod host (VIL-290): run the runbook in VIL-290's latest comment as the container's service account, then check the deploy-ref report lines"
+head: "4e8a893"
+worktree: "/Users/dvillavicencio/Projects/browse-gateway"
 ---
-# HANDOFF — 2026-10-07, early morning
+# HANDOFF — 2026-10-10, afternoon
 
-This session started by getting the search verb (VIL-122, PR #147) merged. Then the move to a new prod host
-(the old VPS was deleted 2026-10-05) left no working deploy path. So the session built an operator-run
-deploy (PR #148), rehearsed it against a real daemon, and wrote up what that turned up (PR #149). **Search
-is merged but not live.** Deploy 1 (new image, search off) and deploy 2 (Brave key, search on) are both
-waiting on the operator. Side work: per-branch handoffs so several sessions can run in parallel worktrees
-(villavicencio/skills#43), and briefs for the dotfiles session.
+This session ran from 2026-10-07 to 2026-10-10. It took the search router and a batch of fixes (PRs #151–#167) from merged to live, through three operator-run deploys. It moved PR review onto MergeWren and retired the dead CI deploy path. Measuring prod latency end to end then showed that every `retrieve` was paying ~5 s for a VPS-era CPU cap, and that a policy-refused URL waited out a whole clearance poll. Both are fixed and live. Nothing is in flight.
 
 ## What We Built
 
-- **PR #147 → `768af59`: the `search` verb with a Brave adapter.** It's off unless `BGW_SEARCH_ENABLED=1`.
-  The CodeRabbit nitpick that the abort controller is never aborted was declined and moved to VIL-123 as a
-  comment. The router rewrites `makeSearchFn` anyway.
-- **PR #148 → `a62801a`: `scripts/deploy/deploy-ref.sh <sha|tag>`, plus a `verify()` that polls.** Verify
-  checks first, sleeps only between attempts, uses one deadline covering the `/mcp` probe, and validates
-  `BGW_VERIFY_TIMEOUT` up front (1..600). **What the PR doesn't tell you:** the prod host's copies of
-  `deploy-on-host.sh`, `deploy-ref.sh` and `preswap-smoke.sh` are what actually run, and **they are not
-  synced yet.** Step 1 of the deploy-1 runbook does that and checks sha256 hashes.
-- **PR #149 → `1f377f4`: the learnings.**
-  - `docs/solutions/runtime-errors/grep-q-under-pipefail-fails-on-the-match-it-was-looking-for.md`
-  - `docs/solutions/runtime-errors/tini-s-dies-on-colima-when-amd64-silently-falls-back-from-rosetta-to-qemu.md`
-  - A refresh of four related docs, and `CONCEPTS.md` *Post-swap verify*.
-  - The fix commit merged without a second review (docs only, review slot exhausted); recorded in the PR body.
-- **Deploy-1 image:** `a62801a` → `ghcr.io/villavicencio/browse-gateway@sha256:87b39b2b1835fdfcfee22d5f1e87625986ddc069e9dd76a3a8a3efb2ad4728f8`.
-  Checked with an anonymous pull: amd64, revision label `a62801a021cb…`.
-- **Real-daemon rehearsal** on the dev Mac (Colima, amd64 under Rosetta): gate PASS, smoke OK,
-  `verify: OK after 1s`, blip about 3 s, boot 2.2 s. These are dev-Mac numbers, not prod's.
-- **The production section of `CONTEXT.local.md`** (local, gitignored) holds the deploy procedure,
-  rollback, blip notes and the VIL-290 env vars. The VPS-era sections there are marked STALE.
-- **villavicencio/skills#43 (VIL-297): handoff/pickup with a per-branch store,** for parallel worktree
-  sessions. Still open. This handoff is in the older 0.4.0 format, because the new version isn't released.
-- **Linear:**
-  - VIL-290 (turn on search; **runbook in its latest comment**), VIL-291 (deploy path), VIL-292 (datacenter
-    flag), VIL-293 (arm64 image), VIL-294 (Colima amd64 handler).
-  - In the Dotfiles project: VIL-299 (`wt` helper, workflow doc, `/ops` page), VIL-300 (agent tab status
-    over SSH), VIL-301 (the CodeRabbit watcher rule).
+- **Prod is `main` `4e8a893`** (digest `sha256:bf48a34d…`), running with `BGW_CPUS=4`. The rollback anchor is `4d83c8c` (`sha256:b2bfa6ea…`).
+  - Deploy history, the procedure and the host paths are in `CONTEXT.local.md` ("Production…" section).
+  - Deploys run from `scripts/deploy/deploy-ref.sh <40-hex sha>` on the prod host, using the host's copies of the scripts. Those were sha256-verified against `163c628`, and the deploy scripts haven't changed since.
+- **PR #166 (VIL-313): `Timing` now accounts for the whole call.** New fields: `sessionAcquireMs` (Chrome launch), `pageSetupMs` and `sessionReleaseMs`. Since the deploy, a thin-404 `retrieve` leaves only 35–71 ms unattributed. The fields describe the *surfaced* render, the same scope as every existing stage.
+- **PR #167 (VIL-314): a navigation the gateway's own guard refused runs no clearance-poll rounds.** It now returns `policy-blocked` about 19 s sooner in prod.
+  - The decision lives in the pure `clearancePollLimitMs` (`src/browser/patchright-core.ts`).
+  - Proof: `scripts/validate-failure-envelope.mjs` asserts the core's poll sleep counter `clearanceWaitedMs === 0`.
+- **PR #157 (VIL-133): `obscura keys new` checks the pool floor before staging anything, and `--apply` (new and revoke) refuses without `smokeCmd`.** Bash sources the env file once, exactly as the launcher does. A value the file leaves to the environment produces a warning, never a refusal.
+- **PR #158 (VIL-294): `scripts/run-gate.sh <image> <gate>`.** It runs the image's own `tini -s` as amd64 first, and refuses to start a gate if Colima has fallen back to QEMU.
+- **Earlier in the arc:**
+  - #151: the search router (VIL-123);
+  - #152: the captcha solver refuses redirects;
+  - #154, #155, #163: poll and escalation fixes for 404/410/429;
+  - #161: `_meta` session-failure kind (VIL-110);
+  - #162: `deploy-http.yml` deleted;
+  - #164: image retention;
+  - #156, #153, #160, #159, #165: smaller changes.
+- **Off-repo:**
+  - **MergeWren** now reviews every browse-gateway PR within minutes; it replaces CodeRabbit's one-review-per-hour throttle.
+  - **GitHub:** the six deploy secrets and the empty `prod` environment are deleted. `BGW_DEPLOY_ID_KEY` stays, because `ci.yml:90` uses it.
+  - **Tailscale:** the old deploy workflow's OAuth client is revoked.
+- **Linear:** VIL-133, VIL-136, VIL-294, VIL-313 and VIL-314 are Done, with evidence on each. VIL-293 carries the launch-cost numbers.
 
 ## Decisions Made
 
-- **Deploys are operator-run on the prod host, not dispatched from CI.** `deploy-http.yml`'s secrets
-  describe the deleted host, so **don't dispatch it.** Never auto-deploy on merge.
-- **Search goes live in two deploys.** Deploy 1: image `a62801a` with search off. Deploy 2: the same digest
-  after adding `BGW_SEARCH_ENABLED=1` and `BGW_BRAVE_SEARCH_API_KEY` to the prod env file. **Brave only
-  for now.** Don't put `google` in `BGW_SEARCH_PROVIDERS` before VIL-123 ships, or boot refuses.
-- **The GHCR package is public**, so pulling needs no token. An earlier "404" was a raw manifest request
-  made without the registry's token handshake.
-- **`BGW_ALLOWED_HOSTS` is the inbound Host-header allowlist,** so the Brave endpoint doesn't belong in it.
-- **The operator says `--init` in `launch-http.sh` is load-bearing.** A refresh suggestion to call it
-  unnecessary was declined.
-- **Herdr is retired.** The operator uses plain iTerm2 with vertical tabs and tab groups.
+- **#157, option 2 (operator):** the gateway's boot check, run inside the pre-swap smoke, is the one authority on whether a config boots. The CLI pre-flight is advisory: it refuses a certain breach and warns on doubt.
+- **The MergeWren stopping rule (operator):** after a trade-off is picked, fix highs and anything that breaks the chosen option. Decline the rest, with reasons on the thread and in the PR body, and merge when no high remains. It's in agent memory.
+- **`BGW_CPUS=4` (operator), from a measured curve.** Whole call at each cap:
+
+  | CPUs | whole call (s) |
+  |---|---|
+  | 2 | 5.4 |
+  | 3 | 4.0 |
+  | 4 | 3.5 |
+  | 6 | 3.0 |
+  | uncapped | 3.0 |
+
+  It's set in the host's deploy config. `launch-http.sh`'s own default is still the VPS-era `1.75`, deliberately left alone, since the host config overrides it.
+- **VIL-314 keeps the poll's single opening read** (~0.7–1.3 s on Chrome's error page). Skipping it was measured: it only moved the same time into `snapshotMs`.
+- **Prod checks of policy blocks use the gate inside prod's image, run on the prod host.** Never use private or metadata IPs; the permission classifier rightly denies those.
 
 ## What Didn't Work
 
-- **Blaming Rosetta for the Colima failure.** The VM had silently lost its Rosetta handler, and QEMU
-  user-mode was running amd64, which refuses `tini -s`. A Colima restart fixed it. An arm64-vs-amd64
-  control proves *a* translator is at fault, not *which* one. Check `binfmt_misc` before naming it.
-- **The first rehearsal crash-looped with `EISDIR`.** Its sandbox was under `/private/tmp`, which Colima
-  doesn't share, so the bind mount became an empty directory. Put rehearsal sandboxes under `$HOME`.
-- **deploy-ref first reported a ~32 s "blip"** for a deploy that never swapped, because `/mcp` was already
-  down. It now takes a baseline probe first.
-- **`verify()` first slept before checking,** so a 1 s budget never inspected anything. The tests' fake
-  `sleep` hid it, because it never advanced `$SECONDS`.
-- **A CodeRabbit watcher reported "skipped"** while the review was actually running: it read a status from
-  before the request. Only trust statuses posted after the request (VIL-301).
+- **Parsing the env file by hand in #157.** Seven review rounds each found another bash rule it got wrong. Bash itself evaluates the file now.
+- **#157's middle rounds (cleared env, sentinels, two-environment agreement).** Each fix drew an opposite medium finding. That's what produced the stopping rule.
+- **Waiting for the block event in VIL-314.** A debug build showed the guard has already recorded the block when `goto` throws (73 ms), so the wait was removed.
+- **Timing drive calls batched in one message.** Parallel `browser_navigate` calls on one session inflated each other; issue them one at a time.
 
 ## What's Next
 
-1. **Deploy 1 (operator).** Use the runbook in VIL-290's latest comment. Run it as the container's service
-   account, not the admin login. Expect `deploy: SUCCESS`, no drift NOTE, `verify: OK after Ns` (the first
-   real boot time on prod) and `boot line: search=off`.
-2. **Deploy 2.** Back up the prod env file, add the two variables, then rerun the same `deploy-ref.sh`
-   command with the same sha. Expect `search=brave`, then make one real query.
-3. **villavicencio/skills#43.** A re-review was requested 2026-10-07 13:49Z and was in flight at handoff
-   time. Merge it if clean, then the `release(dv): 0.5.0` PR, then
-   `claude plugin marketplace update villavicencio-skills && claude plugin update dv@villavicencio-skills`.
-4. **VIL-123:** the search router plus Google CSE. It includes the abort-signal fix declined on #147.
-5. **VIL-291 leftovers.** Decide what happens to `deploy-http.yml`. `CLAUDE.md`'s deploy-gate section still
-   describes the VPS host-sync world beyond the note added in #148.
-6. **Later:** VIL-292, VIL-294's guard, VIL-293.
+1. **VIL-293 (operator decision):** Chrome launch is now the largest per-call cost, about 2.0 s at 4 CPUs (1.7 s uncapped). The options are an arm64 image, or reusing browsers across `retrieve` calls. Browser reuse gives up the fresh browser per call, which matters for isolation and stealth. Compare arm64 at the same CPU setting.
+2. **If agents start fetching in parallel and calls slow down, raise `BGW_CPUS`** (6 measured as fast as uncapped) before suspecting a regression.
+3. **Backlog:**
+   - VIL-292: the boot line still says `datacenter=true` on a residential host.
+   - VIL-131: the Docker VM has ~8 GB of memory and prod takes 4 GiB of it.
+   - `obscura keys` still targets the retired host (README documents the on-host path, #165).
+4. **Minor:** `browse-gateway:vil313` and `:vil314` test images are left inside Colima's VM. Delete them when Colima is next up.
 
 ## Gotchas & Watch-outs
 
-- **No shell state carries over between tool calls,** so every block in a skill or runbook must stand on
-  its own.
-- **Local gates:** before trusting or blaming one, check that `colima ssh -- ls /proc/sys/fs/binfmt_misc/`
-  lists `rosetta`. The "failed to install interpreter" line in `dmesg` appears even on a good boot.
-- **`npm test` on macOS:** compare the failing set by test name against `main`. Today: no branch-only
-  failures, and one timing-flaky artifact test that failed on `main` only.
-- **CodeRabbit:**
-  - It allows one review per hour across every repo and session.
-  - In the skills repo, automatic re-reviews are off, so a push after a completed review shows
-    "incremental reviews are disabled". Request the next review explicitly.
-- **On the new host, image ID and registry digest are the same hash** (containerd image store), unlike the
-  old rootless-Docker VPS.
-- **The Linear project "Skills" was renamed.** Look it up by id `P-VIL-5`, not by the old name.
-- **Background `sleep` jobs stall while the Mac sleeps.** One scheduled review request fired about 9 hours
-  late.
+- **The host deploy config is sourced without `set -a`.** A setting must be written as `export NAME=value` to reach `launch-http.sh`; a bare assignment is silently ignored. Verify with `docker inspect -f '{{.HostConfig.NanoCpus}}' browse-gateway-http`.
+- **`BGW_CPUS` caps the whole container,** so all concurrent sessions share it. The curve was measured one fetch at a time.
+- **A successful `retrieve` returns no timing.** Measure through the thin-404 URL `https://api.github.com/vil121-does-not-exist`. To separate session cost from page work, use drive's `browser_navigate` inside an open session.
+- **The Bash tool here runs zsh:**
+  - Never name a variable `path`; it wipes `PATH`. This happened twice.
+  - `$var` doesn't word-split.
+  - Test output is coloured, so use `node --test --test-reporter=tap <files>` (with the flag before the files) and `tsc --pretty false`.
+- **MergeWren:**
+  - A declined finding stays "still open" in every later round.
+  - Reviews run one PR at a time.
+  - The incremental round is "not a pass"; wait for the full confirmation review.
+  - The full write-up is in agent memory.
+- **Colima is stopped.** Start it only for in-container gates, run them through `scripts/run-gate.sh`, and stop it afterwards.
