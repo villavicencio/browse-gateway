@@ -64,7 +64,7 @@ This session ran from 2026-10-07 to 2026-10-10. It took the search router and a 
 2. **If agents start fetching in parallel and calls slow down, raise `BGW_CPUS`** (6 measured as fast as uncapped) before suspecting a regression.
 3. **Backlog:**
    - VIL-292: the boot line still says `datacenter=true` on a residential host.
-   - VIL-131: the Docker VM has ~8 GB of memory and prod takes 4 GiB of it.
+   - VIL-131: memory may run out before CPU if concurrency grows (host capacity figures are in `CONTEXT.local.md`).
    - `obscura keys` still targets the retired host (README documents the on-host path, #165).
 4. **Minor:** `browse-gateway:vil313` and `:vil314` test images are left inside Colima's VM. Delete them when Colima is next up.
 
@@ -72,7 +72,7 @@ This session ran from 2026-10-07 to 2026-10-10. It took the search router and a 
 
 - **The host deploy config is sourced without `set -a`.** A setting must be written as `export NAME=value` to reach `launch-http.sh`; a bare assignment is silently ignored. Verify with `docker inspect -f '{{.HostConfig.NanoCpus}}' browse-gateway-http`.
 - **`BGW_CPUS` caps the whole container,** so all concurrent sessions share it. The curve was measured one fetch at a time.
-- **A successful `retrieve` returns no timing.** Measure through the thin-404 URL `https://api.github.com/vil121-does-not-exist`. To separate session cost from page work, use drive's `browser_navigate` inside an open session.
+- **A successful MCP `retrieve` tool response carries no timing** (the programmatic `retrieve()` result does). Through the MCP tool, measure via the thin-404 URL `https://api.github.com/vil121-does-not-exist`. To separate session cost from page work, use drive's `browser_navigate` inside an open session.
 - **The Bash tool here runs zsh:**
   - Never name a variable `path`; it wipes `PATH`. This happened twice.
   - `$var` doesn't word-split.
