@@ -32,6 +32,7 @@ import {
   stickySuffixBootError,
   stickySuffixRedactables,
   parseForceProxyHosts,
+  parseEscalateHosts,
   parseWarmupPaths,
   httpCaptchaSolverFromSecrets,
   DEFAULT_CAPTCHA_BUDGET,
@@ -53,6 +54,9 @@ export interface GatewayRuntime {
   onDatacenterIp: boolean;
   stickySuffix?: string;
   forceProxyHosts: ReturnType<typeof parseForceProxyHosts>;
+  /** VIL-292: hosts the AUTOMATIC escalate-on-block path may fire for (BGW_ESCALATE_HOSTS); `undefined` =
+   *  every host, `[]` = none. Force-proxy and the vault's pinned/fresh-exit flows don't read it. */
+  escalateHosts: ReturnType<typeof parseEscalateHosts>;
   /** Hosts whose warm-open replays through a FRESH residential exit instead of re-pinning the captured
    *  one (BGW_WARM_FRESH_EXIT_HOSTS) — the durable fix for exit-reputation-gated hosts. */
   freshExitHosts: ReturnType<typeof parseForceProxyHosts>;
@@ -197,6 +201,8 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
   // config, NOT a secret. Absent = rotating exits (which cannot clear an IP-bound CF interstitial).
   const stickySuffix = env.BGW_PROXY_STICKY_SUFFIX || undefined;
   const forceProxyHosts = parseForceProxyHosts(env.BGW_FORCE_PROXY_HOSTS);
+  // VIL-292: fails closed on "none" mixed with hosts, so the refusal is visible to the pre-swap smoke.
+  const escalateHosts = parseEscalateHosts(env.BGW_ESCALATE_HOSTS);
   // Hosts whose warm-open uses a FRESH residential exit instead of re-pinning the captured one (durable
   // fix for exit-reputation-gated hosts). Same flat-CSV host-suffix shape as force-proxy.
   const freshExitHosts = parseForceProxyHosts(env.BGW_WARM_FRESH_EXIT_HOSTS);
@@ -221,7 +227,7 @@ export function buildGatewayRuntime(env: NodeJS.ProcessEnv, opts: BuildRuntimeOp
 
   return {
     config, secrets, vault, specs, registry, policy, gateway, onDatacenterIp, stickySuffix, forceProxyHosts,
-    freshExitHosts, warmupHosts, warmupPaths, verifyEgress,
+    escalateHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress,
     ...(search ? { search } : {}),
   };
 }

@@ -9,7 +9,7 @@ import { Gateway, loadConfig } from "../gateway/index.js";
 import { rewrapRedacted } from "./redact-rewrap.js";
 import { PolicyEngine, ConsumerRegistry, InMemoryAuditSink, RedactingAuditSink, OriginationBoundary, Allowlist } from "../policy/index.js";
 import { SecretStore, redactSecrets, openVault, canonicalizeHost } from "../security/index.js";
-import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, parseWarmupPaths, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
+import { retrieve, stickySuffixBootError, stickySuffixRedactables, parseForceProxyHosts, parseEscalateHosts, describeEscalateHosts, parseWarmupPaths, hostForcesProxy, httpCaptchaSolverFromSecrets, DEFAULT_CAPTCHA_BUDGET } from "../verbs/index.js";
 import { buildSearch, redactedSearchFn } from "../search/index.js";
 import { createGatewayMcpServer } from "./server.js";
 import { resolveGatewayVersion } from "./version.js";
@@ -75,6 +75,8 @@ async function main(): Promise<void> {
   // Sticky-session suffix template for proxied escalation (parity with http-main; see there).
   const stickySuffix = process.env.BGW_PROXY_STICKY_SUFFIX || undefined;
   const forceProxyHosts = parseForceProxyHosts(process.env.BGW_FORCE_PROXY_HOSTS);
+  // VIL-292: mirror runtime.ts (automatic escalation limited to these hosts; fails closed on a bad value).
+  const escalateHosts = parseEscalateHosts(process.env.BGW_ESCALATE_HOSTS);
   // Parsed standalone here (the stdio launcher does not use buildGatewayRuntime), mirroring forceProxyHosts.
   const freshExitHosts = parseForceProxyHosts(process.env.BGW_WARM_FRESH_EXIT_HOSTS);
   // Warm-up navigation (PX deep-URL-first fix): mirror runtime.ts so the stdio rollback launcher doesn't
@@ -100,6 +102,7 @@ async function main(): Promise<void> {
     onDatacenterIp,
     stickySuffix,
     forceProxyHosts,
+    ...(escalateHosts !== undefined ? { escalateHosts } : {}),
     freshExitHosts,
     warmupHosts,
     warmupPaths,
@@ -125,7 +128,7 @@ async function main(): Promise<void> {
     retrieve: async ({ url, forceProxy }) => {
       try {
         const forced = (forceProxy ?? false) || hostForcesProxy(new URL(url).hostname, forceProxyHosts);
-        return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp }, stickySuffix, forceProxy: forced, timeouts: config.timeouts });
+        return await retrieve(gateway, secrets, { token: consumer.token, url, escalation: { onDatacenterIp, ...(escalateHosts !== undefined ? { escalateHosts } : {}) }, stickySuffix, forceProxy: forced, timeouts: config.timeouts });
       } catch (err) {
         // Never let a proxy/browser error message carry BYO secret material to the consumer (R9).
         // VIL-110: the shared re-wrap keeps the session-failure kind (the MCP layer reads it).
@@ -142,7 +145,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 
   await server.connect(new StdioServerTransport());
-  log(`connected over stdio — consumer=${consumer.id} allow=[${consumer.allow.join(", ")}] datacenter=${onDatacenterIp} sticky=${stickySuffix !== undefined} search=${search ? search.providers.join(",") : "off"}`);
+  log(`connected over stdio — consumer=${consumer.id} allow=[${consumer.allow.join(", ")}] datacenter=${onDatacenterIp} escalate=${describeEscalateHosts(escalateHosts)} sticky=${stickySuffix !== undefined} search=${search ? search.providers.join(",") : "off"}`);
 }
 
 main().catch((err) => {

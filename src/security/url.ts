@@ -72,10 +72,11 @@ export function hostMatchesAnySuffix(host: string, suffixes: readonly string[]):
  * Canonicalize a host AND fold it to ASCII/punycode, so a Unicode IDN host (`bücher.example`) and its
  * punycode form (`xn--bcher-kva.example`, which is what Chrome emits in a cookie `domain`) compare
  * equal. Falls back to the plain canonical form when the host can't be parsed as a URL authority (an
- * IP literal, or already-degenerate input). Used only by {@link cookieBelongsToHost} so both sides of
- * the host-scope comparison are in the same encoding.
+ * IP literal, or already-degenerate input). Used by {@link cookieBelongsToHost} so both sides of the
+ * host-scope comparison are in the same encoding, and by the BGW_ESCALATE_HOSTS matcher (VIL-292), whose
+ * requested host arrives from `new URL().hostname` already in punycode.
  */
-function asciiHost(rawHost: string): string {
+export function asciiHost(rawHost: string): string {
   const canon = canonicalizeHost(rawHost);
   if (!canon) return canon;
   try {

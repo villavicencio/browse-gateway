@@ -7,7 +7,8 @@
  */
 import { assess, isExitClearableHardBlock, isTerminalUnclearableRender, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
-import { parseHostSuffixList, hostMatchesAnySuffix } from "../security/index.js";
+import { domainToUnicode } from "node:url";
+import { parseHostSuffixList, hostMatchesAnySuffix, asciiHost } from "../security/index.js";
 
 /**
  * True when the page is blocked AND the block is specifically a Cloudflare challenge
@@ -28,6 +29,71 @@ export interface EscalationContext {
   onDatacenterIp: boolean;
   /** Whether a residential proxy is configured/available to escalate to. */
   proxyAvailable: boolean;
+  /**
+   * VIL-292: host suffixes AUTOMATIC escalation may fire for (`BGW_ESCALATE_HOSTS`, see
+   * {@link parseEscalateHosts}). `undefined` = every host (the pre-VIL-292 behavior); `[]` = none.
+   */
+  escalateHosts?: readonly string[];
+}
+
+/**
+ * Parse `BGW_ESCALATE_HOSTS` (VIL-292): which hosts the AUTOMATIC escalate-on-block path may spend a
+ * residential session on. Unset or blank → `undefined`, every host escalates as before. `none` → `[]`,
+ * nothing escalates automatically. Otherwise a comma-separated host-suffix list, matched like
+ * force-proxy, except that each entry and the requested host are both folded to ASCII (punycode), so a
+ * Unicode IDN entry matches the `new URL().hostname` it will be compared with. Only the automatic decision reads it: force-proxy (`forceProxy` / `BGW_FORCE_PROXY_HOSTS`),
+ * vault login capture, and vault warm-open keep their own proxy rules. FAIL-CLOSED at boot on `none`
+ * mixed with hosts, which has no single reading.
+ *
+ * Why it exists: on a residential prod host direct-first already clears what the datacenter IP could
+ * not, while `BGW_ON_DATACENTER_IP=1` must stay set because the vault's pinned/fresh-exit replay needs
+ * it. This narrows the paid fallback without touching the vault.
+ */
+export function parseEscalateHosts(value: string | undefined): string[] | undefined {
+  const raw = parseHostSuffixList(value);
+  // Fail closed BEFORE the ASCII fold: asciiHost parses each entry as a URL authority, so `a@b` would
+  // become `b`, `a/b` would become `a`, and `evil%2ecom` would become `evil.com`, quietly authorizing a
+  // host the operator never named.
+  const bad = raw.find((h) => /[@/\\:?#%\s[\]]/.test(h));
+  if (bad !== undefined) throw new Error(notAHostSuffix(bad));
+  const hosts = raw.map(asciiHost);
+  // Then require the folded result to be a plain hostname (non-empty dot-separated labels of letters,
+  // digits, `-` or `_`) that converts back to exactly what was written. The pattern rejects what the fold
+  // leaves behind (a fullwidth `＠`, a wildcard `*.`, an empty label); the round trip rejects what the fold
+  // silently rewrites (a zero-width space deleted, a fullwidth `．` mapped to `.`), while a real IDN
+  // survives it, written either way: `bücher.example` round-trips, and `xn--bcher-kva.example` is already
+  // its own folded form. One class of input, not one character at a time.
+  const invalid = hosts.findIndex(
+    (h, i) => !/^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(h) || (h !== raw[i] && domainToUnicode(h) !== raw[i]),
+  );
+  if (invalid !== -1) throw new Error(notAHostSuffix(raw[invalid] as string));
+  if (hosts.length === 0) return undefined;
+  if (!hosts.includes("none")) return hosts;
+  if (hosts.length > 1) {
+    throw new Error(
+      `BGW_ESCALATE_HOSTS: "none" cannot be combined with hosts (got "${value}") — set "none" to turn ` +
+        `automatic escalation off, or list only the hosts that may escalate`,
+    );
+  }
+  return [];
+}
+
+function notAHostSuffix(entry: string): string {
+  return (
+    `BGW_ESCALATE_HOSTS: "${entry}" is not a host suffix — list bare hosts (no scheme, userinfo, port, ` +
+    `path, query, fragment, percent-encoding or wildcard), comma-separated`
+  );
+}
+
+/** Boot-line rendering of {@link parseEscalateHosts}'s result: `all`, `none`, or the host list. */
+export function describeEscalateHosts(hosts: readonly string[] | undefined): string {
+  if (hosts === undefined) return "all";
+  return hosts.length === 0 ? "none" : hosts.join(",");
+}
+
+/** True when automatic escalation may fire for `host` under `escalateHosts` (undefined = any host). */
+export function hostMayEscalate(host: string, escalateHosts: readonly string[] | undefined): boolean {
+  return escalateHosts === undefined || hostMatchesAnySuffix(asciiHost(host), escalateHosts);
 }
 
 /**
@@ -46,13 +112,18 @@ export interface EscalationContext {
  * status still escalates — screenshot-proven to clear); on every other status a hint-only CF page still
  * escalates exactly as before, so the hint-only interstitial path (403/503 + marker, no phrase) is kept.
  * Full unification (phrase required everywhere) was rejected for that reason.
+ *
+ * VIL-292: `host` is the requested target's host. With `ctx.escalateHosts` set, a host outside the list
+ * never escalates, and a missing `host` cannot be checked against it, so it doesn't escalate either.
  */
 export function shouldEscalateToProxy(
   signal: PageSignal,
   status: number | null,
   ctx: EscalationContext,
+  host?: string,
 ): boolean {
   if (!ctx.onDatacenterIp || !ctx.proxyAvailable) return false;
+  if (ctx.escalateHosts !== undefined && (host === undefined || !hostMayEscalate(host, ctx.escalateHosts))) return false;
   return (isCloudflareBlock(signal) && !isTerminalUnclearableRender(signal, status)) || isExitClearableHardBlock(signal, status);
 }
 

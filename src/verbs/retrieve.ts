@@ -930,7 +930,17 @@ export async function retrieve(
   const escalation: EscalationContext = {
     onDatacenterIp: opts.escalation?.onDatacenterIp ?? false,
     proxyAvailable: opts.escalation?.proxyAvailable ?? Boolean(proxy),
+    ...(opts.escalation?.escalateHosts !== undefined ? { escalateHosts: opts.escalation.escalateHosts } : {}),
   };
+  // VIL-292: the REQUESTED host decides whether automatic escalation may fire (never a redirect's landing
+  // host), the same host force-proxy matches. Unparseable → undefined, which shouldEscalateToProxy treats
+  // as "not on the list" whenever a list is set.
+  let escalationHost: string | undefined;
+  try {
+    escalationHost = new URL(url).hostname;
+  } catch {
+    escalationHost = undefined;
+  }
   // Task 2 §6 — this retrieve's capture host, derived ONCE, server-side, from the already
   // scheme-validated requested url (never re-read from a later redirect/landing). `beginCapture()`
   // mints a FRESH `ArtifactCaptureOperation` on every call — never a shared one — because this verb may
@@ -1025,7 +1035,7 @@ export async function retrieve(
   //    still rotates past dead/slow/dirty exits (see PROXY_MAX_ATTEMPTS note above). The clearance
   //    budget is raised on proxied attempts: an interstitial clears in ~22s on a held exit, over
   //    the 20s default (probe, 2026-06-09).
-  if (proxy && (forced || (render !== undefined && shouldEscalateToProxy(render, render.status, escalation)))) {
+  if (proxy && (forced || (render !== undefined && shouldEscalateToProxy(render, render.status, escalation, escalationHost)))) {
     // #44 (codex r4): the solve hook above ran on the DIRECT render; escalation now REPLACES `render` with a
     // proxied one, so any direct-render solve reason is STALE — it does not describe the surfaced page (which
     // was never handed to the solver). Clear it so a stale code can't ride the final envelope. (No production
