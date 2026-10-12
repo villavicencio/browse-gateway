@@ -61,6 +61,8 @@ services:
       # BGW_ALLOWED_ORIGINS: "<origin>"    # ADDITIONAL only (browser-origin defense) — never a substitute
       # BGW_CONSUMERS_MANIFEST: "/run/consumers.json"  # non-secret {id, allow}[] manifest path
       # BGW_ON_DATACENTER_IP: "1"
+      # BGW_ESCALATE_HOSTS: "<host>,<host>"  # VIL-292: limit AUTOMATIC proxy escalation to these hosts;
+      #   "none" = never; unset = every host. Force-proxy and the vault's pinned/fresh exits ignore it.
       # BYO proxy/CAPTCHA + per-consumer bearer tokens are injected at runtime from a store readable
       # only by this process (never baked into the image or committed). Tokens enter the redaction
       # set so they never reach logs/audit/errors (R9).

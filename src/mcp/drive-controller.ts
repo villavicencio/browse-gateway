@@ -32,6 +32,7 @@ import {
   wafVendorFromFailure,
   EscalationError,
   hostForcesProxy,
+  hostMayEscalate,
   classifyExitOrg,
   parseExitOrg,
   isDeadExit,
@@ -112,6 +113,9 @@ export class GatewayDriveController implements DriveController {
   readonly #stickySuffix?: string;
   /** Host suffixes that force residential from the first request (BGW_FORCE_PROXY_HOSTS). */
   readonly #forceProxyHosts: readonly string[];
+  /** VIL-292: host suffixes the automatic escalate-on-block path may fire for (BGW_ESCALATE_HOSTS);
+   *  `undefined` = every host. Force-proxy and the vault's pinned/fresh exits don't read it. */
+  readonly #escalateHosts?: readonly string[];
   /** Owner-host suffixes whose warm-open navigates a shallow page FIRST (BGW_WARMUP_HOSTS) so a
    *  behavioral WAF (PerimeterX) issues a clearance token before the consumer's deep target. */
   readonly #warmupHosts: readonly string[];
@@ -150,6 +154,8 @@ export class GatewayDriveController implements DriveController {
       onDatacenterIp?: boolean;
       stickySuffix?: string;
       forceProxyHosts?: readonly string[];
+      /** VIL-292: BGW_ESCALATE_HOSTS, parsed. Omitted → every host may escalate (unchanged). */
+      escalateHosts?: readonly string[];
       freshExitHosts?: readonly string[];
       /** Warm-up navigation (BGW_WARMUP_HOSTS / BGW_WARMUP_PATHS): on warm-open to a matching owner
        *  host, navigate the shallow path(s) first so the edge WAF issues a clearance token before the
@@ -176,6 +182,7 @@ export class GatewayDriveController implements DriveController {
     this.#onDatacenterIp = opts.onDatacenterIp ?? false;
     this.#stickySuffix = opts.stickySuffix;
     this.#forceProxyHosts = opts.forceProxyHosts ?? [];
+    this.#escalateHosts = opts.escalateHosts;
     this.#freshExitHosts = opts.freshExitHosts ?? [];
     this.#warmupHosts = opts.warmupHosts ?? [];
     this.#warmupPaths = opts.warmupPaths ?? ["/"];
@@ -665,7 +672,8 @@ export class GatewayDriveController implements DriveController {
     // (an off-allowlist abort or an unreachable host) is surfaced directly: a fresh exit won't fix it,
     // so it must not spend the proxy budget (matches retrieve's escalation gate).
     await this.#discardSession(); // drop the blocked direct session before escalating
-    if (this.#resolveProxyOverride() !== undefined && shouldEscalateDrive(direct)) {
+    const escalationAllowed = hostMayEscalate(new URL(url).hostname, this.#escalateHosts);
+    if (this.#resolveProxyOverride() !== undefined && escalationAllowed && shouldEscalateDrive(direct)) {
       return this.#openHealthyAndNavigate(url, false, budgetDeadlineMs);
     }
     // #45 (codex r2): a non-escalating direct failure that hit the per-call deadline is a TIMEOUT, not nav-failed.
@@ -679,7 +687,11 @@ export class GatewayDriveController implements DriveController {
           ? `navigation timed out (status=${dx.lastStatus ?? "n/a"}): the navigation was truncated by its timeout before the page finished loading — retry navigate`
           : `navigation failed (status=${dx.lastStatus ?? "n/a"}, reason=${dx.reason ?? "unknown"}): ` +
               `the page was blocked or could not be reached` +
-              (dx.proxyConfigured ? "" : " (no residential proxy configured to escalate to)"),
+              (!dx.proxyConfigured
+                ? " (no residential proxy configured to escalate to)"
+                : !escalationAllowed
+                  ? " (automatic proxy escalation is not enabled for this host — BGW_ESCALATE_HOSTS)"
+                  : ""),
       dx,
       this.#failure(direct, { budgetExceeded }),
     );

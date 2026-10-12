@@ -111,3 +111,25 @@ test("fail-closed: vault entries on disk but no master key refuses to boot", () 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("VIL-292: BGW_ESCALATE_HOSTS is parsed at boot — unset → undefined, list → hosts, `none` → []", async () => {
+  for (const [value, expected] of [[undefined, undefined], ["TotalWine.com", ["totalwine.com"]], ["none", []]]) {
+    const fx = fixtureEnv(value === undefined ? {} : { BGW_ESCALATE_HOSTS: value });
+    try {
+      const rt = buildGatewayRuntime(fx.env, { log: noLog });
+      assert.deepEqual(rt.escalateHosts, expected, `BGW_ESCALATE_HOSTS=${value}`);
+      await rt.gateway.shutdown().catch(() => {});
+    } finally {
+      fx.cleanup();
+    }
+  }
+});
+
+test("VIL-292: BGW_ESCALATE_HOSTS mixing `none` with hosts refuses to boot", () => {
+  const fx = fixtureEnv({ BGW_ESCALATE_HOSTS: "none,totalwine.com" });
+  try {
+    assert.throws(() => buildGatewayRuntime(fx.env, { log: noLog }), /BGW_ESCALATE_HOSTS/);
+  } finally {
+    fx.cleanup();
+  }
+});

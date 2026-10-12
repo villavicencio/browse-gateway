@@ -28,6 +28,47 @@ export interface EscalationContext {
   onDatacenterIp: boolean;
   /** Whether a residential proxy is configured/available to escalate to. */
   proxyAvailable: boolean;
+  /**
+   * VIL-292: host suffixes AUTOMATIC escalation may fire for (`BGW_ESCALATE_HOSTS`, see
+   * {@link parseEscalateHosts}). `undefined` = every host (the pre-VIL-292 behavior); `[]` = none.
+   */
+  escalateHosts?: readonly string[];
+}
+
+/**
+ * Parse `BGW_ESCALATE_HOSTS` (VIL-292): which hosts the AUTOMATIC escalate-on-block path may spend a
+ * residential session on. Unset or blank → `undefined`, every host escalates as before. `none` → `[]`,
+ * nothing escalates automatically. Otherwise a comma-separated host-suffix list, matched like
+ * force-proxy. Only the automatic decision reads it: force-proxy (`forceProxy` / `BGW_FORCE_PROXY_HOSTS`),
+ * vault login capture, and vault warm-open keep their own proxy rules. FAIL-CLOSED at boot on `none`
+ * mixed with hosts, which has no single reading.
+ *
+ * Why it exists: on a residential prod host direct-first already clears what the datacenter IP could
+ * not, while `BGW_ON_DATACENTER_IP=1` must stay set because the vault's pinned/fresh-exit replay needs
+ * it. This narrows the paid fallback without touching the vault.
+ */
+export function parseEscalateHosts(value: string | undefined): string[] | undefined {
+  const hosts = parseHostSuffixList(value);
+  if (hosts.length === 0) return undefined;
+  if (!hosts.includes("none")) return hosts;
+  if (hosts.length > 1) {
+    throw new Error(
+      `BGW_ESCALATE_HOSTS: "none" cannot be combined with hosts (got "${value}") — set "none" to turn ` +
+        `automatic escalation off, or list only the hosts that may escalate`,
+    );
+  }
+  return [];
+}
+
+/** Boot-line rendering of {@link parseEscalateHosts}'s result: `all`, `none`, or the host list. */
+export function describeEscalateHosts(hosts: readonly string[] | undefined): string {
+  if (hosts === undefined) return "all";
+  return hosts.length === 0 ? "none" : hosts.join(",");
+}
+
+/** True when automatic escalation may fire for `host` under `escalateHosts` (undefined = any host). */
+export function hostMayEscalate(host: string, escalateHosts: readonly string[] | undefined): boolean {
+  return escalateHosts === undefined || hostMatchesAnySuffix(host, escalateHosts);
 }
 
 /**
@@ -46,13 +87,18 @@ export interface EscalationContext {
  * status still escalates — screenshot-proven to clear); on every other status a hint-only CF page still
  * escalates exactly as before, so the hint-only interstitial path (403/503 + marker, no phrase) is kept.
  * Full unification (phrase required everywhere) was rejected for that reason.
+ *
+ * VIL-292: `host` is the requested target's host. With `ctx.escalateHosts` set, a host outside the list
+ * never escalates, and a missing `host` cannot be checked against it, so it doesn't escalate either.
  */
 export function shouldEscalateToProxy(
   signal: PageSignal,
   status: number | null,
   ctx: EscalationContext,
+  host?: string,
 ): boolean {
   if (!ctx.onDatacenterIp || !ctx.proxyAvailable) return false;
+  if (ctx.escalateHosts !== undefined && (host === undefined || !hostMayEscalate(host, ctx.escalateHosts))) return false;
   return (isCloudflareBlock(signal) && !isTerminalUnclearableRender(signal, status)) || isExitClearableHardBlock(signal, status);
 }
 

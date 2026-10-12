@@ -11,7 +11,7 @@
 import { createServer } from "node:http";
 import type { Consumer } from "../policy/index.js";
 import { redactSecrets } from "../security/index.js";
-import { retrieve, hostForcesProxy } from "../verbs/index.js";
+import { retrieve, hostForcesProxy, describeEscalateHosts } from "../verbs/index.js";
 import { buildGatewayRuntime } from "./runtime.js";
 import { redactedSearchFn } from "../search/index.js";
 import { loadArtifactConfig, buildArtifactRuntime } from "../artifacts/runtime-builder.js";
@@ -125,7 +125,7 @@ async function main(): Promise<void> {
   // capture is a construction-time property of every browser core the gateway is about to pool — see
   // BuildRuntimeOptions.captureEnabled.
   const artifactConfig = loadArtifactConfig(process.env);
-  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress, search } =
+  const { gateway, secrets, policy, specs, config, vault, onDatacenterIp, stickySuffix, forceProxyHosts, escalateHosts, freshExitHosts, warmupHosts, warmupPaths, verifyEgress, search } =
     buildGatewayRuntime(process.env, { log, captureEnabled: artifactConfig.enabled });
   gateway.sessions.startReaper(DRIVE_IDLE_TTL_MS, DRIVE_REAPER_INTERVAL_MS);
 
@@ -193,6 +193,7 @@ async function main(): Promise<void> {
         onDatacenterIp,
         stickySuffix,
         forceProxyHosts,
+        ...(escalateHosts !== undefined ? { escalateHosts } : {}),
         freshExitHosts,
         warmupHosts,
         warmupPaths,
@@ -218,7 +219,7 @@ async function main(): Promise<void> {
             return await retrieve(gateway, secrets, {
               token: consumer.token,
               url,
-              escalation: { onDatacenterIp },
+              escalation: { onDatacenterIp, ...(escalateHosts !== undefined ? { escalateHosts } : {}) },
               stickySuffix,
               forceProxy: forced,
               timeouts: config.timeouts,
@@ -307,6 +308,8 @@ async function main(): Promise<void> {
       log(
         `listening on ${bind}:${port} — consumers=[${specs.map((s) => s.id).join(", ")}] ` +
           `maxSessions=${config.maxSessions} perConsumerMax=${config.perConsumerMax} datacenter=${onDatacenterIp} ` +
+          // VIL-292: which hosts automatic escalation may spend a residential session on (all/none/list).
+          `escalate=${describeEscalateHosts(escalateHosts)} ` +
           `sticky=${stickySuffix !== undefined} ` +
           // VIL-122: the enablement + provider order ride the boot line the pre-swap smoke already
           // greps, so a search misconfiguration is visible to the deploy without a new deploy step.
