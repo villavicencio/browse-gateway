@@ -238,3 +238,12 @@ test("drive: a non-escalatable failure on an unlisted host doesn't blame BGW_ESC
   });
   assert.equal(opened.length, 1);
 });
+
+// --- review round 2 (MergeWren 401eed9) ---------------------------------------------------------
+
+test("parseEscalateHosts: an entry with URL-authority delimiters fails closed instead of folding to another host", () => {
+  for (const entry of ["trusted.example@other.example", "a.example/path", "a.example:8443", "https://a.example", "a.example?x", "a.example#f", "[::1]"]) {
+    assert.throws(() => parseEscalateHosts(entry), /BGW_ESCALATE_HOSTS: ".*" is not a host suffix/, entry);
+  }
+  assert.deepEqual(parseEscalateHosts("a.example,bücher.example"), ["a.example", "xn--bcher-kva.example"], "bare hosts still parse");
+});

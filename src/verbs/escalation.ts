@@ -49,7 +49,17 @@ export interface EscalationContext {
  * it. This narrows the paid fallback without touching the vault.
  */
 export function parseEscalateHosts(value: string | undefined): string[] | undefined {
-  const hosts = parseHostSuffixList(value).map(asciiHost);
+  const raw = parseHostSuffixList(value);
+  // Fail closed BEFORE the ASCII fold: asciiHost parses each entry as a URL authority, so `a@b` would
+  // become `b` and `a/b` would become `a`, quietly authorizing a host the operator never named.
+  const bad = raw.find((h) => /[@/\\:?#\s[\]]/.test(h));
+  if (bad !== undefined) {
+    throw new Error(
+      `BGW_ESCALATE_HOSTS: "${bad}" is not a host suffix — list bare hosts (no scheme, userinfo, port, ` +
+        `path, query or fragment), comma-separated`,
+    );
+  }
+  const hosts = raw.map(asciiHost);
   if (hosts.length === 0) return undefined;
   if (!hosts.includes("none")) return hosts;
   if (hosts.length > 1) {
