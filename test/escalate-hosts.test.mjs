@@ -247,3 +247,10 @@ test("parseEscalateHosts: an entry with URL-authority delimiters fails closed in
   }
   assert.deepEqual(parseEscalateHosts("a.example,bücher.example"), ["a.example", "xn--bcher-kva.example"], "bare hosts still parse");
 });
+
+test("parseEscalateHosts: an entry the ASCII fold would rewrite fails closed (percent, fullwidth, zero-width, wildcard, empty label)", () => {
+  for (const entry of ["evil%2ecom", "a%40b.example", "good.example＠evil.example", "a．example", "a​b.example", "*.a.example", "a..b", ".a.example"]) {
+    assert.throws(() => parseEscalateHosts(entry), /BGW_ESCALATE_HOSTS: ".*" is not a host suffix/, JSON.stringify(entry));
+  }
+  assert.deepEqual(parseEscalateHosts("a.example.,a_b.example,1.2.3.4"), ["a.example", "a_b.example", "1.2.3.4"], "valid forms still parse");
+});

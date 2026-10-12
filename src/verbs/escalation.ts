@@ -7,6 +7,7 @@
  */
 import { assess, isExitClearableHardBlock, isTerminalUnclearableRender, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
+import { domainToUnicode } from "node:url";
 import { parseHostSuffixList, hostMatchesAnySuffix, asciiHost } from "../security/index.js";
 
 /**
@@ -51,15 +52,20 @@ export interface EscalationContext {
 export function parseEscalateHosts(value: string | undefined): string[] | undefined {
   const raw = parseHostSuffixList(value);
   // Fail closed BEFORE the ASCII fold: asciiHost parses each entry as a URL authority, so `a@b` would
-  // become `b` and `a/b` would become `a`, quietly authorizing a host the operator never named.
-  const bad = raw.find((h) => /[@/\\:?#\s[\]]/.test(h));
-  if (bad !== undefined) {
-    throw new Error(
-      `BGW_ESCALATE_HOSTS: "${bad}" is not a host suffix — list bare hosts (no scheme, userinfo, port, ` +
-        `path, query or fragment), comma-separated`,
-    );
-  }
+  // become `b`, `a/b` would become `a`, and `evil%2ecom` would become `evil.com`, quietly authorizing a
+  // host the operator never named.
+  const bad = raw.find((h) => /[@/\\:?#%\s[\]]/.test(h));
+  if (bad !== undefined) throw new Error(notAHostSuffix(bad));
   const hosts = raw.map(asciiHost);
+  // Then require the folded result to be a plain hostname (non-empty dot-separated labels of letters,
+  // digits, `-` or `_`) that converts back to exactly what was written. The pattern rejects what the fold
+  // leaves behind (a fullwidth `＠`, a wildcard `*.`, an empty label); the round trip rejects what the fold
+  // silently rewrites (a zero-width space deleted, a fullwidth `．` mapped to `.`), while a real IDN
+  // (`bücher.example`) survives it. One class of input, not one character at a time.
+  const invalid = hosts.findIndex(
+    (h, i) => !/^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(h) || domainToUnicode(h) !== raw[i],
+  );
+  if (invalid !== -1) throw new Error(notAHostSuffix(raw[invalid] as string));
   if (hosts.length === 0) return undefined;
   if (!hosts.includes("none")) return hosts;
   if (hosts.length > 1) {
@@ -69,6 +75,13 @@ export function parseEscalateHosts(value: string | undefined): string[] | undefi
     );
   }
   return [];
+}
+
+function notAHostSuffix(entry: string): string {
+  return (
+    `BGW_ESCALATE_HOSTS: "${entry}" is not a host suffix — list bare hosts (no scheme, userinfo, port, ` +
+    `path, query, fragment, percent-encoding or wildcard), comma-separated`
+  );
 }
 
 /** Boot-line rendering of {@link parseEscalateHosts}'s result: `all`, `none`, or the host list. */
