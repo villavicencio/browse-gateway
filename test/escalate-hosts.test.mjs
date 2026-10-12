@@ -213,3 +213,28 @@ test("drive: a force-proxy host ignores the list — `none` doesn't block BGW_FO
   assert.equal(opened.length, 1);
   assert.ok(opened[0].overrides?.proxy, "proxied from the first request");
 });
+
+// --- review round 1 (MergeWren ae79f0b) ---------------------------------------------------------
+
+test("IDN: a Unicode entry matches the punycode host new URL() hands the matcher", () => {
+  const hosts = parseEscalateHosts("bücher.example");
+  assert.deepEqual(hosts, ["xn--bcher-kva.example"], "stored in the encoding requests arrive in");
+  assert.equal(hostMayEscalate(new URL("https://www.bücher.example/").hostname, hosts), true);
+  assert.equal(hostMayEscalate("www.bücher.example", hosts), true, "a Unicode host is folded too");
+});
+
+test("drive: a non-escalatable failure on an unlisted host doesn't blame BGW_ESCALATE_HOSTS", async () => {
+  const notFound = { title: "Not Found", tree: "404", status: 404 };
+  const { gateway, opened } = makeDriveGateway([notFound]);
+  const drive = new GatewayDriveController(gateway, new SecretStore(PROXY_SECRETS), "tok", {
+    onDatacenterIp: true,
+    stickySuffix: "_s-{id}",
+    escalateHosts: ["totalwine.com"],
+  });
+  await assert.rejects(drive.navigate("https://www.indexxx.com/missing"), (err) => {
+    assert.ok(err instanceof EscalationError);
+    assert.doesNotMatch(err.message, /BGW_ESCALATE_HOSTS/, "a 404 would not have escalated on any host");
+    return true;
+  });
+  assert.equal(opened.length, 1);
+});

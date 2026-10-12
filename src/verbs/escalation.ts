@@ -7,7 +7,7 @@
  */
 import { assess, isExitClearableHardBlock, isTerminalUnclearableRender, CF_BLOCK_PHRASES, CF_VENDOR_HINTS } from "../browser/index.js";
 import type { PageSignal } from "../browser/index.js";
-import { parseHostSuffixList, hostMatchesAnySuffix } from "../security/index.js";
+import { parseHostSuffixList, hostMatchesAnySuffix, asciiHost } from "../security/index.js";
 
 /**
  * True when the page is blocked AND the block is specifically a Cloudflare challenge
@@ -39,7 +39,8 @@ export interface EscalationContext {
  * Parse `BGW_ESCALATE_HOSTS` (VIL-292): which hosts the AUTOMATIC escalate-on-block path may spend a
  * residential session on. Unset or blank → `undefined`, every host escalates as before. `none` → `[]`,
  * nothing escalates automatically. Otherwise a comma-separated host-suffix list, matched like
- * force-proxy. Only the automatic decision reads it: force-proxy (`forceProxy` / `BGW_FORCE_PROXY_HOSTS`),
+ * force-proxy, except that each entry and the requested host are both folded to ASCII (punycode), so a
+ * Unicode IDN entry matches the `new URL().hostname` it will be compared with. Only the automatic decision reads it: force-proxy (`forceProxy` / `BGW_FORCE_PROXY_HOSTS`),
  * vault login capture, and vault warm-open keep their own proxy rules. FAIL-CLOSED at boot on `none`
  * mixed with hosts, which has no single reading.
  *
@@ -48,7 +49,7 @@ export interface EscalationContext {
  * it. This narrows the paid fallback without touching the vault.
  */
 export function parseEscalateHosts(value: string | undefined): string[] | undefined {
-  const hosts = parseHostSuffixList(value);
+  const hosts = parseHostSuffixList(value).map(asciiHost);
   if (hosts.length === 0) return undefined;
   if (!hosts.includes("none")) return hosts;
   if (hosts.length > 1) {
@@ -68,7 +69,7 @@ export function describeEscalateHosts(hosts: readonly string[] | undefined): str
 
 /** True when automatic escalation may fire for `host` under `escalateHosts` (undefined = any host). */
 export function hostMayEscalate(host: string, escalateHosts: readonly string[] | undefined): boolean {
-  return escalateHosts === undefined || hostMatchesAnySuffix(host, escalateHosts);
+  return escalateHosts === undefined || hostMatchesAnySuffix(asciiHost(host), escalateHosts);
 }
 
 /**

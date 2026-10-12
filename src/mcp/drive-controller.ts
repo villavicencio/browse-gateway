@@ -673,7 +673,8 @@ export class GatewayDriveController implements DriveController {
     // so it must not spend the proxy budget (matches retrieve's escalation gate).
     await this.#discardSession(); // drop the blocked direct session before escalating
     const escalationAllowed = hostMayEscalate(new URL(url).hostname, this.#escalateHosts);
-    if (this.#resolveProxyOverride() !== undefined && escalationAllowed && shouldEscalateDrive(direct)) {
+    const qualifiesForEscalation = shouldEscalateDrive(direct);
+    if (this.#resolveProxyOverride() !== undefined && escalationAllowed && qualifiesForEscalation) {
       return this.#openHealthyAndNavigate(url, false, budgetDeadlineMs);
     }
     // #45 (codex r2): a non-escalating direct failure that hit the per-call deadline is a TIMEOUT, not nav-failed.
@@ -689,7 +690,7 @@ export class GatewayDriveController implements DriveController {
               `the page was blocked or could not be reached` +
               (!dx.proxyConfigured
                 ? " (no residential proxy configured to escalate to)"
-                : !escalationAllowed
+                : !escalationAllowed && qualifiesForEscalation
                   ? " (automatic proxy escalation is not enabled for this host — BGW_ESCALATE_HOSTS)"
                   : ""),
       dx,
