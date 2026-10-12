@@ -61,9 +61,10 @@ export function parseEscalateHosts(value: string | undefined): string[] | undefi
   // digits, `-` or `_`) that converts back to exactly what was written. The pattern rejects what the fold
   // leaves behind (a fullwidth `＠`, a wildcard `*.`, an empty label); the round trip rejects what the fold
   // silently rewrites (a zero-width space deleted, a fullwidth `．` mapped to `.`), while a real IDN
-  // (`bücher.example`) survives it. One class of input, not one character at a time.
+  // survives it, written either way: `bücher.example` round-trips, and `xn--bcher-kva.example` is already
+  // its own folded form. One class of input, not one character at a time.
   const invalid = hosts.findIndex(
-    (h, i) => !/^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(h) || domainToUnicode(h) !== raw[i],
+    (h, i) => !/^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(h) || (h !== raw[i] && domainToUnicode(h) !== raw[i]),
   );
   if (invalid !== -1) throw new Error(notAHostSuffix(raw[invalid] as string));
   if (hosts.length === 0) return undefined;

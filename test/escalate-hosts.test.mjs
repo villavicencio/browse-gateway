@@ -253,4 +253,5 @@ test("parseEscalateHosts: an entry the ASCII fold would rewrite fails closed (pe
     assert.throws(() => parseEscalateHosts(entry), /BGW_ESCALATE_HOSTS: ".*" is not a host suffix/, JSON.stringify(entry));
   }
   assert.deepEqual(parseEscalateHosts("a.example.,a_b.example,1.2.3.4"), ["a.example", "a_b.example", "1.2.3.4"], "valid forms still parse");
+  assert.deepEqual(parseEscalateHosts("xn--bcher-kva.example"), ["xn--bcher-kva.example"], "an IDN already in punycode parses (MergeWren d39d9b5#1)");
 });
