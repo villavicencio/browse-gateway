@@ -1,85 +1,64 @@
 ---
-created_at: "2026-10-10T14:47:18-07:00"
+created_at: "2026-10-20T21:04:25-07:00"
 branch: "main"
-head: "4e8a893"
+head: "e690d24"
 worktree: "/Users/dvillavicencio/Projects/browse-gateway"
 ---
-# HANDOFF — 2026-10-10, afternoon
+# HANDOFF — 2026-10-20, evening
 
-This session ran from 2026-10-07 to 2026-10-10. It took the search router and a batch of fixes (PRs #151–#167) from merged to live, through three operator-run deploys. It moved PR review onto MergeWren and retired the dead CI deploy path. Measuring prod latency end to end then showed that every `retrieve` was paying ~5 s for a VPS-era CPU cap, and that a policy-refused URL waited out a whole clearance poll. Both are fixed and live. Nothing is in flight.
+This session started on 2026-10-12. An IPRoyal usage report showed proxy traffic falling to nothing after the move to the residential prod host. Around the same time IPRoyal published a policy blocking adult sites, which made up almost all of our proxied traffic. That led to VIL-292: the code that limits automatic proxy fallback to named sites is merged, but the setting hasn't been deployed. Nothing has moved since 2026-10-12: no commits and no deploy evidence.
 
 ## What We Built
 
-- **Prod is `main` `4e8a893`** (digest `sha256:bf48a34d…`), running with `BGW_CPUS=4`. The rollback anchor is `4d83c8c` (`sha256:b2bfa6ea…`).
-  - Deploy history, the procedure and the host paths are in `CONTEXT.local.md` ("Production…" section).
-  - Deploys run from `scripts/deploy/deploy-ref.sh <40-hex sha>` on the prod host, using the host's copies of the scripts. Those were sha256-verified against `163c628`, and the deploy scripts haven't changed since.
-- **PR #166 (VIL-313): `Timing` now accounts for the whole call.** New fields: `sessionAcquireMs` (Chrome launch), `pageSetupMs` and `sessionReleaseMs`. Since the deploy, a thin-404 `retrieve` leaves only 35–71 ms unattributed. The fields describe the *surfaced* render, the same scope as every existing stage.
-- **PR #167 (VIL-314): a navigation the gateway's own guard refused runs no clearance-poll rounds.** It now returns `policy-blocked` about 19 s sooner in prod.
-  - The decision lives in the pure `clearancePollLimitMs` (`src/browser/patchright-core.ts`).
-  - Proof: `scripts/validate-failure-envelope.mjs` asserts the core's poll sleep counter `clearanceWaitedMs === 0`.
-- **PR #157 (VIL-133): `obscura keys new` checks the pool floor before staging anything, and `--apply` (new and revoke) refuses without `smokeCmd`.** Bash sources the env file once, exactly as the launcher does. A value the file leaves to the environment produces a warning, never a refusal.
-- **PR #158 (VIL-294): `scripts/run-gate.sh <image> <gate>`.** It runs the image's own `tini -s` as amd64 first, and refuses to start a gate if Colima has fallen back to QEMU.
-- **Earlier in the arc:**
-  - #151: the search router (VIL-123);
-  - #152: the captcha solver refuses redirects;
-  - #154, #155, #163: poll and escalation fixes for 404/410/429;
-  - #161: `_meta` session-failure kind (VIL-110);
-  - #162: `deploy-http.yml` deleted;
-  - #164: image retention;
-  - #156, #153, #160, #159, #165: smaller changes.
-- **Off-repo:**
-  - **MergeWren** now reviews every browse-gateway PR within minutes; it replaces CodeRabbit's one-review-per-hour throttle.
-  - **GitHub:** the six deploy secrets and the empty `prod` environment are deleted. `BGW_DEPLOY_ID_KEY` stays, because `ci.yml:90` uses it.
-  - **Tailscale:** the old deploy workflow's OAuth client is revoked.
-- **Linear:** VIL-133, VIL-136, VIL-294, VIL-313 and VIL-314 are Done, with evidence on each. VIL-293 carries the launch-cost numbers.
+- **PR #169 (`e690d24`, VIL-292): `BGW_ESCALATE_HOSTS`.** Parsed in `parseEscalateHosts` (`src/verbs/escalation.ts`).
+  - **Values:** unset means every host may escalate (unchanged); `none` means no host; a host list allows only those.
+  - **Scope:** only the *automatic* escalate-on-block path reads it: retrieve, and drive's first navigate. Force-proxy (`forceProxy`, `BGW_FORCE_PROXY_HOSTS`), vault login capture and vault warm-open ignore it.
+  - **Boot line:** shows `escalate=all|none|<hosts>`.
+  - **Parser:** strict. An entry the URL/IDNA fold would rewrite (`a@b`, `evil%2ecom`, zero-width or fullwidth characters, `*.`) makes the gateway refuse to boot. A real IDN parses whether written in Unicode or punycode.
+  - **Tests:** `test/escalate-hosts.test.mjs`, plus 2 boot tests in `test/runtime.test.mjs`. Each one was checked to fail with its fix removed.
+- **Linear:** VIL-292 has the measurements (comment from 2026-10-12) and the deploy steps. It auto-closed when #169 merged and was reopened to In Progress, because it isn't done until deployed and verified.
+- **Memory:** `iproyal-adult-sites-blocked` records the policy, the measurements, and "never route adult sites through IPRoyal."
 
 ## Decisions Made
 
-- **#157, option 2 (operator):** the gateway's boot check, run inside the pre-swap smoke, is the one authority on whether a config boots. The CLI pre-flight is advisory: it refuses a certain breach and warns on doubt.
-- **The MergeWren stopping rule (operator):** after a trade-off is picked, fix highs and anything that breaks the chosen option. Decline the rest, with reasons on the thread and in the PR body, and merge when no high remains. It's in agent memory.
-- **`BGW_CPUS=4` (operator), from a measured curve.** Whole call at each cap:
-
-  | CPUs | whole call (s) |
-  |---|---|
-  | 2 | 5.4 |
-  | 3 | 4.0 |
-  | 4 | 3.5 |
-  | 6 | 3.0 |
-  | uncapped | 3.0 |
-
-  It's set in the host's deploy config. `launch-http.sh`'s own default is still the VPS-era `1.75`, deliberately left alone, since the host config overrides it.
-- **VIL-314 keeps the poll's single opening read** (~0.7–1.3 s on Chrome's error page). Skipping it was measured: it only moved the same time into `snapshotMs`.
-- **Prod checks of policy blocks use the gate inside prod's image, run on the prod host.** Never use private or metadata IPs; the permission classifier rightly denies those.
+- **Escalate named hosts only (operator, 2026-10-12)**, chosen over:
+  - setting `BGW_ON_DATACENTER_IP=0`, which breaks the vault's pinned and fresh-exit replay (`src/mcp/vault-login.ts:257-279`);
+  - separating the flag from the vault entirely (the biggest change);
+  - leaving it as is.
+- **Keep the logged-in Total Wine flow working (operator).** That's why `BGW_ON_DATACENTER_IP` stays `1` on the prod host, even though the IP is residential. The boot line will keep saying `datacenter=true`, and that is deliberate.
+- **Intended prod value: `BGW_ESCALATE_HOSTS=totalwine.com`.** Total Wine isn't an adult site, and its homepage already cleared direct (~11 s).
+- **MergeWren: 5 rounds; 4 mediums fixed, 1 declined (`e7d2bed#1`).** A malformed punycode entry like `xn--` boots and matches nothing. That fails safe (less proxy use), and a plain misspelling has the same effect and can't be caught. The reasons are on the thread and in the PR body.
 
 ## What Didn't Work
 
-- **Parsing the env file by hand in #157.** Seven review rounds each found another bash rule it got wrong. Bash itself evaluates the file now.
-- **#157's middle rounds (cleared env, sentinels, two-environment agreement).** Each fix drew an opposite medium finding. That's what produced the stopping rule.
-- **Waiting for the block event in VIL-314.** A debug build showed the guard has already recorded the block when `goto` throws (73 ms), so the wait was removed.
-- **Timing drive calls batched in one message.** Parallel `browser_navigate` calls on one session inflated each other; issue them one at a time.
+- **Reading `captchaSolveReason: not-configured` as a missing solver key on the prod host.** Retrieve never wires a solver, so it always reports that (`src/verbs/retrieve.ts:1341`). Not a migration gap.
+- **Patching the host-list parser one character at a time.** The probes kept finding new ones (`@`, then `%2e`, a zero-width space, fullwidth `．`). What ended it: the folded entry must be a plain hostname, and either be unchanged by the fold or convert back to exactly what was written.
+- **`git checkout -- <file>` to undo a deliberate break during a RED check.** It also wiped the uncommitted fix in that file. Back up with `cp` and restore from the copy.
 
 ## What's Next
 
-1. **VIL-293 (operator decision):** Chrome launch is now the largest per-call cost, about 2.0 s at 4 CPUs (1.7 s uncapped). The options are an arm64 image, or reusing browsers across `retrieve` calls. Browser reuse gives up the fresh browser per call, which matters for isolation and stealth. Compare arm64 at the same CPU setting.
-2. **If agents start fetching in parallel and calls slow down, raise `BGW_CPUS`** (6 measured as fast as uncapped) before suspecting a regression.
-3. **Backlog:**
-   - VIL-292: the boot line still says `datacenter=true` on a residential host.
-   - VIL-131: memory may run out before CPU if concurrency grows (host capacity figures are in `CONTEXT.local.md`).
-   - `obscura keys` still targets the retired host (README documents the on-host path, #165).
-4. **Minor:** `browse-gateway:vil313` and `:vil314` test images are left inside Colima's VM. Delete them when Colima is next up.
+1. **Deploy VIL-292 on the prod host (the operator agent runs it as the service account).**
+   - The runbook is the last comment on VIL-292: back up the container env file, append `export BGW_ESCALATE_HOSTS=totalwine.com`, then `deploy-ref.sh e690d24fbc419742c72ded4a7f1d1312b9fc98c7`.
+   - Check that the boot line shows `escalate=totalwine.com`. The rollback anchor is `4e8a893`.
+   - Have the agent report the `BGW_FORCE_PROXY_HOSTS` and `BGW_WARM_FRESH_EXIT_HOSTS` values. Any adult host on the force list still goes through IPRoyal, because force-proxy ignores the new setting.
+2. **Verify from the Mac after the deploy** (time each call; a successful retrieve doesn't report whether the proxy was used):
+   - an indexxx retrieve should fail with `proxyUsed=false` in roughly 30 s instead of 90 s;
+   - iafd (~6 s) and the Total Wine homepage (~11 s) should still load.
+
+   Then mark VIL-292 Done, with evidence.
+3. **File a ticket: indexxx fails both direct and proxied** (Cloudflare 403 "Just a moment…"; one sample each, 2026-10-12). It cleared through the proxy in September.
+4. **Carried from the 2026-10-10 handoff:**
+   - VIL-293 (operator decision: arm64 image vs reusing browsers; Chrome launch is ~2 s per call);
+   - raise `BGW_CPUS` if parallel calls slow down;
+   - VIL-131;
+   - `obscura keys` still targets the retired host;
+   - delete the `browse-gateway:vil313` and `:vil314` images when Colima is next up.
 
 ## Gotchas & Watch-outs
 
-- **The host deploy config is sourced without `set -a`.** A setting must be written as `export NAME=value` to reach `launch-http.sh`; a bare assignment is silently ignored. Verify with `docker inspect -f '{{.HostConfig.NanoCpus}}' browse-gateway-http`.
-- **`BGW_CPUS` caps the whole container,** so all concurrent sessions share it. The curve was measured one fetch at a time.
-- **A successful MCP `retrieve` tool response carries no timing** (the programmatic `retrieve()` result does). Through the MCP tool, measure via the thin-404 URL `https://api.github.com/vil121-does-not-exist`. To separate session cost from page work, use drive's `browser_navigate` inside an open session.
-- **The Bash tool here runs zsh:**
-  - Never name a variable `path`; it wipes `PATH`. This happened twice.
-  - `$var` doesn't word-split.
-  - Test output is coloured, so use `node --test --test-reporter=tap <files>` (with the flag before the files) and `tsc --pretty false`.
-- **MergeWren:**
-  - A declined finding stays "still open" in every later round.
-  - Reviews run one PR at a time.
-  - The incremental round is "not a pass"; wait for the full confirmation review.
-  - The full write-up is in agent memory.
-- **Colima is stopped.** Start it only for in-container gates, run them through `scripts/run-gate.sh`, and stop it afterwards.
+- **A successful MCP `retrieve` hides `proxyUsed`.** It only shows on failure, so time the call: a direct render takes ~5–11 s, a proxied attempt 8–58 s. To prove the proxy is in use, compare a direct and a `forceProxy` retrieve of an IP-echo endpoint. Never paste those IPs into a ticket or a commit.
+- **Retrieve's `forceProxy` quietly goes direct when no proxy is configured** (`src/verbs/retrieve.ts`, `forced = … && Boolean(proxy) && onDatacenterIp`). A forced success alone doesn't prove the proxy was used.
+- **Naming a VIL id in a PR title auto-closes it on merge.** VIL-292 did; reopen after each merge until the deploy is verified.
+- **MergeWren on this PR only ever ran incremental rounds after the first full one.** "Still open" with no new text after a fix means it wants the class of input closed, not the single case.
+- **The prod host's container env file** is sourced by `launch-http.sh` with `set -a`, and every `BGW_*` variable is forwarded by name. The file's convention is still `export BGW_…=`. Its path, and the deploy procedure, are in `CONTEXT.local.md`.
+- **Unchanged:** the zsh shell rules (no variable named `path`; use `--test-reporter=tap` and `tsc --pretty false`), and Colima stays stopped except for in-container gates.
